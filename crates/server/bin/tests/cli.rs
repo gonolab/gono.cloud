@@ -93,6 +93,22 @@ impl Instance {
             &format!("{PASSWORD}\n"),
         )
     }
+
+    /// Adds a `[relay]` table that runs the relay on a free loopback port, and returns it.
+    fn enable_relay(&self) -> SocketAddr {
+        let relay = free_port();
+        let mut config = std::fs::read_to_string(self.config()).unwrap();
+        config.push_str(&format!(
+            r#"
+            [relay]
+            enabled = true
+            public_url = "https://relay.example.com"
+            bind = "{relay}"
+            "#
+        ));
+        std::fs::write(self.config(), config).unwrap();
+        relay
+    }
 }
 
 fn free_port() -> SocketAddr {
@@ -111,7 +127,15 @@ fn help_lists_every_subcommand() {
     let output = run(gono_cloud().arg("--help"));
     assert!(output.status.success());
     let help = text(&output.stdout);
-    for command in ["serve", "init", "config", "user", "app-password", "rescan"] {
+    for command in [
+        "serve",
+        "relay",
+        "init",
+        "config",
+        "user",
+        "app-password",
+        "rescan",
+    ] {
         assert!(help.contains(command), "missing {command}:\n{help}");
     }
     assert!(help.contains("GONO_CLOUD_CONFIG"), "{help}");
@@ -359,7 +383,7 @@ async fn rescan_changes_are_pushed_by_a_running_server() {
         .spawn()
         .unwrap();
     let addr = instance.addr;
-    wait_for_health(&mut child, addr);
+    wait_for_get(&mut child, addr, "/healthz");
 
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/push/ws"))
         .await
@@ -616,10 +640,83 @@ fn serve_answers_health_checks_and_stops_on_sigterm() {
         .spawn()
         .unwrap();
 
-    let response = wait_for_health(&mut child, instance.addr);
+    let response = wait_for_get(&mut child, instance.addr, "/healthz");
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(response.ends_with("ok\n"), "{response}");
 
+    let logs = terminate(child);
+    assert!(logs.contains("listening"), "{logs}");
+    assert!(logs.contains("received SIGTERM"), "{logs}");
+    assert!(
+        !logs.contains("relay"),
+        "the relay is off by default: {logs}"
+    );
+    assert!(!logs.contains(PASSWORD));
+}
+
+#[test]
+fn the_relay_command_needs_the_relay_enabled() {
+    let instance = Instance::new();
+    let output = run(&mut instance.command(&["relay"]));
+    assert!(!output.status.success());
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("relay.enabled is false"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_runs_the_relay_and_stops_it_on_sigterm() {
+    let instance = Instance::new();
+    let relay = instance.enable_relay();
+    assert!(instance.init().status.success());
+
+    let mut child = instance
+        .command(&["serve"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_get(&mut child, instance.addr, "/healthz");
+    // The probe devices use to detect captive portals, which the reverse proxy forwards.
+    let probe = wait_for_get(&mut child, relay, "/generate_204");
+    assert!(probe.starts_with("HTTP/1.1 204"), "{probe}");
+
+    let logs = terminate(child);
+    assert!(logs.contains("relay listening"), "{logs}");
+    assert!(logs.contains("relay stopped"), "{logs}");
+    // No device may use it yet: the operator is told.
+    assert!(logs.contains("relay.allowed_endpoints is empty"), "{logs}");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_relay_runs_alone_without_a_database() {
+    let instance = Instance::new();
+    let relay = instance.enable_relay();
+
+    let mut child = instance
+        .command(&["relay"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let probe = wait_for_get(&mut child, relay, "/generate_204");
+    assert!(probe.starts_with("HTTP/1.1 204"), "{probe}");
+    assert!(
+        http_get(instance.addr, "/healthz").is_none(),
+        "the file server must not run"
+    );
+
+    let logs = terminate(child);
+    assert!(logs.contains("relay listening"), "{logs}");
+    assert!(logs.contains("relay stopped"), "{logs}");
+    assert!(!instance.db().exists(), "no database is created");
+}
+
+/// Sends SIGTERM to `child`, waits until it exits successfully and returns its log.
+#[cfg(unix)]
+fn terminate(child: Child) -> String {
+    let mut child = child;
     let status = Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
         .status()
@@ -637,20 +734,18 @@ fn serve_answers_health_checks_and_stops_on_sigterm() {
     let output = child.wait_with_output().unwrap();
     let logs = text(&output.stdout);
     assert!(output.status.success(), "{logs}\n{}", text(&output.stderr));
-    assert!(logs.contains("listening"), "{logs}");
-    assert!(logs.contains("received SIGTERM"), "{logs}");
-    assert!(!logs.contains(PASSWORD));
+    logs
 }
 
-/// Polls `GET /healthz` until the server answers.
+/// Polls `GET <path>` on `addr` until it answers.
 #[cfg(unix)]
-fn wait_for_health(child: &mut Child, addr: SocketAddr) -> String {
+fn wait_for_get(child: &mut Child, addr: SocketAddr, path: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             panic!("server exited early with {status}");
         }
-        if let Some(response) = http_get(addr, "/healthz") {
+        if let Some(response) = http_get(addr, path) {
             return response;
         }
         assert!(

@@ -20,8 +20,10 @@ other's way.
 │       ├── core/           gono-server-core: configuration, SQLite metadata store and
 │       │                   migrations, users, app passwords, web sessions, rescan
 │       ├── dav/            gono-server-dav: WebDAV file system on top of dav-server
-│       └── nextcloud/      gono-server-nextcloud: status, capabilities, OCS, chunked upload v2,
-│                           Login Flow v2 documents, notify_push hub
+│       ├── nextcloud/      gono-server-nextcloud: status, capabilities, OCS, chunked upload v2,
+│       │                   Login Flow v2 documents, notify_push hub
+│       └── relay/          gono-server-relay: the iroh relay through which devices reach each
+│                           other, with its allowlist and counters
 ├── packaging/
 │   └── server/             Release archive contents (systemd unit, launchd job, README), the
 │                           install script, the packing script and the install test

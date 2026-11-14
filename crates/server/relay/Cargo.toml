@@ -1,0 +1,30 @@
+[package]
+name = "gono-server-relay"
+description = "The iroh relay through which devices reach each other across the internet."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gono-server-core.workspace = true
+iroh-base.workspace = true
+iroh-relay.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = ["macros", "sync"] }
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+futures-util = { workspace = true, features = ["sink"] }
+iroh-dns = "=1.4.1"
+noq = { version = "=1.4.0", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+rcgen = "0.14"
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

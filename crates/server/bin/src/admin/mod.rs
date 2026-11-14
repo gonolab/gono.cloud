@@ -65,6 +65,7 @@ use gono_server_nextcloud::{
     notify_push::{Endpoints, PushSettings},
     status,
 };
+use gono_server_relay::RelayStatus;
 use ipnet::IpNet;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
@@ -114,6 +115,8 @@ pub struct ServerInfo {
     pub lock_timeout_secs: u64,
     /// The notify_push settings, when enabled.
     pub push: Option<PushSettings>,
+    /// The relay, when enabled.
+    pub relay: Option<RelayStatus>,
     /// Configuration warnings to show.
     pub warnings: Vec<String>,
 }
@@ -536,6 +539,37 @@ async fn logout(
 // Overview
 // ---------------------------------------------------------------------------------------------
 
+/// The relay's line among the features: its host name, the allowed devices connected now, what
+/// it has carried and refused.
+fn relay_feature(t: &'static Text, relay: Option<&RelayStatus>) -> Feature {
+    let detail = match relay {
+        None => t.a_relay_off.to_owned(),
+        Some(relay) if !relay.is_running() => t.a_relay_stopped.to_owned(),
+        Some(relay) => {
+            let now = relay.snapshot();
+            let mut detail = fill(
+                t.a_relay_detail,
+                &[
+                    relay.public_url().host_str().unwrap_or_default(),
+                    &now.devices.to_string(),
+                    &relay.allowed_devices().to_string(),
+                    &format_bytes(now.bytes_sent),
+                    &now.denied.to_string(),
+                ],
+            );
+            if relay.qad_addr().is_none() {
+                detail.push_str(t.a_relay_no_qad);
+            }
+            detail
+        }
+    };
+    Feature {
+        name: t.a_relay,
+        detail,
+        on: relay.is_some_and(RelayStatus::is_running),
+    }
+}
+
 async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let admin = match admin(&state) {
         Ok(admin) => admin,
@@ -623,6 +657,7 @@ async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Response
             on: false,
         }),
     }
+    features.push(relay_feature(t, info.relay.as_ref()));
     features.push(Feature {
         name: "Login Flow v2",
         detail: count(

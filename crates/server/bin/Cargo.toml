@@ -24,6 +24,7 @@ futures-util.workspace = true
 gono-server-core.workspace = true
 gono-server-dav.workspace = true
 gono-server-nextcloud.workspace = true
+gono-server-relay.workspace = true
 ipnet.workspace = true
 rpassword.workspace = true
 rustix.workspace = true

@@ -4,6 +4,7 @@ pub mod app_password;
 pub mod config_check;
 pub mod init;
 pub(crate) mod output;
+pub mod relay;
 pub mod rescan;
 pub mod serve;
 pub mod user;

@@ -26,8 +26,17 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run the HTTP server until SIGTERM or Ctrl-C.
+    /// Run the HTTP server until SIGTERM or Ctrl-C. With `relay.enabled`, the relay runs too.
     Serve,
+
+    /// Run only the relay of `[relay]` until SIGTERM or Ctrl-C, on a host that does not run
+    /// `serve`.
+    ///
+    /// Devices reach each other through the relay when they cannot connect directly. `serve`
+    /// already runs it when `relay.enabled` is true; this command is for running it on a host
+    /// of its own. It reads the same configuration file and needs `relay.enabled = true`, but
+    /// neither the database nor the data directory.
+    Relay,
 
     /// Create the database, apply migrations and create the first admin account.
     Init(InitArgs),

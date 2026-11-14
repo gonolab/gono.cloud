@@ -11,7 +11,7 @@ use axum::{
 use gono_server_core::{
     RelPath, Username,
     app_passwords::{self, Scope},
-    config::DbConfig,
+    config::{DbConfig, RelayConfig},
     db::{self, OpenMode},
     meta::MetaStore,
     password,
@@ -20,6 +20,7 @@ use gono_server_core::{
     web_sessions,
 };
 use gono_server_nextcloud::chunking::ChunkedUploads;
+use gono_server_relay::Relay;
 use http_body_util::BodyExt as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use tower::ServiceExt as _;
@@ -108,6 +109,7 @@ async fn fixture() -> Fixture {
         case_insensitive: Some(false),
         lock_timeout_secs: 3600,
         push: None,
+        relay: None,
         warnings: vec!["a <b>warning</b>".into()],
     };
     let state = AppState {
@@ -959,4 +961,52 @@ async fn pages_follow_the_browser_language() {
     assert!(alice.body.contains("删除 alice…"), "{}", alice.body);
     let english = browser.get(&path("/")).await;
     assert!(english.body.contains("Overview") && !english.body.contains("概览"));
+}
+
+#[tokio::test]
+async fn the_overview_shows_the_relay() {
+    let mut f = fixture().await;
+    let mut browser = Browser::new(&f.state);
+    browser.root().await;
+    let off = browser.get(&path("/")).await;
+    assert!(off.body.contains("Turned off in [relay]"), "{}", off.body);
+
+    let relay = Relay::spawn(&RelayConfig {
+        enabled: true,
+        public_url: Some("https://relay.example.com".parse().unwrap()),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        ..RelayConfig::default()
+    })
+    .await
+    .unwrap();
+    let status = relay.status();
+    let mut info = f.state.admin.as_ref().unwrap().info.clone();
+    info.relay = Some(status.clone());
+    f.state.admin = Some(Arc::new(Admin::new(PREFIX, info)));
+    let mut browser = Browser::new(&f.state);
+    browser.root().await;
+
+    let on = browser.get(&path("/")).await;
+    assert!(
+        on.body
+            .contains("relay.example.com · 0 of 0 devices connected · 0 B relayed · 0 refused"),
+        "{}",
+        on.body
+    );
+    assert!(on.body.contains("no address discovery"), "{}", on.body);
+    let zh = [("Accept-Language", "zh-CN")];
+    let chinese = browser.send("GET", &path("/"), &zh, String::new()).await;
+    assert!(
+        chinese.body.contains("已连接 0/0 台设备"),
+        "{}",
+        chinese.body
+    );
+
+    relay.run_until(async {}).await.unwrap();
+    let stopped = browser.get(&path("/")).await;
+    assert!(
+        stopped.body.contains("Stopped after an error"),
+        "{}",
+        stopped.body
+    );
 }

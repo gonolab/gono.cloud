@@ -78,7 +78,7 @@ fn set_nodelay(stream: &mut TcpStream) {
 }
 
 /// Resolves on the first SIGTERM or Ctrl-C (SIGINT).
-async fn wait_for_signal() {
+pub(crate) async fn wait_for_signal() {
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
             tracing::error!(error = %err, "cannot listen for Ctrl-C");

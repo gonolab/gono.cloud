@@ -36,8 +36,10 @@ RestartSec=5s
 # One descriptor per client connection, open file and notify_push WebSocket.
 LimitNOFILE=65536
 
-# Hardening. The server only needs to write its state directory (database and files) and to
-# accept TCP connections; everything else is read only or hidden.
+# Hardening. The server only needs to write its state directory (database and files), to read
+# its configuration (and the relay's certificate next to it), to accept TCP connections and,
+# for the relay's QUIC address discovery, to use a UDP socket; everything else is read only or
+# hidden. The relay's ports are above 1024 and need no capabilities.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/gono-cloud

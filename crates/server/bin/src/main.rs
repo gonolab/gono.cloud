@@ -50,6 +50,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let config = cli.config.as_path();
     match cli.command {
         Command::Serve => commands::serve::run(config).await,
+        Command::Relay => commands::relay::run(config).await,
         Command::Init(args) => commands::init::run(config, args).await,
         Command::Config(ConfigCommand::Check) => commands::config_check::run(config),
         Command::User(command) => commands::user::run(config, command).await,

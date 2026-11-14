@@ -3,7 +3,9 @@
 Gono Cloud serves plain HTTP on a loopback address and expects a reverse proxy in front of it
 to terminate HTTPS. This guide shows working configurations for **nginx** and **Caddy** and
 explains which Gono Cloud settings have to match the proxy. It covers only the proxy; installing
-the server as a service, upgrades and backups are in [deployment.md](deployment.md).
+the server as a service, upgrades and backups are in [deployment.md](deployment.md). The relay
+(`[relay]`), when enabled, needs a host name and a server block of its own:
+[The relay](#the-relay).
 
 ## What the proxy has to do
 
@@ -237,3 +239,117 @@ Then sign in to the admin UI at `https://cloud.example.com/apps/manage/` (when
 `admin.enabled`): its overview shows the configured public URL, the trusted proxies and the
 number of live push connections. A "Request blocked" page after submitting a form means the
 browser's origin does not match `base_url`.
+
+## The relay
+
+With `relay.enabled`, Gono Cloud also runs the relay through which devices (Input Show) reach
+each other when they cannot connect directly; [deployment.md](deployment.md#the-relay) covers
+the settings, the allowed devices and the certificate. The relay serves plain HTTP on
+`relay.bind` (`127.0.0.1:16103` by default), and the proxy terminates HTTPS for it:
+
+| Requirement | Why |
+|---|---|
+| A host name of its own, `relay.public_url` (for example `relay.example.com`) | The relay cannot run below a path, so it cannot share `base_url`'s host name. |
+| Forward everything on that host name to `relay.bind`, upgrading WebSockets | Devices hold a WebSocket open on `/relay` and probe `/ping`. |
+| Answer `/generate_204` over **plain HTTP** on port 80 instead of redirecting it | Devices use it to detect captive portals. The usual "redirect all of port 80 to HTTPS" breaks it. |
+| Keep idle WebSockets open | A device keeps its relay connection while it is online, quiet between pings. |
+| No HTTP/2 needed | Devices open the WebSocket over HTTP/1.1. |
+
+QUIC address discovery (`relay.qad_bind`, UDP 7842) does not pass through the proxy: devices
+reach it directly, so open that UDP port in the firewall.
+
+The relay sees the proxy's address for every connection, which it does not need: devices are
+admitted by their key (`relay.allowed_endpoints`). Behind a proxy that terminates TLS, the relay
+handshake takes one more round trip to prove a device's key, which is expected.
+
+### nginx
+
+```nginx
+# The map of the main configuration above, when this is a separate file:
+# map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+upstream gono_relay {
+    server 127.0.0.1:16103;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name relay.example.com;
+
+    # The captive-portal probe answers over plain HTTP; everything else goes to HTTPS.
+    location = /generate_204 {
+        proxy_pass http://gono_relay;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name relay.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/relay.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/relay.example.com/privkey.pem;
+
+    # Relay WebSockets stay open while devices are online.
+    proxy_read_timeout 1h;
+    proxy_send_timeout 1h;
+
+    location / {
+        proxy_pass http://gono_relay;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+    }
+}
+```
+
+The relay does not limit how fast new connections arrive. To limit them per client address,
+add `limit_req_zone $binary_remote_addr zone=relay:10m rate=10r/s;` at the `http` level and
+`limit_req zone=relay burst=20;` to the HTTPS `location`.
+
+### Caddy
+
+```caddyfile
+relay.example.com {
+	reverse_proxy 127.0.0.1:16103
+}
+
+# An http:// site of its own replaces Caddy's automatic redirect for this host name, so that
+# the captive-portal probe answers over plain HTTP.
+http://relay.example.com {
+	handle /generate_204 {
+		reverse_proxy 127.0.0.1:16103
+	}
+	handle {
+		redir https://{host}{uri} 308
+	}
+}
+```
+
+### Checking the relay
+
+```sh
+# The captive-portal probe answers over plain HTTP: expect 204.
+curl -s -o /dev/null -w '%{http_code}\n' http://relay.example.com/generate_204
+
+# The relay answers over HTTPS: expect 200.
+curl -s -o /dev/null -w '%{http_code}\n' https://relay.example.com/healthz
+
+# The WebSocket upgrade reaches the relay: expect 400, because curl does not speak the relay
+# protocol. 502 or 504 point at the proxy.
+curl -si --http1.1 -o /dev/null -w '%{http_code}\n' \
+  -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  --max-time 3 https://relay.example.com/relay
+```
+
+The admin UI's overview shows the relay's host name, the allowed devices connected right now,
+the traffic it relayed and the connections it refused.

@@ -270,6 +270,114 @@ and Caddy. Two settings of Gono Cloud have to match the proxy:
 - `server.trusted_proxies` lists the proxies whose `X-Forwarded-For` headers are believed. The
   default configuration trusts `127.0.0.1` and `::1`, which fits a proxy on the same host.
 
+## The relay
+
+Devices of Gono products (Input Show today) connect to each other directly when they can. When
+they cannot, for example behind two NATs, they send their packets through a relay. The packets
+are encrypted end to end between the devices; the relay forwards them without seeing their
+content. The relay also tells devices the public address it sees them at (QUIC address
+discovery, QAD), which they need to punch through NAT and connect directly. Gono Cloud can run
+this relay; it is off by default (`[relay]`, `enabled = false`).
+
+What it needs:
+
+| | |
+|---|---|
+| **A host name of its own** | For example `relay.example.com`, with DNS pointing at this host and a certificate. The relay cannot run below a path, so it cannot share `base_url`'s host name. |
+| **A server block in the reverse proxy** | HTTPS for the host name, WebSockets forwarded to `relay.bind` (`127.0.0.1:16103`), and `/generate_204` over plain HTTP: [reverse-proxy.md](reverse-proxy.md#the-relay). |
+| **UDP 7842 open** (for QAD) | Devices reach QAD directly, not through the proxy. |
+| **A copy of the certificate** (for QAD) | QUIC brings its own TLS, so the relay needs the certificate of its host name and the key, readable by the service user. |
+| **The allowed devices** | Only the devices listed in `relay.allowed_endpoints` may use the relay. |
+
+### Turning it on
+
+A fresh install with `--relay-host relay.example.com` writes `[relay]` with `enabled = true` and
+`public_url`, creates `/etc/gono-cloud/relay-tls/` for the certificate, and lists the remaining
+steps. On an existing installation, edit the configuration:
+
+```toml
+[relay]
+enabled = true
+public_url = "https://relay.example.com"
+
+# QUIC address discovery, once the certificate is in place (below).
+qad_bind = "[::]:7842"
+tls_cert = "relay-tls/fullchain.pem"   # relative to the configuration file
+tls_key = "relay-tls/privkey.pem"
+
+# The device ids that may use the relay: the 64 hex digits Input Show shows for a device.
+allowed_endpoints = [
+  "6f6e8a2a5c1d0b9e7f3a4c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f",  # laptop
+]
+```
+
+Then validate the configuration and restart the service (see "Changing the configuration").
+`config check` warns while no device is allowed and while QAD is off. A device that is refused
+is named in the log, with its full id:
+
+```text
+INFO gono_server_relay::access: relay connection refused: the device is not in relay.allowed_endpoints device=6f6e8a…
+```
+
+Optional: `relay.max_client_bytes_per_sec` and `relay.max_client_burst_bytes` limit what the
+relay reads from one device connection.
+
+### The certificate for QUIC address discovery
+
+The reverse proxy owns the certificate of the relay's host name, and the service user cannot
+read it (certbot keeps private keys readable by root only). Copy the certificate and the key
+into `/etc/gono-cloud/relay-tls/` after every renewal; the relay reads them again every
+`relay.tls_reload_interval_secs` (an hour by default), so a renewal needs no restart. The relay
+does not start while `qad_bind` is set and the files are missing.
+
+With **certbot**, a deploy hook does it after each renewal. Save it as
+`/etc/letsencrypt/renewal-hooks/deploy/gono-cloud-relay` and make it executable:
+
+```sh
+#!/bin/sh
+# Hands the renewed certificate of the relay's host name to Gono Cloud.
+set -eu
+case ${RENEWED_LINEAGE:-} in
+*/relay.example.com) ;;
+*) exit 0 ;;
+esac
+install -m 0644 -o root -g gono-cloud "$RENEWED_LINEAGE/fullchain.pem" /etc/gono-cloud/relay-tls/fullchain.pem
+install -m 0640 -o root -g gono-cloud "$RENEWED_LINEAGE/privkey.pem" /etc/gono-cloud/relay-tls/privkey.pem
+```
+
+Run it once by hand for the certificate certbot already has:
+
+```sh
+sudo chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/gono-cloud-relay
+sudo RENEWED_LINEAGE=/etc/letsencrypt/live/relay.example.com \
+  /etc/letsencrypt/renewal-hooks/deploy/gono-cloud-relay
+```
+
+With **Caddy**, which renews on its own schedule, copy the files daily instead, for example from
+`/etc/cron.daily/gono-cloud-relay` with the same two `install` lines. Caddy keeps them under its
+data directory (`caddy environ` shows it), in
+`certificates/acme-v02.api.letsencrypt.org-directory/relay.example.com/relay.example.com.crt`
+and `.key`.
+
+On macOS the directory is `/usr/local/etc/gono-cloud/relay-tls/` and the group `_gono-cloud`.
+
+### Checking it
+
+- The log shows `relay listening` with the public URL, the address and, when QAD is on, its
+  socket.
+- The admin UI's overview shows the relay's host name, the allowed devices connected now, the
+  traffic it relayed and the connections it refused, or "no address discovery" while QAD is
+  off.
+- [reverse-proxy.md](reverse-proxy.md#checking-the-relay) has `curl` checks for the proxy.
+
+### A relay on a host of its own
+
+`gono-cloud relay` runs only the relay, without the file server: no database and no data
+directory. It reads the same configuration file, which still needs the required keys of
+`[server]`, `[storage]` and `[db]`, and `relay.enabled = true`. Run it with a copy of the
+systemd unit whose `ExecStart` is `/usr/local/bin/gono-cloud relay`, and do not run `serve` with
+the same `[relay]` on that host.
+
 ## Logs
 
 On Linux the server logs to the journal:

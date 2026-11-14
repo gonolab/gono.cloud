@@ -27,6 +27,14 @@ use crate::error::{ConfigError, ValidationIssue};
 pub const DEFAULT_BIND: SocketAddr =
     SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 16102);
 
+/// Default address of the relay's plain-HTTP listener, next to [`DEFAULT_BIND`]. Loopback only:
+/// the reverse proxy terminates HTTPS for the relay's host name.
+pub const DEFAULT_RELAY_BIND: SocketAddr =
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 16103);
+
+/// UDP port of QUIC address discovery that iroh devices use unless told otherwise.
+pub const DEFAULT_QAD_PORT: u16 = 7842;
+
 /// Root of the configuration file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +60,9 @@ pub struct Config {
     /// `[files_ui]`: the web file UI.
     #[serde(default)]
     pub files_ui: FilesUiConfig,
+    /// `[relay]`: the relay through which devices reach each other.
+    #[serde(default)]
+    pub relay: RelayConfig,
 }
 
 /// `[server]` table.
@@ -248,6 +259,75 @@ impl Default for FilesUiConfig {
     }
 }
 
+/// `[relay]` table: the iroh relay through which devices (Input Show and later products) reach
+/// each other across the internet when they cannot connect directly. It forwards end-to-end
+/// encrypted packets only and never sees their content.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RelayConfig {
+    /// Run the relay: `serve` runs it next to the HTTP server, `gono-cloud relay` runs it alone.
+    pub enabled: bool,
+
+    /// Public URL of the relay as devices see it, for example `https://relay.example.com`.
+    ///
+    /// The relay needs a host name of its own: it cannot run below a path, so it cannot share
+    /// `server.base_url`. Required when the relay is enabled.
+    pub public_url: Option<Url>,
+
+    /// Socket address of the relay's plain-HTTP listener. The reverse proxy terminates TLS for
+    /// `public_url` and forwards the relay's WebSocket (`/relay`) and its probes (`/ping`,
+    /// `/generate_204`) to it. Loopback only unless `server.allow_non_loopback_bind`.
+    pub bind: SocketAddr,
+
+    /// Public UDP socket of QUIC address discovery (QAD), through which devices learn their
+    /// public address, for example `[::]:7842`. Needs `tls_cert` and `tls_key`. Off when unset.
+    pub qad_bind: Option<SocketAddr>,
+
+    /// PEM certificate chain for the host of `public_url`, used by QAD.
+    pub tls_cert: Option<PathBuf>,
+
+    /// PEM private key of `tls_cert`.
+    pub tls_key: Option<PathBuf>,
+
+    /// Interval at which `tls_cert` and `tls_key` are read again, in seconds, so that a renewed
+    /// certificate takes effect without a restart.
+    pub tls_reload_interval_secs: u64,
+
+    /// Devices that may use the relay, by device id (the iroh endpoint id): 64 hex digits each.
+    /// Every other device is refused.
+    pub allowed_endpoints: Vec<String>,
+
+    /// Most bytes per second the relay reads from one device connection. Unlimited when unset.
+    pub max_client_bytes_per_sec: Option<u32>,
+
+    /// Largest burst the relay reads from one device connection at once, in bytes. Needs
+    /// `max_client_bytes_per_sec`.
+    pub max_client_burst_bytes: Option<u32>,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            public_url: None,
+            bind: DEFAULT_RELAY_BIND,
+            qad_bind: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_reload_interval_secs: 3600,
+            allowed_endpoints: Vec::new(),
+            max_client_bytes_per_sec: None,
+            max_client_burst_bytes: None,
+        }
+    }
+}
+
+/// Whether `id` is a device id as the relay expects it: 64 hex digits, the 32 bytes of an
+/// Ed25519 public key.
+pub fn is_endpoint_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Default of `admin.path`, next to the web file UI (`/apps/files/`) and the account page
 /// (`/apps/account/`).
 pub const DEFAULT_ADMIN_PATH: &str = "/apps/manage";
@@ -380,7 +460,14 @@ impl Config {
         };
         resolve(&mut self.storage.data_dir);
         resolve(&mut self.db.path);
-        if let Some(file) = self.logging.file.as_mut() {
+        for file in [
+            self.logging.file.as_mut(),
+            self.relay.tls_cert.as_mut(),
+            self.relay.tls_key.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             resolve(file);
         }
     }
@@ -481,10 +568,112 @@ impl Config {
             reject("admin.path", message);
         }
 
+        // [relay]
+        self.validate_relay(&mut reject);
+
         if issues.is_empty() {
             Ok(())
         } else {
             Err(ConfigError::Invalid(issues))
+        }
+    }
+
+    /// Checks the `[relay]` table. Values that are set are always checked, so that a mistake
+    /// shows before the relay is switched on; what the relay needs to run is only required once
+    /// it is enabled.
+    fn validate_relay(&self, reject: &mut impl FnMut(&'static str, String)) {
+        let relay = &self.relay;
+        match &relay.public_url {
+            Some(url) => {
+                if let Err(message) = check_base_url(url) {
+                    reject("relay.public_url", message);
+                } else if url.origin() == self.server.base_url.origin() {
+                    reject(
+                        "relay.public_url",
+                        "must differ from server.base_url: the relay cannot run below a path, so \
+                         it needs a host name of its own, for example https://relay.example.com"
+                            .to_owned(),
+                    );
+                }
+            }
+            None if relay.enabled => {
+                reject(
+                    "relay.public_url",
+                    "is required when the relay is enabled".to_owned(),
+                );
+            }
+            None => {}
+        }
+        if relay.enabled {
+            if !relay.bind.ip().is_loopback() && !self.server.allow_non_loopback_bind {
+                reject(
+                    "relay.bind",
+                    format!(
+                        "{} is not a loopback address; the relay serves plain HTTP behind the \
+                         reverse proxy. Bind to 127.0.0.1 or ::1, or set \
+                         server.allow_non_loopback_bind = true if the proxy cannot reach \
+                         loopback",
+                        relay.bind.ip()
+                    ),
+                );
+            }
+            if relay.bind == self.server.bind {
+                reject("relay.bind", "must differ from server.bind".to_owned());
+            }
+        }
+
+        for (key, path) in [
+            ("relay.tls_cert", relay.tls_cert.as_ref()),
+            ("relay.tls_key", relay.tls_key.as_ref()),
+        ] {
+            match (path, relay.qad_bind) {
+                (Some(path), _) if path.as_os_str().is_empty() => {
+                    reject(key, "must not be empty".to_owned());
+                }
+                (Some(_), None) => reject(
+                    key,
+                    "is only used by QUIC address discovery; set relay.qad_bind too, or remove it"
+                        .to_owned(),
+                ),
+                (None, Some(_)) => reject(key, "is required with relay.qad_bind".to_owned()),
+                _ => {}
+            }
+        }
+        if relay.tls_reload_interval_secs == 0 {
+            reject(
+                "relay.tls_reload_interval_secs",
+                "must be greater than 0".to_owned(),
+            );
+        }
+
+        for id in &relay.allowed_endpoints {
+            if !is_endpoint_id(id) {
+                reject(
+                    "relay.allowed_endpoints",
+                    format!("{id:?} is not a device id: expected 64 hex digits"),
+                );
+            }
+        }
+
+        for (key, value) in [
+            (
+                "relay.max_client_bytes_per_sec",
+                relay.max_client_bytes_per_sec,
+            ),
+            ("relay.max_client_burst_bytes", relay.max_client_burst_bytes),
+        ] {
+            if value == Some(0) {
+                reject(
+                    key,
+                    "must be greater than 0; remove it for no limit".to_owned(),
+                );
+            }
+        }
+        if relay.max_client_burst_bytes.is_some() && relay.max_client_bytes_per_sec.is_none() {
+            reject(
+                "relay.max_client_burst_bytes",
+                "needs relay.max_client_bytes_per_sec".to_owned(),
+            );
         }
     }
 
@@ -504,6 +693,39 @@ impl Config {
                  proxy can connect to it",
                 self.server.bind
             ));
+        }
+
+        let relay = &self.relay;
+        if relay.enabled {
+            if relay.allowed_endpoints.is_empty() {
+                warnings.push(
+                    "relay.allowed_endpoints is empty, so no device can use the relay".to_owned(),
+                );
+            }
+            if relay.qad_bind.is_none() {
+                warnings.push(
+                    "relay.qad_bind is not set: devices cannot learn their public address from \
+                     the relay (QUIC address discovery), so fewer of them connect directly"
+                        .to_owned(),
+                );
+            }
+            if let Some(url) = relay
+                .public_url
+                .as_ref()
+                .filter(|url| url.scheme() == "http" && !is_local_host(url))
+            {
+                warnings.push(format!(
+                    "relay.public_url {url} uses plain http; device ids and traffic metadata \
+                     cross the network unencrypted"
+                ));
+            }
+            if !relay.bind.ip().is_loopback() {
+                warnings.push(format!(
+                    "relay.bind {} is reachable from outside this host; make sure only the \
+                     reverse proxy can connect to it",
+                    relay.bind
+                ));
+            }
         }
         warnings
     }
@@ -830,6 +1052,202 @@ mod tests {
             let raw = format!("{MINIMAL}\n[admin]\npath = \"{bad}\"");
             assert_eq!(issue_keys(&parse(&raw)), ["admin.path"], "{bad:?}");
         }
+    }
+
+    /// A device id: 64 hex digits.
+    const DEVICE: &str = "6f6e8a2a5c1d0b9e7f3a4c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f";
+
+    /// A complete `[relay]` table that runs the relay with QUIC address discovery.
+    const RELAY: &str = r#"
+        enabled = true
+        public_url = "https://relay.example.com"
+        qad_bind = "[::]:7842"
+        tls_cert = "relay-tls/fullchain.pem"
+        tls_key = "relay-tls/privkey.pem"
+    "#;
+
+    /// `MINIMAL` with a `[relay]` table.
+    fn with_relay(table: &str) -> Config {
+        parse(&format!("{MINIMAL}\n[relay]\n{table}"))
+    }
+
+    /// [`RELAY`] with `extra` keys and the given allowed devices.
+    fn complete_relay(extra: &str) -> Config {
+        with_relay(&format!(
+            "{RELAY}\nallowed_endpoints = [\"{DEVICE}\"]\n{extra}"
+        ))
+    }
+
+    #[test]
+    fn relay_is_off_by_default() {
+        let relay = parse(MINIMAL).relay;
+        assert!(!relay.enabled);
+        assert_eq!(relay.public_url, None);
+        assert_eq!(relay.bind, "127.0.0.1:16103".parse().unwrap());
+        assert_eq!(relay.qad_bind, None);
+        assert_eq!(relay.tls_reload_interval_secs, 3600);
+        assert!(relay.allowed_endpoints.is_empty());
+        assert_eq!(relay.max_client_bytes_per_sec, None);
+    }
+
+    #[test]
+    fn complete_relay_is_valid_without_warnings() {
+        let config = complete_relay("");
+        assert!(issue_keys(&config).is_empty());
+        assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+        assert_eq!(config.relay.qad_bind, Some("[::]:7842".parse().unwrap()));
+    }
+
+    #[test]
+    fn enabled_relay_needs_a_host_name_of_its_own() {
+        assert_eq!(
+            issue_keys(&with_relay("enabled = true")),
+            ["relay.public_url"]
+        );
+        for shared in [
+            "https://cloud.example.com",
+            "https://cloud.example.com:443/",
+        ] {
+            let config = complete_relay("").relay;
+            let mut config = Config {
+                relay: RelayConfig {
+                    public_url: Some(shared.parse().unwrap()),
+                    ..config
+                },
+                ..parse(MINIMAL)
+            };
+            assert_eq!(issue_keys(&config), ["relay.public_url"], "{shared}");
+            config.relay.public_url = Some("https://cloud.example.com:8443".parse().unwrap());
+            assert!(
+                issue_keys(&config).is_empty(),
+                "another port is another origin"
+            );
+        }
+        for bad in [
+            "https://relay.example.com/relay",
+            "ftp://relay.example.com",
+            "https://user:secret@relay.example.com",
+        ] {
+            let config = with_relay(&format!("public_url = \"{bad}\""));
+            assert_eq!(issue_keys(&config), ["relay.public_url"], "{bad}");
+        }
+        // A disabled relay needs no URL.
+        assert!(issue_keys(&with_relay("enabled = false")).is_empty());
+    }
+
+    #[test]
+    fn relay_bind_must_be_loopback_unless_allowed() {
+        let public = complete_relay("bind = \"0.0.0.0:16103\"");
+        assert_eq!(issue_keys(&public), ["relay.bind"]);
+
+        let mut allowed = public;
+        allowed.server.allow_non_loopback_bind = true;
+        assert!(issue_keys(&allowed).is_empty());
+        assert_eq!(allowed.warnings().len(), 1, "{:?}", allowed.warnings());
+
+        let clash = complete_relay("bind = \"127.0.0.1:16102\"");
+        assert_eq!(issue_keys(&clash), ["relay.bind"]);
+    }
+
+    #[test]
+    fn qad_and_its_certificate_come_together() {
+        let without_certificate = with_relay("qad_bind = \"[::]:7842\"");
+        assert_eq!(
+            issue_keys(&without_certificate),
+            ["relay.tls_cert", "relay.tls_key"]
+        );
+
+        let without_qad = with_relay("tls_cert = \"cert.pem\"\ntls_key = \"key.pem\"");
+        assert_eq!(
+            issue_keys(&without_qad),
+            ["relay.tls_cert", "relay.tls_key"]
+        );
+
+        let empty = complete_relay("").relay;
+        let config = Config {
+            relay: RelayConfig {
+                tls_cert: Some(PathBuf::new()),
+                tls_reload_interval_secs: 0,
+                ..empty
+            },
+            ..parse(MINIMAL)
+        };
+        assert_eq!(
+            issue_keys(&config),
+            ["relay.tls_cert", "relay.tls_reload_interval_secs"]
+        );
+    }
+
+    #[test]
+    fn allowed_endpoints_are_device_ids() {
+        let upper = DEVICE.to_ascii_uppercase();
+        let config = with_relay(&format!("allowed_endpoints = [\"{DEVICE}\", \"{upper}\"]"));
+        assert!(issue_keys(&config).is_empty());
+
+        for bad in [
+            DEVICE[1..].to_owned(),
+            format!("{DEVICE}0"),
+            DEVICE.replace('a', "g"),
+            "alice".to_owned(),
+            String::new(),
+        ] {
+            let config = with_relay(&format!("allowed_endpoints = [\"{bad}\"]"));
+            assert_eq!(issue_keys(&config), ["relay.allowed_endpoints"], "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn client_rate_limits_are_checked() {
+        let ok =
+            complete_relay("max_client_bytes_per_sec = 1048576\nmax_client_burst_bytes = 65536");
+        assert!(issue_keys(&ok).is_empty());
+
+        let zero = complete_relay("max_client_bytes_per_sec = 0\nmax_client_burst_bytes = 0");
+        assert_eq!(
+            issue_keys(&zero),
+            [
+                "relay.max_client_bytes_per_sec",
+                "relay.max_client_burst_bytes"
+            ]
+        );
+
+        let burst_alone = complete_relay("max_client_burst_bytes = 65536");
+        assert_eq!(issue_keys(&burst_alone), ["relay.max_client_burst_bytes"]);
+
+        let too_large = format!("{MINIMAL}\n[relay]\nmax_client_bytes_per_sec = 4294967296");
+        assert!(Config::from_toml(&too_large).is_err());
+    }
+
+    #[test]
+    fn enabled_relay_warns_about_what_it_lacks() {
+        let bare = with_relay("enabled = true\npublic_url = \"http://relay.example.com\"");
+        assert!(issue_keys(&bare).is_empty());
+        let warnings = bare.warnings();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("relay.allowed_endpoints"));
+        assert!(warnings[1].contains("relay.qad_bind"));
+        assert!(warnings[2].contains("plain http"));
+
+        // A disabled relay warns about nothing.
+        assert!(
+            with_relay("public_url = \"http://relay.example.com\"")
+                .warnings()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn relay_certificate_paths_resolve_against_the_config_directory() {
+        let mut config = complete_relay("");
+        config.resolve_relative_paths(Path::new("/etc/gono-cloud"));
+        assert_eq!(
+            config.relay.tls_cert.as_deref(),
+            Some(Path::new("/etc/gono-cloud/relay-tls/fullchain.pem"))
+        );
+        assert_eq!(
+            config.relay.tls_key.as_deref(),
+            Some(Path::new("/etc/gono-cloud/relay-tls/privkey.pem"))
+        );
     }
 
     #[test]

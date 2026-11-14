@@ -18,7 +18,8 @@ use gono_server_nextcloud::{
     chunking::ChunkedUploads,
     notify_push::{self, Hub, PushSettings},
 };
-use tokio::net::TcpListener;
+use gono_server_relay::Relay;
+use tokio::{net::TcpListener, sync::Notify};
 
 use super::{load_config, refuse_root_on_foreign_install};
 use crate::{
@@ -32,6 +33,9 @@ use crate::{
     shutdown,
     web::Web,
 };
+
+/// How long the relay may take to stop once the HTTP server has.
+const RELAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs the HTTP server until SIGTERM or Ctrl-C.
 pub async fn run(config_path: &Path) -> anyhow::Result<()> {
@@ -105,6 +109,26 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         "listening"
     );
 
+    // The relay serves devices beside the HTTP server. A relay that cannot start stops the
+    // start, like any other configuration error; one that fails later is logged and leaves the
+    // file server running.
+    let relay_stop = Arc::new(Notify::new());
+    let (relay_status, relay_task) = if config.relay.enabled {
+        let relay = Relay::spawn(&config.relay)
+            .await
+            .context("start the relay")?;
+        let status = relay.status();
+        let stop = Arc::clone(&relay_stop);
+        let task = tokio::spawn(async move {
+            if let Err(err) = relay.run_until(stop.notified()).await {
+                tracing::error!("{err:#}");
+            }
+        });
+        (Some(status), Some(task))
+    } else {
+        (None, None)
+    };
+
     // notify_push announces changes committed from now on; older ones are history.
     let push = if config.notify_push.enabled {
         let watermark = MetaStore::new(pool.clone())
@@ -170,6 +194,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
             case_insensitive,
             lock_timeout_secs: config.webdav.max_lock_timeout_secs,
             push: push.as_ref().map(|hub| *hub.settings()),
+            relay: relay_status,
             warnings: config.warnings(),
         };
         tracing::info!(path = %config.admin.path, "web admin UI enabled");
@@ -198,15 +223,27 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
     };
     let on_signal = {
         let push = push.clone();
+        let relay_stop = Arc::clone(&relay_stop);
         move || {
             if let Some(hub) = push {
                 hub.shut_down();
             }
+            // Relay connections are not HTTP requests of this server: end them at once.
+            relay_stop.notify_one();
         }
     };
     let result = shutdown::serve(listener, app::router(state), on_signal).await;
     if let Some(hub) = &push {
         hub.shut_down();
+    }
+    if let Some(task) = relay_task {
+        relay_stop.notify_one();
+        if tokio::time::timeout(RELAY_STOP_TIMEOUT, task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("the relay did not stop in time");
+        }
     }
     if let Some(feed) = feed {
         feed.abort();

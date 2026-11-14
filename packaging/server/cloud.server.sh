@@ -49,6 +49,11 @@ Fresh install (ignored when a configuration exists):
                           input instead of prompting on the terminal.
   --data-dir DIR          Directory for the users' files (default: <state dir>/data). It must
                           not exist yet or be empty.
+  --relay-host HOST       Also run the relay through which devices reach each other, at
+                          https://HOST, for example relay.example.com: a host name of its own,
+                          not the one of --base-url. The reverse proxy needs a server block
+                          for it, and QUIC address discovery a copy of its certificate; the
+                          summary lists the next steps.
 
 Other:
   --no-start              Install or upgrade, but do not start the service.
@@ -83,6 +88,8 @@ BASE_URL=""
 ADMIN="admin"
 PASSWORD_STDIN=0
 DATA_DIR=""
+RELAY_HOST=""
+RELAY_CONFIGURED=0
 START=1
 ACTION=install
 
@@ -129,6 +136,11 @@ while [ $# -gt 0 ]; do
 	--data-dir)
 		need_value "$@"
 		DATA_DIR=$2
+		shift 2
+		;;
+	--relay-host)
+		need_value "$@"
+		RELAY_HOST=$2
 		shift 2
 		;;
 	--no-start)
@@ -491,8 +503,33 @@ prepare_config() {
 	for expected in "base_url = \"$BASE_URL\"" "data_dir = \"$data_dir\"" "path = \"$db_path\""; do
 		grep -qxF "$expected" "$config" || die "cannot adapt config.example.toml ($expected missing)"
 	done
+	if [ -n "$RELAY_HOST" ]; then
+		# The [relay] table is the only one that is off by default. QUIC address discovery stays
+		# off until its certificate is in place: the relay would not start without it.
+		sed -e 's|^enabled = false$|enabled = true|' \
+			-e "s|^# public_url = .*|public_url = \"https://$RELAY_HOST\"|" \
+			"$config" >"$config.relay"
+		mv "$config.relay" "$config"
+		if ! grep -qxF "public_url = \"https://$RELAY_HOST\"" "$config" ||
+			grep -qx 'enabled = false' "$config"; then
+			die "cannot adapt config.example.toml ([relay] missing)"
+		fi
+	fi
 	"$PAYLOAD/gono-cloud" --config "$config" config check >/dev/null ||
 		die "the configuration written for --base-url $BASE_URL is invalid"
+}
+
+# Checks --relay-host: a bare host name, different from the one of --base-url.
+check_relay_host() {
+	check_plain --relay-host "$RELAY_HOST"
+	case $RELAY_HOST in
+	*://* | */* | *:*) die "--relay-host takes a host name only, for example relay.example.com" ;;
+	esac
+	base_host=${BASE_URL#*://}
+	base_host=${base_host%%/*}
+	base_host=${base_host%%:*}
+	[ "$RELAY_HOST" != "$base_host" ] ||
+		die "--relay-host needs a host name of its own: the relay cannot share $base_host with --base-url"
 }
 
 install_release() {
@@ -518,6 +555,7 @@ install_release() {
 		if [ -d "$DATA_DIR" ] && [ -n "$(ls -A "$DATA_DIR")" ]; then
 			die "$DATA_DIR is not empty; choose an empty or new directory with --data-dir"
 		fi
+		[ -z "$RELAY_HOST" ] || check_relay_host
 		db_path=$STATE_DIR/gono-cloud.db
 		if [ -e "$db_path" ]; then
 			die "found a database at $db_path but no configuration at $CONFIG_FILE; restore the configuration or move the database away"
@@ -526,6 +564,7 @@ install_release() {
 	else
 		[ -z "$BASE_URL" ] || warn "--base-url is ignored: $CONFIG_FILE exists"
 		[ -z "$DATA_DIR" ] || warn "--data-dir is ignored: $CONFIG_FILE exists"
+		[ -z "$RELAY_HOST" ] || warn "--relay-host is ignored: $CONFIG_FILE exists; set up [relay] in it as described in docs/deployment.md"
 		needs_init=0
 	fi
 
@@ -590,6 +629,11 @@ install_release() {
 		fi
 		install -m 0640 -o root -g "$SERVICE_GROUP" "$WORK/config.toml" "$CONFIG_FILE"
 		log "Wrote $CONFIG_FILE"
+		if [ -n "$RELAY_HOST" ]; then
+			# Where the renewal hook puts the relay's certificate for QUIC address discovery.
+			ensure_dir "$CONFIG_DIR/relay-tls" 0750 root "$SERVICE_GROUP"
+			RELAY_CONFIGURED=1
+		fi
 	fi
 	if [ "$OS" = linux ] && [ "$fresh_config" = 1 ]; then
 		case $DATA_DIR in
@@ -647,6 +691,20 @@ Manage accounts as the service user, for example:
 Put a reverse proxy with HTTPS in front of the server before clients connect; see
 docs/reverse-proxy.md and docs/deployment.md.
 EOF
+	if [ "$RELAY_CONFIGURED" = 1 ]; then
+		cat <<EOF
+
+The relay runs at https://$RELAY_HOST, but no device may use it yet. Next steps (see "The
+relay" in docs/deployment.md):
+  1. Give $RELAY_HOST a server block of its own in the reverse proxy, with HTTPS, and with
+     plain HTTP for /generate_204 (docs/reverse-proxy.md).
+  2. Allow your devices: add their ids to relay.allowed_endpoints in $CONFIG_FILE.
+  3. For QUIC address discovery, copy the certificate of $RELAY_HOST into
+     $CONFIG_DIR/relay-tls/ after every renewal, then set relay.qad_bind,
+     relay.tls_cert and relay.tls_key, and open UDP 7842 in the firewall.
+  4. Restart the service.
+EOF
+	fi
 	if [ "$START" = 0 ]; then
 		printf '\nThe service was not started (--no-start).\n'
 	fi

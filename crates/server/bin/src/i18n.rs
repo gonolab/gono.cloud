@@ -475,6 +475,11 @@ texts! {
     a_none: "none", "无";
     a_push_detail: "Ping {} s · debounce {} s · {} per user", "心跳 {} 秒 · 合并 {} 秒 · 每用户 {} 个";
     a_push_off_detail: "Clients poll for changes", "客户端轮询变更";
+    a_relay: "Relay", "中继";
+    a_relay_detail: "{} · {} of {} devices connected · {} relayed · {} refused", "{} · 已连接 {}/{} 台设备 · 已转发 {} · 已拒绝 {} 次";
+    a_relay_no_qad: " · no address discovery", " · 未开启地址发现";
+    a_relay_stopped: "Stopped after an error, see the log", "出错后已停止，请查看日志";
+    a_relay_off: "Turned off in [relay]", "已在 [relay] 中关闭";
     a_flow_waiting_one: "1 sign-in waiting", "1 个登录等待中";
     a_flows_waiting: "{} sign-ins waiting", "{} 个登录等待中";
     a_chunked: "Chunked upload v2", "分块上传 v2";

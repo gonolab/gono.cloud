@@ -9,6 +9,7 @@ default-members = [
   "crates/server/core",
   "crates/server/dav",
   "crates/server/nextcloud",
+  "crates/server/relay",
 ]
 # The acceptance suite is a standalone crate with its own `[workspace]`.
 exclude = ["acceptance"]
@@ -29,12 +30,21 @@ publish = false
 gono-server-core = { path = "crates/server/core" }
 gono-server-dav = { path = "crates/server/dav" }
 gono-server-nextcloud = { path = "crates/server/nextcloud" }
+gono-server-relay = { path = "crates/server/relay" }
 
 # Pinned exactly: the WebDAV layer is built against this version's trait surface
 # (`GuardedFileSystem`, `DavMetaData`, `DavLockSystem`). Upgrade deliberately.
 # `proppatch` (a default feature since 0.12.0) provides PROPPATCH and
 # `GuardedFileSystem::patch_props`; without it PROPPATCH answers 501.
 dav-server = { version = "=0.12.0", default-features = false, features = ["localfs", "proppatch"] }
+
+# Pinned exactly: the relay that devices reach each other through. Upgrades are deliberate: read
+# the iroh security advisories and noq's merges of quinn fixes first, and check again that
+# devices configured as in plan/remote-connect-iroh.md contact no third party. `server` brings
+# `tls-ring`, the same crypto provider as rustls below.
+iroh-base = { version = "=1.4.1", default-features = false, features = ["key"] }
+iroh-relay = { version = "=1.4.1", default-features = false, features = ["server"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 
 anyhow = "1.0.100"
 argon2 = "0.6.0"

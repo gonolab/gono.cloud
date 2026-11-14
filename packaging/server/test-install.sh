@@ -26,6 +26,8 @@ checksums=${3:-}
 PASSWORD="install test password"
 BASE_URL=https://cloud.example.com
 ADDR=127.0.0.1:16102
+RELAY_HOST=relay.example.com
+RELAY_ADDR=127.0.0.1:16103
 BIN=/usr/local/bin/gono-cloud
 
 case $(uname -s) in
@@ -136,8 +138,17 @@ cat "$work/out"
 grep -q "checksum mismatch" "$work/out" || fail "the error does not mention the checksum"
 [ ! -e "$config" ] || fail "$config was written"
 
-step "Fresh install"
-printf '%s\n' "$PASSWORD" | run_installer --base-url "$BASE_URL" --admin-password-stdin
+step "A relay host that shares the base URL's host name is refused"
+if run_installer --base-url "$BASE_URL" --relay-host cloud.example.com </dev/null >"$work/out" 2>&1; then
+	fail "installed a relay on the host name of --base-url"
+fi
+cat "$work/out"
+grep -q "host name of its own" "$work/out" || fail "the error does not explain the refusal"
+[ ! -e "$config" ] || fail "$config was written"
+
+step "Fresh install, with the relay"
+printf '%s\n' "$PASSWORD" | run_installer --base-url "$BASE_URL" --relay-host "$RELAY_HOST" \
+	--admin-password-stdin
 
 step "The service runs and answers"
 wait_until_healthy
@@ -158,6 +169,15 @@ step "Ownership and modes"
 owner_and_mode "$state/gono-cloud.db" | grep -q "^$user:$user " || fail "database: $(owner_and_mode "$state/gono-cloud.db")"
 owner_and_mode "$state/data/files/1" | grep -q "^$user:$user " || fail "admin files: $(owner_and_mode "$state/data/files/1")"
 sudo grep -qx "base_url = \"$BASE_URL\"" "$config" || fail "base_url not in $config"
+sudo grep -qx "public_url = \"https://$RELAY_HOST\"" "$config" || fail "relay.public_url not in $config"
+[ "$(owner_and_mode "$(dirname "$config")/relay-tls")" = "root:$user 750" ] ||
+	fail "relay-tls dir: $(owner_and_mode "$(dirname "$config")/relay-tls")"
+
+step "The relay runs inside the (sandboxed) service"
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://$RELAY_ADDR/generate_204")
+[ "$code" = 204 ] || fail "the relay's /generate_204 answered $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://$RELAY_ADDR/healthz")
+[ "$code" = 200 ] || fail "the relay's /healthz answered $code"
 
 step "Management commands refuse root and work as the service user"
 if (cd / && sudo "$BIN" --config "$config" user list) >"$work/out" 2>&1; then

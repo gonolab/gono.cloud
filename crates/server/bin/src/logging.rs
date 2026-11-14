@@ -27,6 +27,7 @@ const OWN_CRATES: &[&str] = &[
     "gono_server_core",
     "gono_server_dav",
     "gono_server_nextcloud",
+    "gono_server_relay",
 ];
 
 /// Where log lines go.

@@ -110,3 +110,41 @@ path = "/apps/manage"
 # change their web login password and manage their own app passwords. Users sign in with their
 # web login password; app passwords cannot access it. "/" leads here. Default: true.
 enabled = true
+
+[relay]
+# The relay through which devices (Input Show, and later other Gono products) reach each other
+# across the internet when they cannot connect directly. It forwards packets that are encrypted
+# end to end between the devices and never sees their content. `serve` runs it when enabled;
+# `gono-cloud relay` runs it alone on a host of its own. The reverse proxy needs a server block
+# for it (docs/reverse-proxy.md), and QUIC address discovery a copy of its certificate
+# (docs/deployment.md). Default: false.
+enabled = false
+
+# Public URL of the relay as devices see it. The relay needs a host name of its own: it cannot
+# run below a path, so it cannot share base_url. Required when enabled.
+# public_url = "https://relay.example.com"
+
+# Address and port of the relay's plain-HTTP listener. The reverse proxy terminates HTTPS for
+# public_url and forwards everything to it. Only loopback addresses are accepted unless
+# server.allow_non_loopback_bind is true. Default: "127.0.0.1:16103".
+bind = "127.0.0.1:16103"
+
+# QUIC address discovery (QAD): a public UDP socket through which devices learn the public
+# address they appear at, which they need to connect directly through NAT. Open this UDP port in
+# the firewall. QUIC brings its own TLS, so the relay needs the certificate of public_url's host
+# name and its key, readable by the service: copy them here from the reverse proxy after every
+# renewal (docs/deployment.md). Relative paths are resolved against this file's directory. The
+# files are read again every tls_reload_interval_secs seconds (default 3600), so a renewal needs
+# no restart. Off unless qad_bind is set.
+# qad_bind = "[::]:7842"
+# tls_cert = "relay-tls/fullchain.pem"
+# tls_key = "relay-tls/privkey.pem"
+
+# Devices that may use the relay, by device id: the 64 hex digits that Input Show shows for a
+# device. Every other device is refused, and the log names it. Default: [] (no device).
+allowed_endpoints = []
+
+# Most bytes per second the relay reads from one device connection, and the largest burst it
+# reads at once. Unlimited unless set.
+# max_client_bytes_per_sec = 2097152
+# max_client_burst_bytes = 262144
