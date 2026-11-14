@@ -168,14 +168,12 @@ fn write_certificate(dir: &Path) -> (rustls::pki_types::CertificateDer<'static>,
     (certified.cert.der().clone(), config)
 }
 
-#[tokio::test]
-async fn quic_address_discovery_reports_the_address_it_sees() {
-    let dir = tempfile::tempdir().unwrap();
-    let (certificate, config) = write_certificate(dir.path());
-    let relay = Relay::spawn(&config).await.unwrap();
-    let status = relay.status();
-    let qad = status.qad_addr().expect("QAD is on");
-
+/// Opens a QAD connection to `qad` that trusts only `certificate`, and returns it with the
+/// client's own address.
+async fn qad_handshake(
+    qad: SocketAddr,
+    certificate: rustls::pki_types::CertificateDer<'static>,
+) -> Result<(noq::Connection, SocketAddr), String> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(certificate).unwrap();
     let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -187,14 +185,25 @@ async fn quic_address_discovery_reports_the_address_it_sees() {
     .with_no_client_auth();
     let endpoint = noq::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     let local = endpoint.local_addr().unwrap();
-
     let connection = tokio::time::timeout(
         TIMEOUT,
         QuicClient::new(endpoint, tls).create_conn(qad, "localhost"),
     )
     .await
-    .expect("handshake within the timeout")
-    .unwrap();
+    .map_err(|_| "no handshake within the timeout".to_owned())?
+    .map_err(|err| err.to_string())?;
+    Ok((connection, local))
+}
+
+#[tokio::test]
+async fn quic_address_discovery_reports_the_address_it_sees() {
+    let dir = tempfile::tempdir().unwrap();
+    let (certificate, config) = write_certificate(dir.path());
+    let relay = Relay::spawn(&config).await.unwrap();
+    let status = relay.status();
+    let qad = status.qad_addr().expect("QAD is on");
+
+    let (connection, local) = qad_handshake(qad, certificate).await.unwrap();
     let observed = tokio::time::timeout(TIMEOUT, connection.observed_external_addr().next())
         .await
         .expect("an address within the timeout")
@@ -204,6 +213,31 @@ async fn quic_address_discovery_reports_the_address_it_sees() {
         local
     );
     wait_for(&status, |snapshot| snapshot.qad_connections == 1).await;
+}
+
+#[tokio::test]
+async fn quic_address_discovery_picks_up_a_renewed_certificate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (old, mut config) = write_certificate(dir.path());
+    config.tls_reload_interval_secs = 1;
+    let relay = Relay::spawn(&config).await.unwrap();
+    let qad = relay.status().qad_addr().expect("QAD is on");
+    qad_handshake(qad, old.clone()).await.unwrap();
+
+    // The renewal hook replaces both files; no restart follows.
+    let (new, _) = write_certificate(dir.path());
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while let Err(err) = qad_handshake(qad, new.clone()).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the renewed certificate was not picked up: {err}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        qad_handshake(qad, old).await.is_err(),
+        "the replaced certificate is no longer served"
+    );
 }
 
 #[tokio::test]
