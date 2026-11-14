@@ -30,8 +30,9 @@
 //!   `Cache-Control: no-store`.
 
 use std::{
+    collections::HashMap,
     net::IpAddr,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Duration,
 };
 
@@ -43,6 +44,7 @@ use axum::{
 use base64::Engine as _;
 use gono_server_core::{
     Username, db, password, secret,
+    two_factor::{self, Key, Verification},
     users::{self, User},
     web_sessions::{self, SessionUser},
 };
@@ -61,6 +63,55 @@ pub const SESSION_COOKIE: &str = "gono_session";
 /// Cookie holding the double-submit CSRF token of forms shown before sign-in.
 pub const CSRF_COOKIE: &str = "gono_csrf";
 
+/// Cookie holding the token of a sign-in waiting for its second step.
+pub const TWO_STEP_COOKIE: &str = "gono_two_step";
+
+/// Where the second step of a sign-in is entered.
+pub const TWO_STEP_PATH: &str = "/login/two-step";
+
+/// How long a sign-in waits for its second step, in seconds.
+const TWO_STEP_TTL_SECS: i64 = 5 * 60;
+
+/// Wrong codes one pending sign-in may take before the password has to be entered again.
+const TWO_STEP_ATTEMPTS: u32 = 5;
+
+/// Sign-ins waiting for their second step, at most.
+const MAX_PENDING: usize = 1000;
+
+/// How long an enrolment waits for its first code, in seconds.
+const ENROLMENT_TTL_SECS: i64 = 10 * 60;
+
+/// A sign-in whose password was right, waiting for its second step.
+#[derive(Debug, Clone)]
+struct Pending {
+    user_id: i64,
+    username: String,
+    /// Where to go once signed in: a local path.
+    next: String,
+    until: i64,
+    failures: u32,
+}
+
+/// A secret being enrolled, by the session that started it.
+#[derive(Debug, Clone)]
+pub struct Enrolment {
+    /// The TOTP secret.
+    pub secret: [u8; two_factor::SECRET_BYTES],
+    /// Where to go once it is on: a local path.
+    pub next: Option<String>,
+    until: i64,
+}
+
+/// Recovery codes waiting to be shown once, by session.
+#[derive(Debug, Clone)]
+pub struct Shown {
+    /// The codes.
+    pub codes: Vec<String>,
+    /// Where to go after reading them.
+    pub next: Option<String>,
+    until: i64,
+}
+
 /// Length of the pre-sign-in CSRF token.
 const CSRF_CHARS: usize = 43;
 
@@ -77,11 +128,51 @@ pub enum Verified {
     Unavailable,
 }
 
+/// Outcome of [`Web::start_session`].
+#[derive(Debug)]
+pub enum Started {
+    /// A session: its cookie token.
+    Session(SecretString),
+    /// The account has two-step verification: the `Set-Cookie` value of the pending sign-in.
+    /// Send the browser to [`TWO_STEP_PATH`].
+    SecondStep(HeaderValue),
+    /// The database failed.
+    Unavailable,
+}
+
+/// Outcome of [`Web::second_step`].
+#[derive(Debug)]
+pub enum SecondStep {
+    /// Signed in: the session's cookie token, where to go, and how many recovery codes are
+    /// left if one was used.
+    Ok {
+        /// The session's cookie token.
+        token: SecretString,
+        /// A local path.
+        next: String,
+        /// Recovery codes left, when the code was one.
+        recovery_left: Option<i64>,
+    },
+    /// The code is wrong; the user may try again.
+    Wrong,
+    /// No sign-in waits: it expired, was used, or took too many wrong codes.
+    Expired,
+    /// Too many wrong codes for this account; the second step is locked for a while.
+    Locked,
+    /// Too many failures from this client.
+    RateLimited(Duration),
+    /// The code could not be checked (database, or the key file changed).
+    Unavailable,
+}
+
 /// Outcome of [`Web::sign_in`].
 #[derive(Debug)]
 pub enum SignIn {
     /// The password is right: the cookie token of a new session.
     Ok(SecretString),
+    /// The password is right and the account has two-step verification: the `Set-Cookie`
+    /// value of the pending sign-in.
+    SecondStep(HeaderValue),
     /// Unknown account, wrong password or disabled account.
     Invalid,
     /// Too many failures from this client; retry after the given time.
@@ -99,6 +190,14 @@ pub struct Web {
     origin: String,
     /// Mark cookies `Secure` (the public origin is HTTPS).
     secure: bool,
+    /// The key of the TOTP secrets; `None` while two-step verification is unavailable.
+    two_factor_key: Option<Key>,
+    /// Sign-ins waiting for their second step, by the digest of their cookie token.
+    pending: Mutex<HashMap<[u8; 32], Pending>>,
+    /// Enrolments waiting for their first code, by session id.
+    enrolments: Mutex<HashMap<i64, Enrolment>>,
+    /// Recovery codes waiting to be shown once, by session id.
+    shown: Mutex<HashMap<i64, Shown>>,
 }
 
 /// A PHC string to verify against when the account does not exist.
@@ -142,7 +241,261 @@ impl Web {
             limiter,
             origin: base_url.origin().ascii_serialization(),
             secure: base_url.scheme() == "https",
+            two_factor_key: None,
+            pending: Mutex::new(HashMap::new()),
+            enrolments: Mutex::new(HashMap::new()),
+            shown: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Makes two-step verification available with `key`.
+    pub fn with_two_factor_key(mut self, key: Key) -> Self {
+        self.two_factor_key = Some(key);
+        self
+    }
+
+    /// The key of the TOTP secrets, when two-step verification is available.
+    pub fn two_factor_key(&self) -> Option<&Key> {
+        self.two_factor_key.as_ref()
+    }
+
+    /// The failed-attempt limiter of the HTML sign-in.
+    pub fn limiter(&self) -> &RateLimiter {
+        &self.limiter
+    }
+
+    /// Opens a session for `user`, whose password was just verified, unless the account has
+    /// two-step verification: then the sign-in waits for its code at [`TWO_STEP_PATH`] and
+    /// continues to `next` (a local path).
+    pub async fn start_session(&self, client: IpAddr, user: &User, next: &str) -> Started {
+        match two_factor::is_enrolled(&self.pool, user.id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return match self.open_session(client, user).await {
+                    Some(token) => Started::Session(token),
+                    None => Started::Unavailable,
+                };
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "cannot check two-step verification");
+                return Started::Unavailable;
+            }
+        }
+        let token = secret::random_token(43);
+        let now = db::unix_now();
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            pending.retain(|_, entry| entry.until > now);
+            if pending.len() >= MAX_PENDING {
+                return Started::Unavailable;
+            }
+            pending.insert(
+                secret::digest(token.expose_secret()),
+                Pending {
+                    user_id: user.id,
+                    username: user.username.to_string(),
+                    next: next.to_owned(),
+                    until: now + TWO_STEP_TTL_SECS,
+                    failures: 0,
+                },
+            );
+        }
+        tracing::info!(%client, user = %user.username, "web sign-in waits for its second step");
+        Started::SecondStep(self.cookie_header(
+            TWO_STEP_COOKIE,
+            token.expose_secret(),
+            "Strict",
+            Some(u32::try_from(TWO_STEP_TTL_SECS).unwrap_or(300)),
+        ))
+    }
+
+    /// The username of the sign-in waiting for its second step in this request, if any.
+    pub fn pending_user(&self, headers: &HeaderMap) -> Option<String> {
+        let token = cookie(headers, TWO_STEP_COOKIE)?;
+        let now = db::unix_now();
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&secret::digest(&token))
+            .filter(|entry| entry.until > now)
+            .map(|entry| entry.username.clone())
+    }
+
+    /// Checks the second step of the sign-in of this request: a TOTP code or a recovery code
+    /// (`docs/connect-protocol.md`, 13.3).
+    pub async fn second_step(&self, client: IpAddr, headers: &HeaderMap, code: &str) -> SecondStep {
+        let Some(token) = cookie(headers, TWO_STEP_COOKIE) else {
+            return SecondStep::Expired;
+        };
+        let digest = secret::digest(&token);
+        let now = db::unix_now();
+        let Some(entry) = self
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&digest)
+            .filter(|entry| entry.until > now)
+            .cloned()
+        else {
+            return SecondStep::Expired;
+        };
+        if let Some(wait) = self.limiter.check(client) {
+            return SecondStep::RateLimited(wait);
+        }
+        match two_factor::locked(&self.pool, entry.user_id, now).await {
+            Ok(false) => {}
+            Ok(true) => return SecondStep::Locked,
+            Err(err) => {
+                tracing::error!(error = %err, "cannot check two-step failures");
+                return SecondStep::Unavailable;
+            }
+        }
+        let Some(key) = &self.two_factor_key else {
+            tracing::error!("two-step verification is enrolled but the key file is missing");
+            return SecondStep::Unavailable;
+        };
+        let verified = match two_factor::verify(&self.pool, key, entry.user_id, code, now).await {
+            Ok(verified) => verified,
+            Err(err) => {
+                tracing::error!(error = %err, "cannot check a second step");
+                return SecondStep::Unavailable;
+            }
+        };
+        let recovery_left = match verified {
+            Verification::Code | Verification::NotEnrolled => None,
+            Verification::RecoveryCode { left } => Some(left),
+            Verification::WrongKey => {
+                tracing::error!(
+                    user = %entry.username,
+                    "the TOTP secret does not open with the key file: was two_factor.key_file replaced?"
+                );
+                return SecondStep::Unavailable;
+            }
+            Verification::Wrong => {
+                self.limiter.record_failure(client);
+                tracing::info!(%client, user = %entry.username, "wrong second step of a web sign-in");
+                if let Err(err) =
+                    two_factor::record_failure(&self.pool, entry.user_id, Some(client), now).await
+                {
+                    tracing::warn!(error = %err, "cannot record a failed second step");
+                }
+                let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(stored) = pending.get_mut(&digest) {
+                    stored.failures += 1;
+                    if stored.failures >= TWO_STEP_ATTEMPTS {
+                        pending.remove(&digest);
+                        return SecondStep::Expired;
+                    }
+                }
+                return SecondStep::Wrong;
+            }
+        };
+        // Used once.
+        if self
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&digest)
+            .is_none()
+        {
+            return SecondStep::Expired;
+        }
+        let user = match users::get(
+            &self.pool,
+            &match Username::new(entry.username.clone()) {
+                Ok(name) => name,
+                Err(_) => return SecondStep::Unavailable,
+            },
+        )
+        .await
+        {
+            Ok(user) if user.enabled => user,
+            Ok(_) => return SecondStep::Expired,
+            Err(err) => {
+                tracing::error!(error = %err, "cannot read the account of a sign-in");
+                return SecondStep::Unavailable;
+            }
+        };
+        match self.open_session(client, &user).await {
+            Some(token) => SecondStep::Ok {
+                token,
+                next: entry.next,
+                recovery_left,
+            },
+            None => SecondStep::Unavailable,
+        }
+    }
+
+    /// The `Set-Cookie` value that ends a pending sign-in.
+    pub fn two_step_removal(&self) -> HeaderValue {
+        self.cookie_header(TWO_STEP_COOKIE, "", "Strict", Some(0))
+    }
+
+    /// Starts enrolling a new secret for session `session_id`.
+    pub fn start_enrolment(&self, session_id: i64, next: Option<String>) -> Enrolment {
+        let now = db::unix_now();
+        let enrolment = Enrolment {
+            secret: two_factor::new_secret(),
+            next,
+            until: now + ENROLMENT_TTL_SECS,
+        };
+        let mut enrolments = self
+            .enrolments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        enrolments.retain(|_, entry| entry.until > now);
+        if enrolments.len() >= MAX_PENDING {
+            enrolments.clear();
+        }
+        enrolments.insert(session_id, enrolment.clone());
+        enrolment
+    }
+
+    /// The enrolment of session `session_id`, if it has not expired.
+    pub fn enrolment(&self, session_id: i64) -> Option<Enrolment> {
+        let now = db::unix_now();
+        self.enrolments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&session_id)
+            .filter(|entry| entry.until > now)
+            .cloned()
+    }
+
+    /// Ends the enrolment of session `session_id`.
+    pub fn end_enrolment(&self, session_id: i64) {
+        self.enrolments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&session_id);
+    }
+
+    /// Keeps `codes` to be shown once to session `session_id`.
+    pub fn show_once(&self, session_id: i64, codes: Vec<String>, next: Option<String>) {
+        let now = db::unix_now();
+        let mut shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
+        shown.retain(|_, entry| entry.until > now);
+        if shown.len() >= MAX_PENDING {
+            shown.clear();
+        }
+        shown.insert(
+            session_id,
+            Shown {
+                codes,
+                next,
+                until: now + ENROLMENT_TTL_SECS,
+            },
+        );
+    }
+
+    /// The recovery codes waiting for session `session_id`, once.
+    pub fn take_shown(&self, session_id: i64) -> Option<Shown> {
+        let now = db::unix_now();
+        self.shown
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&session_id)
+            .filter(|entry| entry.until > now)
     }
 
     fn cookie_header(
@@ -256,12 +609,20 @@ impl Web {
         }
     }
 
-    /// Checks a web login password and opens a session (see the module documentation).
-    pub async fn sign_in(&self, client: IpAddr, username: &str, password: SecretString) -> SignIn {
+    /// Checks a web login password and opens a session, or starts the second step that
+    /// continues to `next` (see the module documentation).
+    pub async fn sign_in(
+        &self,
+        client: IpAddr,
+        username: &str,
+        password: SecretString,
+        next: &str,
+    ) -> SignIn {
         match self.verify_password(client, username, password).await {
-            Verified::Ok(user) => match self.open_session(client, &user).await {
-                Some(token) => SignIn::Ok(token),
-                None => SignIn::Unavailable,
+            Verified::Ok(user) => match self.start_session(client, &user, next).await {
+                Started::Session(token) => SignIn::Ok(token),
+                Started::SecondStep(cookie) => SignIn::SecondStep(cookie),
+                Started::Unavailable => SignIn::Unavailable,
             },
             Verified::Invalid => SignIn::Invalid,
             Verified::RateLimited(wait) => SignIn::RateLimited(wait),

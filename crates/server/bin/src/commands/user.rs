@@ -6,6 +6,7 @@ use anyhow::Context;
 use gono_server_core::{
     db, password,
     storage::DataLayout,
+    two_factor::{self, TurnedOff},
     users::{self, NewUser},
     web_sessions,
 };
@@ -119,6 +120,18 @@ pub async fn run(config_path: &Path, command: UserCommand) -> anyhow::Result<()>
         UserCommand::Demote { username } => {
             users::set_admin(&pool, &username, false).await?;
             println!("{username} is no longer an admin.");
+            Ok(())
+        }
+        UserCommand::ResetTwoFactor { username } => {
+            let user = users::get(&pool, &username).await?;
+            if two_factor::disable(&pool, user.id, TurnedOff::Cli, None, db::unix_now()).await? {
+                println!(
+                    "Reset the two-step verification of {username}. A running server ends the \
+                     remote access of its devices within seconds."
+                );
+            } else {
+                println!("{username} has no two-step verification.");
+            }
             Ok(())
         }
         UserCommand::SetDisplayName {

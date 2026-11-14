@@ -39,6 +39,18 @@ pub fn run(config_path: &Path) -> anyhow::Result<()> {
         ),
         ("db.path", config.db.path.display().to_string()),
         (
+            "two_factor.key_file",
+            format!(
+                "{}{}",
+                config.two_factor.key_file.display(),
+                if config.two_factor.key_file.exists() {
+                    ""
+                } else {
+                    " (missing)"
+                }
+            ),
+        ),
+        (
             "webdav.max_lock_timeout_secs",
             config.webdav.max_lock_timeout_secs.to_string(),
         ),

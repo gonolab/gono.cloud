@@ -90,7 +90,10 @@ async fn fixture_with(files: bool) -> Fixture {
         auth: Arc::new(Authenticator::new(pool.clone(), limiter.clone())),
         dav,
         uploads,
-        web: Arc::new(Web::new(pool, limiter, &base_url)),
+        web: Arc::new(
+            Web::new(pool, limiter, &base_url)
+                .with_two_factor_key(gono_server_core::two_factor::Key::from_bytes(&[9; 32])),
+        ),
         base_url: Arc::new(base_url),
         flow_starts: Arc::new(RateLimiter::new()),
         trusted_proxies: Arc::new(Vec::new()),
@@ -1213,4 +1216,249 @@ async fn remote_devices_are_revoked_after_a_second_confirmation() {
         .await;
     assert_eq!(forged.status, StatusCode::FORBIDDEN);
     assert!(!state(laptop.id).await);
+}
+
+/// Decodes RFC 4648 base32 (spaces allowed), the key the enrolment page shows.
+fn base32_decode(text: &str) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = Vec::new();
+    let mut buffer: u32 = 0;
+    let mut bits = 0;
+    for c in text.bytes().filter(|c| !c.is_ascii_whitespace()) {
+        let value = ALPHABET.iter().position(|&a| a == c).unwrap() as u32;
+        buffer = (buffer << 5) | value;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// The 6-digit code of `secret` `steps` steps from now.
+fn code(secret: &[u8], steps: i64) -> String {
+    use gono_server_core::two_factor;
+    format!(
+        "{:06}",
+        two_factor::code_at(secret, two_factor::step_of(db::unix_now()) + steps)
+    )
+}
+
+/// Turns two-step verification on for alice in `browser` (signed in); returns the secret and
+/// the recovery codes.
+async fn enrol(browser: &mut Browser, csrf: &str) -> (Vec<u8>, Vec<String>) {
+    let started = browser
+        .post(
+            "/apps/account/two-factor/start",
+            &[("csrf", csrf), ("password", ALICE_PASSWORD)],
+        )
+        .await;
+    assert_eq!(
+        started.location(),
+        "/apps/account/two-factor",
+        "{}",
+        started.text()
+    );
+    let page = browser.get("/apps/account/two-factor").await;
+    let text = page.text();
+    assert!(
+        text.contains("<svg ") && text.contains("class=\"qr\""),
+        "{text}"
+    );
+    let key = text
+        .split("<code>")
+        .nth(1)
+        .unwrap()
+        .split("</code>")
+        .next()
+        .unwrap();
+    let secret = base32_decode(key);
+    assert_eq!(secret.len(), 20);
+
+    let wrong = browser
+        .post(
+            "/apps/account/two-factor/confirm",
+            &[("csrf", csrf), ("code", "000000")],
+        )
+        .await;
+    assert_eq!(wrong.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let confirmed = browser
+        .post(
+            "/apps/account/two-factor/confirm",
+            &[("csrf", csrf), ("code", &code(&secret, 0))],
+        )
+        .await;
+    assert_eq!(
+        confirmed.location(),
+        "/apps/account/two-factor/recovery-codes"
+    );
+    let shown = browser
+        .get("/apps/account/two-factor/recovery-codes")
+        .await
+        .text();
+    let codes: Vec<String> = shown
+        .split("<li>")
+        .skip(1)
+        .map(|item| item.split("</li>").next().unwrap().to_owned())
+        .collect();
+    assert_eq!(codes.len(), 10, "{shown}");
+    assert_eq!(
+        browser
+            .get("/apps/account/two-factor/recovery-codes")
+            .await
+            .location(),
+        "/apps/account/",
+        "shown once"
+    );
+    (secret, codes)
+}
+
+/// Signs alice in with her password; returns the reply of the password form.
+async fn password_step(browser: &mut Browser) -> Reply {
+    let form = browser.get("/login").await;
+    let csrf = form.field("name=\"csrf\" value=\"");
+    browser
+        .post(
+            "/login",
+            &[
+                ("csrf", &csrf),
+                ("user", "alice"),
+                ("password", ALICE_PASSWORD),
+            ],
+        )
+        .await
+}
+
+/// Enters `code` at the second step; returns the reply.
+async fn code_step(browser: &mut Browser, code: &str) -> Reply {
+    let page = browser.get("/login/two-step").await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.text());
+    let csrf = page.field("name=\"csrf\" value=\"");
+    browser
+        .post("/login/two-step", &[("csrf", &csrf), ("code", code)])
+        .await
+}
+
+#[tokio::test]
+async fn two_step_verification_guards_every_later_sign_in() {
+    let f = fixture().await;
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+    let page = browser.get("/apps/account/").await.text();
+    assert!(page.contains("/apps/account/two-factor/start"), "{page}");
+    let refused = browser
+        .post(
+            "/apps/account/two-factor/start",
+            &[("csrf", &csrf), ("password", "wrong")],
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (secret, codes) = enrol(&mut browser, &csrf).await;
+    let page = browser
+        .get("/apps/account/?done=two-factor-on")
+        .await
+        .text();
+    assert!(page.contains("Two-step verification is on."), "{page}");
+    assert!(page.contains("Recovery codes left: 10."), "{page}");
+
+    // A new browser: the password alone opens no session.
+    let mut other = Browser::new(&f.state);
+    let first = password_step(&mut other).await;
+    assert_eq!(first.location(), "/login/two-step");
+    assert_eq!(
+        other.get("/apps/files/").await.status,
+        StatusCode::SEE_OTHER,
+        "no session yet"
+    );
+    let wrong = code_step(&mut other, "123456").await;
+    assert_eq!(wrong.status, StatusCode::FORBIDDEN);
+    assert!(
+        wrong.text().contains("That code is not right"),
+        "{}",
+        wrong.text()
+    );
+    // The code of the enrolment was used up; the next step's works.
+    let used = code_step(&mut other, &code(&secret, 0)).await;
+    assert_eq!(used.status, StatusCode::FORBIDDEN, "a code works once");
+    let signed_in = code_step(&mut other, &code(&secret, 1)).await;
+    assert_eq!(signed_in.location(), "/apps/files/", "{}", signed_in.text());
+    assert_eq!(other.get("/apps/files/").await.status, StatusCode::OK);
+    assert_eq!(
+        other.get("/login/two-step").await.status,
+        StatusCode::NOT_FOUND,
+        "the pending sign-in is gone"
+    );
+
+    // A recovery code signs in once.
+    let mut third = Browser::new(&f.state);
+    password_step(&mut third).await;
+    let recovered = code_step(&mut third, &codes[0].to_ascii_lowercase()).await;
+    assert_eq!(recovered.location(), "/apps/files/");
+    let mut fourth = Browser::new(&f.state);
+    password_step(&mut fourth).await;
+    let again = code_step(&mut fourth, &codes[0]).await;
+    assert_eq!(again.status, StatusCode::FORBIDDEN);
+    let page = browser.get("/apps/account/").await.text();
+    assert!(page.contains("Recovery codes left: 9."), "{page}");
+    assert!(
+        page.contains("the second step failed"),
+        "failures are shown: {page}"
+    );
+
+    // Turning it off needs the password and a code.
+    let without_code = browser
+        .post(
+            "/apps/account/two-factor/disable",
+            &[
+                ("csrf", &csrf),
+                ("password", ALICE_PASSWORD),
+                ("code", "000000"),
+            ],
+        )
+        .await;
+    assert_eq!(without_code.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let off = browser
+        .post(
+            "/apps/account/two-factor/disable",
+            &[
+                ("csrf", &csrf),
+                ("password", ALICE_PASSWORD),
+                ("code", &codes[1]),
+            ],
+        )
+        .await;
+    assert_eq!(off.location(), "/apps/account/?done=two-factor-off");
+    let mut fifth = Browser::new(&f.state);
+    assert_eq!(password_step(&mut fifth).await.location(), "/apps/files/");
+}
+
+#[tokio::test]
+async fn wrong_codes_lock_the_second_step() {
+    let f = fixture().await;
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+    let (secret, _) = enrol(&mut browser, &csrf).await;
+
+    let mut other = Browser::new(&f.state);
+    password_step(&mut other).await;
+    for _ in 0..4 {
+        assert_eq!(
+            code_step(&mut other, "000000").await.status,
+            StatusCode::FORBIDDEN
+        );
+    }
+    // The fifth wrong code ends the pending sign-in; the account is locked for a while.
+    assert_eq!(
+        code_step(&mut other, "000000").await.status,
+        StatusCode::NOT_FOUND
+    );
+    password_step(&mut other).await;
+    let locked = code_step(&mut other, &code(&secret, 1)).await;
+    assert_eq!(locked.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        locked.text().contains("Too many wrong codes"),
+        "{}",
+        locked.text()
+    );
 }

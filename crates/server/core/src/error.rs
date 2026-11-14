@@ -120,6 +120,10 @@ pub enum Error {
     #[error("invalid scopes: {0}")]
     InvalidScopes(String),
 
+    /// Two-step verification is enrolled already.
+    #[error("two-step verification is on already")]
+    TwoFactorEnrolled,
+
     /// A field of a device (name, product, platform, services) is not acceptable.
     #[error("invalid device {field}: {reason}")]
     InvalidDevice {

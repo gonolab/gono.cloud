@@ -930,3 +930,7 @@ progress::-moz-progress-bar { border-radius: var(--r-pill); background: var(--ac
 @media (max-width: 420px) {
   .masthead__brand { padding-inline: 8px; font-size: 15px; }
 }
+
+/* Two-step verification: the enrolment QR code and the recovery codes. */
+.qr { display: block; width: 220px; height: 220px; margin: 16px auto; border-radius: var(--r-xs); }
+ol.codes { columns: 2; margin: 16px 0; padding-left: 1.6em; font-family: var(--font-mono); line-height: 1.9; }

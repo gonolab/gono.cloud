@@ -16,6 +16,7 @@ mod login_flow;
 mod nextcloud;
 mod notify_push;
 mod password_input;
+mod qr;
 mod ratelimit;
 mod request_log;
 mod shutdown;

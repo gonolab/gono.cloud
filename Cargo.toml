@@ -69,7 +69,11 @@ libc = "0.2.191"
 # Global allocator of the musl builds only; see crates/server/bin/src/main.rs.
 mimalloc = { version = "0.1.52", default-features = false }
 pin-project-lite = "0.2.17"
+# The QR code of two-step verification enrolment, rendered as SVG on the server.
+qrcodegen = "1.8.0"
 rand = "0.10.3"
+# HMAC-SHA-1 of TOTP and the AEAD of stored TOTP secrets; the version rustls already uses.
+ring = "0.17.14"
 rpassword = "7.5.0"
 rustix = { version = "1.1.6", default-features = false, features = ["fs", "process", "std"] }
 secrecy = "0.10.3"

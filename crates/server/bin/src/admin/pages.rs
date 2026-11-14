@@ -174,6 +174,9 @@ pub struct UserView {
     pub created: String,
     pub updated: String,
     pub storage: String,
+    /// "On since …" or "Off".
+    pub two_factor: String,
+    pub two_factor_on: bool,
 }
 
 /// One mount of an app password, as text.

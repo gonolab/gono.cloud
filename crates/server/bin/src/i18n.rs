@@ -191,6 +191,17 @@ texts! {
     not_found_lead: "There is nothing at this address, or you have no access to it.", "这个地址没有内容，或者你没有权限访问。";
     back_to_files: "Back to files", "返回文件";
 
+    // Two-step verification: sign-in
+    two_step_title: "Two-step verification", "两步验证";
+    two_step_lead: "Enter the 6-digit code from your authenticator app.", "请输入身份验证器 app 里的 6 位验证码。";
+    two_step_code: "Code", "验证码";
+    two_step_verify: "Verify", "验证";
+    two_step_recovery_note: "No access to your authenticator? Enter one of your recovery codes instead; each works once.", "无法使用身份验证器？可以改为输入一个恢复码，每个恢复码只能用一次。";
+    two_step_wrong: "That code is not right. Try the current one.", "验证码不正确，请输入当前显示的验证码。";
+    two_step_locked: "Too many wrong codes for this account. Try again later.", "这个账号输错验证码的次数太多，请稍后再试。";
+    two_step_expired: "Sign in again", "请重新登录";
+    two_step_expired_lead: "The sign-in waited too long for its code, or took too many wrong ones. Enter your password again.", "登录等待验证码超时，或者验证码输错次数太多。请重新输入密码。";
+
     // Login Flow v2
     connect_device: "Connect a device", "连接设备";
     flow_sign_in_lead: "wants to access your account. Sign in to continue; you will be asked to confirm.", "想要访问你的账号。请先登录，之后还需要你确认。";
@@ -224,7 +235,7 @@ texts! {
     device_grant_note: "The device will be able to reach your other devices remotely and be reached by them. It gets no access to your files. You can revoke it at any time on your account page.", "这台设备将可以远程连接你的其他设备，也能被它们连接；它不能访问你的文件。你可以随时在账户页吊销它。";
     device_grant: "Add device", "添加设备";
     two_factor_needed: "Two-step verification needed", "需要两步验证";
-    two_factor_needed_lead: "Remote access needs two-step verification on your account. Turn it on, then start the sign-in on the device again.", "远程访问要求账号开启两步验证。请先开启，再在设备上重新发起登录。";
+    two_factor_needed_lead: "Remote access needs two-step verification on your account. Turn it on; this page follows again afterwards.", "远程访问要求账号开启两步验证。请先开启，之后会回到这个页面。";
     too_many_devices: "Too many devices", "设备太多";
     too_many_devices_lead: "This account already has 50 devices for remote access. Revoke one on your account page, then start the sign-in on the device again.", "这个账号已有 50 台远程访问设备。请先在账户页吊销一台，再在设备上重新发起登录。";
 
@@ -391,6 +402,32 @@ texts! {
     done: "Done", "完成";
     notice_display_name: "Your display name was changed.", "显示名称已修改。";
     notice_revoked: "The app password was revoked.", "app password 已吊销。";
+    tf_title: "Two-step verification", "两步验证";
+    tf_note: "Protects your sign-ins with a code from an authenticator app on your phone. Remote access for your devices needs it.", "用手机上身份验证器 app 生成的验证码保护你的登录。设备远程访问需要先开启它。";
+    tf_on_since: "On since {}.", "已开启，开启时间：{}。";
+    tf_recovery_left: "Recovery codes left: {}.", "剩余恢复码：{} 个。";
+    tf_unavailable: "Not available: the server has no key file for it. Ask the operator.", "暂不可用：服务器缺少两步验证的密钥文件，请联系管理员。";
+    tf_turn_on: "Turn on", "开启";
+    tf_turn_off: "Turn off", "关闭";
+    tf_renew: "New recovery codes", "生成新的恢复码";
+    tf_password: "Web login password", "网页登录密码";
+    tf_code: "Code or recovery code", "验证码或恢复码";
+    tf_failures: "Your password was entered correctly, but the second step failed:", "有人输对了你的密码，但两步验证失败了：";
+    tf_failure_at: "{}, from {}", "{}，来自 {}";
+    tf_setup_title: "Set up two-step verification", "设置两步验证";
+    tf_setup_scan: "Scan this code with an authenticator app (for example Google Authenticator, Microsoft Authenticator or 1Password), or enter the key by hand.", "用身份验证器 app（例如 Google Authenticator、Microsoft Authenticator 或 1Password）扫描这个二维码，或者手动输入密钥。";
+    tf_key: "Key", "密钥";
+    tf_setup_confirm: "Then enter the 6-digit code the app shows.", "然后输入 app 显示的 6 位验证码。";
+    tf_setup_expired: "The setup took too long. Start again.", "设置超时，请重新开始。";
+    tf_recovery_title: "Recovery codes", "恢复码";
+    tf_recovery_lead: "Keep these codes somewhere safe, apart from your phone. Each one signs you in once when you cannot use your authenticator app. They are shown only now.", "请把这些恢复码保存在安全的地方，不要和手机放在一起。无法使用身份验证器时，每个恢复码可以登录一次。它们只显示这一次。";
+    tf_recovery_saved: "I have saved them", "我已保存";
+    notice_tf_on: "Two-step verification is on.", "两步验证已开启。";
+    notice_tf_off: "Two-step verification is off. Remote access for your devices stays off until you turn it on again.", "两步验证已关闭。在重新开启之前，你的设备无法远程访问。";
+    a_tf_on: "On since {}", "已开启：{}";
+    a_tf_off: "Off", "未开启";
+    a_tf_reset: "Reset two-step verification", "重置两步验证";
+    a_notice_tf_reset: "Two-step verification was reset. The account signs in with its password alone until it turns it on again, and its devices have no remote access until then.", "两步验证已重置。在重新开启之前，这个账号只用密码登录，它的设备也无法远程访问。";
     remote_devices: "Remote devices", "远程设备";
     remote_devices_note: "Devices registered for remote access. Revoke one that is lost or that you no longer use: its key can never be used again, and your other devices forget it.", "已注册远程访问的设备。设备丢失或不再使用时请吊销：它的密钥将永远作废，你的其他设备也会忘记它。";
     no_remote_devices: "No device is registered for remote access yet.", "还没有设备注册远程访问。";

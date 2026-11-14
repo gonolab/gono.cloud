@@ -1,0 +1,14 @@
+{%- extends "files/frame.html" -%}
+{%- block title %}{{ chrome.t.tf_recovery_title }}{% endblock -%}
+{%- block content %}
+<div class="page-head"><div><h1>{{ chrome.t.tf_recovery_title }}</h1></div></div>
+<section class="panel narrow"><div class="panel-body">
+  <p><b>{{ chrome.t.tf_recovery_lead }}</b></p>
+  <ol class="codes">
+  {%- for code in codes %}
+    <li>{{ code }}</li>
+  {%- endfor %}
+  </ol>
+  <div class="actions"><a class="btn primary" href="{{ next }}">{{ chrome.t.tf_recovery_saved }}</a></div>
+</div></section>
+{%- endblock %}

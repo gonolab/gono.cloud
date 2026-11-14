@@ -28,6 +28,7 @@ gono-server-dav.workspace = true
 gono-server-nextcloud.workspace = true
 gono-server-relay.workspace = true
 ipnet.workspace = true
+qrcodegen.workspace = true
 rpassword.workspace = true
 rustix.workspace = true
 secrecy.workspace = true

@@ -212,6 +212,10 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(site::root))
         .route("/login", get(site::login_page).post(site::login))
         .route("/logout", post(site::logout))
+        .route(
+            web::TWO_STEP_PATH,
+            get(site::two_step_page).post(site::two_step),
+        )
         .route(web::THEME_PATH, post(site::theme))
         .route("/apps/assets/{name}", get(site::asset));
     if state.files.is_some() {

@@ -629,6 +629,49 @@ fn app_passwords_are_shown_once_and_can_be_revoked() {
 }
 
 #[tokio::test]
+async fn the_two_step_key_is_created_once_and_its_loss_stops_serve() {
+    let instance = Instance::new();
+    assert!(instance.init().status.success());
+    let key = instance.dir.path().join("two-factor.key");
+    let bytes = std::fs::read(&key).expect("init creates the key");
+    assert_eq!(bytes.len(), 32);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640, "{mode:o}");
+    }
+    let check = text(&run(&mut instance.command(&["config", "check"])).stdout);
+    assert!(
+        check.contains("two_factor.key_file") && !check.contains("(missing)"),
+        "{check}"
+    );
+
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", instance.db().display()))
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (1, x'00', 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    // The secrets cannot be read without the key: serve does not start.
+    std::fs::remove_file(&key).unwrap();
+    let serve = run(&mut instance.command(&["serve"]));
+    assert!(!serve.status.success());
+    let logs = format!("{}{}", text(&serve.stdout), text(&serve.stderr));
+    assert!(logs.contains("two_factor.key_file"), "{logs}");
+    assert!(logs.contains("reset-two-factor"), "{logs}");
+
+    let reset = run(&mut instance.command(&["user", "reset-two-factor", "admin"]));
+    assert!(reset.status.success(), "{}", text(&reset.stderr));
+    assert!(text(&reset.stdout).contains("Reset the two-step verification of admin"));
+    let again = run(&mut instance.command(&["user", "reset-two-factor", "admin"]));
+    assert!(text(&again.stdout).contains("has no two-step verification"));
+}
+
+#[tokio::test]
 async fn devices_can_be_listed_and_revoked_after_a_confirmation() {
     let instance = Instance::new();
     assert!(instance.init().status.success());

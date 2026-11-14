@@ -5,6 +5,7 @@
 //! | `GET /` | Redirects to the file UI, or to the admin UI when the file UI is off. |
 //! | `GET /login`, `POST /login` | Sign in with the web login password (file UI only). `?next=` names a local page to return to. |
 //! | `POST /logout` | Sign out (file UI only). |
+//! | `GET /login/two-step`, `POST /login/two-step` | The second step of every web sign-in of an account with two-step verification: a TOTP code or a recovery code. |
 //! | `POST /apps/theme` | Switches the theme (system, light, dark) and returns to the page; a script asking for JSON gets the new theme instead. |
 //! | `GET /apps/assets/<name>` | The stylesheet and the script, under content-hashed names, cached for a year. |
 //!
@@ -28,7 +29,10 @@ use crate::{
     app::AppState,
     client_ip::client_ip,
     i18n::Text,
-    web::{self, ASSETS_PATH, CSRF_COOKIE, Chrome, Message, SESSION_COOKIE, Theme, Verified, page},
+    web::{
+        self, ASSETS_PATH, CSRF_COOKIE, Chrome, Message, SESSION_COOKIE, SecondStep, Started,
+        Theme, Verified, page,
+    },
 };
 
 /// Where the file UI lives.
@@ -140,7 +144,133 @@ struct SignInPage {
     error: Option<&'static str>,
 }
 
-page!(SignInPage);
+/// `two_step.html`: the second step of a sign-in.
+#[derive(Template)]
+#[template(path = "two_step.html")]
+struct TwoStepPage {
+    chrome: Chrome,
+    csrf: String,
+    username: String,
+    error: Option<&'static str>,
+}
+
+page!(SignInPage, TwoStepPage);
+
+fn two_step_form(
+    state: &AppState,
+    headers: &HeaderMap,
+    status: StatusCode,
+    username: String,
+    error: Option<&'static str>,
+) -> Response {
+    let (csrf, cookie) = state.web.login_csrf(headers);
+    let page = TwoStepPage {
+        chrome: Chrome::for_request(headers),
+        csrf,
+        username,
+        error,
+    };
+    let mut response = web::render(status, &page);
+    response.headers_mut().append(header::SET_COOKIE, cookie);
+    response
+}
+
+/// The page that says a sign-in waiting for its second step is gone.
+fn two_step_expired(state: &AppState, headers: &HeaderMap) -> Response {
+    let chrome = Chrome::for_request(headers);
+    let t = chrome.t;
+    let mut response = Message::new(
+        chrome,
+        t.two_step_expired,
+        t.two_step_expired,
+        t.two_step_expired_lead,
+    )
+    .respond(StatusCode::NOT_FOUND);
+    response
+        .headers_mut()
+        .append(header::SET_COOKIE, state.web.two_step_removal());
+    response
+}
+
+/// `GET /login/two-step`.
+pub async fn two_step_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    match state.web.pending_user(&headers) {
+        Some(username) => two_step_form(&state, &headers, StatusCode::OK, username, None),
+        None => two_step_expired(&state, &headers),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TwoStepForm {
+    #[serde(default)]
+    csrf: String,
+    #[serde(default)]
+    code: String,
+}
+
+/// `POST /login/two-step`.
+pub async fn two_step(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(form): Form<TwoStepForm>,
+) -> Response {
+    if !state.web.same_origin(&headers) {
+        return blocked(&headers, |t| t.from_other_site);
+    }
+    let Some(username) = state.web.pending_user(&headers) else {
+        return two_step_expired(&state, &headers);
+    };
+    let t = Chrome::for_request(&headers).t;
+    if !state.web.check_login_csrf(&headers, &form.csrf) {
+        return two_step_form(
+            &state,
+            &headers,
+            StatusCode::FORBIDDEN,
+            username,
+            Some(t.form_expired_sign_in),
+        );
+    }
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    match state.web.second_step(client, &headers, &form.code).await {
+        SecondStep::Ok {
+            token,
+            next,
+            recovery_left,
+        } => {
+            if let Some(left) = recovery_left {
+                tracing::info!(%client, user = %username, left, "signed in with a recovery code");
+            }
+            web::see_other(
+                &next,
+                &[
+                    state.web.session_cookie(&token),
+                    state.web.removal_cookie(CSRF_COOKIE),
+                    state.web.two_step_removal(),
+                ],
+            )
+        }
+        SecondStep::Wrong => two_step_form(
+            &state,
+            &headers,
+            StatusCode::FORBIDDEN,
+            username,
+            Some(t.two_step_wrong),
+        ),
+        SecondStep::Locked => two_step_form(
+            &state,
+            &headers,
+            StatusCode::TOO_MANY_REQUESTS,
+            username,
+            Some(t.two_step_locked),
+        ),
+        SecondStep::Expired => two_step_expired(&state, &headers),
+        SecondStep::RateLimited(wait) => {
+            web::too_many_attempts(Chrome::for_request(&headers), wait)
+        }
+        SecondStep::Unavailable => web::unavailable(Chrome::for_request(&headers)),
+    }
+}
 
 #[derive(Deserialize)]
 pub struct LoginQuery {
@@ -255,15 +385,16 @@ pub async fn login(
         .verify_password(client, &user, SecretString::from(form.password))
         .await
     {
-        Verified::Ok(account) => match state.web.open_session(client, &account).await {
-            Some(token) => web::see_other(
+        Verified::Ok(account) => match state.web.start_session(client, &account, &next).await {
+            Started::Session(token) => web::see_other(
                 &next,
                 &[
                     state.web.session_cookie(&token),
                     state.web.removal_cookie(CSRF_COOKIE),
                 ],
             ),
-            None => web::unavailable(Chrome::for_request(&headers)),
+            Started::SecondStep(cookie) => web::see_other(web::TWO_STEP_PATH, &[cookie]),
+            Started::Unavailable => web::unavailable(Chrome::for_request(&headers)),
         },
         Verified::Invalid => sign_in_form(
             &state,

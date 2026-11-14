@@ -9,7 +9,7 @@ use gono_server_core::{
     db::{self, OpenMode},
     password,
     storage::DataLayout,
-    users,
+    two_factor, users,
 };
 
 use super::{load_config, refuse_root_on_foreign_install};
@@ -60,10 +60,27 @@ pub async fn run(config_path: &Path, args: InitArgs) -> anyhow::Result<()> {
         .create_user(user_id)
         .context("create the admin's storage directories")?;
 
+    // The key of two-step verification. The install script creates it as root, since the
+    // service user cannot write the configuration directory; a manual setup gets it here.
+    let key_file = &config.two_factor.key_file;
+    let key = match two_factor::Key::create(key_file) {
+        Ok(true) => format!("{} (created)", key_file.display()),
+        Ok(false) => key_file.display().to_string(),
+        Err(err) => {
+            eprintln!(
+                "warning: cannot create the two-step verification key {}: {err:#}; create it with \
+                 32 random bytes, readable by the service, before turning two-step verification on",
+                key_file.display()
+            );
+            format!("{} (missing)", key_file.display())
+        }
+    };
+
     println!("Initialized {PRODUCT_NAME}.");
     println!();
     println!("  database        {}", config.db.path.display());
     println!("  data directory  {}", config.storage.data_dir.display());
+    println!("  two-step key    {key}");
     println!("  admin account   {}", args.admin);
     println!();
     println!("Start the server with `gono-cloud serve`.");

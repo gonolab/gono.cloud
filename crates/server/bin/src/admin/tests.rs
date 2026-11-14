@@ -1104,3 +1104,54 @@ async fn admins_revoke_devices_after_a_second_confirmation() {
     assert_eq!(records[0].kind, "device.revoked");
     assert_eq!(records[0].actor, "admin");
 }
+
+#[tokio::test]
+async fn admins_with_two_step_verification_pass_the_second_step_first() {
+    let f = fixture().await;
+    sqlx::query("INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?1, x'00', 0)")
+        .bind(f.root)
+        .execute(&f.state.db)
+        .await
+        .unwrap();
+    let mut browser = Browser::new(&f.state);
+    let reply = browser.sign_in("root", ROOT_PASSWORD).await;
+    assert_eq!(reply.location(), "/login/two-step");
+    let overview = browser.get(&path("/")).await;
+    assert_ne!(
+        overview.status,
+        StatusCode::OK,
+        "no session before the second step"
+    );
+    let page = browser.get("/login/two-step").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("Two-step verification"), "{}", page.body);
+
+    // The admin page shows it and resets it.
+    let mut admin = Browser::new(&f.state);
+    sqlx::query("DELETE FROM two_factor WHERE user_id = ?1")
+        .bind(f.root)
+        .execute(&f.state.db)
+        .await
+        .unwrap();
+    let csrf = admin.root().await;
+    sqlx::query("INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?1, x'00', 0)")
+        .bind(f.alice)
+        .execute(&f.state.db)
+        .await
+        .unwrap();
+    let page = admin.get(&path("/users/alice")).await;
+    assert!(
+        page.body.contains("Reset two-step verification"),
+        "{}",
+        page.body
+    );
+    let reset = admin
+        .post(&path("/users/alice/two-factor/reset"), &[("csrf", &csrf)])
+        .await;
+    assert_eq!(reset.location(), path("/users/alice?done=two-factor-reset"));
+    assert!(
+        !gono_server_core::two_factor::is_enrolled(&f.state.db, f.alice)
+            .await
+            .unwrap()
+    );
+}

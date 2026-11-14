@@ -177,6 +177,30 @@ pub fn routes() -> Router<AppState> {
             &format!("{ACCOUNT}/devices/{{id}}/pairing"),
             post(account::allow_pairing),
         )
+        .route(
+            &format!("{ACCOUNT}/two-factor"),
+            get(account::two_factor_page),
+        )
+        .route(
+            &format!("{ACCOUNT}/two-factor/start"),
+            post(account::two_factor_start),
+        )
+        .route(
+            &format!("{ACCOUNT}/two-factor/confirm"),
+            post(account::two_factor_confirm),
+        )
+        .route(
+            &format!("{ACCOUNT}/two-factor/recovery-codes"),
+            get(account::recovery_codes),
+        )
+        .route(
+            &format!("{ACCOUNT}/two-factor/renew"),
+            post(account::two_factor_renew),
+        )
+        .route(
+            &format!("{ACCOUNT}/two-factor/disable"),
+            post(account::two_factor_disable),
+        )
 }
 
 async fn to_home() -> Response {

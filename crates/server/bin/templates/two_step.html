@@ -1,0 +1,17 @@
+{%- extends "card.html" -%}
+{%- block title %}{{ chrome.t.two_step_title }}{% endblock -%}
+{%- block card %}
+<h1>{{ chrome.t.two_step_title }}</h1>
+<p class="muted mt-6">{{ chrome.t.two_step_lead }}</p>
+{%- if let Some(error) = error %}
+<div class="flash bad" role="alert">{{ error }}</div>
+{%- endif %}
+<form method="post" action="/login/two-step">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="text" name="username" value="{{ username }}" autocomplete="username" hidden>
+  <label class="field" for="two-step-code"><span>{{ chrome.t.two_step_code }}</span>
+    <input id="two-step-code" type="text" name="code" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" maxlength="32" required autofocus></label>
+  <button class="btn primary block" type="submit">{{ chrome.t.two_step_verify }}</button>
+</form>
+<p class="muted small mt-20">{{ chrome.t.two_step_recovery_note }}</p>
+{%- endblock %}

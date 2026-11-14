@@ -12,7 +12,7 @@ use gono_server_core::{
     meta::MetaStore,
     settings,
     storage::DataLayout,
-    users,
+    two_factor, users,
 };
 use gono_server_dav::{DavService, ScopedFs, locks::SqliteLs};
 use gono_server_nextcloud::{
@@ -208,11 +208,15 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
     ));
     // The HTML sign-in has a limiter of its own: failing devices must not block it, and its
     // policy differs (see `crate::ratelimit`).
-    let web = Arc::new(Web::new(
+    let mut web = Web::new(
         pool.clone(),
         Arc::new(RateLimiter::new()),
         &config.server.base_url,
-    ));
+    );
+    if let Some(key) = two_factor_key(&config, &pool).await? {
+        web = web.with_two_factor_key(key);
+    }
+    let web = Arc::new(web);
     let admin = if config.admin.enabled {
         let info = ServerInfo {
             started_at,
@@ -304,6 +308,67 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
     pool.close().await;
     tracing::info!("stopped");
     result
+}
+
+/// The key of two-step verification (`two_factor.key_file`). A missing file is created when
+/// no account has two-step verification yet; without it, enrolled accounts could not sign in,
+/// so its absence stops the start then. When it cannot be created, two-step verification is
+/// unavailable and the start goes on.
+async fn two_factor_key(
+    config: &Config,
+    pool: &db::Pool,
+) -> anyhow::Result<Option<two_factor::Key>> {
+    let path = &config.two_factor.key_file;
+    let read = |path: &Path| {
+        two_factor::Key::load(path)
+            .with_context(|| format!("read two_factor.key_file {}", path.display()))
+    };
+    if let Some(key) = read(path)? {
+        warn_if_readable_by_others(path);
+        return Ok(Some(key));
+    }
+    if two_factor::any_enrolled(pool).await? {
+        anyhow::bail!(
+            "two_factor.key_file {} is missing, but accounts have two-step verification on: \
+             restore the file from a backup, or reset their two-step verification with \
+             `gono-cloud user reset-two-factor`",
+            path.display()
+        );
+    }
+    match two_factor::Key::create(path) {
+        Ok(_) => {
+            tracing::info!(path = %path.display(), "created the two-step verification key");
+            read(path)
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "two-step verification is unavailable: two_factor.key_file does not exist and \
+                 cannot be created; create it with 32 random bytes, readable by the service \
+                 (docs/deployment.md)"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Warns when the key file is readable by everyone.
+fn warn_if_readable_by_others(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Ok(metadata) = std::fs::metadata(path)
+            && metadata.permissions().mode() & 0o004 != 0
+        {
+            tracing::warn!(
+                path = %path.display(),
+                "two_factor.key_file is readable by every user of this host; make it 0640"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Builds the one `DavHandler` of the process and the service around it. Every metadata

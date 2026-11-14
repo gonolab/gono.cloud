@@ -248,6 +248,10 @@ pub fn routes(prefix: &str) -> Router<AppState> {
             &format!("{p}/users/{{name}}/devices/{{id}}/revoke"),
             get(revoke_device_page).post(revoke_device),
         )
+        .route(
+            &format!("{p}/users/{{name}}/two-factor/reset"),
+            post(reset_two_factor),
+        )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -476,15 +480,20 @@ async fn login(
     let password = SecretString::from(form.password);
     match state.web.verify_password(client, &user, password).await {
         Verified::Ok(account) if account.is_admin => {
-            match state.web.open_session(client, &account).await {
-                Some(token) => {
+            match state
+                .web
+                .start_session(client, &account, &admin.url("/"))
+                .await
+            {
+                web::Started::Session(token) => {
                     let mut response = see_other(&admin.url("/"));
                     let headers = response.headers_mut();
                     headers.append(header::SET_COOKIE, state.web.session_cookie(&token));
                     headers.append(header::SET_COOKIE, state.web.removal_cookie(CSRF_COOKIE));
                     response
                 }
-                None => web::unavailable(admin.chrome(&state, &headers)),
+                web::Started::SecondStep(cookie) => web::see_other(web::TWO_STEP_PATH, &[cookie]),
+                web::Started::Unavailable => web::unavailable(admin.chrome(&state, &headers)),
             }
         }
         Verified::Ok(account) => {
@@ -993,6 +1002,10 @@ async fn user_page_response(
         }
         Err(err) => return internal_error(&session.chrome, &err),
     };
+    let two_factor_status = match gono_server_core::two_factor::status(&state.db, user.id).await {
+        Ok(status) => status,
+        Err(err) => return internal_error(&session.chrome, &err),
+    };
     let t = session.chrome.t;
     let now = pages::now();
     let app_passwords = passwords
@@ -1036,6 +1049,11 @@ async fn user_page_response(
             created: pages::time(user.created_at),
             updated: pages::time(user.updated_at),
             storage: format_bytes(storage),
+            two_factor: match two_factor_status {
+                Some(status) => fill(t.a_tf_on, &[&pages::date(status.enabled_at)]),
+                None => t.a_tf_off.to_owned(),
+            },
+            two_factor_on: two_factor_status.is_some(),
         },
         is_self: user.id == session.user.user_id,
         delete_label: fill(t.a_delete_named, &[user.username.as_str()]),
@@ -1044,6 +1062,50 @@ async fn user_page_response(
         remote,
     };
     web::render(status, &page)
+}
+
+/// `POST <admin>/users/<name>/two-factor/reset`.
+async fn reset_two_factor(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let admin = match admin(&state) {
+        Ok(admin) => admin,
+        Err(halt) => return *halt,
+    };
+    let session = match form_session(&state, &admin, &headers, &form.csrf).await {
+        Ok(session) => session,
+        Err(halt) => return *halt,
+    };
+    let user = match find_user(&state, &admin, &session, &name).await {
+        Ok(user) => user,
+        Err(halt) => return *halt,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    match gono_server_core::two_factor::disable(
+        &state.db,
+        user.id,
+        gono_server_core::two_factor::TurnedOff::Admin,
+        Some(client),
+        db::unix_now(),
+    )
+    .await
+    {
+        Ok(_) => {
+            tracing::info!(by = %session.user.username, user = %user.username, "admin reset two-step verification");
+            if let Some(connect) = &state.connect {
+                connect.poke();
+            }
+            see_other(&format!(
+                "{}?done=two-factor-reset",
+                admin.user_url(user.username.as_str())
+            ))
+        }
+        Err(err) => internal_error(&session.chrome, &err),
+    }
 }
 
 /// A device registered for remote access, as the admin UI lists it.
@@ -1242,6 +1304,7 @@ async fn user_page(
         Some("renamed") => Some(t.a_notice_renamed.to_owned()),
         Some("password") => Some(t.a_notice_password.to_owned()),
         Some("device-revoked") => Some(t.notice_device_revoked.to_owned()),
+        Some("two-factor-reset") => Some(t.a_notice_tf_reset.to_owned()),
         Some("revoked") => Some(t.notice_revoked.to_owned()),
         _ => None,
     };

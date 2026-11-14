@@ -80,6 +80,40 @@
     </section>
   </div>
   <div class="stack">
+    <section class="panel" id="two-factor"><div class="panel-body">
+      <h2>{{ chrome.t.tf_title }}</h2>
+      <p class="muted small">{{ chrome.t.tf_note }}</p>
+      {%- if !two_factor.failures.is_empty() %}
+      <div class="flash bad" role="alert">{{ chrome.t.tf_failures }}{% for failure in two_factor.failures %}<div>{{ failure }}</div>{% endfor %}</div>
+      {%- endif %}
+      {%- if let Some(on) = two_factor.on %}
+      <p>{{ on }} {{ two_factor.recovery_left }}</p>
+      <form method="post" action="/apps/account/two-factor/renew">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <input type="text" name="username" value="{{ username }}" autocomplete="username" hidden>
+        <label class="field" for="tf-renew-password"><span>{{ chrome.t.tf_password }}</span><input id="tf-renew-password" type="password" name="password" autocomplete="current-password" required></label>
+        <label class="field" for="tf-renew-code"><span>{{ chrome.t.tf_code }}</span><input id="tf-renew-code" type="text" name="code" autocomplete="one-time-code" maxlength="32" required></label>
+        <button class="btn block" type="submit">{{ chrome.t.tf_renew }}</button>
+      </form>
+      <form method="post" action="/apps/account/two-factor/disable" class="mt-20">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <input type="text" name="username" value="{{ username }}" autocomplete="username" hidden>
+        <label class="field" for="tf-off-password"><span>{{ chrome.t.tf_password }}</span><input id="tf-off-password" type="password" name="password" autocomplete="current-password" required></label>
+        <label class="field" for="tf-off-code"><span>{{ chrome.t.tf_code }}</span><input id="tf-off-code" type="text" name="code" autocomplete="one-time-code" maxlength="32" required></label>
+        <button class="btn danger block" type="submit">{{ chrome.t.tf_turn_off }}</button>
+      </form>
+      {%- else if two_factor.available %}
+      <form method="post" action="/apps/account/two-factor/start">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <input type="hidden" name="next" value="{{ two_factor.next }}">
+        <input type="text" name="username" value="{{ username }}" autocomplete="username" hidden>
+        <label class="field" for="tf-on-password"><span>{{ chrome.t.tf_password }}</span><input id="tf-on-password" type="password" name="password" autocomplete="current-password" required></label>
+        <button class="btn primary block" type="submit">{{ chrome.t.tf_turn_on }}</button>
+      </form>
+      {%- else %}
+      <p class="muted">{{ chrome.t.tf_unavailable }}</p>
+      {%- endif %}
+    </div></section>
     <section class="panel"><div class="panel-body">
       <h2>{{ chrome.t.profile }}</h2>
       <p class="muted small">{{ chrome.t.display_name_note }}</p>

@@ -322,7 +322,12 @@ fn consent_page(
 
 /// Why a device registration cannot be granted to `user_id` (`docs/connect-protocol.md`,
 /// 4.2): the account has no two-step verification, or holds the most devices already.
-async fn device_refusal(state: &AppState, headers: &HeaderMap, user_id: i64) -> Option<Response> {
+async fn device_refusal(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: i64,
+    page: &str,
+) -> Option<Response> {
     let checked = async {
         let enrolled = two_factor::is_enrolled(&state.db, user_id).await?;
         let devices = devices::count_active(&state.db, user_id).await?;
@@ -332,15 +337,23 @@ async fn device_refusal(state: &AppState, headers: &HeaderMap, user_id: i64) -> 
     let chrome = Chrome::for_request(headers);
     let t = chrome.t;
     match checked {
-        Ok((false, _)) => Some(
-            Message::new(
+        Ok((false, _)) => {
+            let mut message = Message::new(
                 chrome,
                 t.two_factor_needed,
                 t.two_factor_needed,
                 t.two_factor_needed_lead,
-            )
-            .respond(StatusCode::FORBIDDEN),
-        ),
+            );
+            // The account page leads through enrolment and comes back to this page.
+            if state.files.is_some() && state.web.two_factor_key().is_some() {
+                let next: String = url::form_urlencoded::byte_serialize(page.as_bytes()).collect();
+                message.link = Some((
+                    format!("/apps/account/?next={next}#two-factor"),
+                    t.tf_turn_on.to_owned(),
+                ));
+            }
+            Some(message.respond(StatusCode::FORBIDDEN))
+        }
         Ok((true, count)) if count >= devices::MAX_DEVICES_PER_ACCOUNT => Some(
             Message::new(
                 chrome,
@@ -430,7 +443,12 @@ pub async fn submit(
             );
         }
         let password = SecretString::from(form.password);
-        return match state.web.sign_in(client, &form.user, password).await {
+        return match state
+            .web
+            .sign_in(client, &form.user, password, uri.path())
+            .await
+        {
+            SignIn::SecondStep(cookie) => web::see_other(web::TWO_STEP_PATH, &[cookie]),
             SignIn::Ok(token) => back_to(
                 &uri,
                 &[
@@ -470,7 +488,7 @@ pub async fn submit(
     let user = &session.0;
     if form.action == "grant"
         && flow.device.is_some()
-        && let Some(refusal) = device_refusal(&state, &headers, user.user_id).await
+        && let Some(refusal) = device_refusal(&state, &headers, user.user_id, uri.path()).await
     {
         return refusal;
     }

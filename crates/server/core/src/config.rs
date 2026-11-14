@@ -63,6 +63,9 @@ pub struct Config {
     /// `[relay]`: the relay through which devices reach each other.
     #[serde(default)]
     pub relay: RelayConfig,
+    /// `[two_factor]`: two-step verification of web sign-ins.
+    #[serde(default)]
+    pub two_factor: TwoFactorConfig,
 }
 
 /// `[server]` table.
@@ -256,6 +259,24 @@ pub struct FilesUiConfig {
 impl Default for FilesUiConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// `[two_factor]` table: two-step verification (TOTP) of web sign-ins.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TwoFactorConfig {
+    /// The key the TOTP secrets are encrypted with: 32 random bytes (or 64 hex digits) in a file
+    /// outside the database directory, readable by the service. Relative paths are resolved
+    /// against the configuration file's directory. `init` and the install script create it.
+    pub key_file: PathBuf,
+}
+
+impl Default for TwoFactorConfig {
+    fn default() -> Self {
+        Self {
+            key_file: crate::two_factor::default_key_file(),
+        }
     }
 }
 
@@ -460,6 +481,7 @@ impl Config {
         };
         resolve(&mut self.storage.data_dir);
         resolve(&mut self.db.path);
+        resolve(&mut self.two_factor.key_file);
         for file in [
             self.logging.file.as_mut(),
             self.relay.tls_cert.as_mut(),
@@ -680,6 +702,15 @@ impl Config {
     /// Settings that are valid but probably not what the operator wants in production.
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
+        let key = &self.two_factor.key_file;
+        if !self.storage.data_dir.as_os_str().is_empty() && key.starts_with(&self.storage.data_dir)
+        {
+            warnings.push(format!(
+                "two_factor.key_file {} lies in the data directory: a copy of it would give the \
+                 second factor of every account away; keep it in the configuration directory",
+                key.display()
+            ));
+        }
         let url = &self.server.base_url;
         if url.scheme() == "http" && !is_local_host(url) {
             warnings.push(format!(
@@ -1229,6 +1260,28 @@ mod tests {
             with_relay("public_url = \"http://relay.example.com\"")
                 .warnings()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_two_factor_key_lives_next_to_the_config_file() {
+        let mut config = parse(MINIMAL);
+        config.resolve_relative_paths(Path::new("/etc/gono-cloud"));
+        assert_eq!(
+            config.two_factor.key_file,
+            Path::new("/etc/gono-cloud/two-factor.key")
+        );
+        assert!(
+            config.warnings().iter().all(|w| !w.contains("two_factor")),
+            "{:?}",
+            config.warnings()
+        );
+        config.two_factor.key_file = config.storage.data_dir.join("two-factor.key");
+        assert!(
+            config
+                .warnings()
+                .iter()
+                .any(|w| w.contains("two_factor.key_file"))
         );
     }
 

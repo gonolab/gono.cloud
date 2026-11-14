@@ -120,6 +120,14 @@ pub enum UserCommand {
     /// List user accounts.
     List,
 
+    /// Turn two-step verification of a user off, for example after a lost phone without
+    /// recovery codes. The account signs in with its password alone until it turns it on
+    /// again, and its devices have no remote access until then.
+    ResetTwoFactor {
+        /// Account whose two-step verification is reset.
+        username: Username,
+    },
+
     /// Delete a user account with its app passwords, sessions and metadata.
     ///
     /// The user's files are not deleted: they are moved to `<data_dir>/deleted/` so that a new
