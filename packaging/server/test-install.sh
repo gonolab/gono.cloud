@@ -172,6 +172,9 @@ sudo grep -qx "base_url = \"$BASE_URL\"" "$config" || fail "base_url not in $con
 sudo grep -qx "public_url = \"https://$RELAY_HOST\"" "$config" || fail "relay.public_url not in $config"
 [ "$(owner_and_mode "$(dirname "$config")/relay-tls")" = "root:$user 750" ] ||
 	fail "relay-tls dir: $(owner_and_mode "$(dirname "$config")/relay-tls")"
+key="$(dirname "$config")/two-factor.key"
+[ "$(owner_and_mode "$key")" = "root:$user 640" ] || fail "two-factor key: $(owner_and_mode "$key")"
+[ "$(sudo wc -c "$key" | awk '{print $1}')" = 32 ] || fail "the two-factor key is not 32 bytes"
 
 step "The relay runs inside the (sandboxed) service"
 code=$(curl -s -o /dev/null -w '%{http_code}' "http://$RELAY_ADDR/generate_204")
@@ -234,9 +237,11 @@ wait_until_healthy
 
 step "Upgrade keeps the configuration and the files and backs the database up"
 before=$(sudo cat "$config" | sha256)
+key_before=$(sudo cat "$key" | sha256)
 run_installer </dev/null
 after=$(sudo cat "$config" | sha256)
 [ "$before" = "$after" ] || fail "the upgrade changed $config"
+[ "$key_before" = "$(sudo cat "$key" | sha256)" ] || fail "the upgrade replaced the two-factor key"
 sudo ls "$state/backups"
 backup=$(sudo ls "$state/backups" | head -n 1)
 sudo test -f "$state/backups/$backup/gono-cloud.db" || fail "no database backup"

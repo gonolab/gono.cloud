@@ -392,6 +392,20 @@ ensure_dir() {
 	[ -d "$1" ] || install -d -m "$2" -o "$3" -g "$4" "$1"
 }
 
+# The key the TOTP secrets of two-step verification are encrypted with (two_factor.key_file):
+# 32 random bytes, readable by the service, created once and never replaced. Losing it means
+# resetting the two-step verification of every account, so it belongs in backups of
+# $CONFIG_DIR, apart from the database.
+ensure_two_factor_key() {
+	key="$CONFIG_DIR/two-factor.key"
+	[ -e "$key" ] && return 0
+	(umask 077 && head -c 32 /dev/urandom >"$key.new")
+	chown "root:$SERVICE_GROUP" "$key.new"
+	chmod 0640 "$key.new"
+	mv "$key.new" "$key"
+	log "Created $key, the key of two-step verification (back it up with $CONFIG_DIR)"
+}
+
 # ---------------------------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------------------------
@@ -647,6 +661,8 @@ install_release() {
 			;;
 		esac
 	fi
+
+	ensure_two_factor_key
 
 	if [ "$needs_init" = 1 ]; then
 		log "Creating the database and the admin account $ADMIN"
