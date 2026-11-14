@@ -971,12 +971,15 @@ async fn the_overview_shows_the_relay() {
     let off = browser.get(&path("/")).await;
     assert!(off.body.contains("Turned off in [relay]"), "{}", off.body);
 
-    let relay = Relay::spawn(&RelayConfig {
-        enabled: true,
-        public_url: Some("https://relay.example.com".parse().unwrap()),
-        bind: "127.0.0.1:0".parse().unwrap(),
-        ..RelayConfig::default()
-    })
+    let relay = Relay::spawn(
+        &RelayConfig {
+            enabled: true,
+            public_url: Some("https://relay.example.com".parse().unwrap()),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ..RelayConfig::default()
+        },
+        None,
+    )
     .await
     .unwrap();
     let status = relay.status();

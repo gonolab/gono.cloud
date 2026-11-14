@@ -1014,6 +1014,27 @@ pub async fn admissible(pool: &Pool) -> Result<Vec<EndpointId>> {
         .collect())
 }
 
+/// The keys of revoked devices (tombstones), with their accounts.
+pub async fn revoked_keys(pool: &Pool) -> Result<Vec<(EndpointId, i64)>> {
+    let rows: Vec<(Vec<u8>, i64)> =
+        sqlx::query_as("SELECT endpoint_id, user_id FROM devices WHERE revoked_at IS NOT NULL")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(key, user_id)| Some((EndpointId::from_slice(&key)?, user_id)))
+        .collect())
+}
+
+/// The accounts on which remote access is available: enabled, with two-step verification.
+pub async fn remote_access_accounts(pool: &Pool) -> Result<Vec<i64>> {
+    Ok(sqlx::query_scalar(
+        "SELECT u.id FROM users u JOIN two_factor t ON t.user_id = u.id WHERE u.enabled = 1",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

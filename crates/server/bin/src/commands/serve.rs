@@ -114,7 +114,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
     // file server running.
     let relay_stop = Arc::new(Notify::new());
     let (relay_status, relay_task) = if config.relay.enabled {
-        let relay = Relay::spawn(&config.relay)
+        let relay = Relay::spawn(&config.relay, None)
             .await
             .context("start the relay")?;
         let status = relay.status();

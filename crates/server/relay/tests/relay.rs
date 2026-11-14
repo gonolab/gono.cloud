@@ -1,11 +1,17 @@
 //! The relay as devices see it: iroh relay clients and a QUIC address discovery client talk to
 //! a relay started from a `[relay]` table.
 
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use gono_server_core::config::RelayConfig;
-use gono_server_relay::{Relay, RelaySnapshot};
+use gono_server_relay::{Admission, Relay, RelaySnapshot};
 use iroh_base::{EndpointId, RelayUrl, SecretKey};
 use iroh_dns::dns::DnsResolver;
 use iroh_relay::{
@@ -79,7 +85,9 @@ async fn wait_for(relay: &gono_server_relay::RelayStatus, done: impl Fn(&RelaySn
 #[tokio::test]
 async fn allowed_devices_reach_each_other_and_others_are_refused() {
     let (alice, bob, mallory) = (device(1), device(2), device(3));
-    let relay = Relay::spawn(&relay_config(&[&alice, &bob])).await.unwrap();
+    let relay = Relay::spawn(&relay_config(&[&alice, &bob]), None)
+        .await
+        .unwrap();
     let status = relay.status();
     assert_eq!(status.allowed_devices(), 2);
     assert_eq!(status.qad_addr(), None);
@@ -120,7 +128,7 @@ async fn device_ids_are_accepted_in_either_case() {
     let alice = device(4);
     let mut config = relay_config(&[]);
     config.allowed_endpoints = vec![alice.public().to_string().to_ascii_uppercase()];
-    let relay = Relay::spawn(&config).await.unwrap();
+    let relay = Relay::spawn(&config, None).await.unwrap();
     connect(relay.status().http_addr(), &alice).await.unwrap();
 }
 
@@ -129,7 +137,7 @@ async fn invalid_device_ids_stop_the_start() {
     let mut config = relay_config(&[]);
     // 64 hex digits that are not an Ed25519 public key: no point on the curve has them.
     config.allowed_endpoints = vec!["02".repeat(32)];
-    let err = Relay::spawn(&config).await.unwrap_err();
+    let err = Relay::spawn(&config, None).await.unwrap_err();
     assert!(
         format!("{err:#}").contains("relay.allowed_endpoints"),
         "{err:#}"
@@ -139,7 +147,7 @@ async fn invalid_device_ids_stop_the_start() {
 #[tokio::test]
 async fn run_until_shuts_the_relay_down() {
     let alice = device(5);
-    let relay = Relay::spawn(&relay_config(&[&alice])).await.unwrap();
+    let relay = Relay::spawn(&relay_config(&[&alice]), None).await.unwrap();
     let status = relay.status();
     connect(status.http_addr(), &alice).await.unwrap();
     assert!(status.is_running());
@@ -150,6 +158,65 @@ async fn run_until_shuts_the_relay_down() {
         .unwrap();
     assert!(!status.is_running());
     assert!(connect(status.http_addr(), &alice).await.is_err());
+}
+
+/// An admission whose devices the test changes, as the device directory does.
+#[derive(Debug, Default)]
+struct Directory {
+    admitted: Mutex<HashSet<EndpointId>>,
+    refused: Mutex<Vec<EndpointId>>,
+}
+
+impl Admission for Directory {
+    fn admits(&self, device: &EndpointId) -> bool {
+        self.admitted.lock().unwrap().contains(device)
+    }
+
+    fn count(&self) -> usize {
+        self.admitted.lock().unwrap().len()
+    }
+
+    fn refused(&self, device: &EndpointId) {
+        self.refused.lock().unwrap().push(*device);
+    }
+}
+
+#[tokio::test]
+async fn an_admission_admits_devices_and_disconnect_ends_their_connections() {
+    let (alice, bob) = (device(6), device(7));
+    let directory = Arc::new(Directory::default());
+    directory.admitted.lock().unwrap().insert(alice.public());
+    let relay = Relay::spawn(&relay_config(&[]), Some(directory.clone()))
+        .await
+        .unwrap();
+    let status = relay.status();
+    assert_eq!(status.allowed_devices(), 1);
+    let addr = status.http_addr();
+
+    let mut client = connect(addr, &alice).await.unwrap();
+    assert!(connect(addr, &bob).await.is_err());
+    assert_eq!(*directory.refused.lock().unwrap(), [bob.public()]);
+    wait_for(&status, |snapshot| snapshot.connections == 1).await;
+
+    // The directory no longer admits Alice: disconnect her, and she cannot come back.
+    directory.admitted.lock().unwrap().clear();
+    assert!(status.disconnect(&alice.public()));
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match client.next().await {
+                None | Some(Err(_)) => break,
+                Some(Ok(RelayToClientMsg::Ping(payload))) => {
+                    let _ = client.send(ClientToRelayMsg::Pong(payload)).await;
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .expect("the connection ends");
+    wait_for(&status, |snapshot| snapshot.connections == 0).await;
+    assert!(connect(addr, &alice).await.is_err());
+    assert!(!status.disconnect(&alice.public()), "nothing left to close");
 }
 
 /// Writes a self-signed certificate for `localhost` into `dir`.
@@ -199,7 +266,7 @@ async fn qad_handshake(
 async fn quic_address_discovery_reports_the_address_it_sees() {
     let dir = tempfile::tempdir().unwrap();
     let (certificate, config) = write_certificate(dir.path());
-    let relay = Relay::spawn(&config).await.unwrap();
+    let relay = Relay::spawn(&config, None).await.unwrap();
     let status = relay.status();
     let qad = status.qad_addr().expect("QAD is on");
 
@@ -220,7 +287,7 @@ async fn quic_address_discovery_picks_up_a_renewed_certificate() {
     let dir = tempfile::tempdir().unwrap();
     let (old, mut config) = write_certificate(dir.path());
     config.tls_reload_interval_secs = 1;
-    let relay = Relay::spawn(&config).await.unwrap();
+    let relay = Relay::spawn(&config, None).await.unwrap();
     let qad = relay.status().qad_addr().expect("QAD is on");
     qad_handshake(qad, old.clone()).await.unwrap();
 
@@ -245,6 +312,6 @@ async fn a_missing_certificate_stops_the_start() {
     let dir = tempfile::tempdir().unwrap();
     let (_, mut config) = write_certificate(dir.path());
     config.tls_cert = Some(dir.path().join("missing.pem"));
-    let err = Relay::spawn(&config).await.unwrap_err();
+    let err = Relay::spawn(&config, None).await.unwrap_err();
     assert!(format!("{err:#}").contains("missing.pem"), "{err:#}");
 }

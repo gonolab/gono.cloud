@@ -1,11 +1,13 @@
 [workspace]
-members = ["crates/server/*"]
+members = ["crates/protocol", "crates/server/*"]
 # What a plain `cargo build` / `cargo test` in the repository root builds. Client crates (and the
 # desktop, Android and iOS apps) will be workspace members but stay out of this list, so default
 # builds never pull in Tauri or mobile toolchains; build them with `-p` or `--workspace`.
 # See docs/repository-layout.md.
 default-members = [
+  "crates/protocol",
   "crates/server/bin",
+  "crates/server/connect",
   "crates/server/core",
   "crates/server/dav",
   "crates/server/nextcloud",
@@ -27,6 +29,8 @@ publish = false
 
 [workspace.dependencies]
 # Internal crates.
+gono-protocol = { path = "crates/protocol" }
+gono-server-connect = { path = "crates/server/connect" }
 gono-server-core = { path = "crates/server/core" }
 gono-server-dav = { path = "crates/server/dav" }
 gono-server-nextcloud = { path = "crates/server/nextcloud" }

@@ -1344,6 +1344,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
+name = "gono-protocol"
+version = "1.2.0"
+dependencies = [
+ "base64 0.22.1",
+ "iroh-base",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "gono-server"
 version = "1.2.0"
 dependencies = [
@@ -1377,6 +1388,25 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "gono-server-connect"
+version = "1.2.0"
+dependencies = [
+ "gono-protocol",
+ "gono-server-core",
+ "gono-server-relay",
+ "iroh-base",
+ "rand 0.10.3",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
  "url",
 ]
 

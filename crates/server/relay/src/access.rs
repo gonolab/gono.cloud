@@ -2,8 +2,9 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Debug,
     sync::{
-        Mutex, PoisonError,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -12,7 +13,24 @@ use anyhow::anyhow;
 use iroh_base::EndpointId;
 use iroh_relay::server::{Access, AccessControl, ClientRequest, ConnectionId};
 
-/// Admits the devices of `relay.allowed_endpoints` and refuses every other one.
+/// Devices admitted besides `relay.allowed_endpoints`: the device directory of Gono Cloud
+/// (`docs/connect-protocol.md`, section 11.1).
+pub trait Admission: Debug + Send + Sync + 'static {
+    /// Whether `device` may use the relay now. Called for every connection, so it must answer
+    /// from memory.
+    fn admits(&self, device: &EndpointId) -> bool;
+
+    /// How many devices it admits, for the admin UI.
+    fn count(&self) -> usize;
+
+    /// Called when `device` was refused, by this and by the static list.
+    fn refused(&self, device: &EndpointId) {
+        let _ = device;
+    }
+}
+
+/// Admits the devices of `relay.allowed_endpoints` and those an [`Admission`] admits, and
+/// refuses every other one.
 ///
 /// The relay handshake proves that a connecting device holds the secret key of the id it
 /// claims before [`AccessControl::on_connect`] runs, so the id alone decides. The allowlist
@@ -20,6 +38,7 @@ use iroh_relay::server::{Access, AccessControl, ClientRequest, ConnectionId};
 #[derive(Debug)]
 pub(crate) struct Allowlist {
     allowed: HashSet<EndpointId>,
+    admission: Option<Arc<dyn Admission>>,
     /// Open connections that were admitted, with the device each belongs to. A device may hold
     /// several, for example while it reconnects.
     connected: Mutex<HashMap<ConnectionId, EndpointId>>,
@@ -28,8 +47,12 @@ pub(crate) struct Allowlist {
 }
 
 impl Allowlist {
-    /// Parses the device ids of `relay.allowed_endpoints` (64 hex digits each, any case).
-    pub(crate) fn parse(ids: &[String]) -> anyhow::Result<Self> {
+    /// Parses the device ids of `relay.allowed_endpoints` (64 hex digits each, any case), and
+    /// admits the devices of `admission` as well.
+    pub(crate) fn parse(
+        ids: &[String],
+        admission: Option<Arc<dyn Admission>>,
+    ) -> anyhow::Result<Self> {
         let allowed = ids
             .iter()
             .map(|id| {
@@ -42,14 +65,19 @@ impl Allowlist {
             .collect::<anyhow::Result<_>>()?;
         Ok(Self {
             allowed,
+            admission,
             connected: Mutex::new(HashMap::new()),
             denied: AtomicU64::new(0),
         })
     }
 
-    /// Number of distinct allowed devices.
+    /// Number of allowed devices: the static list and the admission.
     pub(crate) fn len(&self) -> usize {
         self.allowed.len()
+            + self
+                .admission
+                .as_ref()
+                .map_or(0, |admission| admission.count())
     }
 
     /// Open connections and the number of distinct devices holding them.
@@ -71,7 +99,12 @@ impl Allowlist {
 impl AccessControl for Allowlist {
     async fn on_connect(&self, request: &ClientRequest) -> Access {
         let device = request.endpoint_id();
-        if self.allowed.contains(&device) {
+        let admitted = self.allowed.contains(&device)
+            || self
+                .admission
+                .as_ref()
+                .is_some_and(|admission| admission.admits(&device));
+        if admitted {
             self.connected
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -83,8 +116,12 @@ impl AccessControl for Allowlist {
             // The full id, so that an operator setting up a device can allow it.
             tracing::info!(
                 %device,
-                "relay connection refused: the device is not in relay.allowed_endpoints"
+                "relay connection refused: the device is neither registered for remote access \
+                 nor in relay.allowed_endpoints"
             );
+            if let Some(admission) = &self.admission {
+                admission.refused(&device);
+            }
             // No reason: the client learns that it was refused, nothing about the list.
             Access::Deny { reason: None }
         }

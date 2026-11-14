@@ -30,7 +30,7 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
         tracing::warn!("{warning}");
     }
 
-    let result = match Relay::spawn(&config.relay).await {
+    let result = match Relay::spawn(&config.relay, None).await {
         Ok(relay) => relay.run_until(shutdown::wait_for_signal()).await,
         Err(err) => Err(err),
     };

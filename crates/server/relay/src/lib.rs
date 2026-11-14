@@ -14,14 +14,18 @@
 //!   relay reads the certificate of its host name from `relay.tls_cert` and `relay.tls_key`
 //!   and reads them again every `relay.tls_reload_interval_secs`, so that a renewal takes
 //!   effect without a restart.
-//! - **Access control**: only the devices of `relay.allowed_endpoints` may connect (the
-//!   allowlist in `access.rs`).
+//! - **Access control**: only the devices of `relay.allowed_endpoints` and those an
+//!   [`Admission`] admits may connect (the allowlist in `access.rs`). `serve` passes the device
+//!   directory, and disconnects a device through [`RelayStatus::disconnect`] once it may no
+//!   longer use the relay.
 //! - **A rate limit** per connection, `relay.max_client_bytes_per_sec`.
 //!
 //! The relay serves no metrics endpoint of its own; [`RelayStatus`] hands its counters to the
 //! admin UI.
 
 mod access;
+
+pub use access::Admission;
 
 use std::{
     future::Future,
@@ -37,8 +41,10 @@ use std::{
 
 use anyhow::{Context, anyhow, bail};
 use gono_server_core::config::RelayConfig;
+use iroh_base::EndpointId;
 use iroh_relay::server::{
-    ClientRateLimit, QuicConfig, RelayMetrics, Server, ServerConfig, reloading_resolver,
+    ClientRateLimit, QuicConfig, RelayMetrics, Server, ServerConfig, clients::Clients,
+    reloading_resolver,
 };
 use url::Url;
 
@@ -53,13 +59,17 @@ pub struct Relay {
 
 impl Relay {
     /// Starts the relay described by `config`, which must be valid
-    /// ([`gono_server_core::Config::validate`]) and enabled.
-    pub async fn spawn(config: &RelayConfig) -> anyhow::Result<Self> {
+    /// ([`gono_server_core::Config::validate`]) and enabled. `admission` admits devices besides
+    /// `relay.allowed_endpoints`.
+    pub async fn spawn(
+        config: &RelayConfig,
+        admission: Option<Arc<dyn Admission>>,
+    ) -> anyhow::Result<Self> {
         let public_url = config
             .public_url
             .clone()
             .context("relay.public_url is not set")?;
-        let access = Arc::new(Allowlist::parse(&config.allowed_endpoints)?);
+        let access = Arc::new(Allowlist::parse(&config.allowed_endpoints, admission)?);
 
         let mut relay = iroh_relay::server::RelayConfig::new(config.bind);
         relay.access = access.clone();
@@ -87,6 +97,9 @@ impl Relay {
 
         let status = RelayStatus(Arc::new(Shared {
             metrics: server.metrics().clone(),
+            clients: server
+                .relay_service()
+                .map(|service| service.clients().clone()),
             access,
             public_url,
             http_addr: server.http_addr().unwrap_or(config.bind),
@@ -151,6 +164,8 @@ pub struct RelayStatus(Arc<Shared>);
 #[derive(Debug)]
 struct Shared {
     metrics: RelayMetrics,
+    /// The registry of connected devices, through which they are disconnected.
+    clients: Option<Clients>,
     access: Arc<Allowlist>,
     public_url: Url,
     http_addr: SocketAddr,
@@ -181,9 +196,23 @@ impl RelayStatus {
         self.0.qad_addr
     }
 
-    /// Number of allowed devices.
+    /// Number of allowed devices: `relay.allowed_endpoints` and the admission.
     pub fn allowed_devices(&self) -> usize {
         self.0.access.len()
+    }
+
+    /// Disconnects every connection of `device` at once. Returns `false` if it had none. A
+    /// device that the allowlist no longer admits cannot connect again.
+    pub fn disconnect(&self, device: &EndpointId) -> bool {
+        let disconnected = self
+            .0
+            .clients
+            .as_ref()
+            .is_some_and(|clients| clients.disconnect(*device, None));
+        if disconnected {
+            tracing::info!(device = %device.fmt_short(), "relay connections closed");
+        }
+        disconnected
     }
 
     /// `relay.max_client_bytes_per_sec`.
