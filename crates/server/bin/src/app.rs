@@ -1739,7 +1739,7 @@ mod tests {
             .unwrap()
             .expect("pending flow");
         assert!(
-            gono_server_core::login_flows::grant(&f.state.db, flow.id, 1, now)
+            gono_server_core::login_flows::grant(&f.state.db, flow.id, 1, None, now)
                 .await
                 .unwrap()
         );
@@ -1778,7 +1778,7 @@ mod tests {
             .await
             .unwrap()
             .expect("pending flow");
-        gono_server_core::login_flows::grant(&f.state.db, flow.id, 1, now)
+        gono_server_core::login_flows::grant(&f.state.db, flow.id, 1, None, now)
             .await
             .unwrap();
         let completed = f

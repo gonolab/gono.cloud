@@ -147,12 +147,12 @@ async fn login_flows_mint_one_app_password_after_consent() {
     assert_eq!(found.client_name, "Nextcloud desktop 3.13.0 (macOS)");
     assert_eq!(found.granted_user_id, None);
     assert!(
-        login_flows::grant(&pool, found.id, owner, now)
+        login_flows::grant(&pool, found.id, owner, None, now)
             .await
             .unwrap()
     );
     assert!(
-        !login_flows::grant(&pool, found.id, owner, now)
+        !login_flows::grant(&pool, found.id, owner, None, now)
             .await
             .unwrap(),
         "granted once"
@@ -194,7 +194,9 @@ async fn login_flows_mint_one_app_password_after_consent() {
         .id;
     assert!(login_flows::deny(&pool, id).await.unwrap());
     assert!(
-        !login_flows::grant(&pool, id, owner, now).await.unwrap(),
+        !login_flows::grant(&pool, id, owner, None, now)
+            .await
+            .unwrap(),
         "nothing left to grant"
     );
     let late = login_flows::create(&pool, "y", now).await.unwrap().unwrap();
@@ -203,7 +205,11 @@ async fn login_flows_mint_one_app_password_after_consent() {
         .unwrap()
         .unwrap()
         .id;
-    assert!(login_flows::grant(&pool, id, owner, now).await.unwrap());
+    assert!(
+        login_flows::grant(&pool, id, owner, None, now)
+            .await
+            .unwrap()
+    );
     let expired = now + FLOW_TTL_SECS;
     assert!(
         login_flows::complete(&pool, late.poll_token.expose_secret(), expired)
@@ -243,7 +249,9 @@ async fn login_flows_are_bounded_and_skip_disabled_accounts() {
         .unwrap()
         .unwrap()
         .id;
-    login_flows::grant(&pool, id, owner, later).await.unwrap();
+    login_flows::grant(&pool, id, owner, None, later)
+        .await
+        .unwrap();
     users::set_enabled(&pool, &Username::new("alice").unwrap(), false)
         .await
         .unwrap();

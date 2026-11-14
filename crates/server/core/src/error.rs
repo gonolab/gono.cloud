@@ -120,6 +120,15 @@ pub enum Error {
     #[error("invalid scopes: {0}")]
     InvalidScopes(String),
 
+    /// A field of a device (name, product, platform, services) is not acceptable.
+    #[error("invalid device {field}: {reason}")]
+    InvalidDevice {
+        /// Which field.
+        field: &'static str,
+        /// Which rule was violated.
+        reason: &'static str,
+    },
+
     /// A storage path is not acceptable.
     #[error("invalid path {path:?}: {source}")]
     InvalidPath {

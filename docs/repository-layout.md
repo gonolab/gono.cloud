@@ -35,9 +35,7 @@ other's way.
 Server crates are named `gono-server-*` (the binary crate is plain `gono-server`), so that no
 name is ambiguous once client crates that also speak WebDAV join the workspace. Until the
 restructure they were `gono-core`, `gono-dav` and `gono-nextcloud` under `crates/core`,
-`crates/dav` and `crates/nextcloud`, and the binary crate lived in `crates/server`. Comments in
-the released migrations under `crates/server/core/migrations/` still use those old names:
-migrations are pinned by checksum and are never edited.
+`crates/dav` and `crates/nextcloud`, and the binary crate lived in `crates/server`.
 
 ## Planned layout
 

@@ -4,8 +4,9 @@
 //! - Writes go through [`begin_immediate`]: one `BEGIN IMMEDIATE` transaction per operation,
 //!   so the write lock is taken up front and concurrent writers wait on `busy_timeout` instead
 //!   of failing halfway through a transaction with `SQLITE_BUSY`.
-//! - Migrations live in `crates/server/core/migrations/` and are embedded into the binary. They are
-//!   append-only once released; see the header of `0001_initial.sql` and
+//! - Migrations live in `crates/server/core/migrations/` and are embedded into the binary. Until
+//!   the first production deployment the schema is the single file `0001_initial.sql`, edited
+//!   in place; from then on migrations are append-only. See the header of that file, and
 //!   [`crate::meta`] for the path comparison rules every query must follow.
 
 use std::{

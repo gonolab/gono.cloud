@@ -242,11 +242,13 @@ impl TryFrom<ScopeRow> for Scope {
     }
 }
 
-/// Lists the app passwords of a user, oldest first.
+/// Lists the app passwords of a user, oldest first. The credentials of devices registered for
+/// remote access are not app passwords to the user and are left out ([`crate::devices`]).
 pub async fn list(pool: &Pool, user_id: i64) -> Result<Vec<AppPassword>> {
     let rows: Vec<AppPasswordRow> = sqlx::query_as(
         "SELECT id, user_id, label, created_at, expires_at, last_used_at FROM app_passwords \
-         WHERE user_id = ?1 ORDER BY id",
+         WHERE user_id = ?1 AND id NOT IN (SELECT app_password_id FROM devices \
+         WHERE app_password_id IS NOT NULL) ORDER BY id",
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -280,14 +282,19 @@ pub async fn list(pool: &Pool, user_id: i64) -> Result<Vec<AppPassword>> {
     Ok(passwords)
 }
 
-/// Revokes an app password of `user_id`. Returns `false` if there is no such app password.
+/// Revokes an app password of `user_id`. Returns `false` if there is no such app password. The
+/// credential of a registered device is not deleted here: revoking the device deletes it
+/// ([`crate::devices::revoke`]).
 pub async fn delete(pool: &Pool, user_id: i64, id: i64) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
-    let result = sqlx::query("DELETE FROM app_passwords WHERE id = ?1 AND user_id = ?2")
-        .bind(id)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
+    let result = sqlx::query(
+        "DELETE FROM app_passwords WHERE id = ?1 AND user_id = ?2 \
+         AND id NOT IN (SELECT app_password_id FROM devices WHERE app_password_id IS NOT NULL)",
+    )
+    .bind(id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(result.rows_affected() == 1)
 }

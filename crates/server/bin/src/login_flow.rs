@@ -386,7 +386,14 @@ pub async fn submit(
     }
     let user = &session.0;
     match form.action.as_str() {
-        "grant" => match login_flows::grant(&state.db, flow.id, user.user_id, db::unix_now()).await
+        "grant" => match login_flows::grant(
+            &state.db,
+            flow.id,
+            user.user_id,
+            Some(client),
+            db::unix_now(),
+        )
+        .await
         {
             Ok(_) => {
                 tracing::info!(

@@ -10,6 +10,10 @@
 //! - [`password`]: hashing of web login passwords.
 //! - [`users`]: user account storage.
 //! - [`app_passwords`]: device credentials and their mount scopes.
+//! - [`devices`]: the directory of devices registered for remote access, its event log and
+//!   its approvals.
+//! - [`audit`]: the audit log of remote access.
+//! - [`two_factor`]: two-step verification of accounts.
 //! - [`locks`]: persistent WebDAV locks.
 //! - [`uploads`]: chunked upload sessions.
 //! - [`login_flows`]: pending Login Flow v2 sign-ins.
@@ -21,8 +25,10 @@
 //! - [`error`]: the domain error types.
 
 pub mod app_passwords;
+pub mod audit;
 pub mod config;
 pub mod db;
+pub mod devices;
 pub mod direct_downloads;
 pub mod error;
 pub mod locks;
@@ -35,6 +41,7 @@ pub mod secret;
 pub mod settings;
 pub mod stats;
 pub mod storage;
+pub mod two_factor;
 pub mod types;
 pub mod uploads;
 pub mod users;

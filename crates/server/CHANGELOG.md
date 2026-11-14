@@ -28,6 +28,12 @@ compatible within a major version: released clients keep working with newer serv
 
 ### Changed
 
+- **The database schema is one file again**, `0001_initial.sql`, which also holds the tables of
+  remote access (the device directory, its event log, the audit log, two-step verification).
+  There are no production deployments yet, so the schema is edited in place until the first
+  one; migrations become append-only from then on. A database created by an earlier version
+  is refused (its migration checksums differ) and must be created again with
+  `gono-cloud init`.
 - The web admin UI moves to `/apps/manage/` by default (`admin.path`), next to the web file UI
   and the account page; `admin.path` may now be `/apps/manage` although `/apps` is otherwise
   reserved. Configurations that set `path` keep their path: the one written by the install

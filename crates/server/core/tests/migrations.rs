@@ -14,24 +14,12 @@ use secrecy::SecretString;
 /// SHA-384 checksums (as computed by sqlx, equal to `shasum -a 384 <file>`) of every published
 /// migration.
 ///
-/// A migration counts as published once it is merged into `main`: from then on, development and
-/// test databases have applied it, and sqlx refuses to open them if the file changes. If this
-/// test fails because you edited one of these files, revert the edit and add a new migration
-/// instead. Pin every new migration here in the change that adds it.
-const RELEASED_MIGRATIONS: &[(i64, &str)] = &[
-    (
-        1,
-        "b210dcedf8f0e378c06e55b33997812a9f78bdfdeef12d030f3ab88d6d0b65e75c85daace5264adbf6f2ccbba65b8124",
-    ),
-    (
-        2,
-        "7a726883aaa0e53361d7943f3e4a273276b287f2c5a25eba4fead40e7d23ba788ce8fadede635c3433f04a3e41cdcaa3",
-    ),
-    (
-        3,
-        "293fe61b0a6bf2df3c2308fb83440e553a2662b20fc66227f10a2aa6f06ddfa6a02e7dc0f36f1129e8edbf90cdb1fd61",
-    ),
-];
+/// Empty until the first production deployment: until then the schema is the single file
+/// `0001_initial.sql`, edited in place (see its header). From that deployment on, a migration
+/// counts as published once it is merged into `main`, and sqlx refuses to open databases whose
+/// applied migrations changed. Pin every published migration here, and if this test fails
+/// because you edited one, revert the edit and add a new migration instead.
+const RELEASED_MIGRATIONS: &[(i64, &str)] = &[];
 
 fn db_config(dir: &Path) -> DbConfig {
     DbConfig {
@@ -82,13 +70,20 @@ async fn migrations_apply_to_an_empty_database() {
         [
             "app_password_scopes",
             "app_passwords",
+            "audit_log",
             "change_log",
             "dead_props",
+            "device_approvals",
+            "device_events",
+            "devices",
             "direct_downloads",
             "files",
             "locks",
             "login_flows",
+            "recovery_codes",
+            "revocations_applied",
             "settings",
+            "two_factor",
             "upload_sessions",
             "users",
             "web_sessions",
