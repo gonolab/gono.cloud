@@ -1,8 +1,9 @@
 //! Log output.
 //!
 //! `logging.level` applies to Gono Cloud's own crates; dependencies log at `warn` and above so
-//! that, for example, sqlx does not log every statement. `GONO_CLOUD_LOG` replaces the whole
-//! filter with a `tracing` directive string for debugging (`info,sqlx=debug`).
+//! that, for example, sqlx does not log every statement, and the relay library at `error` and
+//! above (see [`QUIET_CRATES`]). `GONO_CLOUD_LOG` replaces the whole filter with a `tracing`
+//! directive string for debugging (`info,sqlx=debug`).
 //!
 //! Secrets never reach the log: plaintext passwords are carried in `SecretString`, whose
 //! `Debug` output is redacted, and nothing logs request credentials or tokens.
@@ -29,6 +30,14 @@ const OWN_CRATES: &[&str] = &[
     "gono_server_nextcloud",
     "gono_server_relay",
 ];
+
+/// Dependencies that log only errors, because their warnings describe normal operation.
+///
+/// iroh-relay warns once for every packet it drops because the receiving device falls behind,
+/// and once for every device that disconnects. A sender that outruns its receiver produced
+/// about 950,000 such lines (120 MB) in ten seconds in a load test, which would fill the
+/// journal or `logging.file`. Gono Cloud's relay logs refused devices itself.
+const QUIET_CRATES: &[&str] = &["iroh_relay"];
 
 /// Where log lines go.
 #[derive(Debug, Clone)]
@@ -84,12 +93,20 @@ fn filter(level: LogLevel) -> anyhow::Result<EnvFilter> {
             .with_context(|| format!("invalid {LOG_ENV} filter {directives:?}"));
     }
 
+    Ok(EnvFilter::try_new(default_directives(level))?)
+}
+
+/// The filter without `GONO_CLOUD_LOG`.
+fn default_directives(level: LogLevel) -> String {
     let level = level.as_str();
     let mut directives = String::from("warn");
     for krate in OWN_CRATES {
         directives.push_str(&format!(",{krate}={level}"));
     }
-    Ok(EnvFilter::try_new(directives)?)
+    for krate in QUIET_CRATES {
+        directives.push_str(&format!(",{krate}=error"));
+    }
+    directives
 }
 
 fn open_log_file(path: &Path) -> anyhow::Result<std::fs::File> {
@@ -102,4 +119,20 @@ fn open_log_file(path: &Path) -> anyhow::Result<std::fs::File> {
         .append(true)
         .open(path)
         .with_context(|| format!("open log file {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_level_applies_to_own_crates_and_the_relay_library_stays_quiet() {
+        let directives = default_directives(LogLevel::Debug);
+        assert_eq!(
+            directives,
+            "warn,gono_cloud=debug,gono_server_core=debug,gono_server_dav=debug,\
+             gono_server_nextcloud=debug,gono_server_relay=debug,iroh_relay=error"
+        );
+        EnvFilter::try_new(directives).unwrap();
+    }
 }
