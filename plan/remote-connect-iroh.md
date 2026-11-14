@@ -446,8 +446,13 @@ and 2; Phase 4 needs the gates listed in it. The sizes are estimates.
   `crates/server/connect`): registration, the control channel, presence, `connect` / `lookup`,
   pairing requests and approvals, session reports, revocation from the account page, the admin
   UI and the CLI, relay admission from the directory, the audit log. Remote access needs the
-  `two_factor` table, which part 2c fills. Still open: `gono-connect`; revocation delay and
-  lookup latency measured on real hosts (V7).
+  `two_factor` table, which part 2c fills. **`gono-connect` implemented** (`crates/client/connect`):
+  the endpoint of 3.5 (both address families, IPv4 alone where IPv6 is missing; the system's
+  DNS without fallback, or `getaddrinfo` for HarmonyOS), registration, the control channel with
+  reconnects, and iroh's `AddressLookup` through it. An end-to-end test runs `gono-cloud serve`
+  with two such devices that register, connect by device ID alone and see a revocation made
+  with the CLI. Still open: the revocation delay and lookup latency measured on real hosts
+  (V7), and the product's side of pairing (Phase 3).
   - the `devices` table;
   - registration;
   - the control channel `/gono/v1/ws`;

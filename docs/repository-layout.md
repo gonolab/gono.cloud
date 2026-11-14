@@ -13,6 +13,10 @@ other's way.
 ├── Cargo.lock              One lock file for the whole workspace
 ├── config.example.toml     Annotated server configuration
 ├── crates/
+│   ├── client/
+│   │   └── connect/        gono-connect: remote access for products (the one iroh
+│   │                       configuration, device registration, the control channel client,
+│   │                       iroh's address lookup through it). Not in default-members
 │   ├── protocol/           gono-protocol: wire types shared by server and clients (today the
 │   │                       connect protocol of docs/connect-protocol.md)
 │   └── server/
@@ -51,8 +55,7 @@ crates/
 ├── protocol/           as above; the sync engine's wire types join it
 ├── server/             as above
 └── client/
-    ├── connect/        gono-connect: the iroh endpoint and the control channel client of
-    │                   remote access, for Input Show and the other products
+    ├── connect/        as above
     ├── sync/           the sync engine
     └── ffi/            UniFFI bindings of the sync engine for the mobile apps
 apps/

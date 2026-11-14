@@ -1,7 +1,8 @@
 # Gono Connect: Control Protocol
 
 - Status: draft for review. This is Phase 0 of `plan/remote-connect-iroh.md`. Part 2b implements
-  it: the server side is in `crates/server/connect` and the wire types are in `crates/protocol`.
+  it: the server side is in `crates/server/connect`, the device side in `crates/client/connect`
+  (`gono-connect`), and the wire types are in `crates/protocol`.
   Two-step verification enrolment (13) comes with part 2c.
 - Protocol version: 1.
 - Reviewers: gono-cloud, and Input Show NE.
