@@ -169,6 +169,14 @@ pub fn routes() -> Router<AppState> {
             post(account::revoke_app_password),
         )
         .route(&format!("{ACCOUNT}/created"), get(account::created))
+        .route(
+            &format!("{ACCOUNT}/devices/{{id}}/revoke"),
+            get(account::revoke_page).post(account::revoke_device),
+        )
+        .route(
+            &format!("{ACCOUNT}/devices/{{id}}/pairing"),
+            post(account::allow_pairing),
+        )
 }
 
 async fn to_home() -> Response {

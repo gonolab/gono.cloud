@@ -134,6 +134,7 @@ fn help_lists_every_subcommand() {
         "config",
         "user",
         "app-password",
+        "device",
         "rescan",
     ] {
         assert!(help.contains(command), "missing {command}:\n{help}");
@@ -627,6 +628,79 @@ fn app_passwords_are_shown_once_and_can_be_revoked() {
     );
 }
 
+#[tokio::test]
+async fn devices_can_be_listed_and_revoked_after_a_confirmation() {
+    let instance = Instance::new();
+    assert!(instance.init().status.success());
+    let key = "01".repeat(32);
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", instance.db().display()))
+        .await
+        .unwrap();
+    let password: i64 = sqlx::query_scalar(
+        "INSERT INTO app_passwords (user_id, token_hash, label, created_at) \
+         VALUES (1, randomblob(32), 'Phone', 0) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (user_id, endpoint_id, app_password_id, product, platform, name, \
+         registered_at) VALUES (1, ?1, ?2, 'input-show', 'android', 'Phone', 0)",
+    )
+    .bind(vec![1u8; 32])
+    .bind(password)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let list = run(&mut instance.command(&["device", "list", "admin"]));
+    assert!(list.status.success(), "{}", text(&list.stderr));
+    let listed = text(&list.stdout);
+    assert!(
+        listed.contains(&key) && listed.contains("Phone"),
+        "{listed}"
+    );
+    // Device credentials are not app passwords.
+    let passwords = text(&run(&mut instance.command(&["app-password", "list", "admin"])).stdout);
+    assert!(!passwords.contains("Phone"), "{passwords}");
+
+    // Without a terminal, only --confirm with the endpoint ID again revokes.
+    let unconfirmed = run(&mut instance.command(&["device", "revoke", "admin", &key]));
+    assert!(!unconfirmed.status.success());
+    assert!(
+        text(&unconfirmed.stderr).contains("--confirm"),
+        "{}",
+        text(&unconfirmed.stderr)
+    );
+    let wrong = run(&mut instance.command(&[
+        "device",
+        "revoke",
+        "admin",
+        &key,
+        "--confirm",
+        &"02".repeat(32),
+    ]));
+    assert!(!wrong.status.success());
+    let revoked =
+        run(&mut instance.command(&["device", "revoke", "admin", &key, "--confirm", &key]));
+    assert!(revoked.status.success(), "{}", text(&revoked.stderr));
+    assert!(
+        text(&revoked.stdout).contains("Revoked Phone."),
+        "{}",
+        text(&revoked.stdout)
+    );
+    let again = run(&mut instance.command(&["device", "revoke", "admin", &key, "--confirm", &key]));
+    assert!(
+        text(&again.stdout).contains("revoked already"),
+        "{}",
+        text(&again.stdout)
+    );
+    let listed = text(&run(&mut instance.command(&["device", "list", "admin"])).stdout);
+    let row = listed.lines().find(|line| line.contains(&key)).unwrap();
+    assert!(!row.trim_end().ends_with('-'), "a revocation time: {row}");
+}
+
 #[cfg(unix)]
 #[test]
 fn serve_answers_health_checks_and_stops_on_sigterm() {
@@ -680,12 +754,18 @@ fn serve_runs_the_relay_and_stops_it_on_sigterm() {
     // The probe devices use to detect captive portals, which the reverse proxy forwards.
     let probe = wait_for_get(&mut child, relay, "/generate_204");
     assert!(probe.starts_with("HTTP/1.1 204"), "{probe}");
+    // A loopback origin serves remote connectivity, whose relay admits the directory's devices.
+    let discovery = wait_for_get(&mut child, instance.addr, "/gono/v1/connect");
+    assert!(discovery.starts_with("HTTP/1.1 200"), "{discovery}");
+    assert!(
+        discovery.contains("\"two_factor_required\":true"),
+        "{discovery}"
+    );
 
     let logs = terminate(child);
     assert!(logs.contains("relay listening"), "{logs}");
     assert!(logs.contains("relay stopped"), "{logs}");
-    // No device may use it yet: the operator is told.
-    assert!(logs.contains("relay.allowed_endpoints is empty"), "{logs}");
+    assert!(logs.contains("remote connectivity enabled"), "{logs}");
 }
 
 #[cfg(unix)]
@@ -710,6 +790,8 @@ fn the_relay_runs_alone_without_a_database() {
     let logs = terminate(child);
     assert!(logs.contains("relay listening"), "{logs}");
     assert!(logs.contains("relay stopped"), "{logs}");
+    // On a host of its own it cannot read the device directory: the operator is told.
+    assert!(logs.contains("relay.allowed_endpoints is empty"), "{logs}");
     assert!(!instance.db().exists(), "no database is created");
 }
 

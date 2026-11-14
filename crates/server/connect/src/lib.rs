@@ -324,6 +324,11 @@ impl Connect {
         devices::find_by_app_password(&self.pool, app_password_id).await
     }
 
+    /// Whether `device` of `user_id` has a control connection.
+    pub fn is_online(&self, user_id: i64, device: EndpointId) -> bool {
+        self.hub.online(user_id).contains(&device)
+    }
+
     /// The account's devices with their presence, for the account page.
     pub async fn devices_with_presence(
         &self,

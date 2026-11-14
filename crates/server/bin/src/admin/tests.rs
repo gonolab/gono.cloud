@@ -1014,3 +1014,93 @@ async fn the_overview_shows_the_relay() {
         stopped.body
     );
 }
+
+#[tokio::test]
+async fn admins_revoke_devices_after_a_second_confirmation() {
+    use gono_server_core::{
+        devices::{self, EndpointId, NewDevice, Registration},
+        login_flows,
+    };
+
+    let mut f = fixture().await;
+    f.state.connect = Some(
+        gono_server_connect::Connect::new(
+            f.state.db.clone(),
+            gono_server_connect::ConnectConfig {
+                base_url: "https://cloud.example.com".parse().unwrap(),
+                relay_url: "https://relay.example.com".parse().unwrap(),
+                audit_retention_secs: 3600,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let now = db::unix_now();
+    let new = NewDevice {
+        endpoint_id: EndpointId([7; 32]),
+        product: "input-show".to_owned(),
+        platform: "macos".to_owned(),
+        name: "Alice's Mac".to_owned(),
+        version: String::new(),
+    };
+    let (flow, _) = login_flows::create_device(&f.state.db, &new, now)
+        .await
+        .unwrap()
+        .unwrap();
+    let found = login_flows::find(&f.state.db, flow.login_token.expose_secret(), now)
+        .await
+        .unwrap()
+        .unwrap();
+    login_flows::grant(&f.state.db, found.id, f.alice, None, now)
+        .await
+        .unwrap();
+    let (_, Registration::Registered { device, .. }) =
+        login_flows::complete_device(&f.state.db, flow.poll_token.expose_secret(), now)
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("registered");
+    };
+
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.root().await;
+    let page = browser.get(&path("/users/alice")).await;
+    assert!(page.body.contains("Remote devices"), "{}", page.body);
+    assert!(page.body.contains("Input Show · macOS"), "{}", page.body);
+    let hex = device.endpoint_id.to_hex();
+    let confirm = browser
+        .get(&path(&format!("/users/alice/devices/{hex}/revoke")))
+        .await;
+    assert_eq!(confirm.status, StatusCode::OK);
+    assert!(
+        confirm.body.contains("This cannot be undone"),
+        "{}",
+        confirm.body
+    );
+    // Another account's path does not reach it.
+    let elsewhere = browser
+        .get(&path(&format!("/users/root/devices/{hex}/revoke")))
+        .await;
+    assert_eq!(elsewhere.status, StatusCode::NOT_FOUND);
+
+    let revoked = browser
+        .post(
+            &path(&format!("/users/alice/devices/{hex}/revoke")),
+            &[("csrf", &csrf)],
+        )
+        .await;
+    assert_eq!(revoked.location(), path("/users/alice?done=device-revoked"));
+    assert!(
+        devices::get(&f.state.db, device.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_revoked()
+    );
+    let records = gono_server_core::audit::list(&f.state.db, Some(f.alice), None, 5)
+        .await
+        .unwrap();
+    assert_eq!(records[0].kind, "device.revoked");
+    assert_eq!(records[0].actor, "admin");
+}

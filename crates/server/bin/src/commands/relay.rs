@@ -29,6 +29,13 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
     for warning in config.warnings() {
         tracing::warn!("{warning}");
     }
+    if config.relay.allowed_endpoints.is_empty() {
+        // On a host of its own the relay cannot read the device directory.
+        tracing::warn!(
+            "relay.allowed_endpoints is empty: a relay on a host of its own admits only the \
+             devices listed there, so no device can use it"
+        );
+    }
 
     let result = match Relay::spawn(&config.relay, None).await {
         Ok(relay) => relay.run_until(shutdown::wait_for_signal()).await,

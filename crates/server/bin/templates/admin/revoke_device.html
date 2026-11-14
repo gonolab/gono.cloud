@@ -1,0 +1,27 @@
+{%- extends "admin/frame.html" -%}
+{%- block title %}{{ chrome.t.revoke_title }}{% endblock -%}
+{%- block content %}
+<div class="crumbs"><a href="{{ frame.prefix }}/users">{{ chrome.t.a_users }}</a> / <a href="{{ base }}">{{ username }}</a> / {{ device.name }}</div>
+<div class="panel narrow danger"><div class="panel-body">
+  <h1>{{ chrome.t.revoke_title }}</h1>
+  <dl class="facts mt-6">
+    <dt>{{ chrome.t.name }}</dt><dd>{{ device.name }}</dd>
+    <dt>{{ chrome.t.device_product }}</dt><dd>{{ device.what }}</dd>
+    <dt>{{ chrome.t.device_id }}</dt><dd><code>{{ device.short }}</code></dd>
+    <dt>{{ chrome.t.last_used }}</dt><dd>{{ device.status }}</dd>
+  </dl>
+  <p class="mt-6"><b>{{ chrome.t.revoke_consequences }}</b></p>
+  <form method="post" action="{{ base }}/devices/{{ device.hex }}/revoke">
+    <input type="hidden" name="csrf" value="{{ frame.csrf }}">
+    {%- if !introduced.is_empty() %}
+    <fieldset class="scope"><legend>{{ chrome.t.revoke_introduced }}</legend>
+      <p class="muted small">{{ chrome.t.revoke_introduced_note }}</p>
+      {%- for (hex, name, short) in introduced %}
+      <label class="choice" for="also-{{ loop.index }}"><input id="also-{{ loop.index }}" type="checkbox" name="also_{{ hex }}" value="1"><span><b>{{ name }}</b><span><code>{{ short }}</code></span></span></label>
+      {%- endfor %}
+    </fieldset>
+    {%- endif %}
+    <div class="actions"><button class="btn danger solid" type="submit">{{ chrome.t.revoke_confirm }}</button><a class="btn ghost" href="{{ base }}">{{ chrome.t.cancel }}</a></div>
+  </form>
+</div></div>
+{%- endblock %}

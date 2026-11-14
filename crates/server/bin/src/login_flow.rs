@@ -214,7 +214,7 @@ impl DeviceFacts {
 }
 
 /// A readable name of a product slug.
-fn product_name(slug: &str) -> String {
+pub(crate) fn product_name(slug: &str) -> String {
     match slug {
         "input-show" => "Input Show".to_owned(),
         "gono-md" => "gono.md".to_owned(),
@@ -223,7 +223,7 @@ fn product_name(slug: &str) -> String {
 }
 
 /// A readable name of a platform slug.
-fn platform_name(slug: &str) -> String {
+pub(crate) fn platform_name(slug: &str) -> String {
     match slug {
         "macos" => "macOS",
         "windows" => "Windows",

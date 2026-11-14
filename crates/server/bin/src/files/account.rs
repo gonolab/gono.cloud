@@ -7,6 +7,14 @@
 //! | `POST /apps/account/password` | Change the web login password (needs the current one). The other browser sessions end; this one stays. |
 //! | `POST /apps/account/app-passwords` | Create an app password, then show it once at `/apps/account/created`. |
 //! | `POST /apps/account/app-passwords/<id>/delete` | Revoke one of the user's app passwords. |
+//! | `GET /apps/account/devices/<endpoint id>/revoke` | The second confirmation of revoking a device for remote access. |
+//! | `POST /apps/account/devices/<endpoint id>/revoke` | Revoke it, and the devices it introduced that are ticked. |
+//! | `POST /apps/account/devices/<endpoint id>/pairing` | Let the device send pairing requests for an hour. |
+//!
+//! Devices registered for remote access (`docs/connect-protocol.md`, sections 6 and 9) are
+//! listed only when remote connectivity is on. Their credentials are not app passwords and do
+//! not appear among them. Revoking one is final for its key, so it is never one click: the
+//! revoke button opens a confirmation page.
 //!
 //! Every change is a POST with the session's CSRF token from this origin, answered with a
 //! redirect. A new app password is kept in memory for its session only and shown once; the
@@ -29,7 +37,9 @@ use axum::{
 };
 use gono_server_core::{
     app_passwords::{self, Scope},
-    db, password, users, web_sessions,
+    db,
+    devices::{self, Device, EndpointId, RevokedBy},
+    password, users, web_sessions,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
@@ -97,6 +107,27 @@ pub struct DeviceRow {
     pub expiry: String,
 }
 
+/// One device registered for remote access in the list.
+#[derive(Debug, Clone)]
+pub struct RemoteRow {
+    /// Endpoint ID, 64 hex digits (the URLs of its actions).
+    pub hex: String,
+    pub name: String,
+    /// "Input Show · Windows".
+    pub what: String,
+    pub short: String,
+    /// "Online", "Last seen …", "Revoked …".
+    pub status: String,
+    pub online: bool,
+    pub revoked: bool,
+    /// What the device reported about remote access.
+    pub remote: Vec<&'static str>,
+    /// "May ask to pair until …".
+    pub pairing: Option<String>,
+    /// For a revoked device: which devices have applied the revocation.
+    pub applied: Option<String>,
+}
+
 /// `account/page.html`.
 #[derive(Template)]
 #[template(path = "account/page.html")]
@@ -104,6 +135,8 @@ struct AccountPage {
     chrome: Chrome,
     username: String,
     display_name: String,
+    /// `None` when remote connectivity is off.
+    remote: Option<Vec<RemoteRow>>,
     devices: Vec<DeviceRow>,
     form: AppPasswordForm,
     notice: Option<String>,
@@ -124,7 +157,17 @@ struct CreatedPage {
     webdav: String,
 }
 
-page!(AccountPage, CreatedPage);
+/// `account/revoke.html`: the second confirmation of a revocation.
+#[derive(Template)]
+#[template(path = "account/revoke.html")]
+struct RevokePage {
+    chrome: Chrome,
+    device: RemoteRow,
+    /// The devices it introduced: `(endpoint ID, name, short ID)`.
+    introduced: Vec<(String, String, String)>,
+}
+
+page!(AccountPage, CreatedPage, RevokePage);
 
 /// The signed-in user, or a redirect to the sign-in page.
 async fn account_visitor(
@@ -202,6 +245,10 @@ async fn render_page(
             expiry: expiry(t, visitor, now, password.expires_at),
         })
         .collect();
+    let remote = match remote_rows(state, visitor, now).await {
+        Ok(remote) => remote,
+        Err(err) => return internal(visitor, "device list", &err),
+    };
     let status = if error.is_some() {
         StatusCode::UNPROCESSABLE_ENTITY
     } else {
@@ -211,12 +258,235 @@ async fn render_page(
         chrome: visitor.chrome(Nav::Account),
         username: visitor.user.username.to_string(),
         display_name: visitor.user.display_name.clone(),
+        remote,
         devices,
         form,
         notice,
         error,
     };
     web::render(status, &page)
+}
+
+/// The rows of the remote devices, or `None` when remote connectivity is off.
+async fn remote_rows(
+    state: &AppState,
+    visitor: &Visitor,
+    now: i64,
+) -> gono_server_core::Result<Option<Vec<RemoteRow>>> {
+    let Some(connect) = &state.connect else {
+        return Ok(None);
+    };
+    let listed = connect.devices_with_presence(visitor.user.user_id).await?;
+    let applied = devices::applied(&state.db, visitor.user.user_id).await?;
+    let rows = listed
+        .iter()
+        .map(|(device, online)| {
+            let applied = device.revoked_at.map(|revoked_at| {
+                // The devices that existed when it was revoked and have not applied it.
+                let pending: Vec<&str> = listed
+                    .iter()
+                    .map(|(other, _)| other)
+                    .filter(|other| {
+                        other.id != device.id
+                            && !other.is_revoked()
+                            && other.registered_at <= revoked_at
+                            && !applied.contains(&(device.id, other.id))
+                    })
+                    .map(|other| other.name.as_str())
+                    .collect();
+                if pending.is_empty() {
+                    visitor.t().applied_by_all.to_owned()
+                } else {
+                    fill(visitor.t().applied_pending, &[&pending.join(", ")])
+                }
+            });
+            remote_row(visitor, device, *online, now, applied)
+        })
+        .collect();
+    Ok(Some(rows))
+}
+
+fn remote_row(
+    visitor: &Visitor,
+    device: &Device,
+    online: bool,
+    now: i64,
+    applied: Option<String>,
+) -> RemoteRow {
+    let t = visitor.t();
+    let lang = visitor.lang();
+    let status = match (device.revoked_at, online, device.last_seen_at) {
+        (Some(at), _, _) => fill(t.revoked_on, &[&when(lang, now, at).0]),
+        (None, true, _) => t.online.to_owned(),
+        (None, false, Some(at)) => fill(t.last_seen, &[&when(lang, now, at).0]),
+        (None, false, None) => t.never_connected.to_owned(),
+    };
+    let mut remote = Vec::new();
+    if !device.is_revoked() {
+        if device.accept_remote {
+            remote.push(t.accepts_remote);
+        }
+        if device.unattended {
+            remote.push(t.unattended_on);
+        }
+    }
+    RemoteRow {
+        hex: device.endpoint_id.to_hex(),
+        name: device.name.clone(),
+        what: format!(
+            "{} · {}",
+            crate::login_flow::product_name(&device.product),
+            crate::login_flow::platform_name(&device.platform)
+        ),
+        short: device.endpoint_id.short(),
+        status,
+        online,
+        revoked: device.is_revoked(),
+        remote,
+        pairing: device
+            .pairing_open(now)
+            .then_some(device.pairing_open_until)
+            .flatten()
+            .map(|until| fill(t.pairing_open_until, &[&when(lang, now, until).0])),
+        applied,
+    }
+}
+
+/// The unrevoked remote device `hex` of the visitor, or the page that says there is none.
+async fn own_device(
+    state: &AppState,
+    visitor: &Visitor,
+    hex: &str,
+) -> Result<Device, Box<Response>> {
+    if state.connect.is_none() {
+        return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
+    }
+    let not_found = || Box::new(super::not_found(visitor));
+    let key = EndpointId::parse(hex).ok_or_else(not_found)?;
+    match devices::find(&state.db, key).await {
+        Ok(Some(device)) if device.user_id == visitor.user.user_id && !device.is_revoked() => {
+            Ok(device)
+        }
+        Ok(_) => Err(not_found()),
+        Err(err) => Err(Box::new(internal(visitor, "device", &err))),
+    }
+}
+
+/// `GET /apps/account/devices/<endpoint id>/revoke`.
+pub async fn revoke_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(hex): Path<String>,
+) -> Response {
+    let visitor = match account_visitor(&state, &headers, &uri).await {
+        Ok(visitor) => visitor,
+        Err(response) => return *response,
+    };
+    let device = match own_device(&state, &visitor, &hex).await {
+        Ok(device) => device,
+        Err(response) => return *response,
+    };
+    let introduced = match devices::introduced_by(&state.db, device.id).await {
+        Ok(introduced) => introduced,
+        Err(err) => return internal(&visitor, "device approvals", &err),
+    };
+    let online = state
+        .connect
+        .as_ref()
+        .is_some_and(|connect| connect.is_online(device.user_id, device.endpoint_id));
+    let page = RevokePage {
+        chrome: visitor.chrome(Nav::Account),
+        device: remote_row(&visitor, &device, online, db::unix_now(), None),
+        introduced: introduced
+            .iter()
+            .map(|other| {
+                (
+                    other.endpoint_id.to_hex(),
+                    other.name.clone(),
+                    other.endpoint_id.short(),
+                )
+            })
+            .collect(),
+    };
+    web::render(StatusCode::OK, &page)
+}
+
+/// `POST /apps/account/devices/<endpoint id>/revoke`: the device, and every introduced device
+/// ticked as `also_<endpoint id>`.
+pub async fn revoke_device(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(hex): Path<String>,
+    Form(fields): Form<HashMap<String, String>>,
+) -> Response {
+    let csrf = fields.get("csrf").cloned().unwrap_or_default();
+    let visitor = match form_visitor(&state, &headers, &uri, &csrf).await {
+        Ok(visitor) => visitor,
+        Err(response) => return *response,
+    };
+    let device = match own_device(&state, &visitor, &hex).await {
+        Ok(device) => device,
+        Err(response) => return *response,
+    };
+    let mut keys = vec![device.endpoint_id];
+    keys.extend(
+        fields
+            .keys()
+            .filter_map(|name| name.strip_prefix("also_"))
+            .filter_map(EndpointId::parse),
+    );
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    match devices::revoke(
+        &state.db,
+        visitor.user.user_id,
+        &keys,
+        RevokedBy::AccountPage,
+        Some(client),
+        db::unix_now(),
+    )
+    .await
+    {
+        Ok(revoked) => {
+            for device in &revoked {
+                tracing::info!(
+                    user = %visitor.user.username,
+                    device = %device.endpoint_id.short(),
+                    "user revoked a device"
+                );
+            }
+            if let Some(connect) = &state.connect {
+                connect.poke();
+            }
+            web::see_other(&format!("{ACCOUNT}/?done=device-revoked"), &[])
+        }
+        Err(err) => internal(&visitor, "revoke a device", &err),
+    }
+}
+
+/// `POST /apps/account/devices/<endpoint id>/pairing`.
+pub async fn allow_pairing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(hex): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let visitor = match form_visitor(&state, &headers, &uri, &form.csrf).await {
+        Ok(visitor) => visitor,
+        Err(response) => return *response,
+    };
+    let device = match own_device(&state, &visitor, &hex).await {
+        Ok(device) => device,
+        Err(response) => return *response,
+    };
+    let until = db::unix_now() + devices::PAIRING_WINDOW_SECS;
+    match devices::open_pairing(&state.db, visitor.user.user_id, device.endpoint_id, until).await {
+        Ok(_) => web::see_other(&format!("{ACCOUNT}/?done=pairing"), &[]),
+        Err(err) => internal(&visitor, "allow pairing", &err),
+    }
 }
 
 #[derive(Deserialize)]
@@ -240,6 +510,8 @@ pub async fn show(
         Some("display-name") => Some(t.notice_display_name.to_owned()),
         Some("password") => Some(t.notice_password_changed.to_owned()),
         Some("revoked") => Some(t.notice_revoked.to_owned()),
+        Some("device-revoked") => Some(t.notice_device_revoked.to_owned()),
+        Some("pairing") => Some(t.notice_pairing_open.to_owned()),
         _ => None,
     };
     render_page(&state, &visitor, AppPasswordForm::default(), notice, None).await

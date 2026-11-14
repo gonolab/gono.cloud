@@ -697,11 +697,8 @@ impl Config {
 
         let relay = &self.relay;
         if relay.enabled {
-            if relay.allowed_endpoints.is_empty() {
-                warnings.push(
-                    "relay.allowed_endpoints is empty, so no device can use the relay".to_owned(),
-                );
-            }
+            // An empty relay.allowed_endpoints is normal: `serve` admits the devices registered
+            // for remote access. `gono-cloud relay` on a host of its own warns about it.
             if relay.qad_bind.is_none() {
                 warnings.push(
                     "relay.qad_bind is not set: devices cannot learn their public address from \
@@ -1223,10 +1220,9 @@ mod tests {
         let bare = with_relay("enabled = true\npublic_url = \"http://relay.example.com\"");
         assert!(issue_keys(&bare).is_empty());
         let warnings = bare.warnings();
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
-        assert!(warnings[0].contains("relay.allowed_endpoints"));
-        assert!(warnings[1].contains("relay.qad_bind"));
-        assert!(warnings[2].contains("plain http"));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("relay.qad_bind"));
+        assert!(warnings[1].contains("plain http"));
 
         // A disabled relay warns about nothing.
         assert!(

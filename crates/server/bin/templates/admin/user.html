@@ -30,6 +30,26 @@
 </div>
 <div class="grid">
   <div class="stack">
+    {%- if let Some(remote) = remote %}
+    <div class="panel">
+      <div class="panel-head"><div><h2>{{ chrome.t.remote_devices }}</h2><p class="muted small">{{ chrome.t.remote_devices_note }}</p></div></div>
+      {%- if remote.is_empty() %}
+      <div class="empty">{{ chrome.t.no_remote_devices }}</div>
+      {%- else %}
+      <div class="table-wrap"><table>
+        <thead><tr><th>{{ chrome.t.name }}</th><th>{{ chrome.t.device_id }}</th><th>{{ chrome.t.last_used }}</th><th class="end"></th></tr></thead>
+        <tbody>
+        {%- for device in remote %}
+          <tr><td><b>{{ device.name }}</b><div class="muted small nowrap">{{ device.what }}</div></td>
+            <td><code>{{ device.short }}</code></td>
+            <td>{{ device.status }}</td>
+            <td class="end">{% if !device.revoked %}<a class="btn danger sm" href="{{ base }}/devices/{{ device.hex }}/revoke">{{ chrome.t.revoke_device }}</a>{% endif %}</td></tr>
+        {%- endfor %}
+        </tbody>
+      </table></div>
+      {%- endif %}
+    </div>
+    {%- endif %}
     <div class="panel">
       <div class="panel-head"><div><h2>{{ chrome.t.a_app_passwords }}</h2><p class="muted small">{{ chrome.t.a_devices_note }}</p></div></div>
       {%- if app_passwords.is_empty() %}

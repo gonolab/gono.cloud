@@ -1047,3 +1047,170 @@ async fn the_file_ui_can_be_turned_off() {
         "no admin UI either"
     );
 }
+
+/// Registers a device for remote access through a device flow, as the browser would grant it.
+async fn register_device(
+    state: &AppState,
+    user_id: i64,
+    seed: u8,
+    name: &str,
+) -> gono_server_core::devices::Device {
+    use gono_server_core::{
+        devices::{EndpointId, NewDevice, Registration},
+        login_flows,
+    };
+    let now = db::unix_now();
+    let new = NewDevice {
+        endpoint_id: EndpointId([seed; 32]),
+        product: "input-show".to_owned(),
+        platform: "windows".to_owned(),
+        name: name.to_owned(),
+        version: String::new(),
+    };
+    let (flow, _) = login_flows::create_device(&state.db, &new, now)
+        .await
+        .unwrap()
+        .unwrap();
+    let found = login_flows::find(&state.db, flow.login_token.expose_secret(), now)
+        .await
+        .unwrap()
+        .unwrap();
+    login_flows::grant(&state.db, found.id, user_id, None, now)
+        .await
+        .unwrap();
+    let (_, registration) =
+        login_flows::complete_device(&state.db, flow.poll_token.expose_secret(), now)
+            .await
+            .unwrap()
+            .unwrap();
+    let Registration::Registered { device, .. } = registration else {
+        panic!("registered");
+    };
+    *device
+}
+
+#[tokio::test]
+async fn remote_devices_are_revoked_after_a_second_confirmation() {
+    use gono_server_core::devices;
+
+    let mut f = fixture().await;
+    let connect = gono_server_connect::Connect::new(
+        f.state.db.clone(),
+        gono_server_connect::ConnectConfig {
+            base_url: ORIGIN.parse().unwrap(),
+            relay_url: "https://relay.example.com".parse().unwrap(),
+            audit_retention_secs: 3600,
+        },
+    )
+    .await
+    .unwrap();
+    f.state.connect = Some(connect);
+    let alice = users::get(&f.state.db, &Username::new("alice").unwrap())
+        .await
+        .unwrap()
+        .id;
+    let phone = register_device(&f.state, alice, 1, "Phone").await;
+    let work = register_device(&f.state, alice, 2, "Work PC").await;
+    let laptop = register_device(&f.state, alice, 3, "Laptop").await;
+    for subject in [&work, &laptop] {
+        devices::record_approval(
+            &f.state.db,
+            alice,
+            phone.id,
+            subject.id,
+            &serde_json::json!({}),
+            1,
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+    let page = browser.get("/apps/account/").await;
+    let text = page.text();
+    assert!(text.contains("Remote devices"), "{text}");
+    assert!(text.contains(&phone.endpoint_id.short()), "{text}");
+    assert!(text.contains("Input Show · Windows"), "{text}");
+    // The device credentials are not app passwords: only the fixture's own one is listed.
+    assert_eq!(text.matches("/delete\"").count(), 1, "{text}");
+    let csrf = page.csrf();
+
+    let hex = phone.endpoint_id.to_hex();
+    let confirm = browser
+        .get(&format!("/apps/account/devices/{hex}/revoke"))
+        .await;
+    assert_eq!(confirm.status, StatusCode::OK);
+    let confirm_text = confirm.text();
+    assert!(
+        confirm_text.contains("This cannot be undone"),
+        "{confirm_text}"
+    );
+    assert!(
+        confirm_text.contains("Work PC") && confirm_text.contains("Laptop"),
+        "{confirm_text}"
+    );
+    assert!(
+        !devices::get(&f.state.db, phone.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_revoked(),
+        "the page alone changes nothing"
+    );
+
+    let also = format!("also_{}", work.endpoint_id.to_hex());
+    let revoked = browser
+        .post(
+            &format!("/apps/account/devices/{hex}/revoke"),
+            &[("csrf", &csrf), (&also, "1")],
+        )
+        .await;
+    assert_eq!(revoked.location(), "/apps/account/?done=device-revoked");
+    let state = |id| {
+        let db = f.state.db.clone();
+        async move { devices::get(&db, id).await.unwrap().unwrap().is_revoked() }
+    };
+    assert!(state(phone.id).await);
+    assert!(state(work.id).await, "ticked, revoked along with it");
+    assert!(!state(laptop.id).await, "not ticked, still trusted");
+    let page = browser
+        .get("/apps/account/?done=device-revoked")
+        .await
+        .text();
+    assert!(page.contains("Revoked."), "{page}");
+    assert!(page.contains("Not applied yet by: Laptop"), "{page}");
+
+    // A revoked device has no actions any more.
+    assert_eq!(
+        browser
+            .get(&format!("/apps/account/devices/{hex}/revoke"))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+
+    let laptop_hex = laptop.endpoint_id.to_hex();
+    let pairing = browser
+        .post(
+            &format!("/apps/account/devices/{laptop_hex}/pairing"),
+            &[("csrf", &csrf)],
+        )
+        .await;
+    assert_eq!(pairing.location(), "/apps/account/?done=pairing");
+    assert!(
+        devices::get(&f.state.db, laptop.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .pairing_open(db::unix_now())
+    );
+    let forged = browser
+        .post(
+            &format!("/apps/account/devices/{laptop_hex}/revoke"),
+            &[("csrf", "forged")],
+        )
+        .await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    assert!(!state(laptop.id).await);
+}

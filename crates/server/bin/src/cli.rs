@@ -53,6 +53,10 @@ pub enum Command {
     #[command(subcommand)]
     AppPassword(AppPasswordCommand),
 
+    /// Manage the devices registered for remote access.
+    #[command(subcommand)]
+    Device(DeviceCommand),
+
     /// Re-read files that were changed directly in the data directory.
     ///
     /// The data directory belongs to the server. After changing files behind its back (SSH,
@@ -206,6 +210,34 @@ pub enum AppPasswordCommand {
 
         /// Id of the app password, as shown by `app-password list`.
         id: i64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DeviceCommand {
+    /// List the devices of a user that are registered for remote access, revoked ones included.
+    List {
+        /// Account whose devices are listed.
+        username: Username,
+    },
+
+    /// Revoke a device for good, for example one that was lost or stolen.
+    ///
+    /// The device's key can never be registered again on this server, its credential stops
+    /// working, the relay disconnects it, and the account's other devices forget it, on the
+    /// local network as well. A running server picks the revocation up within seconds. This
+    /// cannot be undone: the command asks for the device's short ID first, or, without a
+    /// terminal, needs `--confirm` with the full endpoint ID again.
+    Revoke {
+        /// Account the device belongs to.
+        username: Username,
+
+        /// The device's endpoint ID: 64 hex digits, as shown by `device list`.
+        endpoint_id: String,
+
+        /// The same endpoint ID again, to revoke without being asked.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        confirm: Option<String>,
     },
 }
 

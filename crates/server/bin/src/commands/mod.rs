@@ -2,6 +2,7 @@
 
 pub mod app_password;
 pub mod config_check;
+pub mod device;
 pub mod init;
 pub(crate) mod output;
 pub mod relay;

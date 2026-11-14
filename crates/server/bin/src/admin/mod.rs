@@ -57,7 +57,9 @@ use axum::{
 use gono_server_core::{
     Error as CoreError, Permission, RelPath, Username,
     app_passwords::{self, Scope},
-    db, password, stats,
+    db,
+    devices::{self, Device, EndpointId, RevokedBy},
+    password, stats,
     users::{self, NewUser, User},
     web_sessions::{self, SessionUser},
 };
@@ -73,8 +75,8 @@ use serde::Deserialize;
 pub(crate) use self::pages::{AppPasswordForm, ScopeChip};
 use self::pages::{
     AppPasswordRow, CreatedPage, DeletePage, Fact, Feature, Frame, LoginPage, MOUNT_ROWS,
-    MessagePage, MountInput, NewUserPage, NotAdminPage, OverviewPage, UserPage, UserRow, UserView,
-    UsersPage,
+    MessagePage, MountInput, NewUserPage, NotAdminPage, OverviewPage, RemoteDeviceRow,
+    RevokeDevicePage, UserPage, UserRow, UserView, UsersPage,
 };
 use crate::{
     app::AppState,
@@ -242,6 +244,10 @@ pub fn routes(prefix: &str) -> Router<AppState> {
             post(revoke_app_password),
         )
         .route(&format!("{p}/created"), get(created_page))
+        .route(
+            &format!("{p}/users/{{name}}/devices/{{id}}/revoke"),
+            get(revoke_device_page).post(revoke_device),
+        )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1003,6 +1009,18 @@ async fn user_page_response(
             expiry: pages::expiry(t, password.expires_at, now),
         })
         .collect();
+    let remote = match &state.connect {
+        Some(connect) => match connect.devices_with_presence(user.id).await {
+            Ok(listed) => Some(
+                listed
+                    .iter()
+                    .map(|(device, online)| remote_row(t, device, *online, now))
+                    .collect(),
+            ),
+            Err(err) => return internal_error(&session.chrome, &err),
+        },
+        None => None,
+    };
     let page = UserPage {
         chrome: session.chrome.clone(),
         frame: admin.frame(session, false, true),
@@ -1023,8 +1041,176 @@ async fn user_page_response(
         delete_label: fill(t.a_delete_named, &[user.username.as_str()]),
         app_passwords,
         form,
+        remote,
     };
     web::render(status, &page)
+}
+
+/// A device registered for remote access, as the admin UI lists it.
+fn remote_row(t: &Text, device: &Device, online: bool, now: i64) -> RemoteDeviceRow {
+    let status = match (device.revoked_at, online, device.last_seen_at) {
+        (Some(at), _, _) => fill(t.revoked_on, &[&pages::date(at)]),
+        (None, true, _) => t.online.to_owned(),
+        (None, false, Some(at)) => fill(t.last_seen, &[&ago(t, now, at, pages::date)]),
+        (None, false, None) => t.never_connected.to_owned(),
+    };
+    RemoteDeviceRow {
+        hex: device.endpoint_id.to_hex(),
+        name: device.name.clone(),
+        what: format!(
+            "{} · {}",
+            crate::login_flow::product_name(&device.product),
+            crate::login_flow::platform_name(&device.platform)
+        ),
+        short: device.endpoint_id.short(),
+        status,
+        revoked: device.is_revoked(),
+    }
+}
+
+/// The unrevoked remote device `hex` of `user`, or the page that says there is none.
+async fn user_device(
+    state: &AppState,
+    admin: &Admin,
+    session: &Session,
+    user: &User,
+    hex: &str,
+) -> Result<Device, Box<Response>> {
+    let missing = || {
+        let page = MessagePage {
+            chrome: session.chrome.clone(),
+            frame: admin.frame(session, false, true),
+            heading: session.chrome.t.not_found.to_owned(),
+            lead: session.chrome.t.not_found_lead.to_owned(),
+            link_href: admin.user_url(user.username.as_str()),
+            link_label: user.username.to_string(),
+        };
+        Box::new(web::render(StatusCode::NOT_FOUND, &page))
+    };
+    if state.connect.is_none() {
+        return Err(missing());
+    }
+    let key = EndpointId::parse(hex).ok_or_else(missing)?;
+    match devices::find(&state.db, key).await {
+        Ok(Some(device)) if device.user_id == user.id && !device.is_revoked() => Ok(device),
+        Ok(_) => Err(missing()),
+        Err(err) => Err(Box::new(internal_error(&session.chrome, &err))),
+    }
+}
+
+/// `GET <admin>/users/<name>/devices/<endpoint id>/revoke`: the second confirmation.
+async fn revoke_device_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((name, hex)): Path<(String, String)>,
+) -> Response {
+    let admin = match admin(&state) {
+        Ok(admin) => admin,
+        Err(halt) => return *halt,
+    };
+    let session = match session(&state, &admin, &headers).await {
+        Ok(session) => session,
+        Err(halt) => return *halt,
+    };
+    let user = match find_user(&state, &admin, &session, &name).await {
+        Ok(user) => user,
+        Err(halt) => return *halt,
+    };
+    let device = match user_device(&state, &admin, &session, &user, &hex).await {
+        Ok(device) => device,
+        Err(halt) => return *halt,
+    };
+    let introduced = match devices::introduced_by(&state.db, device.id).await {
+        Ok(introduced) => introduced,
+        Err(err) => return internal_error(&session.chrome, &err),
+    };
+    let online = state
+        .connect
+        .as_ref()
+        .is_some_and(|connect| connect.is_online(user.id, device.endpoint_id));
+    let page = RevokeDevicePage {
+        chrome: session.chrome.clone(),
+        frame: admin.frame(&session, false, true),
+        base: admin.user_url(user.username.as_str()),
+        username: user.username.to_string(),
+        device: remote_row(session.chrome.t, &device, online, pages::now()),
+        introduced: introduced
+            .iter()
+            .map(|other| {
+                (
+                    other.endpoint_id.to_hex(),
+                    other.name.clone(),
+                    other.endpoint_id.short(),
+                )
+            })
+            .collect(),
+    };
+    web::render(StatusCode::OK, &page)
+}
+
+/// `POST <admin>/users/<name>/devices/<endpoint id>/revoke`: the device, and every introduced
+/// device ticked as `also_<endpoint id>`.
+async fn revoke_device(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((name, hex)): Path<(String, String)>,
+    Form(fields): Form<HashMap<String, String>>,
+) -> Response {
+    let admin = match admin(&state) {
+        Ok(admin) => admin,
+        Err(halt) => return *halt,
+    };
+    let csrf = fields.get("csrf").cloned().unwrap_or_default();
+    let session = match form_session(&state, &admin, &headers, &csrf).await {
+        Ok(session) => session,
+        Err(halt) => return *halt,
+    };
+    let user = match find_user(&state, &admin, &session, &name).await {
+        Ok(user) => user,
+        Err(halt) => return *halt,
+    };
+    let device = match user_device(&state, &admin, &session, &user, &hex).await {
+        Ok(device) => device,
+        Err(halt) => return *halt,
+    };
+    let mut keys = vec![device.endpoint_id];
+    keys.extend(
+        fields
+            .keys()
+            .filter_map(|name| name.strip_prefix("also_"))
+            .filter_map(EndpointId::parse),
+    );
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    match devices::revoke(
+        &state.db,
+        user.id,
+        &keys,
+        RevokedBy::Admin,
+        Some(client),
+        db::unix_now(),
+    )
+    .await
+    {
+        Ok(revoked) => {
+            for device in &revoked {
+                tracing::info!(
+                    by = %session.user.username,
+                    user = %user.username,
+                    device = %device.endpoint_id.short(),
+                    "admin revoked a device"
+                );
+            }
+            if let Some(connect) = &state.connect {
+                connect.poke();
+            }
+            see_other(&format!(
+                "{}?done=device-revoked",
+                admin.user_url(user.username.as_str())
+            ))
+        }
+        Err(err) => internal_error(&session.chrome, &err),
+    }
 }
 
 async fn user_page(
@@ -1055,6 +1241,7 @@ async fn user_page(
         Some("demoted") => Some(fill(t.a_notice_demoted, &[name])),
         Some("renamed") => Some(t.a_notice_renamed.to_owned()),
         Some("password") => Some(t.a_notice_password.to_owned()),
+        Some("device-revoked") => Some(t.notice_device_revoked.to_owned()),
         Some("revoked") => Some(t.notice_revoked.to_owned()),
         _ => None,
     };

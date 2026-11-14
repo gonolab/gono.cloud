@@ -22,6 +22,7 @@ page!(
     UserPage,
     CreatedPage,
     DeletePage,
+    RevokeDevicePage,
 );
 
 /// What every page of the signed-in admin UI shows around its content.
@@ -252,6 +253,36 @@ pub struct UserPage {
     pub delete_label: String,
     pub app_passwords: Vec<AppPasswordRow>,
     pub form: AppPasswordForm,
+    /// The account's devices registered for remote access; `None` when remote connectivity is
+    /// off.
+    pub remote: Option<Vec<RemoteDeviceRow>>,
+}
+
+/// One device registered for remote access.
+#[derive(Debug, Clone)]
+pub struct RemoteDeviceRow {
+    /// Endpoint ID, 64 hex digits.
+    pub hex: String,
+    pub name: String,
+    /// "Input Show · Windows".
+    pub what: String,
+    pub short: String,
+    /// "Online", "Last seen …", "Revoked …".
+    pub status: String,
+    pub revoked: bool,
+}
+
+/// `admin/revoke_device.html`: the second confirmation of revoking a device.
+#[derive(Template)]
+#[template(path = "admin/revoke_device.html")]
+pub struct RevokeDevicePage {
+    pub chrome: Chrome,
+    pub frame: Frame,
+    pub base: String,
+    pub username: String,
+    pub device: RemoteDeviceRow,
+    /// The devices it introduced: `(endpoint ID, name, short ID)`.
+    pub introduced: Vec<(String, String, String)>,
 }
 
 /// `admin/created.html`: the one-time display of a new app password.
