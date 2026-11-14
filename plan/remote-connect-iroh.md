@@ -237,7 +237,7 @@ would only help diagnostics. The channels map one to one:
   - A typed address first goes through the "who are you" exchange (D5). It is unauthenticated: the
     6-digit comparison that follows authenticates the key.
 - **The comparison code over a relay.** It stays sound: TLS is end to end and the code is bound to
-  both keys. Phase 3 mixes in `export_keying_material` for channel binding.
+  both keys. Input Show's pairing version 2 already mixes in the TLS exporter for channel binding.
 - **Remote pairing**, for two devices that have never been on one LAN:
   - **In person:** a QR or invite code that carries the ID and addresses, then the comparison code.
   - **Vouched for by the account (D7).** A compromised server must not be able to add a device on
@@ -255,6 +255,9 @@ would only help diagnostics. The channels map one to one:
   - **What a compromised server can still do.** It can deny service and lie about addresses. It
     cannot add a device without an approval signed by a device key the targets already trust.
     Phase 0 writes this down as part of the threat model.
+  - **As specified** in `docs/connect-protocol.md` (section 8), step 3 includes the 6-digit
+    comparison between the approving device and the new device over iroh, and the approval
+    introduces in both directions. The protocol's section 8.7 explains why.
 - **Revocation.** gono-cloud tells devices that a device was revoked, and the relay refuses the
   revoked key at once. Each device then removes the pairing.
 - **While controlled.** The controlled device shows "being controlled by …" with one-click
@@ -384,6 +387,18 @@ and 2; Phase 4 needs the gates listed in it. The sizes are estimates.
     - a leaked device key: is revocation complete?
 - **Deliverables**: the protocol specification and the threat model under `docs/`.
 - **Done when**: both projects have reviewed them.
+- **Status**: drafted as `docs/connect-protocol.md` and `docs/connect-threat-model.md`;
+  waiting for Input Show NE's review. Decisions taken while drafting:
+  - Remote pairing runs Input Show's 6-digit comparison (version 2, bound to the TLS exporter)
+    between the approver and the new device over iroh, with the code typed on the approver.
+  - The approval introduces in both directions, so the new device takes its peers' keys from
+    the approver and not from the directory.
+  - Only direct pairings vouch, one level deep.
+  - Revocation is final for the key: the key is tombstoned, peers forget it on the LAN as well,
+    and the step is confirmed twice.
+  - Devices vouched for by a revoked device stay; revocation lists them and offers to revoke
+    them too.
+  - TOTP secrets are encrypted with a key file kept in the configuration directory.
 
 ### 4.2 Phase 1: remote prototype
 
@@ -465,7 +480,8 @@ and 2; Phase 4 needs the gates listed in it. The sizes are estimates.
   - Pairing by QR or invite code, and account-vouched pairing (3.4).
   - The unattended-access setting.
   - The "being controlled" notice with disconnect.
-  - Channel binding in the comparison code.
+  - Channel binding in the comparison code (done: pairing version 2 binds the code to the TLS
+    exporter).
   - The remote transport profile.
 - **Checks:**
   - V3: builds and permissions on every platform;
