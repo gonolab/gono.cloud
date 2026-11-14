@@ -214,6 +214,19 @@ texts! {
     access_denied_lead: "did not get access to your account.", "没有获得访问你账号的权限。";
     close_window: "You can close this window.", "可以关闭这个窗口。";
     unknown_action: "Unknown action.", "未知操作。";
+    device_grant_title: "Add a device", "添加设备";
+    device_grant_question: "Add this device for remote access?", "添加这台设备用于远程访问？";
+    device_grant_asks: "asks to join the devices of", "请求加入以下账号的设备：";
+    device_product: "Product", "产品";
+    device_platform: "Platform", "平台";
+    device_id: "Device ID", "设备 ID";
+    device_grant_check: "Continue only if you started this on that device and it shows this ID.", "只有在你刚刚从那台设备上发起、并且它显示的 ID 与这里一致时，才继续。";
+    device_grant_note: "The device will be able to reach your other devices remotely and be reached by them. It gets no access to your files. You can revoke it at any time on your account page.", "这台设备将可以远程连接你的其他设备，也能被它们连接；它不能访问你的文件。你可以随时在账户页吊销它。";
+    device_grant: "Add device", "添加设备";
+    two_factor_needed: "Two-step verification needed", "需要两步验证";
+    two_factor_needed_lead: "Remote access needs two-step verification on your account. Turn it on, then start the sign-in on the device again.", "远程访问要求账号开启两步验证。请先开启，再在设备上重新发起登录。";
+    too_many_devices: "Too many devices", "设备太多";
+    too_many_devices_lead: "This account already has 50 devices for remote access. Revoke one on your account page, then start the sign-in on the device again.", "这个账号已有 50 台远程访问设备。请先在账户页吊销一台，再在设备上重新发起登录。";
 
     // Files: listing
     all_files: "All files", "全部文件";

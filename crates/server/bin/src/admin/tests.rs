@@ -124,6 +124,7 @@ async fn fixture() -> Fixture {
         push: None,
         admin: Some(Arc::new(Admin::new(PREFIX, info))),
         files: None,
+        connect: None,
     };
     Fixture {
         _dir: dir,

@@ -22,7 +22,10 @@ mod session;
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, OnceLock, PoisonError, RwLock},
+    sync::{
+        Arc, Mutex, OnceLock, PoisonError, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -97,6 +100,8 @@ pub struct Connect {
     directory: Arc<Directory>,
     relay: OnceLock<RelayStatus>,
     poke: Notify,
+    /// Set by [`Connect::shut_down`]: no new sessions.
+    stopping: AtomicBool,
 }
 
 impl Connect {
@@ -112,6 +117,7 @@ impl Connect {
             directory,
             relay: OnceLock::new(),
             poke: Notify::new(),
+            stopping: AtomicBool::new(false),
         }))
     }
 
@@ -138,6 +144,19 @@ impl Connect {
     /// The relay URL devices must use.
     pub fn relay_url(&self) -> &str {
         self.config.relay_url.as_str()
+    }
+
+    /// Ends every control connection with `1001 Going Away` and refuses new ones, when the
+    /// server stops.
+    pub fn shut_down(&self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        self.hub
+            .close_all(&Outgoing::Close(1001, "the server is shutting down"));
+    }
+
+    /// Whether [`Connect::shut_down`] was called.
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Relaxed)
     }
 
     /// Wakes the background task, after a change it must act on at once (a revocation, a new
@@ -432,7 +451,8 @@ impl Connect {
                 if let ServerMessage::DeviceRevoked { endpoint_id, .. } = &message {
                     revoked.push((event.user_id, EndpointId(*endpoint_id.as_bytes())));
                 }
-                self.hub.broadcast(event.user_id, &message.to_text(), None);
+                self.hub
+                    .broadcast_logged(event.user_id, event.seq, &message.to_text());
             }
             for (user_id, key) in &revoked {
                 self.hub.send(

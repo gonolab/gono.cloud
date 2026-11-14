@@ -26,7 +26,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use gono_server_core::{db, login_flows};
+use gono_server_core::{db, devices, login_flows, two_factor};
 use gono_server_nextcloud::login_flow;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
@@ -191,6 +191,49 @@ struct ConsentPage<'a> {
     /// "Not `<account>`?"
     not_you: String,
     csrf: &'a str,
+    /// For a device registering for remote access.
+    device: Option<DeviceFacts>,
+}
+
+/// What the consent page shows about a registering device (`docs/connect-protocol.md`, 4.2).
+struct DeviceFacts {
+    product: String,
+    platform: String,
+    short_id: String,
+}
+
+impl DeviceFacts {
+    fn of(flow: &login_flows::Flow) -> Option<Self> {
+        let device = flow.device.as_ref()?;
+        Some(Self {
+            product: product_name(&device.product),
+            platform: platform_name(&device.platform),
+            short_id: device.endpoint_id.short(),
+        })
+    }
+}
+
+/// A readable name of a product slug.
+fn product_name(slug: &str) -> String {
+    match slug {
+        "input-show" => "Input Show".to_owned(),
+        "gono-md" => "gono.md".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// A readable name of a platform slug.
+fn platform_name(slug: &str) -> String {
+    match slug {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        "harmonyos" => "HarmonyOS",
+        "ios" => "iOS",
+        "android" => "Android",
+        other => other,
+    }
+    .to_owned()
 }
 
 page!(SignInPage<'_>, ConsentPage<'_>);
@@ -251,9 +294,10 @@ fn login_page(
 fn consent_page(
     state: &AppState,
     headers: &HeaderMap,
-    client: &str,
+    flow: &login_flows::Flow,
     session: &(gono_server_core::web_sessions::SessionUser, String),
 ) -> Response {
+    let client = flow.client_name.as_str();
     let (user, token) = session;
     let account = if user.display_name == user.username.as_str() {
         user.display_name.clone()
@@ -271,8 +315,47 @@ fn consent_page(
             account,
             not_you,
             csrf: &csrf,
+            device: DeviceFacts::of(flow),
         },
     )
+}
+
+/// Why a device registration cannot be granted to `user_id` (`docs/connect-protocol.md`,
+/// 4.2): the account has no two-step verification, or holds the most devices already.
+async fn device_refusal(state: &AppState, headers: &HeaderMap, user_id: i64) -> Option<Response> {
+    let checked = async {
+        let enrolled = two_factor::is_enrolled(&state.db, user_id).await?;
+        let devices = devices::count_active(&state.db, user_id).await?;
+        Ok::<_, gono_server_core::Error>((enrolled, devices))
+    }
+    .await;
+    let chrome = Chrome::for_request(headers);
+    let t = chrome.t;
+    match checked {
+        Ok((false, _)) => Some(
+            Message::new(
+                chrome,
+                t.two_factor_needed,
+                t.two_factor_needed,
+                t.two_factor_needed_lead,
+            )
+            .respond(StatusCode::FORBIDDEN),
+        ),
+        Ok((true, count)) if count >= devices::MAX_DEVICES_PER_ACCOUNT => Some(
+            Message::new(
+                chrome,
+                t.too_many_devices,
+                t.too_many_devices,
+                t.too_many_devices_lead,
+            )
+            .respond(StatusCode::FORBIDDEN),
+        ),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::error!(error = %err, "cannot check a device registration");
+            Some(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
 }
 
 /// Redirects to the page itself (Post/Redirect/Get), with extra `Set-Cookie` values.
@@ -308,7 +391,7 @@ pub async fn page(
         return done_page(&headers, &flow.client_name);
     }
     match state.web.session(&headers).await {
-        Some(session) => consent_page(&state, &headers, &flow.client_name, &session),
+        Some(session) => consent_page(&state, &headers, &flow, &session),
         None => login_page(&state, &headers, StatusCode::OK, &flow.client_name, None),
     }
 }
@@ -385,6 +468,12 @@ pub async fn submit(
         return done_page(&headers, &flow.client_name);
     }
     let user = &session.0;
+    if form.action == "grant"
+        && flow.device.is_some()
+        && let Some(refusal) = device_refusal(&state, &headers, user.user_id).await
+    {
+        return refusal;
+    }
     match form.action.as_str() {
         "grant" => match login_flows::grant(
             &state.db,

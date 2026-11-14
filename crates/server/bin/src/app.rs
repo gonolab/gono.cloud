@@ -21,6 +21,8 @@
 //!   few thousand levels would overflow the stack and abort the whole server.
 //! - notify_push, when `notify_push.enabled`: the WebSocket at `/push/ws` and the pre-auth
 //!   endpoint `/index.php/apps/notify_push/pre_auth`: see [`crate::notify_push`].
+//! - Remote connectivity under `/gono/v1/`, when the relay is enabled and `server.base_url` is
+//!   HTTPS: device registration, the control channel and signing out. See [`crate::connect`].
 //! - The web admin UI under `admin.path`, when `admin.enabled`: see [`crate::admin`].
 //! - The web file UI under `/apps/files/`, when `files_ui.enabled`: see [`crate::files`]; the
 //!   sign-in page `/login`, `/logout`, the theme switch and the assets of every HTML page:
@@ -64,7 +66,7 @@ use crate::{
     admin::{self, Admin},
     auth::{AuthOutcome, Authenticator, basic_challenge},
     client_ip::client_ip,
-    direct,
+    connect, direct,
     files::{self, Files},
     login_flow, nextcloud, notify_push,
     ratelimit::RateLimiter,
@@ -98,6 +100,8 @@ pub struct AppState {
     pub admin: Option<Arc<Admin>>,
     /// The web file UI, when `files_ui.enabled`.
     pub files: Option<Arc<Files>>,
+    /// Remote connectivity, when the relay is enabled and `server.base_url` allows it.
+    pub connect: Option<Arc<gono_server_connect::Connect>>,
 }
 
 /// Compresses the XML bodies of WebDAV responses (PROPFIND, REPORT, error documents) when the
@@ -190,6 +194,15 @@ pub fn router(state: AppState) -> Router {
             .route(WEBSOCKET_PATH, get(notify_push::websocket))
             .route(PRE_AUTH_PATH, post(notify_push::pre_auth))
             .route("/apps/notify_push/pre_auth", post(notify_push::pre_auth));
+    }
+    if state.connect.is_some() {
+        use gono_protocol::connect::paths;
+        router = router
+            .route(paths::DISCOVERY, get(connect::discovery))
+            .route(paths::LOGIN, post(connect::login))
+            .route(paths::LOGIN_POLL, post(connect::poll))
+            .route(paths::WEBSOCKET, get(connect::websocket))
+            .route(paths::DEVICE, axum::routing::delete(connect::sign_out));
     }
     if let Some(admin) = &state.admin {
         router = router.merge(admin::routes(admin.prefix()));
@@ -514,6 +527,7 @@ mod tests {
             push: None,
             admin: None,
             files: None,
+            connect: None,
         };
         Fixture {
             dir,

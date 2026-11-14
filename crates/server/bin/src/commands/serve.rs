@@ -4,8 +4,9 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use dav_server::{DavHandler, DavMethodSet};
+use gono_server_connect::{Connect, ConnectConfig};
 use gono_server_core::{
-    Config,
+    Config, audit,
     db::{self, OpenMode},
     locks::LockStore,
     meta::MetaStore,
@@ -18,7 +19,7 @@ use gono_server_nextcloud::{
     chunking::ChunkedUploads,
     notify_push::{self, Hub, PushSettings},
 };
-use gono_server_relay::Relay;
+use gono_server_relay::{Admission, Relay};
 use tokio::{net::TcpListener, sync::Notify};
 
 use super::{load_config, refuse_root_on_foreign_install};
@@ -109,15 +110,54 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         "listening"
     );
 
+    // Remote connectivity: the device directory and the control channel, with the relay. It
+    // needs an HTTPS origin, since devices send their credentials to it.
+    let connect = if config.relay.enabled {
+        let base_url = &config.server.base_url;
+        if ConnectConfig::allowed_origin(base_url) {
+            let relay_url = config
+                .relay
+                .public_url
+                .clone()
+                .context("relay.public_url is not set")?;
+            let connect = Connect::new(
+                pool.clone(),
+                ConnectConfig {
+                    base_url: base_url.clone(),
+                    relay_url,
+                    audit_retention_secs: audit::DEFAULT_RETENTION_SECS,
+                },
+            )
+            .await
+            .context("read the device directory")?;
+            tracing::info!("remote connectivity enabled at /gono/v1/");
+            Some(connect)
+        } else {
+            tracing::warn!(
+                "remote connectivity is off: it needs an https server.base_url; the relay admits \
+                 only relay.allowed_endpoints"
+            );
+            None
+        }
+    } else {
+        None
+    };
+
     // The relay serves devices beside the HTTP server. A relay that cannot start stops the
     // start, like any other configuration error; one that fails later is logged and leaves the
     // file server running.
     let relay_stop = Arc::new(Notify::new());
     let (relay_status, relay_task) = if config.relay.enabled {
-        let relay = Relay::spawn(&config.relay, None)
+        let admission = connect
+            .as_ref()
+            .map(|connect| connect.directory() as Arc<dyn Admission>);
+        let relay = Relay::spawn(&config.relay, admission)
             .await
             .context("start the relay")?;
         let status = relay.status();
+        if let Some(connect) = &connect {
+            connect.set_relay(status.clone());
+        }
         let stop = Arc::clone(&relay_stop);
         let task = tokio::spawn(async move {
             if let Err(err) = relay.run_until(stop.notified()).await {
@@ -220,13 +260,19 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         push: push.clone(),
         admin,
         files,
+        connect: connect.clone(),
     };
+    let connect_task = connect.clone().map(|connect| tokio::spawn(connect.run()));
     let on_signal = {
         let push = push.clone();
+        let connect = connect.clone();
         let relay_stop = Arc::clone(&relay_stop);
         move || {
             if let Some(hub) = push {
                 hub.shut_down();
+            }
+            if let Some(connect) = connect {
+                connect.shut_down();
             }
             // Relay connections are not HTTP requests of this server: end them at once.
             relay_stop.notify_one();
@@ -247,6 +293,12 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
     }
     if let Some(feed) = feed {
         feed.abort();
+    }
+    if let Some(connect) = &connect {
+        connect.shut_down();
+    }
+    if let Some(task) = connect_task {
+        task.abort();
     }
     janitor.abort();
     pool.close().await;

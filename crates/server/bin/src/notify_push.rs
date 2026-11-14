@@ -500,6 +500,7 @@ mod tests {
             push: Some(hub),
             admin: None,
             files: None,
+            connect: None,
         };
         let app = crate::app::router(state.clone());
         tokio::spawn(async move {

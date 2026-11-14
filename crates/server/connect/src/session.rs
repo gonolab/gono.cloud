@@ -34,7 +34,7 @@ use url::Url;
 
 use crate::{
     Connect, device_id, entry,
-    hub::{Outgoing, PendingPair, Published, RequestRefusal},
+    hub::{Frame, Outgoing, PendingPair, Published, RequestRefusal},
     logged_message,
 };
 
@@ -150,7 +150,9 @@ pub struct Session {
     key: EndpointId,
     id: DeviceId,
     conn_id: u64,
-    rx: mpsc::Receiver<Outgoing>,
+    rx: mpsc::Receiver<Frame>,
+    /// The last logged event the `welcome` carried or covered; later copies are dropped.
+    cursor: i64,
     features: Vec<String>,
     requests: Bucket,
     connects: PerMinute,
@@ -189,6 +191,9 @@ impl Connect {
         text: &str,
     ) -> Result<(Session, String), String> {
         let fail = |code, message: &str| error(None, code, message).to_text();
+        if self.is_stopping() {
+            return Err(fail(ErrorCode::Unavailable, "the server is shutting down"));
+        }
         let hello: HelloMessage = match serde_json::from_str(text) {
             Ok(ClientMessage::Hello(hello)) => hello,
             _ => {
@@ -278,7 +283,7 @@ impl Connect {
         }
         device.last_seen_at = Some(now);
 
-        let session = Session {
+        let mut session = Session {
             connect: Arc::clone(self),
             user_id: login.user_id,
             username: login.username.clone(),
@@ -287,6 +292,7 @@ impl Connect {
             id,
             conn_id: registered.conn_id,
             rx: registered.rx,
+            cursor: 0,
             features,
             requests: Bucket::new(limits::REQUESTS_PER_SECOND, limits::REQUEST_BURST),
             connects: PerMinute::new(limits::CONNECTS_PER_MINUTE),
@@ -336,7 +342,7 @@ impl Session {
     }
 
     async fn welcome(
-        &self,
+        &mut self,
         login: &DeviceLogin,
         since: i64,
         now: i64,
@@ -363,11 +369,14 @@ impl Session {
         } else {
             Vec::new()
         };
+        // The cursor first: an event appended after it reaches the device live as well, which
+        // is a harmless duplicate; read the other way round, it could be missed.
+        let cursor = devices::last_seq(pool).await?;
         let (events, truncated) =
             devices::events_since(pool, self.user_id, since.max(0), limits::MAX_WELCOME_EVENTS)
                 .await?;
+        self.cursor = events.iter().map(|event| event.seq).fold(cursor, i64::max);
         let events: Vec<ServerMessage> = events.iter().filter_map(logged_message).collect();
-        let cursor = devices::last_seq(pool).await?;
         let welcome = Welcome {
             server_time: now,
             account: AccountInfo {
@@ -418,10 +427,17 @@ impl Session {
     /// The next frame to send to the device. When the hub dropped this connection (its queue
     /// was full), the answer is to close it.
     pub async fn next_outgoing(&mut self) -> Outgoing {
-        self.rx
-            .recv()
-            .await
-            .unwrap_or(Outgoing::Close(close::TIMED_OUT, "too slow"))
+        loop {
+            match self.rx.recv().await {
+                Some(Frame::Out(frame)) => return frame,
+                Some(Frame::Logged(seq, text)) if seq > self.cursor => {
+                    return Outgoing::Text(text);
+                }
+                // The welcome carried it already.
+                Some(Frame::Logged(..)) => {}
+                None => return Outgoing::Close(close::TIMED_OUT, "too slow"),
+            }
+        }
     }
 
     /// The check of every ping (protocol 5.4): whether the device may stay connected. Also

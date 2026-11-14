@@ -38,6 +38,14 @@ pub enum Outgoing {
     Close(u16, &'static str),
 }
 
+/// What the hub queues for a connection: a frame, or a logged event with its sequence
+/// number, which the session drops if its `welcome` carried it already.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Frame {
+    Out(Outgoing),
+    Logged(i64, String),
+}
+
 /// What a device published (protocol 7.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Published {
@@ -61,7 +69,7 @@ pub(crate) struct PendingPair {
 #[derive(Debug)]
 struct Conn {
     id: u64,
-    tx: mpsc::Sender<Outgoing>,
+    tx: mpsc::Sender<Frame>,
     published: Option<Published>,
     /// Targets of `connect`, with when.
     connects: HashMap<EndpointId, i64>,
@@ -89,7 +97,7 @@ struct Account {
 #[derive(Debug)]
 pub(crate) struct Registered {
     pub conn_id: u64,
-    pub rx: mpsc::Receiver<Outgoing>,
+    pub rx: mpsc::Receiver<Frame>,
     /// The device connected from an address it did not use last time.
     pub new_address: bool,
     /// Its connections keep replacing each other from different addresses: the addresses.
@@ -124,7 +132,7 @@ impl Hub {
         let account = accounts.entry(user_id).or_default();
         let mut flapping = None;
         if let Some(old) = account.conns.remove(&device) {
-            let _ = old.tx.try_send(replaced);
+            let _ = old.tx.try_send(Frame::Out(replaced));
             let history = account.replacements.entry(device).or_default();
             history.push_back((now, ip));
             while history
@@ -189,10 +197,10 @@ impl Hub {
         let Some(account) = accounts.get_mut(&user_id) else {
             return false;
         };
-        Self::queue(account, device, frame)
+        Self::queue(account, device, Frame::Out(frame))
     }
 
-    fn queue(account: &mut Account, device: EndpointId, frame: Outgoing) -> bool {
+    fn queue(account: &mut Account, device: EndpointId, frame: Frame) -> bool {
         let Some(conn) = account.conns.get(&device) else {
             return false;
         };
@@ -219,7 +227,29 @@ impl Hub {
             .filter(|device| Some(*device) != except)
             .collect();
         for device in devices {
-            Self::queue(account, device, Outgoing::Text(text.to_owned()));
+            Self::queue(account, device, Frame::Out(Outgoing::Text(text.to_owned())));
+        }
+    }
+
+    /// Queues the logged event `seq` for every connected device of `user_id`.
+    pub fn broadcast_logged(&self, user_id: i64, seq: i64, text: &str) {
+        let mut accounts = self.lock();
+        let Some(account) = accounts.get_mut(&user_id) else {
+            return;
+        };
+        let devices: Vec<EndpointId> = account.conns.keys().copied().collect();
+        for device in devices {
+            Self::queue(account, device, Frame::Logged(seq, text.to_owned()));
+        }
+    }
+
+    /// Queues `frame` for every connection and forgets them all (shutdown).
+    pub fn close_all(&self, frame: &Outgoing) {
+        for account in self.lock().values_mut() {
+            for conn in account.conns.values() {
+                let _ = conn.tx.try_send(Frame::Out(frame.clone()));
+            }
+            account.conns.clear();
         }
     }
 
@@ -482,7 +512,7 @@ mod tests {
         assert!(first.new_address);
         let second = hub.register(1, key(1), a, 10, replaced());
         assert!(!second.new_address);
-        assert_eq!(first.rx.recv().await, Some(replaced()));
+        assert_eq!(first.rx.recv().await, Some(Frame::Out(replaced())));
         assert!(
             !hub.unregister(1, key(1), first.conn_id),
             "replaced already"

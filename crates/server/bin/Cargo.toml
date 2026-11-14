@@ -21,6 +21,8 @@ clap.workspace = true
 crc32fast.workspace = true
 dav-server.workspace = true
 futures-util.workspace = true
+gono-protocol.workspace = true
+gono-server-connect.workspace = true
 gono-server-core.workspace = true
 gono-server-dav.workspace = true
 gono-server-nextcloud.workspace = true
@@ -44,6 +46,7 @@ url.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]
+iroh-base.workspace = true
 futures-util = { workspace = true, features = ["sink"] }
 http-body-util.workspace = true
 sqlx.workspace = true

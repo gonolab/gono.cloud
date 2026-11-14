@@ -1,11 +1,23 @@
 {%- extends "card.html" -%}
-{%- block title %}{{ chrome.t.grant_title }}{% endblock -%}
+{%- block title %}{% if device.is_some() %}{{ chrome.t.device_grant_title }}{% else %}{{ chrome.t.grant_title }}{% endif %}{% endblock -%}
 {%- block card %}
+{%- if let Some(device) = device %}
+<h1>{{ chrome.t.device_grant_question }}</h1>
+<p class="mt-6"><span class="client">{{ client }}</span> {{ chrome.t.device_grant_asks }} <b>{{ account }}</b>.</p>
+<dl class="facts">
+  <dt>{{ chrome.t.device_product }}</dt><dd>{{ device.product }}</dd>
+  <dt>{{ chrome.t.device_platform }}</dt><dd>{{ device.platform }}</dd>
+  <dt>{{ chrome.t.device_id }}</dt><dd><code>{{ device.short_id }}</code></dd>
+</dl>
+<p><b>{{ chrome.t.device_grant_check }}</b></p>
+<p class="muted small">{{ chrome.t.device_grant_note }}</p>
+{%- else %}
 <h1>{{ chrome.t.grant_question }}</h1>
 <p class="mt-6"><span class="client">{{ client }}</span> {{ chrome.t.grant_asks }} <b>{{ account }}</b>.</p>
 <p class="muted small">{{ chrome.t.grant_note }}</p>
+{%- endif %}
 <div class="split">
-  <form method="post" action=""><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary block" type="submit" name="action" value="grant">{{ chrome.t.grant }}</button></form>
+  <form method="post" action=""><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary block" type="submit" name="action" value="grant">{% if device.is_some() %}{{ chrome.t.device_grant }}{% else %}{{ chrome.t.grant }}{% endif %}</button></form>
   <form method="post" action=""><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn block" type="submit" name="action" value="deny">{{ chrome.t.cancel }}</button></form>
 </div>
 <form method="post" action="" class="signed-as"><input type="hidden" name="csrf" value="{{ csrf }}"><span>{{ not_you }}</span><button class="btn link" type="submit" name="action" value="logout">{{ chrome.t.log_out }}</button></form>

@@ -97,6 +97,7 @@ async fn fixture_with(files: bool) -> Fixture {
         push: None,
         admin: None,
         files: files.then(|| Arc::new(Files::new())),
+        connect: None,
     };
     Fixture {
         _dir: dir,

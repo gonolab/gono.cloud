@@ -6,6 +6,7 @@ mod auth;
 mod cli;
 mod client_ip;
 mod commands;
+mod connect;
 mod direct;
 mod files;
 mod i18n;
