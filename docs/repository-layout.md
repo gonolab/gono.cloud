@@ -13,6 +13,8 @@ other's way.
 ├── Cargo.lock              One lock file for the whole workspace
 ├── config.example.toml     Annotated server configuration
 ├── crates/
+│   ├── protocol/           gono-protocol: wire types shared by server and clients (today the
+│   │                       connect protocol of docs/connect-protocol.md)
 │   └── server/
 │       ├── CHANGELOG.md    Changes of each server release
 │       ├── bin/            gono-server: the `gono-cloud` binary (CLI, HTTP routing, Login Flow
@@ -22,8 +24,10 @@ other's way.
 │       ├── dav/            gono-server-dav: WebDAV file system on top of dav-server
 │       ├── nextcloud/      gono-server-nextcloud: status, capabilities, OCS, chunked upload v2,
 │       │                   Login Flow v2 documents, notify_push hub
+│       ├── connect/        gono-server-connect: the device directory and the control channel of
+│       │                   remote access (registration, presence, addresses, pairing, revocation)
 │       └── relay/          gono-server-relay: the iroh relay through which devices reach each
-│                           other, with its allowlist and counters
+│                           other, with its admission and counters
 ├── packaging/
 │   └── server/             Release archive contents (systemd unit, launchd job, README), the
 │                           install script, the packing script and the install test
@@ -44,10 +48,11 @@ crates or directories.
 
 ```text
 crates/
-├── protocol/           gono-protocol: wire types shared by server and client (request and
-│                       response documents, capabilities)
+├── protocol/           as above; the sync engine's wire types join it
 ├── server/             as above
 └── client/
+    ├── connect/        gono-connect: the iroh endpoint and the control channel client of
+    │                   remote access, for Input Show and the other products
     ├── sync/           the sync engine
     └── ffi/            UniFFI bindings of the sync engine for the mobile apps
 apps/
@@ -56,8 +61,8 @@ apps/
 └── ios/                iOS app
 ```
 
-`gono-protocol` is split out of the server crates only when the client work starts; until then
-the wire types stay where they are used.
+`gono-protocol` holds the connect protocol, which the server and `gono-connect` share. The
+WebDAV and sync wire types stay where they are used until the client work starts.
 
 ## Rules
 

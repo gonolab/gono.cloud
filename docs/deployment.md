@@ -287,7 +287,7 @@ What it needs:
 | **A server block in the reverse proxy** | HTTPS for the host name, WebSockets forwarded to `relay.bind` (`127.0.0.1:16103`), and `/generate_204` over plain HTTP: [reverse-proxy.md](reverse-proxy.md#the-relay). |
 | **UDP 7842 open** (for QAD) | Devices reach QAD directly, not through the proxy. |
 | **A copy of the certificate** (for QAD) | QUIC brings its own TLS, so the relay needs the certificate of its host name and the key, readable by the service user. |
-| **The allowed devices** | Only the devices listed in `relay.allowed_endpoints` may use the relay. |
+| **An https `base_url`** | Devices register and keep their control channel on the main host name (`/gono/v1/`), with their credentials; without HTTPS, remote access is off and the relay admits only `relay.allowed_endpoints`. |
 
 ### Turning it on
 
@@ -305,18 +305,20 @@ qad_bind = "[::]:7842"
 tls_cert = "relay-tls/fullchain.pem"   # relative to the configuration file
 tls_key = "relay-tls/privkey.pem"
 
-# The device ids that may use the relay: the 64 hex digits Input Show shows for a device.
-allowed_endpoints = [
-  "6f6e8a2a5c1d0b9e7f3a4c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f",  # laptop
-]
+# Optional: devices that may use the relay without being registered (tests, a relay on a host
+# of its own): the 64 hex digits Input Show shows for a device.
+# allowed_endpoints = [
+#   "6f6e8a2a5c1d0b9e7f3a4c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f",  # laptop
+# ]
 ```
 
 Then validate the configuration and restart the service (see "Changing the configuration").
-`config check` warns while no device is allowed and while QAD is off. A device that is refused
-is named in the log, with its full id:
+`config check` warns while QAD is off. `serve` admits the devices registered for remote access
+("Remote access" below), and the devices of `relay.allowed_endpoints` besides. A device that is
+refused is named in the log, with its full id:
 
 ```text
-INFO gono_server_relay::access: relay connection refused: the device is not in relay.allowed_endpoints device=6f6e8a…
+INFO gono_server_relay::access: relay connection refused: the device is neither registered for remote access nor in relay.allowed_endpoints device=6f6e8a…
 ```
 
 Optional: `relay.max_client_bytes_per_sec` and `relay.max_client_burst_bytes` limit what the
@@ -370,10 +372,45 @@ On macOS the directory is `/usr/local/etc/gono-cloud/relay-tls/` and the group `
   off.
 - [reverse-proxy.md](reverse-proxy.md#checking-the-relay) has `curl` checks for the proxy.
 
+### Remote access
+
+With the relay enabled and an https `base_url`, Gono Cloud serves remote access under
+`/gono/v1/` on the main host name; `gono-cloud serve` logs `remote connectivity enabled`. The
+protocol is [connect-protocol.md](connect-protocol.md), and
+[connect-threat-model.md](connect-threat-model.md) says what it protects against.
+
+- **Registering a device.** A device (Input Show) signs in through the browser like a Nextcloud
+  client: it opens a link, the user signs in with the web login password, and the consent page
+  names the device, its platform and its short device ID, which the device shows as well. The
+  device gets a credential of its own, without access to files.
+- **Two-step verification is required.** Only accounts with two-step verification enrolled
+  register devices, reach each other's addresses and use the relay. Its enrolment is not part
+  of this version yet, so no account can register a device yet.
+- **The account page** lists the account's devices, whether they are online, and lets a device
+  ask the account's other devices to pair for an hour.
+- **Revoking a device** (lost, stolen, retired) is final for its key: the account's other
+  devices forget it, on the local network as well, and it can never be registered again on
+  this server. Revoke on the account page or the admin UI, both of which ask for confirmation
+  on a page of its own, or with the CLI:
+
+  ```sh
+  sudo -u gono-cloud gono-cloud --config /etc/gono-cloud/config.toml device list alice
+  sudo -u gono-cloud gono-cloud --config /etc/gono-cloud/config.toml device revoke alice <ENDPOINT_ID>
+  ```
+
+  The CLI asks for the device's short ID, or takes `--confirm <ENDPOINT_ID>` without a terminal.
+  A running server picks the revocation up within seconds: it closes the device's control
+  channel and disconnects it from the relay.
+- **The audit log** records registrations, revocations, connection requests, pairings and the
+  sessions devices report, never what they send each other, for 180 days.
+- **The reverse proxy** forwards the WebSocket upgrade of `/gono/v1/ws`, as for `/push/ws`
+  ([reverse-proxy.md](reverse-proxy.md#nginx)).
+
 ### A relay on a host of its own
 
 `gono-cloud relay` runs only the relay, without the file server: no database and no data
-directory. It reads the same configuration file, which still needs the required keys of
+directory. It cannot read the device directory, so it admits only the devices of
+`relay.allowed_endpoints`. It reads the same configuration file, which still needs the required keys of
 `[server]`, `[storage]` and `[db]`, and `relay.enabled = true`. Run it with a copy of the
 systemd unit whose `ExecStart` is `/usr/local/bin/gono-cloud relay`, and do not run `serve` with
 the same `[relay]` on that host.

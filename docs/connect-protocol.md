@@ -1,7 +1,8 @@
 # Gono Connect: Control Protocol
 
-- Status: draft for review. This is Phase 0 of `plan/remote-connect-iroh.md`, and part 2b
-  implements it.
+- Status: draft for review. This is Phase 0 of `plan/remote-connect-iroh.md`. Part 2b implements
+  it: the server side is in `crates/server/connect` and the wire types are in `crates/protocol`.
+  Two-step verification enrolment (13) comes with part 2c.
 - Protocol version: 1.
 - Reviewers: gono-cloud, and Input Show NE.
 - Companion document: [connect-threat-model.md](connect-threat-model.md). It explains why the
@@ -118,10 +119,12 @@ key. That data travels as a **statement**:
   | `pair-approval` | `gono-connect pair-approval v1` | 8.4 |
 
 - **Verification:**
-  1. Verify the signature with `verify_strict` semantics (ed25519-dalek, which is what
-     `iroh_base::PublicKey::verify` uses): non-canonical signatures and small-order keys are
-     rejected.
-  2. Then parse the statement, and check that its `kind` matches the context.
+  1. Decode the bytes and parse them only to find the signer: the field the kind names
+     (`endpoint_id` for `login` and `hello`, `requester.endpoint_id` for `pair-request`,
+     `approver` for `pair-approval`). Nothing is acted on yet.
+  2. Verify the signature over the context of that `kind` with `verify_strict` semantics
+     (ed25519-dalek, which is what `iroh_base::PublicKey::verify` uses): non-canonical
+     signatures and small-order keys are rejected.
   3. Then check the fields as the section of that kind says.
 - **Limit:** statements are at most 16 KiB.
 - **Domain separation.** The device key also signs TLS 1.3 handshakes and the iroh relay
@@ -274,6 +277,7 @@ Rules:
 | `404` | `{"error":"not_found"}` | The flow is unknown, expired, used already, or the user denied it |
 | `409` | `{"error":"endpoint_taken"}` | The endpoint ID belongs to another account on this server. The flow is used up |
 | `409` | `{"error":"endpoint_revoked"}` | The endpoint ID was revoked (9). The device needs a new key. The flow is used up |
+| `409` | `{"error":"too_many_devices"}` | The account reached its device limit (15) since the consent. The flow is used up |
 
 **The proof** is checked only once the user has granted the flow. The server checks:
 - that `server` is its own origin;
@@ -324,8 +328,9 @@ The endpoint ID decides what happens:
   - `DELETE /gono/v1/device`, which signs the device out (9.4).
 - **One for one.** Each directory entry has exactly one app password and each such app
   password has exactly one entry.
-- **Deleting the app password** (account page, admin UI, CLI) revokes the device (9.1). The
-  app password lists show these app passwords as devices.
+- **Not an app password to the user.** The app password lists (account page, admin UI, CLI)
+  leave these credentials out, and deleting app passwords never deletes one. Revoking the
+  device (9.1) deletes its credential; the database refuses to delete it on its own.
 - **Products that need both.** A product that also needs files, such as gono.md, signs in
   twice: through Login Flow v2 for files, and through this flow for its device entry.
 
@@ -534,10 +539,16 @@ Some events must reach devices that are offline when they happen. These are:
 - `pair.approved`.
 
 **How they are kept.**
-- They go into a log per account, numbered by a sequence number `seq` that only grows.
+- They go into the event log, in the same transaction as the change, numbered by a sequence
+  number `seq` that only grows. It is one sequence for the whole server, so a device sees gaps
+  where other accounts' events are.
 - A device sends the last `seq` it has processed in `hello.since`, and with `ack {"seq": n}`
   as it goes.
 - `welcome.events` carries the retained events after `since`, at most 1000 of them.
+  `welcome.cursor` is the last `seq` the server had handed out when it built the `welcome`; the
+  server does not send the same events again live.
+- The server sends events as its event log has them, whichever process wrote them: a
+  revocation made with the CLI reaches connected devices within seconds.
 
 **What a device does with them:**
 - It processes them in order and stores the cursor only after it has acted on them, so a
@@ -767,8 +778,8 @@ The steps:
 
    `pair.requested` carries:
    - `request_id` and `expires_at`;
-   - the requester's directory entry;
-   - the statement.
+   - `requester`: the requester's directory entry;
+   - `request`: the signed statement.
 
 2. **The user approves on A.** A shows N's name, platform and short ID, and asks: "Approve only
    a device you have with you right now." On approval:
@@ -804,6 +815,17 @@ The steps:
 - `pair.withdraw {request_id}` from N ends it with `"withdrawn"`.
 - Expiry ends it with `"expired"`.
 - N gets `pair.closed` in every case.
+
+**Messages of the flow:**
+
+| Message | Fields |
+|---|---|
+| `pair.request` (N) | `id`, `request`: the signed `pair-request` statement. Result: `request_id`, `expires_at` |
+| `pair.requested` (event) | `request_id`, `expires_at`, `requester`, `request` |
+| `pair.approve` (A) | `id`, `request_id`, `approval`: the signed `pair-approval` statement |
+| `pair.approved` (logged event) | `seq`, `request_id`, `approval`, `at` |
+| `pair.decline` (any device but N), `pair.withdraw` (N) | `id`, `request_id` |
+| `pair.closed` (event) | `request_id`, `outcome`: `approved`, `declined`, `withdrawn` or `expired` |
 
 ### 8.3 `pair-request` statement
 
@@ -940,7 +962,6 @@ model weighs this choice (5.4).
 - the user, on the account page, with a session that passed the second step;
 - an admin, in the admin UI or with `gono-cloud device revoke <user> <endpoint id>`.
 
-Deleting a device's app password, in any of those places, also revokes the device (4.5).
 
 **What it means.** Revocation is for a device that is lost, stolen, compromised or retired for
 good.
@@ -961,8 +982,7 @@ action opens a confirmation step, and nothing changes until it is confirmed:
   page also needs a session that passed the second step.
 - **CLI.** `gono-cloud device revoke` asks interactively. Without a terminal it needs
   `--confirm <endpoint id>`, repeating the full ID.
-- **App passwords.** Deleting a device's app password goes through the same confirmation, since
-  it revokes the device (4.5).
+
 
 ### 9.2 What the server does
 
@@ -981,6 +1001,10 @@ From then on:
 - the relay refuses the key;
 - `connect` and `lookup` refuse it as a caller and as a target;
 - and the registration refuses it (4.4).
+
+The steps after the transaction follow from the event log, so they also happen when another
+process revoked the device: `gono-cloud device revoke` takes effect on a running server within
+seconds.
 
 ### 9.3 What devices do
 
@@ -1068,9 +1092,10 @@ The relay's `AccessControl::on_connect` admits endpoint E if either holds:
 2. E is an active device (10) of an account on which remote access is available.
 
 **How it decides:**
-- The decision uses the directory's current state, held in memory and updated in the same
-  place as every registration, revocation, account change and change of two-step
-  verification, so no database query runs per connection.
+- The decision uses the directory's admitted keys, held in memory so that no database query
+  runs per connection. The server reads them again at once after every registration and
+  revocation it makes, when a revocation appears in the event log, and every 30 seconds, which
+  picks up account changes and changes made by another process (the CLI).
 - Unknown keys are refused as today (`Deny { reason: None }`, logged at info).
 - A refused key that is a tombstone is also recorded as `relay.refused_revoked`.
 
@@ -1247,78 +1272,22 @@ this next to backups.
 
 ---
 
-## 14. Storage sketch
+## 14. Storage
 
-Part 2b decides the final tables. This sketch shows what the protocol needs, following the
-conventions of `crates/server/core/migrations/0001_initial.sql`: STRICT tables, UNIX seconds,
-and digests of secrets.
+The tables are in `crates/server/core/migrations/0001_initial.sql`, which follows the conventions
+of that file (STRICT tables, UNIX seconds, digests of secrets):
 
-```sql
-CREATE TABLE devices (
-    id              INTEGER PRIMARY KEY,
-    user_id         INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    endpoint_id     BLOB    NOT NULL UNIQUE CHECK (length(endpoint_id) = 32),
-    -- NULL once revoked; the app password is deleted with the revocation.
-    app_password_id INTEGER UNIQUE REFERENCES app_passwords (id) ON DELETE SET NULL,
-    product         TEXT    NOT NULL,
-    platform        TEXT    NOT NULL,
-    name            TEXT    NOT NULL,
-    version         TEXT,
-    accept_remote   INTEGER NOT NULL DEFAULT 0 CHECK (accept_remote IN (0, 1)),
-    unattended      INTEGER NOT NULL DEFAULT 0 CHECK (unattended IN (0, 1)),
-    services        TEXT    NOT NULL DEFAULT '[]',
-    pairing_open_until INTEGER,
-    registered_at   INTEGER NOT NULL,
-    last_seen_at    INTEGER,
-    revoked_at      INTEGER
-) STRICT;
+| Table | Content |
+|---|---|
+| `devices` | The directory (6.1), with revoked entries as tombstones (9.1). An unrevoked entry always has its app password; a revoked one never |
+| `device_events` | The event log (5.6) |
+| `device_approvals` | Which device approved which newcomer, so that a revocation can list them (9.1) |
+| `revocations_applied` | Which device applied which revocation (9.3) |
+| `audit_log` | The audit log (12) |
+| `two_factor`, `recovery_codes` | Two-step verification (13) |
+| `login_flows` | Registrations, in the columns `device_*` (4) |
 
--- 5.6: events that must reach devices that are offline.
-CREATE TABLE device_events (
-    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    kind       TEXT    NOT NULL CHECK (kind IN ('device.added', 'device.revoked', 'pair.approved')),
-    body       TEXT    NOT NULL,
-    created_at INTEGER NOT NULL
-) STRICT;
-
--- 9.3: which device has applied which revocation.
-CREATE TABLE revocations_applied (
-    revoked_device_id INTEGER NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
-    device_id         INTEGER NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
-    applied_at        INTEGER NOT NULL,
-    PRIMARY KEY (revoked_device_id, device_id)
-) STRICT;
-
-CREATE TABLE audit_log (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER REFERENCES users (id) ON DELETE CASCADE,
-    at         INTEGER NOT NULL,
-    kind       TEXT    NOT NULL,
-    actor      TEXT    NOT NULL,
-    device     BLOB,
-    peer       BLOB,
-    client_ip  TEXT,
-    details    TEXT    NOT NULL DEFAULT '{}'
-) STRICT;
-
-CREATE TABLE two_factor (
-    user_id    INTEGER PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
-    secret     BLOB    NOT NULL,          -- encrypted (13.6)
-    last_step  INTEGER NOT NULL DEFAULT 0,
-    enabled_at INTEGER NOT NULL
-) STRICT;
-
-CREATE TABLE recovery_codes (
-    user_id   INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    code_hash BLOB    NOT NULL CHECK (length(code_hash) = 32),
-    used_at   INTEGER,
-    PRIMARY KEY (user_id, code_hash)
-) STRICT;
-```
-
-Pending flows extend `login_flows` with the device fields and the challenge. Pending pairing
-requests, addresses and presence live in memory.
+Pending pairing requests, addresses and presence live in memory only.
 
 ---
 

@@ -114,8 +114,10 @@ enabled = true
 [relay]
 # The relay through which devices (Input Show, and later other Gono products) reach each other
 # across the internet when they cannot connect directly. It forwards packets that are encrypted
-# end to end between the devices and never sees their content. `serve` runs it when enabled;
-# `gono-cloud relay` runs it alone on a host of its own. The reverse proxy needs a server block
+# end to end between the devices and never sees their content. `serve` runs it when enabled,
+# and with an https base_url also serves remote access under /gono/v1/: device registration and
+# the control channel (docs/connect-protocol.md); `gono-cloud relay` runs it alone on a host of
+# its own. The reverse proxy needs a server block
 # for it (docs/reverse-proxy.md), and QUIC address discovery a copy of its certificate
 # (docs/deployment.md). Default: false.
 enabled = false
@@ -140,8 +142,11 @@ bind = "127.0.0.1:16103"
 # tls_cert = "relay-tls/fullchain.pem"
 # tls_key = "relay-tls/privkey.pem"
 
-# Devices that may use the relay, by device id: the 64 hex digits that Input Show shows for a
-# device. Every other device is refused, and the log names it. Default: [] (no device).
+# Devices that may use the relay besides those registered for remote access, by device id: the
+# 64 hex digits that Input Show shows for a device. `serve` admits the registered devices of
+# accounts with two-step verification on its own, when base_url is https; `gono-cloud relay` on
+# a host of its own admits only this list. Every other device is refused, and the log names it.
+# Default: [].
 allowed_endpoints = []
 
 # Most bytes per second the relay reads from one device connection, and the largest burst it

@@ -14,11 +14,11 @@ the server as a service, upgrades and backups are in [deployment.md](deployment.
 | Terminate TLS and forward everything to `server.bind` | Gono Cloud has no TLS of its own. |
 | Pass the request path through **unchanged** | WebDAV paths carry percent-encoded file names; a proxy that decodes or re-encodes them (nginx with a URI in `proxy_pass`) renames files or breaks requests. |
 | Pass every HTTP method and header | WebDAV uses `PROPFIND`, `PROPPATCH`, `MKCOL`, `COPY`, `MOVE`, `LOCK`, `UNLOCK`, `REPORT`, and headers such as `Depth`, `Destination`, `Overwrite`, `If`, `OC-Total-Length`. |
-| Upgrade WebSockets on `/push/ws` | notify_push (real-time change notifications) runs over a WebSocket. |
+| Upgrade WebSockets on `/push/ws` and `/gono/v1/ws` | notify_push (real-time change notifications) and the control channel of devices registered for remote access run over WebSockets. |
 | Stream request and response bodies | Uploads and downloads can be gigabytes; buffering them in the proxy costs disk space and time and breaks progress reporting. |
 | Pass `Accept-Encoding` and compressed responses through | Gono Cloud gzips the XML of WebDAV responses itself when a client asks for it (folder listings shrink by a factor of 50 or more). File downloads are never compressed, so the proxy needs no compression settings of its own. |
 | Allow large request bodies | Nextcloud clients upload big files in chunks, but generic WebDAV clients (Finder, rclone, Cyberduck, the mobile apps for some uploads) send a whole file in one `PUT`. |
-| Keep long requests and idle WebSockets open | A WebSocket is quiet between pings (`notify_push.ping_interval_secs`, 30 s by default); large transfers can take hours. |
+| Keep long requests and idle WebSockets open | A WebSocket is quiet between pings (`notify_push.ping_interval_secs`, 30 s by default; 30 s on `/gono/v1/ws`); large transfers can take hours. |
 | Send the client address in `X-Forwarded-For` (or `Forwarded`) | Failed-login rate limiting and the logs work per client address. |
 
 ## Gono Cloud settings that must match
@@ -133,8 +133,8 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # notify_push WebSocket.
-    location = /push/ws {
+    # The WebSockets: notify_push, and the control channel of remote access (with the relay).
+    location ~ ^/(push/ws|gono/v1/ws)$ {
         proxy_pass http://gono_cloud;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
@@ -204,8 +204,8 @@ cloud.example.com {
 
 Caddy already does the rest by default:
 
-- WebSocket upgrades are proxied for every path, including `/push/ws`, and idle WebSockets are
-  not timed out.
+- WebSocket upgrades are proxied for every path, including `/push/ws` and `/gono/v1/ws`, and idle
+  WebSockets are not timed out.
 - Request bodies are streamed, not buffered, and there is no size limit unless a
   `request_body { max_size ... }` directive sets one.
 - The request path is forwarded unchanged.
@@ -349,6 +349,16 @@ curl -si --http1.1 -o /dev/null -w '%{http_code}\n' \
   -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
   -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
   --max-time 3 https://relay.example.com/relay
+
+# Remote access is served on the main host name: the discovery document names the relay.
+curl -s https://cloud.example.com/gono/v1/connect
+
+# The control channel's WebSocket reaches Gono Cloud: expect 401, because it needs a device's
+# credentials. 404 means remote access is off (the relay is disabled, or base_url is not https).
+curl -si --http1.1 -o /dev/null -w '%{http_code}\n' \
+  -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  --max-time 3 https://cloud.example.com/gono/v1/ws
 ```
 
 The admin UI's overview shows the relay's host name, the allowed devices connected right now,

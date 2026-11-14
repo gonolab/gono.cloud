@@ -442,7 +442,12 @@ and 2; Phase 4 needs the gates listed in it. The sizes are estimates.
     `docs/reverse-proxy.md` and `docs/deployment.md`, and `config check` for the relay settings;
   - a load test: memory for 1000 idle clients, CPU per Gbps relayed.
 - **2b. Directory and control channel.** Starts once Phase 0's specification is reviewed. About
-  two to three weeks.
+  two to three weeks. **Server side implemented** ahead of the review (`crates/protocol`,
+  `crates/server/connect`): registration, the control channel, presence, `connect` / `lookup`,
+  pairing requests and approvals, session reports, revocation from the account page, the admin
+  UI and the CLI, relay admission from the directory, the audit log. Remote access needs the
+  `two_factor` table, which part 2c fills. Still open: `gono-connect`; revocation delay and
+  lookup latency measured on real hosts (V7).
   - the `devices` table;
   - registration;
   - the control channel `/gono/v1/ws`;

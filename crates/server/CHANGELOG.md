@@ -25,8 +25,26 @@ compatible within a major version: released clients keep working with newer serv
   overview shows the relay, `config check` its settings, and the install script takes
   `--relay-host` for fresh installs. See "The relay" in `docs/deployment.md` and
   `docs/reverse-proxy.md`. The binary grows by about 6.6 MB (static Linux build).
+- Remote access for devices, the server side of `docs/connect-protocol.md`: with the relay
+  enabled and an https `base_url`, `serve` answers under `/gono/v1/`. Devices register through
+  the browser like a Nextcloud client (`/gono/v1/login`), proving their Ed25519 key; the consent
+  page names the device and its short ID. A registered device gets a credential without file
+  access, keeps a control channel open (`/gono/v1/ws`, a WebSocket the reverse proxy must
+  forward like `/push/ws`), sees the account's other devices and their presence, gets their
+  addresses only through recorded connection requests, and passes pairing requests and signed
+  approvals between devices. The relay admits these devices besides `relay.allowed_endpoints`.
+  Only accounts with two-step verification enrolled have remote access; enrolment comes in a
+  later release, so no account can register a device yet. The account page lists the devices;
+  revoking one (account page, admin UI, `gono-cloud device revoke`) is final for its key, needs
+  a second confirmation, disconnects it at once and tells the account's other devices. An audit
+  log records registrations, revocations, connection requests, pairings and reported sessions.
 
 ### Changed
+
+- `config check` and `serve` no longer warn about an empty `relay.allowed_endpoints`, since
+  `serve` admits the registered devices; `gono-cloud relay` on a host of its own still does.
+- The credentials of devices registered for remote access are not listed among app passwords,
+  and cannot be deleted as app passwords.
 
 - **The database schema is one file again**, `0001_initial.sql`, which also holds the tables of
   remote access (the device directory, its event log, the audit log, two-step verification).
