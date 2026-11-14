@@ -1,0 +1,43 @@
+[package]
+name = "gono-connect"
+description = "Remote connectivity for Gono products: the one iroh endpoint configuration, device registration and the control channel of Gono Cloud."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# UPnP / NAT-PMP / PCP port mapping on the local gateway (plan D3). It talks only to the gateway;
+# check again that nothing else is contacted (plan V4) before turning it on in a product.
+portmapper = ["iroh/portmapper"]
+
+[dependencies]
+base64.workspace = true
+futures-util = { workspace = true, features = ["sink", "std"] }
+gono-protocol.workspace = true
+# Pinned exactly, like iroh-relay: the configuration of plan 3.5 is checked against this
+# version. Only `tls-ring`: no metrics, no portmapper unless asked for, no Apple datapath.
+iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring"] }
+n0-error = "1.0.3"
+n0-future = "0.3.2"
+rand.workspace = true
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+url.workspace = true
+webpki-roots = "1.0.12"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

@@ -46,6 +46,8 @@ url.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]
+# The end-to-end test of remote access (tests/remote.rs) runs two devices with it.
+gono-connect.workspace = true
 iroh-base.workspace = true
 futures-util = { workspace = true, features = ["sink"] }
 http-body-util.workspace = true
