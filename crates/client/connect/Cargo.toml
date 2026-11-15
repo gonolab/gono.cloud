@@ -18,6 +18,8 @@ portmapper = ["iroh/portmapper"]
 base64.workspace = true
 futures-util = { workspace = true, features = ["sink", "std"] }
 gono-protocol.workspace = true
+# The `Date` header of the registration answer: the flow's expiry by the server's clock.
+httpdate.workspace = true
 # Pinned exactly, like iroh-relay: the configuration of plan 3.5 is checked against this
 # version. Only `tls-ring`: no metrics, no portmapper unless asked for, no Apple datapath.
 iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring"] }
@@ -37,7 +39,9 @@ url.workspace = true
 webpki-roots = "1.0.12"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# Canned HTTP answers for the body limit.
+http.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 
 [lints]
 workspace = true

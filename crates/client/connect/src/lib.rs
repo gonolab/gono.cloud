@@ -8,15 +8,24 @@
 //!   hands the product its events.
 //! - [`ControlLookup`]: iroh's address lookup backed by the control channel (protocol 7).
 //! - [`Remote`]: the endpoint and the channel together, with the product API of plan 3.3:
-//!   connect to a device, accept connections, forward network changes.
+//!   connect to a device, accept connections from trusted keys
+//!   ([`Remote::accept_trusted`]), forward network changes.
+//!
+//! The server is bound to the origin the user entered: `https` (plain `http` only on a
+//! loopback host), every URL it names on that origin, no redirects, and every statement naming
+//! that origin, never a value of the server's (threat model C16). Its answers are checked
+//! where they could steer the device: a `connect` or `lookup` answer for another key is
+//! refused, and a relay other than the discovery document's is dropped (C15).
 //!
 //! Trust stays with the product: this crate never decides whether a peer may connect or
 //! control anything. It carries the server's messages and checks nothing the product must
-//! check itself (the statements of protocol 8.5, the trust list, unattended access).
+//! check itself (the statements of protocol 8.5, the trust list, unattended access);
+//! [`Remote::accept_trusted`] applies the product's own predicate.
 
 mod channel;
 pub mod endpoint;
 mod lookup;
+mod origin;
 mod register;
 mod remote;
 mod tls;
@@ -27,16 +36,32 @@ pub use gono_protocol::connect as protocol;
 pub use iroh;
 pub use lookup::ControlLookup;
 pub use register::{Credentials, DeviceInfo, PendingRegistration, Server};
-pub use remote::{Remote, RemoteOptions};
+pub use remote::{CLOSE_NOT_TRUSTED, Remote, RemoteOptions};
 
-use gono_protocol::connect::ErrorCode;
+use gono_protocol::connect::{ErrorCode, VERSION};
 
 /// What can go wrong.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The server origin or a URL it named is not usable.
+    /// The server origin or a URL it named is not usable: not `https` (plain `http` only on a
+    /// loopback host), or a URL the server named is not on its origin.
     #[error("invalid URL: {0}")]
     Url(String),
+    /// The server calls itself by another origin than the one the device talks to
+    /// (`discovery.server` or the registration's `server`): its `server.base_url` does not
+    /// match the address entered, or it passes another server's answers on.
+    #[error("the server at {expected} calls itself {found}")]
+    WrongServer {
+        /// The origin the device talks to.
+        expected: String,
+        /// The origin the server named.
+        found: String,
+    },
+    /// The server speaks another version of the connect protocol than this crate.
+    #[error(
+        "the server speaks version {0} of the connect protocol; this device speaks version {VERSION}"
+    )]
+    UnsupportedVersion(u32),
     /// The server does not offer remote access (`404` on the discovery document).
     #[error("this server does not offer remote access")]
     NotOffered,
@@ -75,3 +100,46 @@ pub enum Error {
 
 /// Result alias of this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Helpers of the unit tests.
+#[cfg(test)]
+pub(crate) mod tests {
+    use gono_protocol::connect::{DeviceEntry, DeviceId};
+    use iroh::SecretKey;
+
+    use crate::Credentials;
+
+    /// The device ID of the key made from `seed`.
+    pub(crate) fn device_id(seed: u8) -> DeviceId {
+        SecretKey::from_bytes(&[seed; 32]).public().into()
+    }
+
+    /// The directory entry of the device made from `seed`.
+    pub(crate) fn entry(seed: u8) -> DeviceEntry {
+        DeviceEntry {
+            endpoint_id: device_id(seed),
+            name: format!("Device {seed}"),
+            product: "input-show".to_owned(),
+            platform: "linux".to_owned(),
+            version: String::new(),
+            registered_at: 0,
+            online: true,
+            last_seen_at: None,
+            accept_remote: false,
+            unattended: false,
+            services: Vec::new(),
+            revoked_at: None,
+        }
+    }
+
+    /// A credential of the device made from `seed` on `server`.
+    pub(crate) fn credentials(server: &str, seed: u8) -> Credentials {
+        Credentials {
+            server: server.to_owned(),
+            username: "kim".to_owned(),
+            app_password: "app-password-secret".to_owned(),
+            device: entry(seed),
+            pairing_open_until: None,
+        }
+    }
+}

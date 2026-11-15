@@ -8,6 +8,13 @@
 //!   ([`SystemResolver`]) where the app cannot read the network's DNS (HarmonyOS);
 //! - both address families bound, on a free port unless the product needs a fixed one.
 //!
+//! Incoming connections: iroh 1.4.1 has no builder option for the endpoint's limit of pending
+//! connection attempts (noq's `max_incoming`, 65536 by default; `ServerConfigBuilder` only
+//! applies to `Incoming::accept_with`, after that limit was checked). Products accept with
+//! [`crate::Remote::accept_trusted`], which drains the queue at once, refuses attempts beyond a
+//! few concurrent handshakes per second, and closes keys outside the trust list (threat model
+//! C8).
+//!
 //! Products depend on this crate, never on iroh's configuration directly, so that an iroh
 //! upgrade that adds a default changes one file.
 

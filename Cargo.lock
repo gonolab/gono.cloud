@@ -1442,6 +1442,8 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "gono-protocol",
+ "http",
+ "httpdate",
  "iroh",
  "n0-error",
  "n0-future",
