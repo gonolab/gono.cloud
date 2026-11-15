@@ -8,20 +8,23 @@
 //! - [`Remote::accept_trusted`] is how a product accepts connections: it hands out only the
 //!   peers whose key the product's predicate admits (its trust list, and the key of a pending
 //!   pairing that `incoming` announced), closes every other right after the handshake, and
-//!   limits pending handshakes and their rate (threat model C8). Whether an admitted peer may
-//!   do anything stays the product's decision.
+//!   limits pending handshakes and their rate (threat model C8), per source first so that one
+//!   stranger cannot keep the user's own devices out. Whether an admitted peer may do anything
+//!   stays the product's decision.
 //! - [`Remote::network_change`] forwards the platform's network events (plan 3.3; HarmonyOS
 //!   and Android need it).
 
 use std::{
-    sync::Arc,
+    collections::HashMap,
+    net::IpAddr,
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 
 use gono_protocol::connect::{DeviceId, Discovery, message::Purpose};
 use iroh::{
     Endpoint, EndpointId, RelayUrl, SecretKey,
-    endpoint::{Accept, Connection, Incoming},
+    endpoint::{Accept, Connection, Incoming, IncomingAddr},
 };
 use tokio::sync::{Semaphore, mpsc};
 
@@ -39,6 +42,16 @@ const MAX_PENDING_HANDSHAKES: usize = 16;
 
 /// How many incoming handshakes [`Remote::accept_trusted`] starts per second; more are refused.
 const HANDSHAKES_PER_SECOND: u32 = 8;
+
+/// How many incoming handshakes of one source run at once; more from it are refused.
+const MAX_PENDING_PER_SOURCE: usize = 2;
+
+/// How many incoming handshakes of one source start per second; more from it are refused.
+const HANDSHAKES_PER_SOURCE_PER_SECOND: u32 = 2;
+
+/// Sources kept at once. Beyond that, the idle ones are forgotten, and a new source waits
+/// until there is room.
+const MAX_SOURCES: usize = 1024;
 
 /// How long an incoming handshake may take.
 const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -242,6 +255,82 @@ impl Rate {
     }
 }
 
+/// Where an incoming connection attempt comes from, as far as fairness goes (threat model 5.6):
+/// the relay's source label for relayed attempts (an honest relay labels frames with the
+/// sender's authenticated key; this is a pre-filter, not authentication), and the IP address
+/// for direct ones, IPv6 by its /64, which one host usually holds as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Source {
+    Relayed(EndpointId),
+    Ipv4([u8; 4]),
+    Ipv6([u8; 8]),
+    Other,
+}
+
+impl Source {
+    fn of(addr: &IncomingAddr) -> Self {
+        match addr {
+            IncomingAddr::Relay { endpoint_id, .. } => Self::Relayed(*endpoint_id),
+            IncomingAddr::Ip(addr) => match addr.ip().to_canonical() {
+                IpAddr::V4(ip) => Self::Ipv4(ip.octets()),
+                IpAddr::V6(ip) => {
+                    let mut prefix = [0; 8];
+                    prefix.copy_from_slice(&ip.octets()[..8]);
+                    Self::Ipv6(prefix)
+                }
+            },
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Handshakes in progress and started per source.
+#[derive(Debug)]
+struct SourceBudget {
+    pending: usize,
+    rate: Rate,
+}
+
+/// The per-source budgets, shared with the handshake tasks that give their slot back.
+#[derive(Debug, Default)]
+struct Sources(Mutex<HashMap<Source, SourceBudget>>);
+
+impl Sources {
+    /// Takes a slot for `source` at `now`, or says why there is none.
+    fn take(&self, source: Source, now: Instant) -> Result<(), &'static str> {
+        let mut sources = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if !sources.contains_key(&source) && sources.len() >= MAX_SOURCES {
+            sources.retain(|_, budget| {
+                budget.pending > 0
+                    || now.duration_since(budget.rate.window) < Duration::from_secs(1)
+            });
+            if sources.len() >= MAX_SOURCES {
+                return Err("too many sources at once");
+            }
+        }
+        let budget = sources.entry(source).or_insert_with(|| SourceBudget {
+            pending: 0,
+            rate: Rate::new(HANDSHAKES_PER_SOURCE_PER_SECOND, now),
+        });
+        if budget.pending >= MAX_PENDING_PER_SOURCE {
+            return Err("too many pending handshakes from this source");
+        }
+        if !budget.rate.allow(now) {
+            return Err("too many handshakes per second from this source");
+        }
+        budget.pending += 1;
+        Ok(())
+    }
+
+    /// Gives the slot of `source` back once its handshake ended.
+    fn give_back(&self, source: Source) {
+        let mut sources = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(budget) = sources.get_mut(&source) {
+            budget.pending = budget.pending.saturating_sub(1);
+        }
+    }
+}
+
 /// See [`Remote::accept_trusted`].
 fn accept_trusted(endpoint: Endpoint, allow: Allow) -> mpsc::Receiver<Connection> {
     let (accepted, receiver) = mpsc::channel(MAX_PENDING_HANDSHAKES);
@@ -249,8 +338,13 @@ fn accept_trusted(endpoint: Endpoint, allow: Allow) -> mpsc::Receiver<Connection
     receiver
 }
 
+/// Takes every connection attempt off the endpoint at once (so noq's own queue of 65536, which
+/// iroh 1.4.1 cannot lower, never fills), refuses those beyond the budgets before any
+/// cryptography, and runs the rest. The budget of a source is checked before the endpoint's, so
+/// that one source refused does not use up the endpoint's rate.
 async fn accept_loop(endpoint: Endpoint, allow: Allow, accepted: mpsc::Sender<Connection>) {
     let handshakes = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
+    let sources = Arc::new(Sources::default());
     let mut rate = Rate::new(HANDSHAKES_PER_SECOND, Instant::now());
     loop {
         let incoming = tokio::select! {
@@ -261,21 +355,33 @@ async fn accept_loop(endpoint: Endpoint, allow: Allow, accepted: mpsc::Sender<Co
             },
             () = accepted.closed() => return,
         };
+        let now = Instant::now();
+        let source = Source::of(&incoming.remote_addr());
+        if let Err(reason) = sources.take(source, now) {
+            tracing::debug!(?source, "refusing a connection: {reason}");
+            incoming.refuse();
+            continue;
+        }
         let Ok(permit) = Arc::clone(&handshakes).try_acquire_owned() else {
+            sources.give_back(source);
             tracing::debug!("refusing a connection: too many pending handshakes");
             incoming.refuse();
             continue;
         };
-        if !rate.allow(Instant::now()) {
+        if !rate.allow(now) {
+            sources.give_back(source);
             tracing::debug!("refusing a connection: too many handshakes per second");
             incoming.refuse();
             continue;
         }
         let allow = Arc::clone(&allow);
         let accepted = accepted.clone();
+        let sources = Arc::clone(&sources);
         tokio::spawn(async move {
             let _permit = permit;
-            if let Some(connection) = handshake(incoming, &allow).await {
+            let connection = handshake(incoming, &allow).await;
+            sources.give_back(source);
+            if let Some(connection) = connection {
                 let _ = accepted.send(connection).await;
             }
         });
@@ -373,6 +479,64 @@ mod tests {
         assert!(rate.allow(start + Duration::from_millis(10)));
         assert!(!rate.allow(start + Duration::from_millis(20)));
         assert!(rate.allow(start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn one_source_cannot_use_up_the_budget_of_others() {
+        let sources = Sources::default();
+        let start = Instant::now();
+        let stranger = Source::Ipv4([198, 51, 100, 7]);
+        assert!(sources.take(stranger, start).is_ok());
+        assert!(sources.take(stranger, start).is_ok());
+        assert!(
+            sources.take(stranger, start).is_err(),
+            "two pending at most"
+        );
+        // Others still get in.
+        let relayed = Source::Relayed(SecretKey::from_bytes(&[4; 32]).public());
+        assert!(sources.take(relayed, start).is_ok());
+        assert!(sources.take(Source::Ipv4([192, 0, 2, 1]), start).is_ok());
+        // A slot given back is usable again, within the rate.
+        sources.give_back(stranger);
+        assert!(
+            sources.take(stranger, start).is_err(),
+            "two per second at most"
+        );
+        assert!(
+            sources
+                .take(stranger, start + Duration::from_secs(1))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn sources_are_keyed_by_relay_label_ipv4_address_and_ipv6_slash_64() {
+        let key = SecretKey::from_bytes(&[5; 32]).public();
+        let relayed = IncomingAddr::Relay {
+            url: "https://relay.example.com".parse().unwrap(),
+            endpoint_id: key,
+        };
+        assert_eq!(Source::of(&relayed), Source::Relayed(key));
+        let ip = |addr: &str| Source::of(&IncomingAddr::Ip(addr.parse().unwrap()));
+        assert_eq!(ip("198.51.100.7:1"), ip("198.51.100.7:2"));
+        assert_ne!(ip("198.51.100.7:1"), ip("198.51.100.8:1"));
+        assert_eq!(ip("[::ffff:198.51.100.7]:1"), ip("198.51.100.7:1"));
+        assert_eq!(ip("[2001:db8:1:2::1]:1"), ip("[2001:db8:1:2:ffff::9]:1"));
+        assert_ne!(ip("[2001:db8:1:2::1]:1"), ip("[2001:db8:1:3::1]:1"));
+    }
+
+    #[test]
+    fn idle_sources_are_forgotten_when_the_table_is_full() {
+        let sources = Sources::default();
+        let start = Instant::now();
+        for i in 0..MAX_SOURCES {
+            let source = Source::Ipv4((i as u32).to_be_bytes());
+            sources.take(source, start).unwrap();
+            sources.give_back(source);
+        }
+        assert!(sources.take(Source::Ipv4([10, 0, 0, 1]), start).is_err());
+        let later = start + Duration::from_secs(2);
+        assert!(sources.take(Source::Ipv4([10, 0, 0, 1]), later).is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread")]

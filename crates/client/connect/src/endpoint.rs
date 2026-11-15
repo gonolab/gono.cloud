@@ -17,8 +17,9 @@
 //! connection attempts (noq's `max_incoming`, 65536 by default; `ServerConfigBuilder` only
 //! applies to `Incoming::accept_with`, after that limit was checked). Products accept with
 //! [`crate::Remote::accept_trusted`], which drains the queue at once, refuses attempts beyond a
-//! few concurrent handshakes per second, and closes keys outside the trust list (threat model
-//! C8).
+//! few concurrent handshakes per source and for the endpoint, and closes keys outside the trust
+//! list right after the handshake (threat model C8). iroh's `after_handshake` hook would close
+//! them at the same point, so it is not used.
 //!
 //! Products depend on this crate, never on iroh's configuration directly, so that an iroh
 //! upgrade that adds a default changes one file.
