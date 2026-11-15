@@ -302,6 +302,12 @@ and Caddy. Two settings of Gono Cloud have to match the proxy:
 - `server.trusted_proxies` lists the proxies whose `X-Forwarded-For` headers are believed. The
   default configuration trusts `127.0.0.1` and `::1`, which fits a proxy on the same host.
 
+The proxy is as trusted as Gono Cloud itself: HTTPS ends there, so it sees every password and
+app password that clients send, and with remote access also every device's credential,
+statement and address (`docs/connect-threat-model.md`, section 2). Keep it on a host and under
+an administration you trust as much as the server; a hosting panel that manages it is part of
+that.
+
 ## The relay
 
 Devices of Gono products (Input Show today) connect to each other directly when they can. When

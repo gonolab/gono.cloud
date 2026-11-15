@@ -1,6 +1,7 @@
 # Gono Connect: Control Protocol
 
-- Status: draft for review. This is Phase 0 of `plan/remote-connect-iroh.md`. Part 2b implements
+- Status: reviewed by Input Show NE on 2026-11-16; the changes from that review are in (threat
+  model 9). This is Phase 0 of `plan/remote-connect-iroh.md`. Part 2b implements
   it: the server side is in `crates/server/connect`, the device side in `crates/client/connect`
   (`gono-connect`), and the wire types are in `crates/protocol`.
   Two-step verification (13) is part 2c, in `crates/server/core/src/two_factor.rs` and the
@@ -86,7 +87,7 @@ The words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 | Server origin | `scheme://host[:port]`: lower-case host, no default port, no path, no trailing slash. It is gono-cloud's `server.base_url`, which never has a path |
 | Relay URL | An iroh `RelayUrl` as a string, for example `https://relay.example.com/` |
 | Direct address | `ip:port`, with IPv6 in brackets: `192.0.2.10:51820`, `[2001:db8::1]:51820` |
-| Names | UTF-8, trimmed, 1–64 characters, no control characters |
+| Names | UTF-8, trimmed, 1–64 characters; no control characters, no bidirectional controls (U+202A–U+202E, U+2066–U+2069), and no invisible characters (U+00AD, U+034F, U+061C, U+115F, U+1160, U+17B4, U+17B5, U+180B–U+180F, U+200B–U+200F, U+2028–U+202F, U+205F–U+206F, U+3164, U+FE00–U+FE0F, U+FEFF, U+FFA0, U+FFF0–U+FFFB, U+E0000–U+E0FFF). Names are self-asserted: every prompt and notice that shows another device's name shows its short ID next to it |
 | `product` | `[a-z0-9-]{1,32}`: `input-show`, later `gono-md`, … |
 | `platform` | `[a-z0-9-]{1,32}`: `macos`, `windows`, `linux`, `harmonyos`, `ios`, `android`, … |
 | Service | An ALPN as a string, for example `inputshow/1` |
@@ -138,7 +139,8 @@ key. That data travels as a **statement**:
   - Every context above starts with `gono-connect `, and every signed message is longer than
     32 bytes.
   - A TLS 1.3 `CertificateVerify` message starts with 64 spaces. The iroh relay handshake
-    signs exactly 32 bytes: a BLAKE3-derived challenge, or a TLS exporter value.
+    signs 16 or 32 bytes: 16 bytes of the relay TLS session's exporter, or, when TLS ends at a
+    proxy as with gono-cloud, a 32-byte BLAKE3-derived challenge.
   - So none of the three can be mistaken for another.
 - **The server verifies too.** It verifies every statement before it stores or relays it, and
   refuses invalid ones (S5). Devices verify again on receipt and never rely on the server's
@@ -150,6 +152,10 @@ key. That data travels as a **statement**:
 - **Within version 1, changes are additions only.** New message types, new optional fields
   and new error codes. A field never changes meaning, and a released message never loses a
   field.
+- **Statements only gain information.** Receivers ignore unknown fields (2.2), so a new field
+  in a statement may only add information. A field that narrows what a statement allows (say,
+  "valid only for product X") needs a new `kind`, with its own context: older devices would
+  otherwise apply the statement without the restriction.
 - **Features.** `hello` and `welcome` each list feature strings (`features`). A side uses an
   optional feature only when both lists name it. The features of version 1 are `pairing` and
   `session-reports`. The server sends a feature's events only to devices that negotiated it:
@@ -689,7 +695,11 @@ The server keeps addresses **in memory only**:
   `Endpoint::watch_addr()` changes, at most once a second (coalesced).
 - **Checks.**
   - The relay URL must be the server's relay.
-  - Direct addresses must parse.
+  - Direct addresses must parse, and must not be addresses no peer can reach: the unspecified
+    address, loopback, multicast, the IPv4 broadcast address, port 0, and the IPv4-mapped forms
+    of these. The server refuses a `publish` with any of them, and devices drop them from
+    answers (7.2). iroh filters none of them, so a compromised server could otherwise make a
+    device send probes to its own loopback (Input Show's LAN endpoint) or to multicast groups.
   - Private and link-local addresses are allowed, because two devices on one LAN may reach
     each other through the remote endpoint.
 
@@ -729,8 +739,8 @@ peer, or a product feature needs it.
   connections only from the key that `incoming` named (8.2).
 
 **What the caller checks.** A device refuses a result whose `target` is not the device it
-asked about, ignores a `relay_url` other than the discovery document's, and uses at most 16
-direct addresses.
+asked about, ignores a `relay_url` other than the discovery document's, drops the direct
+addresses that 7.1 refuses, and uses at most 16 direct addresses.
 
 **Recorded.** Every `connect` is recorded in the audit log as `connect.requested`, refused
 ones included.
@@ -779,7 +789,7 @@ it has never shared a LAN with.
 ### 8.1 What devices store
 
 Each trust-list entry holds the fields of Input Show's `TrustedDevice` (`inputshow-config`) and
-three new ones:
+four new ones:
 
 | Field | Content |
 |---|---|
@@ -791,10 +801,28 @@ three new ones:
 | `method` (new) | `lan-sas`, `remote-sas`, `in-person` (QR or invite code), or `vouched` |
 | `vouched_by` (new) | For `vouched`: the endpoint ID of the approver |
 | `request_nonce` (new) | For `vouched`: the nonce of the request (8.3) |
+| `remote` (new) | "One of my devices", decided locally: the peer may reach this device through the remote endpoint, and may vouch (8.5, check 3) |
 
 Entries that exist today have no `method`; they count as `lan-sas`.
 
-Devices also keep the set of endpoint IDs they have seen revoked (9.3).
+**The `remote` flag.** The remote endpoint admits only entries with `remote` (threat model C8),
+and only they can vouch. Without the flag, a direct pairing with somebody else's device (a
+colleague's PC paired on the office LAN) would reach this device over the internet as soon as
+remote access is on, and could vouch through a compromised server (threat model 5.8).
+- Entries added by `remote-sas`, by `vouched`, and by a QR or invite code meant for remote use
+  get it.
+- For `lan-sas` entries the user decides when turning remote access on: the device lists its
+  trust list, ticks in advance the devices that appear in the account's directory, and stores
+  what the user confirms. The directory only suggests; the decision is local, and the user can
+  change it later.
+
+Devices also keep:
+- the set of endpoint IDs they have seen revoked (9.3);
+- the set of **consumed approvals**, keyed by `(approver, request_nonce)`, each until its
+  `expires_at` plus 10 minutes (8.5). It is stored with the trust list, so it is lost only
+  together with it;
+- on N, the nonce of each pairing request it sent, while the request is open and for the
+  longest validity of an approval after it (8.5, check 5).
 
 ### 8.2 Flow
 
@@ -812,7 +840,7 @@ N                         server                         A                      
 │                         │                              │ user taps "Approve"      │
 │                         │ ◀── connect(N, purpose=pair) │                          │
 │ ◀── incoming(A, pair) ─ │ ── result (N's addresses) ─▶ │                          │
-│ ◀═════════ iroh connection, Input Show pairing (6-digit code typed on A) ═══════▶ │
+│ ◀════ iroh connection, Input Show pairing (code typed on A, confirmed on N) ════▶ │
 │                         │ ◀──── pair.approve ───────── │  (statement signed by A) │
 │ ◀── pair.approved ───── │ ──── pair.approved ────────────────────────────────────▶ │
 │ adds each introduced T  │ ── pair.closed ────────────▶ │       T adds N (vouched) │
@@ -832,8 +860,9 @@ The steps:
    - `requester`: the requester's directory entry;
    - `request`: the signed statement.
 
-2. **The user approves on A.** A shows N's name, platform and short ID, and asks: "Approve only
-   a device you have with you right now." On approval:
+2. **The user approves on A.** A shows N's name, platform and short ID (names are
+   self-asserted, 2.1), and asks: "Approve only a device you have with you right now." On
+   approval:
    - A sends `connect` with `purpose: "pair"` and the `request_id`, which is allowed even
      though N does not accept remote connections yet;
    - A dials N through iroh;
@@ -841,10 +870,20 @@ The steps:
      request, and only for pairing.
 3. **Comparison code.** N and A run Input Show's pairing protocol over this connection, end to
    end: version 2, commit-then-reveal with 6 digits, with the code bound to this TLS session
-   through its exporter (`inputshow-net` `pairing.rs`).
-   - N shows the code. The user types it on A; A does not ask "do these match?".
-   - Each side then adds the other as `remote-sas`.
-   - A failed or abandoned comparison ends the flow, and A sends `pair.decline`.
+   through its exporter (`inputshow-net` `pairing.rs`). **Both sides ask their user**, as on the
+   LAN:
+   - N shows the code with "Type this code on <A's name> (<A's short ID>)". The user types it on
+     A, and A checks it; A does not ask "do these match?".
+   - N then asks its own user "Did <A's name> accept the code?". Until the user says yes, N
+     stores nothing: no `remote-sas` entry for A, and A is not an approver N accepts approvals
+     from for this request (8.5, check 5).
+   - The code authenticates N to A; the confirmation on N authenticates A to N. Without it, a
+     server that names its own key in `incoming` could pair with N with no step on N, and then
+     sign approvals that N would apply (threat model 5.2).
+   - Each side adds the other as `remote-sas` only after its own user's step, with both
+     directions allowed, as for a new pairing on the LAN.
+   - A failed or abandoned comparison, or a "no" on either side, ends the flow, and A sends
+     `pair.decline`.
 4. **A signs the approval.** A's user chooses which of A's direct pairings N is introduced to,
    and the directions.
    - The default is A's direct pairings that are devices of the account. For targets that
@@ -935,8 +974,8 @@ The steps:
   T applies them to its entry for N as they are. N applies them to its entry for T the other way
   round: N's `allow_incoming` for T is the statement's `allow_outgoing`.
 - **Both directions.** The approval vouches N to the introduced devices and the introduced
-  devices to N. So N learns their keys from A, whom it has just verified, and not from the
-  server's directory, which could have substituted a key.
+  devices to N. So N learns their keys from A, whom its user has just confirmed in the step of
+  8.2 step 3, and not from the server's directory, which could have substituted a key.
 
 ### 8.5 Checks on receipt
 
@@ -944,24 +983,42 @@ A device D that receives `pair.approved` accepts it only if all of these hold:
 
 1. The signature is valid (2.3).
 2. `server` is D's server origin, and `account` is D's account.
-3. `approver` is in D's trust list with a method other than `vouched`. Vouching goes **one
-   level deep**: a device that was itself vouched for cannot vouch.
+3. `approver` is in D's trust list with a method other than `vouched`, and with `remote`
+   (8.1). Vouching goes **one level deep**: a device that was itself vouched for cannot vouch.
 4. `approver` is not in D's revoked set.
 5. One of these:
    - D is named in `introduced`, and `subject` is the newcomer;
-   - D is `subject.endpoint_id`, and D has a `remote-sas` pairing with `approver` from a
-     request whose nonce is `request_nonce`.
+   - D is `subject.endpoint_id`; `request_nonce` is the nonce of a request D sent itself and
+     still keeps (8.1); and D's user confirmed the `remote-sas` pairing with `approver` for
+     that request (8.2 step 3). D accepts at most one approval per request nonce: the first
+     that passes every check.
 6. `subject.endpoint_id` is not in D's revoked set, and is not D.
 7. D's clock is before `expires_at`, and after `issued_at` minus 10 minutes (to allow for
    clock skew).
 8. D's local policy allows vouched devices. This is a setting that the device's user can turn
    off. When it is off, D keeps the approval as a notice that the local user can accept or
    ignore.
+9. `(approver, request_nonce)` is not in D's set of consumed approvals (8.1).
 
 **Applying it.**
-- D applies the approval with the permissions it names, capped by D's own policy, D6 included.
-- D records `method: vouched`, `vouched_by` and `request_nonce`.
-- Applying the same approval twice changes nothing.
+- **Only additions.** An approval adds entries and never changes one: if D already has an
+  entry for a key the approval names (N on T, an introduced T on N, or A listing itself in
+  `introduced`), that entry stays as it is: its method, flags and name. Otherwise an approval
+  could undo a restriction the local user set, or turn a direct pairing into a vouched one.
+- **Capped by the approver's own rights (SHOULD).** An approver should not grant more than it
+  holds on D: T SHOULD set `allow_incoming` (N may control T) to the statement's
+  `allow_incoming` and its own entry for A's `allow_incoming`, and `allow_outgoing` likewise;
+  N SHOULD cap the reversed flags by its entry for A in the same way. Otherwise a device the
+  user restricted (say, a phone that may not control the home PC) could introduce a device
+  with more rights than it has, which matters most when its key leaks. D's own policy, D6
+  included, caps the flags in any case.
+- D records `method: vouched`, `vouched_by`, `request_nonce` and `remote` (8.1).
+- **Once only.** D adds `(approver, request_nonce)` to its consumed approvals when it applies
+  the approval, or when its user dismisses the notice of check 8. An approval in that set is
+  never applied again, whatever happened to the entries since: a vouched entry that the user
+  removed stays removed, even when the server delivers the approval again (a replay, or an
+  event log replayed from `since = 0`). Only a new request, which needs the user to open a
+  pairing window, can bring it back.
 - An approval that fails a check is dropped, and the device logs it locally.
 
 ### 8.6 Server rules and limits
@@ -998,7 +1055,7 @@ name, platform and ID, and the user approves it there", into:
 
 | Change | Why |
 |---|---|
-| The approver runs the 6-digit comparison with N over an iroh connection, and the user types N's code on A | The server delivers the request and could substitute its own key. Users do not reliably compare 16 hex digits, and a short ID is open to key grinding. The comparison code is already what Input Show uses on the LAN (threat model 5.2) |
+| The approver runs the 6-digit comparison with N over an iroh connection: the user types N's code on A, and confirms on N that A accepted it | The server delivers the request and could substitute its own key. Users do not reliably compare 16 hex digits, and a short ID is open to key grinding. The comparison code is already what Input Show uses on the LAN (threat model 5.2). The code authenticates N to A; the confirmation on N authenticates A to N, which N needs before it applies A's approvals |
 | The approval introduces in both directions | Otherwise N would take T's keys from the server's directory, which a compromised server can forge |
 | Only direct pairings may vouch, one level deep | One vouched device cannot vouch further devices |
 
@@ -1029,7 +1086,9 @@ action opens a confirmation step, and nothing changes until it is confirmed:
 - **What it shows:**
   - the device's name, platform and short ID;
   - that the key can never be used again on this server, and that the account's other devices
-    will forget it, on the LAN as well;
+    will forget it, on the LAN as well. For a product whose LAN identity is the same key
+    (Input Show), the device needs a new identity and must be paired again everywhere,
+    including on the LAN;
   - the devices this device introduced through approvals (8.4), taken from the event log. They
     stay trusted unless the user ticks them here to be revoked as well.
 - **Account page and admin UI.** A separate confirmation page with its own button. The account
@@ -1106,8 +1165,13 @@ device that is still in its user's hands.
   out and offer revocation. An app password alone can sign a device out, so a leaked key and
   app password must not be able to hide the device from the user or move the key to another
   account.
-- **The account page offers only revocation.** A user cleaning up there is either retiring a
-  device or has lost it, and revocation is the safe choice in both cases.
+- **The account page offers both, clearly apart.** "Stop remote access for this device" signs
+  the device out as above (the key stays bound to the account, nothing is forgotten, and the
+  device can register again). "Revoke" is for a device that is lost, stolen or compromised
+  (9.1). A user who only wants to stop remote access for one computer must not have to pay
+  for it with all of that computer's pairings, which revocation costs a product like Input
+  Show. The page says which one to pick. A signed-out entry stays on the page and stays
+  revocable, so a leaked key and app password still cannot hide the device.
 
 ---
 
@@ -1133,7 +1197,7 @@ device that is still in its user's hands.
 | `pair.withdraw` | device N | its own request |
 | `session` report | a device | the peer is a device of the account; one side of the session must be the reporter |
 | Revoke a device | a user / an admin | after the second confirmation (9.1). The user: own account, session past the second step. The admin: any account |
-| Sign out | a device | itself |
+| Sign out | a device / a user | the device itself; or its user on the account page, with a session past the second step (9.4) |
 | Relay admission | endpoint E | 11.1 |
 | Two-step verification | a user / an admin | 13 |
 
@@ -1442,4 +1506,5 @@ so in-memory state never carries over to a newer row.
    rows be aggregated?
 5. **Unattended targets and the control channel.** Should a target refuse remote sessions when
    its last `welcome` is older than 24 hours, so that it cannot miss revocations for long? The
-   threat model recommends it (C14); Input Show decides.
+   threat model recommends it (C14). Input Show adopts it for incoming remote sessions, after
+   24 hours; outgoing remote sessions and LAN use are unaffected (NE review, 2026-11-16).

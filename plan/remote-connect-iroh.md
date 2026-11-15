@@ -231,8 +231,10 @@ would only help diagnostics. The channels map one to one:
 ### 3.4 Identity, pairing and trust
 
 - **What pairing stores.** The peer's `EndpointId`, which is its device ID.
-- **iroh needs the key before dialing.** The dialer puts the expected key into the SNI, and the
-  handshake fails on any other key; there is no accept-any mode. Consequences:
+- **iroh needs the key before dialing.** The dialer puts the expected key into a server name
+  that only its own verifier reads (iroh 1.4.1 sends no SNI, so an observer does not see which
+  device is dialed), and the handshake fails on any other key; there is no accept-any mode.
+  Consequences:
   - Devices found by mDNS dial directly, because the TXT record carries the full ID.
   - A typed address first goes through the "who are you" exchange (D5). It is unauthenticated: the
     6-digit comparison that follows authenticates the key.
@@ -394,8 +396,13 @@ and 2; Phase 4 needs the gates listed in it. The sizes are estimates.
     - a leaked device key: is revocation complete?
 - **Deliverables**: the protocol specification and the threat model under `docs/`.
 - **Done when**: both projects have reviewed them.
-- **Status**: drafted as `docs/connect-protocol.md` and `docs/connect-threat-model.md`;
-  waiting for Input Show NE's review. Decisions taken while drafting:
+- **Status**: drafted as `docs/connect-protocol.md` and `docs/connect-threat-model.md`, and
+  reviewed by Input Show NE on 2026-11-16 (Input Show
+  `docs/notes/NE-汇报-connect-protocol-review.md`); the review's changes are in both documents
+  (threat model 9). Decided with the user: remote pairing gets a confirmation on the new device
+  (F-02, the minimum fix rather than a code each way); devices remember consumed approvals
+  (F-07); approvers cannot grant more than they hold stays a SHOULD (F-08). Decisions taken
+  while drafting:
   - Remote pairing runs Input Show's 6-digit comparison (version 2, bound to the TLS exporter)
     between the approver and the new device over iroh, with the code typed on the approver.
   - The approval introduces in both directions, so the new device takes its peers' keys from

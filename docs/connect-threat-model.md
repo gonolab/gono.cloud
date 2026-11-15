@@ -56,6 +56,12 @@ listed in section 8.
 | Device ↔ device | Input, clipboard, pairing | TLS 1.3 with raw public keys, end to end |
 | Device ↔ its own storage | Device key, trust list, app password | The operating system (C13) |
 
+**The reverse proxy is part of the trusted base.** TLS from devices and browsers ends at nginx
+or Caddy, so whoever controls the proxy sees every device's app password (Basic auth on each
+WebSocket upgrade), every statement and every published address, and can answer as the server.
+It is the compromised gono-cloud of 5.2, on a host that is often shared with other sites or run
+by a hosting panel. `docs/deployment.md` says so.
+
 ---
 
 ## 3. Assets
@@ -83,7 +89,7 @@ listed in section 8.
 | G4 | A revoked device loses relay access and the control channel at once, and every device that learns of the revocation stops trusting it on every path |
 | G5 | Addresses of a device go only to devices of its own account, and each first disclosure is recorded and announced to the target |
 | G6 | Taking over remote access needs the account password and a second factor, and even then it gives no device trust |
-| G7 | LAN use works without gono-cloud and reveals nothing to it |
+| G7 | LAN use works without gono-cloud and reveals nothing to it. A revocation, which devices take on the server's word, still reaches LAN pairings: a compromised server can make devices forget LAN peers (5.2, R6) |
 | G8 | Metadata is kept to what the features need, and content never reaches the server |
 
 ---
@@ -140,8 +146,9 @@ protocol 1.1).
 
 ### 5.2 A compromised gono-cloud
 
-This covers an attacker with control of the gono-cloud process, its database or its host, and
-an operator who runs gono-cloud for other people and turns malicious.
+This covers an attacker with control of the gono-cloud process, its database or its host, or
+of the reverse proxy in front of it (2), and an operator who runs gono-cloud for other people
+and turns malicious.
 
 **It can:**
 - **deny service:** refuse sign-ins, hide devices, drop the control channel, stop the relay;
@@ -153,7 +160,9 @@ an operator who runs gono-cloud for other people and turns malicious.
   - announce false `incoming` connections;
 - **hold back or delay** revocations, approvals and notices;
 - **revoke devices.** This only removes trust, but revoked keys never come back, so the user
-  has to re-pair those devices;
+  has to re-pair those devices. Devices apply a revocation to LAN pairings too (protocol 9.3),
+  so the server can make them forget any key, also a LAN peer that was never in the account,
+  by claiming it was registered and revoked. This is denial of service, not added trust (R6);
 - **read metadata:** devices, presence, addresses, the audit log;
 - **phish the account.** It serves the sign-in page, so it can capture the password and a live
   second-step code;
@@ -169,7 +178,16 @@ an operator who runs gono-cloud for other people and turns malicious.
 - **pass off a forged key to a newcomer.** The newcomer N learns its peers' keys from the
   approval, which the approver signed, and not from the directory (protocol 8.4). Without this,
   a compromised server could hand N a false "Home PC" key, and the user would type passwords
-  into the attacker's endpoint.
+  into the attacker's endpoint. What makes the approver itself genuine for N is N's own step:
+  N's user confirms that the approver accepted the code, and N stores the pairing and accepts
+  approvals from it only after that (protocol 8.2 step 3). The code is an output of the
+  exchange, so typing it on the approver authenticates N to the approver only. Without the
+  step on N, the server could name its own key in `incoming`, pair with N with nobody
+  checking on N, and sign approvals that introduce its own devices to N, in both directions.
+- **bring back a device the user removed.** Approvals are valid for 30 days, and the server
+  could deliver one again (or replay the event log to a device that lost its cursor). Devices
+  remember the approvals they consumed and never apply one twice (protocol 8.5), so a vouched
+  entry the user removed stays removed.
 - **read or change session traffic**, or impersonate a device (5.1).
 - **use a fabricated pairing request to get anything signed.** The approver dials the key in
   the request and runs the comparison code with it. The attacker's endpoint can complete the
@@ -317,6 +335,23 @@ on the same server can:
 - admission only of registered devices of accounts with two-step verification (S7), so the
   people on a self-hosted relay are the operator's own users.
 
+**What a stranger can still do after a handshake.** The remote endpoint accepts any client
+key in the TLS handshake and closes unknown keys right after it. iroh, however, acts on the
+peer's NAT-traversal frames itself (noq's `REACH_OUT`): a peer that completes a handshake can
+name up to 32 addresses per round, loopback and the LAN included, to which the device sends
+1200-byte probe packets. Closing the connection right after the handshake bounds this to the
+frames that arrive with the client's last flight. iroh filters no address there, and has no
+switch to hold NAT traversal until the application accepted the peer. `gono-connect` should
+refuse unknown keys as early as iroh allows, and upstream issues ask for an address filter
+and for that switch (plan V9). The addresses the control plane hands out are filtered
+(protocol 7.1).
+
+**Starving the handshake budget.** The limits of C8 are for the whole endpoint. One stranger
+who starts the allowed number of handshakes every second, or leaves them unfinished, would
+keep the user's own devices out. So the budget is kept per source first: per relay source label
+for relayed attempts (an honest relay labels frames with the sender's authenticated key) and
+per IP address (/64 for IPv6) for direct ones, before the global limit (C8).
+
 **Remaining:** handshake load, and presence probing by other users of the same server (R7).
 
 ### 5.7 Network attacker
@@ -333,8 +368,8 @@ This covers anyone on the path: public Wi-Fi, an ISP, a state.
     behind lost packets (plan R8);
   - blocking the relay, which ends remote access;
   - spoofing DNS, which fails against certificate validation;
-  - spoofing the plain-HTTP `/generate_204` answer, which affects only iroh's network report,
-    not security.
+  - spoofing the plain-HTTP `/generate_204` answer, which would affect only iroh's network
+    report, not security. Gono's devices skip that check altogether (`gono-connect`).
 
 ### 5.8 A trusted peer that turns malicious
 
@@ -347,8 +382,10 @@ pairing. What remote access adds:
   approvals from devices outside the account (protocol 8.6). A compromised server would
   deliver it, and the target would accept it, because the `account` field is self-asserted.
   This needs a compromised server and a malicious paired device acting together (R8).
-- **Mitigations:** notices (C10); the setting that turns acceptance of vouched devices off
-  (protocol 8.5, check 8).
+- **Mitigations:** only trust entries that the local user marked as their own devices
+  (`remote`, protocol 8.1) may vouch or reach the device remotely, so a colleague's PC paired
+  on the LAN can do neither unless the user says so; notices (C10); the setting that turns
+  acceptance of vouched devices off (protocol 8.5, check 8).
 
 ### 5.9 Denial of service against gono-cloud
 
@@ -372,6 +409,28 @@ Mitigations:
 - keeping iroh behind `gono-connect`;
 - the CI test that a configured endpoint contacts no one but the peer and our relay (plan
   3.5).
+
+### 5.11 A hostile device inside the account
+
+A device registered in the account but in nobody's trust list: registered by an attacker after
+an account takeover (5.5), or a vouched device that turned hostile.
+
+**It can:**
+- see the directory and presence of the account;
+- `connect` to any device that accepts remote connections: recorded, announced to the target,
+  and refused by the target's trust list;
+- decline every pairing request of the account (`pair.decline` is open to any device of the
+  account), which is denial of service;
+- dial a requester for pairing in a race with the real approver. It gains nothing: the
+  requester's user confirms which approver accepted the code (protocol 8.2 step 3), and the
+  requester accepts a pairing connection only for its own pending request;
+- send session reports that pollute the audit log.
+
+**It cannot** control any device, or get one to trust it or another device: trust lists decide
+(G1, G3).
+
+**Mitigations:** notices of new devices on every device of the account, the device list on the
+account page, and revocation.
 
 ---
 
@@ -449,17 +508,17 @@ These are the rules the analysis depends on. V9, the security review, checks eac
 |---|---|---|
 | C1 | The trust list is local. The server's directory is never a source of trust | 1.1, 8 |
 | C2 | Peers are dialed by key. Keys come from the trust list or from a verified approval, never from the directory alone. Addresses and relay source labels are never identity | 1.1, 8.4 |
-| C3 | Every statement is verified strictly, with all checks of protocol 8.5. Vouching goes one level deep | 2.3, 8.5 |
-| C4 | Remote pairing uses Input Show's pairing protocol (version 2, bound to the TLS exporter), with the code typed on the approver | 8.2 |
+| C3 | Every statement is verified strictly, with all checks of protocol 8.5. Vouching goes one level deep. Consumed approvals are remembered until they expire, so none is applied twice | 2.3, 8.5 |
+| C4 | Remote pairing uses Input Show's pairing protocol (version 2, bound to the TLS exporter), with a user step on both sides: the code typed on the approver, and a confirmation on the new device before it stores anything | 8.2 |
 | C5 | On a revocation: add the key to the revoked set, close sessions, remove the entry (LAN pairings included), list the entries it vouched for and offer to remove them, and report `revocations.applied` | 9.3 |
 | C6 | On `4003`: stop using the credentials and never register the key again. On `503` or `1011`: never treat it as signed out | 5.1, 5.4, 9.3 |
 | C7 | Nothing is granted because of `incoming`, presence, or any claim the server makes; revocation is the only thing taken on the server's word | 7.2 |
-| C8 | On the remote endpoint, keys outside the trust list are closed right after the handshake. The only exception is the pairing connection that `incoming` announced for a pending request. Pending handshakes and the handshake rate are limited. `gono-connect`'s `Remote::accept_trusted` applies the product's predicate right after the handshake and limits pending handshakes; iroh 1.4.1 has no endpoint-wide limit on connection attempts | 8.2, 11.3 |
+| C8 | On the remote endpoint, keys outside the trust list, and entries without `remote`, are closed right after the handshake. The only exception is the pairing connection that `incoming` announced for the device's own pending request. Pending handshakes and the handshake rate are limited, per source first (relay source label, or IP address and /64) and then for the endpoint. `gono-connect`'s `Remote::accept_trusted` applies the product's predicate right after the handshake and enforces the limits; iroh 1.4.1 has no endpoint-wide limit on connection attempts | 8.1, 8.2, 11.3 |
 | C9 | `accept_remote` and unattended access (plan D6) are enforced on the device. The controlled device shows "being controlled by …" with one-click disconnect | 6.1 |
 | C10 | Every device added by an approval is announced on the device that accepted it, naming the approver. A setting turns acceptance of vouched devices off | 8.5 |
 | C11 | Only remote sessions are reported; LAN sessions never are | 12.2 |
 | C12 | Logged events are processed in order, and the cursor is stored only after acting on them | 5.6 |
-| C13 | The device key and the app password are kept in the operating system's protected storage where it has one: Keychain; DPAPI, or TPM-backed storage, on Windows; a key wrapped by the Android Keystore; HUKS on HarmonyOS. Otherwise a file with mode 0600, as Input Show does today | — |
+| C13 | The device key and the app password are kept in the operating system's protected storage where it has one: Keychain; DPAPI, or TPM-backed storage, on Windows; a key wrapped by the Android Keystore; HUKS on HarmonyOS. Otherwise a file with mode 0600, as Input Show does today. This protects the key at rest only: iroh needs the secret key in process memory to sign TLS handshakes, so the protected storage wraps the stored seed and cannot keep the key in hardware | — |
 | C14 | (SHOULD) Remote sessions are refused when the last `welcome` is older than 24 hours (configurable). LAN use is unaffected. `gono-connect` tells when the server was last heard from (`ControlChannel::last_heard`) | 16 |
 | C15 | The iroh endpoint is configured as in plan 3.5, with exactly the discovery document's `relay_url` | 3 |
 | C16 | Every signature made with the device key outside TLS and iroh uses a context of protocol 2.3. No data from the server is ever signed as it is | 2.3 |
@@ -477,7 +536,7 @@ These are the rules the analysis depends on. V9, the security review, checks eac
 | R5 | Social engineering of the remote pairing | No code stops a user from approving the attacker's own device | Prompt wording; notices; audit |
 | R6 | Denial of service by the server or the network | Availability against a compromised server is not a goal | — |
 | R7 | Other users of the same relay can cause handshakes and probe presence | iroh-relay 1.4.1 decides per connection | Per-pair policy on hosted relays |
-| R8 | A compromised server together with a malicious directly paired device from another account can introduce devices | It needs two parties; the approval is announced | — |
+| R8 | A compromised server together with a malicious directly paired device from another account can introduce devices | Mitigated: only entries the local user marked as their own (`remote`, protocol 8.1) may vouch. What remains needs the user to have marked such a device as their own, and the approval is announced | — |
 | R9 | A peer that has not heard of a revocation can be reached directly by the revoked key | Bounded by C14 | Measure the delays in 2b |
 
 ---
@@ -492,6 +551,25 @@ reviews:
 - whether to adopt C14.
 
 The review is done when both projects have signed it off (plan 4.1).
+
+**Input Show NE's review (2026-11-16)** of this document, the protocol and their
+implementation at gono.cloud `4831c3a` (Input Show `docs/notes/NE-汇报-connect-protocol-review.md`)
+found the design sound and three MUST items, two of them here:
+- remote pairing authenticated only the new device to the approver: the new device now asks
+  its user too (protocol 8.2 step 3, C4, 5.2);
+- a replayed approval re-added devices the user had removed: devices now remember consumed
+  approvals (protocol 8.5, C3, 5.2).
+
+Also taken over: approvers cannot grant more than they hold (SHOULD), approvals only add
+entries, a local `remote` flag per trust entry that decides who may vouch and reach a device
+remotely (R8 mitigated), one approval per request on the new device, the rule that statements
+only gain information, display-safe names, the address filter (protocol 7.1), "stop remote
+access" next to revocation on the account page (protocol 9.4), per-source handshake budgets
+(C8), the reverse proxy in the trusted base (2), a hostile device inside the account (5.11),
+NAT-traversal frames from strangers (5.6), and C13's limit. The answers to the questions above:
+C4, C8, C9, C10 and C13 fit `inputshow-net`; the trust list gains `remote` and the consumed
+approvals; acceptance of vouched devices is **on** by default, because only `remote` entries
+can vouch; Input Show adopts C14 for incoming remote sessions.
 
 **Review of the implementation (November 2026).** Before the first deployment, the server side
 (parts 2b and 2c) and `gono-connect` were reviewed against this document, area by area:
