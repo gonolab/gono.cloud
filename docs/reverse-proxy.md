@@ -251,8 +251,8 @@ the settings, the allowed devices and the certificate. The relay serves plain HT
 |---|---|
 | A host name of its own, `relay.public_url` (for example `relay.example.com`) | The relay cannot run below a path, so it cannot share `base_url`'s host name. |
 | Forward everything on that host name to `relay.bind`, upgrading WebSockets | Devices hold a WebSocket open on `/relay` and probe `/ping`. |
-| Answer `/generate_204` over **plain HTTP** on port 80 instead of redirecting it | Devices use it to detect captive portals. The usual "redirect all of port 80 to HTTPS" breaks it. |
-| Keep the ACME challenges of the relay's certificate away from the relay | Everything else on the host name goes to the relay, which answers `/.well-known/acme-challenge/` with 404: a renewal that proves the host name over HTTP (certbot `--webroot`) needs a location of its own. |
+| Answer `/generate_204` over **plain HTTP** on port 80 instead of redirecting it | iroh clients use it to detect captive portals; the usual "redirect all of port 80 to HTTPS" breaks it. Gono's devices skip that check, so the relay works without it, for example where port 80 is intercepted ([deployment.md](deployment.md#hosts-in-mainland-china)). |
+| Keep the ACME challenges of the relay's certificate away from the relay | Everything else on the host name goes to the relay, which answers `/.well-known/acme-challenge/` with 404: a renewal that proves the host name over HTTP (certbot `--webroot`) needs a location of its own. Hosts in mainland China without an ICP filing need DNS validation instead ([deployment.md](deployment.md#hosts-in-mainland-china)). |
 | Keep idle WebSockets open | A device keeps its relay connection while it is online, quiet between pings. |
 | No HTTP/2 needed | Devices open the WebSocket over HTTP/1.1. |
 

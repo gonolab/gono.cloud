@@ -316,7 +316,7 @@ What it needs:
 | | |
 |---|---|
 | **A host name of its own** | For example `relay.example.com`, with DNS pointing at this host and a certificate. The relay cannot run below a path, so it cannot share `base_url`'s host name. |
-| **A server block in the reverse proxy** | HTTPS for the host name, WebSockets forwarded to `relay.bind` (`127.0.0.1:16103`), and `/generate_204` over plain HTTP: [reverse-proxy.md](reverse-proxy.md#the-relay). |
+| **A server block in the reverse proxy** | HTTPS for the host name and WebSockets forwarded to `relay.bind` (`127.0.0.1:16103`); on port 80, `/generate_204` and the ACME challenges of the certificate: [reverse-proxy.md](reverse-proxy.md#the-relay). Gono's devices do not need port 80. |
 | **UDP 7842 open** (for QAD) | Devices reach QAD directly, not through the proxy. |
 | **A copy of the certificate** (for QAD) | QUIC brings its own TLS, so the relay needs the certificate of its host name and the key, readable by the service user. |
 | **An https `base_url`** | Devices register and keep their control channel on the main host name (`/gono/v1/`), with their credentials; without HTTPS, remote access is off and the relay admits only `relay.allowed_endpoints`. |
@@ -400,6 +400,28 @@ data directory (`caddy environ` shows it), in
 and `.key`.
 
 On macOS the directory is `/usr/local/etc/gono-cloud/relay-tls/` and the group `_gono-cloud`.
+
+### Hosts in mainland China
+
+Cloud providers in mainland China (Tencent Cloud, Alibaba Cloud and others) intercept plain
+HTTP on port 80 for domains without an ICP filing (备案): clients get a redirect to the
+provider's block page, although the server's access log shows the request answered as usual.
+For the relay's host name, and for `base_url`'s, this means:
+
+- **Certificates need DNS validation (DNS-01).** HTTP-01 fails: the CA reads the block page
+  instead of the challenge, and reports an error such as `reader size limit exceeded`. This
+  applies to every client that validates over port 80: certbot's webroot and nginx plugins,
+  Caddy's HTTP challenge, and the file validation of hosting panels. Use certbot with a DNS
+  plugin, acme.sh with the DNS API of your DNS provider, Caddy with a DNS provider module, or
+  the DNS validation of the panel. Renewals use the same validation as the first issue, so
+  switch before the certificate is due.
+- **Probes on port 80 are unavailable.** `/generate_204` over plain HTTP returns the block
+  page. Gono's devices do not use it (they skip iroh's captive-portal check), so remote
+  access works without it; other iroh clients would take the block page for a captive
+  portal, which only makes them probe again more often.
+- **HTTPS on port 443 and UDP 7842 were not intercepted** when this was written: the relay's
+  WebSocket, its HTTPS probe, QUIC address discovery and the control channel work. Providers
+  may extend the block; an ICP filing, or a host outside mainland China, avoids it.
 
 ### Checking it
 
