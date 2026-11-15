@@ -283,7 +283,7 @@ the user notice:
 | What the attacker has | What it gives |
 |---|---|
 | The web password only, two-step verification on | Nothing beyond the failed second step. The user sees "your password was entered correctly" on the account page (protocol 13.3) |
-| The web password only, no two-step verification | The account's files (outside this document) and no remote access, which is unavailable without verification. The attacker could enrol verification and lock the user out; an admin reset restores the account. Every user should enrol |
+| The web password only, no two-step verification | The account's files (outside this document) and no remote access, which is unavailable without verification. The attacker could enrol verification with its own authenticator, lock the user out, and register devices of its own, which get the directory and the relay but **no device's trust**: pairing still needs the comparison code on a device of the user's. Enrolling ends every other browser session, the user's included, which the user notices; an admin reset restores the account. Every user should enrol |
 | A device's app password only (a proxy log, a leaked config) | No file access (protocol 4.5). No control channel either, since `hello` needs a signature by the device key (protocol 5.2). It can sign the device out (protocol 9.4), which is a denial of service: the device needs the user's consent to register again, and the key stays bound to the account |
 | Password and a live second-step code (real-time phishing) | A web session: register devices, revoke devices (each confirmed twice), turn verification off, read the audit log and presence. **No device trust:** pairing still needs the comparison code on a device of the user's |
 

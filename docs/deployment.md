@@ -219,8 +219,10 @@ for devices is available only on accounts that have it on.
 - **The server's clock must be right** (NTP): codes change every 30 seconds.
 - **The key file.** The TOTP secrets are encrypted with the key in `two_factor.key_file`,
   `/etc/gono-cloud/two-factor.key` (on macOS `/usr/local/etc/gono-cloud/two-factor.key`). The
-  install script creates it (32 random bytes, `root:gono-cloud`, mode 0640) and never
-  replaces it; `config check` shows whether it exists. **Back it up with the configuration,
+  install script creates it at the path the configuration names (32 random bytes,
+  `root:gono-cloud`, mode 0640) and never replaces it, nor a symbolic link put there;
+  `config check` shows whether it exists. Keep it out of the data directory and the database's
+  directory, which `serve` warns about. **Back it up with the configuration,
   apart from the database**: a copy of the database alone does not give the second factor
   away. Without the file, accounts with two-step verification cannot sign in, so `serve`
   refuses to start while any account uses it; restore the file, or reset those accounts with
@@ -229,9 +231,11 @@ for devices is available only on accounts that have it on.
   and on again, or an admin resets it (the account's page in the admin UI, or
   `user reset-two-factor`). The account then signs in with its password alone until it turns it
   on again.
+- **Turning it on ends the account's other browser sessions**, so that a session opened with
+  the password alone does not outlive it.
 - **Failures.** After 5 wrong codes in 15 minutes, or 20 in a day, the second step of the
   account is locked until the window passes. The account page shows its user when the password
-  was right but the code was not.
+  was right but the code was not, and when a recovery code was used.
 
 ## Service management
 

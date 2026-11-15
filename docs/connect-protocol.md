@@ -1289,18 +1289,30 @@ the feature `session-reports`.
   1. The page shows a QR code and the base32 secret in groups of four. The QR code is an SVG
      rendered on the server, since the pages work without scripts. It encodes:
      `otpauth://totp/Gono%20Cloud:<username>?secret=<base32>&issuer=Gono%20Cloud&digits=6&period=30`
-  2. The user enters a code, which turns verification on.
+  2. The user enters a code, which turns verification on. In the same transaction, every
+     other browser session of the account ends: a session opened with the password alone
+     must not keep what only the second step gives from then on (granting registrations,
+     revoking devices, "Allow pairing").
   3. The page then shows the recovery codes once (13.4).
+
+  The secret being enrolled and the recovery codes waiting to be shown are bound to the
+  browser session and to its account.
 
 ### 13.3 Signing in
 
 1. **Password.** The sign-in form checks the web login password as today.
 2. **The pending sign-in.** If the account has two-step verification, no session is created
    yet. The server sets a pending-sign-in cookie instead: a random token, bound to the
-   account, valid for 5 minutes and usable once. It then shows the code form.
+   account by its ID, valid for 5 minutes and usable once. It then shows the code form.
+   - An account has at most 5 pending sign-ins and a client at most 20 (IPv6 counted per
+     `/64`), 1000 in all. A new one ends the oldest instead of being refused, so nobody can
+     fill the table and block other people's sign-ins.
+   - A pending sign-in ends when the account's password changes, when it is disabled or
+     deleted, and when its verification is turned off or reset.
 3. **The code.** The form at `/login/two-step`, shared by every sign-in form, takes a TOTP code
    or a recovery code, and only a correct one creates the session; the sign-in then continues
-   where it started (the file UI, the admin UI, a consent page). Five wrong codes end the
+   where it started (the file UI, the admin UI, a consent page), with the account looked up by
+   its ID and refused if it changed since the password was checked. Five wrong codes end the
    pending sign-in, and the password must be entered again.
 
 **Limits.**
@@ -1308,6 +1320,11 @@ the feature `session-reports`.
 - Failed codes are also counted **per account**, from the audit log: after 5 in 15 minutes or
   20 in 24 hours, the second step is locked for that account until the window passes. The
   same codes guard the forms that renew recovery codes and turn verification off.
+- **One at a time.** The codes of one account are checked one after the other: the lock
+  check, the verification and the record of a failure never interleave, so codes sent in
+  parallel cannot all pass the lock check before the first failure is recorded. The attempt
+  of the pending sign-in and the client's limiter count before a code is verified, and a
+  failure that cannot be recorded answers "try again later" and never lets a code through.
 - The account page shows failures to its user: "your password was entered correctly but the
   second step failed, at … from …". They are recorded as `two_factor.failed` and
   `two_factor.locked`.
@@ -1318,7 +1335,8 @@ the feature `session-reports`.
   shown once.
 - **Storage.** Only their SHA-256 digests are stored: 80 random bits are enough for a fast
   hash.
-- **Use.** Each code works once. Using one is recorded and shown on the account page.
+- **Use.** Each code works once. Using one is recorded with the client IP and shown on the
+  account page, and a sign-in with one says how many codes are left.
 - **Renewal.** Generating new codes (password and a code required) replaces all of them.
 
 ### 13.5 Turning it off, and resets
@@ -1339,8 +1357,12 @@ the feature `session-reports`.
 **Encryption.** TOTP secrets are encrypted with a 32-byte key that lives outside the database
 directory, in `two_factor.key_file` (`two-factor.key` next to the configuration file by
 default):
-- created by the install script as root (mode 0640, owner root, group `gono-cloud`), and by
-  `init` and `serve` when they can write there; never replaced once it exists;
+- created by the install script as root (mode 0640, owner root, group `gono-cloud`) at the
+  path the configuration names, and by `init` and `serve` when they can write there. It is
+  written to a temporary file, synced and then linked into place, so a crash leaves no
+  partial key, and it is never replaced once it exists, a symbolic link included;
+- `config check` and `serve` warn when it lies in the data directory, or in the database's
+  directory when that is not the configuration directory;
 - ChaCha20-Poly1305 from ring;
 - a random 96-bit nonce, stored before the ciphertext;
 - associated data `gono-cloud totp v1` and the user ID, so a secret cannot be moved to another
@@ -1402,7 +1424,7 @@ so in-memory state never carries over to a newer row.
 | Event log | 45 days; 1000 events per `welcome`, 512 KiB of them inside it |
 | Address cache on devices | 10 minutes |
 | Failed second steps per account | 5 per 15 minutes; 20 per 24 hours |
-| Pending sign-in | 5 minutes, used once |
+| Pending sign-in | 5 minutes, used once; 5 per account, 20 per client, 1000 in all |
 | Audit retention | 180 days (configurable) |
 
 ---

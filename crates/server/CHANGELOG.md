@@ -36,13 +36,16 @@ compatible within a major version: released clients keep working with newer serv
   Only accounts with two-step verification on have remote access. The account page lists the
   devices;
   revoking one (account page, admin UI, `gono-cloud device revoke`) is final for its key, needs
-  a second confirmation, disconnects it at once and tells the account's other devices. An audit
-  log records registrations, revocations, connection requests, pairings and reported sessions.
+  a second confirmation, disconnects it at once and tells the account's other devices. A device
+  that signs out stays listed as signed out and can still be revoked; its key can register
+  again only into the same account. An audit log records registrations, revocations,
+  connection requests, pairings and reported sessions.
 
 - **Two-step verification** (TOTP) of web sign-ins. Users turn it on on the account page with a
   QR code and keep ten recovery codes; every web sign-in (file UI, admin UI, the sign-in pages of
   Nextcloud apps and devices) then asks for a code at `/login/two-step`. Codes work once;
-  wrong codes lock the step of the account for a while, and the account page shows them. Admins
+  wrong codes lock the step of the account for a while, and the account page shows them and
+  the use of recovery codes. Turning it on ends the account's other browser sessions. Admins
   reset it in the admin UI, operators with `gono-cloud user reset-two-factor`. The secrets are
   encrypted with a key in the configuration directory, `two_factor.key_file`
   (`two-factor.key`), which the install script, `init` and `serve` create when missing; back it
