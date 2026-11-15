@@ -96,7 +96,10 @@ The words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 - All bodies and WebSocket frames are UTF-8 JSON objects with snake_case field names.
 - Receivers ignore unknown fields.
 - Optional fields may be absent or `null`, and the two mean the same.
-- A frame or body over 64 KiB is refused (11.1).
+- A frame or body that a device sends over 64 KiB is refused; on the control channel, with
+  the close code `1009` (5.4).
+- Messages the server sends stay below 4 MiB, and devices refuse larger ones. The `welcome`
+  keeps to that by sending part of the event backlog after it (5.6).
 
 ### 2.3 Signed statements
 
@@ -148,7 +151,8 @@ key. That data travels as a **statement**:
   field.
 - **Features.** `hello` and `welcome` each list feature strings (`features`). A side uses an
   optional feature only when both lists name it. The features of version 1 are `pairing` and
-  `session-reports`.
+  `session-reports`. The server sends a feature's events only to devices that negotiated it:
+  `pair.requested` and `pair.closed` go to devices with `pairing`.
 - **Breaking changes** get a new path (`/gono/v2/`), served next to v1 for at least the
   support period of the last release that spoke only v1.
 
@@ -360,8 +364,8 @@ app_password)`.
 | `503` | The server cannot check credentials now | Retry with backoff. This is never "signed out" |
 
 **One connection per device.** A new connection of the same device closes the older one with
-`4001`. When connections keep replacing each other from different client addresses, that is
-recorded as `device.flapping` (12).
+`4001`, and the older one answers no further request. When connections keep replacing each
+other from different client addresses, that is recorded as `device.flapping` (12).
 
 ### 5.2 Handshake
 
@@ -414,6 +418,18 @@ The `hello` statement:
 
 A failure is answered with an `error` and the close code `4000`. So an app password without
 the device key cannot open the channel (threat model 5.5).
+
+**After the checks**, once the connection is registered, the server reads the device's entry
+again: a revocation or sign-out that happened after the upgrade was authenticated refuses the
+`hello` too. So does a device that opens more than 20 connections a minute.
+
+| Refusal | `error` code | Close code | Device |
+|---|---|---|---|
+| Bad proof, malformed `hello` | `bad_signature`, `bad_request` | `4000` | Do not retry with the same credentials |
+| Signed out since the upgrade | `not_found` | `4000` | As `4000` |
+| Revoked since the upgrade | `not_permitted` | `4003` | As `4003` (9.3) |
+| Over 20 connections a minute | `rate_limited` | `4029` | Reconnect after 60 seconds |
+| The server's own trouble | `unavailable` | `1011` | Reconnect with backoff |
 
 **Other fields of `hello`:**
 - `since` is the last event sequence number the device has processed (5.6); `0` on first use.
@@ -546,7 +562,9 @@ Some events must reach devices that are offline when they happen. These are:
   where other accounts' events are.
 - A device sends the last `seq` it has processed in `hello.since`, and with `ack {"seq": n}`
   as it goes.
-- `welcome.events` carries the retained events after `since`, at most 1000 of them.
+- The retained events after `since` are due, at most 1000 of them; when more are due, the
+  newest 1000. `welcome.events` carries the first of them, up to 512 KiB; the server sends the
+  rest right after the `welcome`, in order, as ordinary event messages, before any live one.
   `welcome.cursor` is the last `seq` the server had handed out when it built the `welcome`; the
   server does not send the same events again live.
 - The server sends events as its event log has them, whichever process wrote them: a
@@ -560,7 +578,9 @@ Some events must reach devices that are offline when they happen. These are:
 **Retention.** Events are kept for 45 days; approvals are valid for 30 (8.4).
 
 **When events are missing.** If a device's `since` is older than the oldest retained event,
-or more than 1000 events are due, `events_truncated` is true. The device then:
+or more than 1000 events are due, `events_truncated` is true. The newest 1000 are sent then:
+the snapshot covers the older additions and revocations, and the newest approvals are the
+ones still valid. The device then:
 - acts on the `devices` snapshot, which holds every revocation (9.2);
 - misses the approvals it did not see, so those pairings must be approved again.
 
@@ -603,7 +623,8 @@ or more than 1000 events are due, `events_truncated` is true. The device then:
 ### 6.2 Who sees what
 
 Every device of an account sees every directory entry of that account, its own included, and
-nothing of other accounts.
+nothing of other accounts. Signed-out entries (9.4) are left out until the device registers
+again.
 
 | Event | When | Fields |
 |---|---|---|
@@ -702,11 +723,14 @@ writing to the audit log. It backs iroh's `AddressLookup` in `gono-connect` whil
 is set up or kept alive.
 
 It is allowed only if the caller:
-- sent `connect` for that target in the last 10 minutes, or
-- has reported a session with it that has not ended (12.2).
+- was allowed `connect` for that target in the last 10 minutes, and that `connect` would still
+  be allowed: the target still accepts remote connections and the service, or the pairing
+  request is still pending; or
+- has reported a session with it that has not ended (12.2), for at most 24 hours.
 
 So every first disclosure of a device's addresses is a recorded `connect` that the target
-hears about.
+hears about. What a device was allowed, like its rate limits (15), is kept per device and not
+per connection, so reconnecting changes neither.
 
 ### 7.4 Caching and outages
 
@@ -919,7 +943,7 @@ A device D that receives `pair.approved` accepts it only if all of these hold:
 
 **`pair.request` is accepted only if:**
 - remote access is available on the account;
-- the requester is not revoked;
+- the requester is registered: neither revoked nor signed out;
 - its **pairing window** is open:
   - for 1 hour after registration (4.3, 4.4);
   - or for 1 hour after the user presses "Allow pairing" for the device on the account page,
@@ -929,10 +953,13 @@ A device D that receives `pair.approved` accepts it only if all of these hold:
 
 **`pair.approve` is accepted only if:**
 - the request is pending;
-- the approver is an unrevoked device of the account other than the subject;
+- the approver is a registered device of the account other than the subject;
 - the statement is valid;
 - its `subject` and `request_nonce` match the request;
-- its `server` and `account` are this server's and this account's.
+- its `server` and `account` are this server's and this account's;
+- its `issued_at` is within 10 minutes of the server's clock, which devices learn from
+  `challenge` and `welcome`;
+- its `expires_at` is in the future and at most 30 days after `issued_at`.
 
 **The server does not check `introduced`.** It cannot know the approver's trust list.
 
@@ -1001,7 +1028,9 @@ Then, at once:
 
 From then on:
 - the relay refuses the key;
-- `connect` and `lookup` refuse it as a caller and as a target;
+- `hello`, `connect`, `lookup` and the pairing requests refuse it as a caller, even on a
+  connection that has not heard of the revocation yet, and `connect` and `lookup` refuse it as
+  a target;
 - and the registration refuses it (4.4).
 
 The steps after the transaction follow from the event log, so they also happen when another
@@ -1038,13 +1067,20 @@ remote access is not trusted on the LAN either.
 
 ### 9.4 Signing out
 
-`DELETE /gono/v1/device` (device app password) or `leave` on the control channel removes a
+`DELETE /gono/v1/device` (device app password) or `leave` on the control channel signs out a
 device that is still in its user's hands.
 
-- **What is deleted.** The directory entry and its app password.
-- **No tombstone.** The device can register again with the same key.
+- **What is deleted.** The app password. The directory entry stays, marked signed out.
+- **The key stays bound to the account.** The device can register again with the same key,
+  into the same account only; any other account gets `endpoint_taken`. A signed-out device is
+  not admitted to the relay and does not count towards the limit of 50 devices.
 - **No revocation.** Other devices get `device.removed`, which removes the entry from their
-  directory views but **does not** touch their trust lists.
+  directory views but **does not** touch their trust lists. Signed-out entries are left out of
+  `welcome.devices`. When the device registers again, they get `device.added`.
+- **It can still be revoked.** The account page, the admin UI and the CLI list it as signed
+  out and offer revocation. An app password alone can sign a device out, so a leaked key and
+  app password must not be able to hide the device from the user or move the key to another
+  account.
 - **The account page offers only revocation.** A user cleaning up there is either retiring a
   device or has lost it, and revocation is the safe choice in both cases.
 
@@ -1095,11 +1131,13 @@ The relay's `AccessControl::on_connect` admits endpoint E if either holds:
 
 **How it decides:**
 - The decision uses the directory's admitted keys, held in memory so that no database query
-  runs per connection. The server reads them again at once after every registration and
-  revocation it makes, when a revocation appears in the event log, and every 30 seconds, which
-  picks up account changes and changes made by another process (the CLI).
+  runs per connection. The server reads them again at once after every registration,
+  revocation and sign-out it makes, after account changes in the admin UI, when a revocation
+  appears in the event log, and every 30 seconds, which picks up changes made by another
+  process (the CLI). Reads are serialized, so an older read never replaces a newer one.
 - Unknown keys are refused as today (`Deny { reason: None }`, logged at info).
-- A refused key that is a tombstone is also recorded as `relay.refused_revoked`.
+- A refused key that is a tombstone is also recorded as `relay.refused_revoked`, without the
+  client IP, which the relay's access control does not see.
 
 The relay handshake proves E: the client signs a challenge or a TLS exporter value. So
 admission by key is admission by key holder.
@@ -1113,7 +1151,15 @@ through `Server::relay_service()` → `RelayService::clients()` → `Clients::di
 - its account is disabled or deleted;
 - two-step verification is turned off or reset on its account.
 
-Part 2b measures the time from the revocation to the disconnect.
+Every 2 seconds the server also checks each device connected to the relay against the admitted
+keys and disconnects those no longer admitted. That ends connections a disconnect could not
+reach, such as one admitted an instant before the change. The control connections of a
+disabled or deleted account are closed with `4004` at the same time.
+
+Changes made in the admin UI and on the account page take effect at once; changes made with
+the CLI in another process within 30 seconds, except revocations, which reach the server
+through the event log within seconds (9.2). Part 2b measures the time from the revocation to
+the disconnect.
 
 ### 11.3 Limits of the relay in version 1
 
@@ -1150,7 +1196,7 @@ clipboard, no screen, no file names, and no addresses published by devices.
 | `pair.approved` | 8.2 | device A | subject, introduced devices |
 | `pair.declined`, `pair.withdrawn`, `pair.expired` | 8.2 | device or — | request ID |
 | `revocation.applied` | 9.3 | device | revoked devices |
-| `relay.refused_revoked` | 11.1 | — | endpoint, client IP |
+| `relay.refused_revoked` | 11.1 | — | endpoint |
 | `two_factor.enabled`, `two_factor.disabled`, `two_factor.reset` | 13 | user, admin, CLI | client IP |
 | `two_factor.failed`, `two_factor.locked` | 13.3 | — | client IP |
 | `recovery_code.used`, `recovery_codes.renewed` | 13.4 | user | client IP |
@@ -1177,6 +1223,11 @@ the feature `session-reports`.
   - `role` is `controller` or `controlled`; for services without such roles it is
     `initiator` or `acceptor`.
   - `path` is the path in use when the report was made: `direct`, `relayed` or `mixed`.
+- **Checks.** A `started` report is accepted only for a session that is open already (sent
+  again after a reconnect), or between two devices one of which was allowed `connect` to the
+  other in the last 10 minutes (7.2). `session_id` must be 16 bytes, `role` and `path` one of
+  the values above, and `service` an ALPN as in 6.3. Other reports are refused with
+  `not_permitted` or `bad_request`, and nothing is recorded.
 - **Both sides report.** The controlled side's report is the one that counts.
 - **Offline.** A device that is offline queues up to 100 reports and sends them later.
 - **Remote only.** Only sessions on the remote endpoint are reported. **Sessions on Input
@@ -1288,7 +1339,7 @@ of that file (STRICT tables, UNIX seconds, digests of secrets):
 
 | Table | Content |
 |---|---|
-| `devices` | The directory (6.1), with revoked entries as tombstones (9.1). An unrevoked entry always has its app password; a revoked one never |
+| `devices` | The directory (6.1), with revoked entries as tombstones (9.1) and signed-out entries (9.4). An entry has its app password exactly when it is neither revoked nor signed out |
 | `device_events` | The event log (5.6) |
 | `device_approvals` | Which device approved which newcomer, so that a revocation can list them (9.1) |
 | `revocations_applied` | Which device applied which revocation (9.3) |
@@ -1296,7 +1347,9 @@ of that file (STRICT tables, UNIX seconds, digests of secrets):
 | `two_factor`, `recovery_codes` | Two-step verification (13) |
 | `login_flows` | Registrations, in the columns `device_*` (4) |
 
-Pending pairing requests, addresses and presence live in memory only.
+Pending pairing requests, addresses, presence, `connect` grants, open sessions and rate limits
+live in memory only. Ids of accounts, credentials, web sessions and devices are never reused,
+so in-memory state never carries over to a newer row.
 
 ---
 
@@ -1306,11 +1359,12 @@ Pending pairing requests, addresses and presence live in memory only.
 |---|---|
 | Registration flow lifetime | 20 minutes |
 | Unrevoked devices per account | 50 |
-| Frame or body size | 64 KiB |
+| Frame or body size | 64 KiB from devices; 4 MiB from the server |
 | Statement size | 16 KiB |
 | `hello` after the upgrade | 10 seconds |
 | Ping interval | 30 seconds |
-| Requests per connection | 10 per second, bursts of 100 |
+| Requests per device | 10 per second, bursts of 100 |
+| Control connections per device | 20 per minute |
 | `publish` | 1 per second (coalesced); 16 direct addresses |
 | `connect` | 30 per device per minute |
 | `lookup` | 120 per device per minute |
@@ -1320,7 +1374,7 @@ Pending pairing requests, addresses and presence live in memory only.
 | Pairing request lifetime | 10 minutes |
 | Approval validity | 30 days |
 | Devices in `introduced` | 50 |
-| Event log | 45 days; 1000 events per `welcome` |
+| Event log | 45 days; 1000 events per `welcome`, 512 KiB of them inside it |
 | Address cache on devices | 10 minutes |
 | Failed second steps per account | 5 per 15 minutes; 20 per 24 hours |
 | Pending sign-in | 5 minutes, used once |

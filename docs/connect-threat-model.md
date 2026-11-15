@@ -233,14 +233,18 @@ stored next to the key and leaks with it.
   introduce devices of its own to them;
 - **use remote access as the device** until it is revoked, if it also has the app password:
   open the control channel, use the relay, read presence, and get addresses through `connect`,
-  which is recorded and announced to the target.
+  which is recorded and announced to the target;
+- **sign the device out** with the app password alone. That does not hide the key from the
+  user: the entry stays on the account page as signed out, can still be revoked, and the key
+  can register again only into the same account (protocol 9.4).
 
 **Revocation** (protocol 9):
 - **Second confirmation.** It is confirmed twice, because it is permanent.
 - **On the server:**
   - the key becomes a tombstone;
   - the app password is deleted;
-  - the control channel closes with `4003`;
+  - the control channel closes with `4003`, and a connection opened just before the
+    revocation is refused at its `hello` or at its next request (protocol 5.2, 9.2);
   - the relay disconnects the key at once (protocol 11.2);
   - `connect`, `lookup` and registration refuse the key.
 - **On the devices:** every device that learns of it closes its sessions with the key and
@@ -280,7 +284,7 @@ the user notice:
 |---|---|
 | The web password only, two-step verification on | Nothing beyond the failed second step. The user sees "your password was entered correctly" on the account page (protocol 13.3) |
 | The web password only, no two-step verification | The account's files (outside this document) and no remote access, which is unavailable without verification. The attacker could enrol verification and lock the user out; an admin reset restores the account. Every user should enrol |
-| A device's app password only (a proxy log, a leaked config) | No file access (protocol 4.5). No control channel either, since `hello` needs a signature by the device key (protocol 5.2) |
+| A device's app password only (a proxy log, a leaked config) | No file access (protocol 4.5). No control channel either, since `hello` needs a signature by the device key (protocol 5.2). It can sign the device out (protocol 9.4), which is a denial of service: the device needs the user's consent to register again, and the key stays bound to the account |
 | Password and a live second-step code (real-time phishing) | A web session: register devices, revoke devices (each confirmed twice), turn verification off, read the audit log and presence. **No device trust:** pairing still needs the comparison code on a device of the user's |
 
 **Social engineering remains** (R5):
@@ -378,8 +382,9 @@ Mitigations:
 | Path X could use | Effect | Delay |
 |---|---|---|
 | Our relay | Disconnected at once and refused from then on | Measured in part 2b; expected well under a second |
-| Control channel | Closed with `4003`; credentials deleted | Immediate |
-| Registering again with the same key | Refused for good (tombstone) | Immediate |
+| Control channel | Closed with `4003`; credentials deleted. A connection whose `hello` was in flight is refused, and every later request of a stale connection is too | Immediate |
+| Registering again with the same key | Refused for good (tombstone), in every account | Immediate |
+| A device that signed out before the revocation | Revocable like any other: signing out keeps the entry, so the key never leaves the account | Immediate |
 | `connect`, `lookup` | Refused, as caller and as target | Immediate |
 | Peers that are connected to gono-cloud | Remove X from their trust lists, LAN pairings included, and close sessions | Seconds |
 | Peers that are offline | Remove X when they next connect: the snapshot in `welcome` holds every tombstone | Until they reconnect |
@@ -428,15 +433,15 @@ These are the rules the analysis depends on. V9, the security review, checks eac
 | S3 | Device addresses live in memory only: never in the database, the audit log or the server log | 7 |
 | S4 | The first disclosure of a device's addresses to a peer is a recorded `connect` that the target is told about | 7.2, 7.3 |
 | S5 | Every statement is verified before it is stored or relayed | 2.3 |
-| S6 | Revocation needs a second confirmation. It then tombstones the key, deletes the app password, closes the control channel, disconnects the relay at once, refuses the key everywhere, and pushes the event | 9.1, 9.2, 11.2 |
-| S7 | The relay admits only active devices of accounts with two-step verification, besides the static list. A device that stops being admissible is disconnected at once | 11 |
+| S6 | Revocation needs a second confirmation. It then tombstones the key, deletes the app password, closes the control channel, disconnects the relay at once, refuses the key everywhere (connections opened just before it included), and pushes the event. Signing out never frees a key from its account | 9.1, 9.2, 9.4, 11.2 |
+| S7 | The relay admits only active devices of accounts with two-step verification, besides the static list. A device that stops being admissible is disconnected at once, and a regular sweep catches any connection a disconnect missed | 11 |
 | S8 | No answer tells a device anything about another account (`not_found`) | 5.3, 10 |
 | S9 | Registration proves the key, with the server origin and a fresh challenge signed. The consent page shows product, platform, name and short ID with a warning. Nothing reveals before consent whether an endpoint is registered | 4 |
-| S10 | The limits of protocol 15 | 15 |
+| S10 | The limits of protocol 15, kept per device so that reconnecting resets none of them | 15 |
 | S11 | TOTP codes cannot be replayed; failures are limited per account; secrets are encrypted with a key outside the database directory; recovery codes have 80 bits and are stored as digests | 13 |
 | S12 | The audit log records the events of protocol 12, and never content or device addresses | 12 |
 | S13 | Each device's application of each revocation is shown on the account page | 9.3 |
-| S14 | One control connection per device, with repeated replacement from different addresses recorded | 5.1 |
+| S14 | One control connection per device: a replaced or dropped connection answers no further request. Repeated replacement from different addresses is recorded | 5.1 |
 
 ### 7.2 Devices (`gono-connect`, Input Show)
 
