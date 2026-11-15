@@ -154,6 +154,14 @@ pub async fn create(
 
 async fn insert(tx: &mut db::Tx, user: &NewUser<'_>) -> Result<i64> {
     let now = db::unix_now();
+    let retired: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM retired_usernames WHERE username = ?1")
+            .bind(user.username.as_str())
+            .fetch_optional(&mut **tx)
+            .await?;
+    if retired.is_some() {
+        return Err(Error::UsernameRetired(user.username.clone()));
+    }
     let result = sqlx::query(
         "INSERT INTO users (username, display_name, password_hash, enabled, is_admin, \
          created_at, updated_at) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?5)",
@@ -230,12 +238,20 @@ async fn keep_an_admin(tx: &mut db::Tx, username: &Username) -> Result<()> {
     }
 }
 
-/// Deletes an account. App passwords, sessions, file metadata and locks go with it through
-/// `ON DELETE CASCADE`; the storage directories are left to the caller. The last enabled admin
-/// cannot be deleted.
+/// Deletes an account. App passwords, sessions, file metadata, locks and devices go with it
+/// through `ON DELETE CASCADE`; the storage directories are left to the caller. Revoked keys
+/// stay in `revoked_keys`, and the name of an account that registered devices is retired: it
+/// is never given to another account (protocol 9.1). The last enabled admin cannot be deleted.
 pub async fn delete(pool: &Pool, username: &Username) -> Result<User> {
     let mut tx = db::begin_immediate(pool).await?;
     keep_an_admin(&mut tx, username).await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO retired_usernames (username, retired_at)          SELECT username, ?2 FROM users WHERE username = ?1          AND EXISTS (SELECT 1 FROM devices WHERE devices.user_id = users.id)",
+    )
+    .bind(username.as_str())
+    .bind(db::unix_now())
+    .execute(&mut *tx)
+    .await?;
     let sql = format!("DELETE FROM users WHERE username = ?1 RETURNING {USER_COLUMNS}");
     let user: Option<User> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(username.as_str())

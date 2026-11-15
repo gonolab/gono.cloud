@@ -44,7 +44,9 @@ compatible within a major version: released clients keep working with newer serv
   revoking one (account page, admin UI, `gono-cloud device revoke`) is final for its key, needs
   a second confirmation, disconnects it at once and tells the account's other devices. A device
   that signs out stays listed as signed out and can still be revoked; its key can register
-  again only into the same account. An audit log records registrations, revocations,
+  again only into the same account. Revoked keys stay revoked after their account is deleted,
+  and the name of a deleted account that registered devices cannot be given to a new account
+  (pairing statements name the account by it). An audit log records registrations, revocations,
   connection requests, pairings and reported sessions.
 
 - **Two-step verification** (TOTP) of web sign-ins. Users turn it on on the account page with a

@@ -391,6 +391,72 @@ async fn deleting_an_account_removes_its_devices() {
 }
 
 #[tokio::test]
+async fn a_revoked_key_stays_revoked_after_its_account_is_deleted() {
+    // Review F-18: the tombstone goes with the account, the revoked key does not.
+    let (_dir, pool) = fixture().await;
+    let alice = user(&pool, "alice").await;
+    register(&pool, alice, &new_device(1, "Laptop"), 100).await;
+    devices::revoke(&pool, alice, &[key(1)], RevokedBy::Admin, None, 110)
+        .await
+        .unwrap();
+    users::delete(&pool, &Username::new("alice").unwrap())
+        .await
+        .unwrap();
+    let kept: Vec<(Vec<u8>, i64)> =
+        sqlx::query_as("SELECT endpoint_id, revoked_at FROM revoked_keys")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        kept,
+        vec![(key(1).0.to_vec(), 110)],
+        "keys only, no account data"
+    );
+    let bob = user(&pool, "bob").await;
+    assert!(matches!(
+        register(&pool, bob, &new_device(1, "Laptop"), 200).await,
+        Registration::Revoked
+    ));
+    // An unrevoked key of the deleted account is free again.
+    assert!(matches!(
+        register(&pool, bob, &new_device(2, "Phone"), 200).await,
+        Registration::Registered { .. }
+    ));
+}
+
+#[tokio::test]
+async fn the_name_of_a_deleted_account_that_registered_devices_is_retired() {
+    // Review F-31: statements name the account by its username.
+    let (_dir, pool) = fixture().await;
+    let carol = user(&pool, "carol").await;
+    register(&pool, carol, &new_device(3, "Laptop"), 100).await;
+    users::delete(&pool, &Username::new("carol").unwrap())
+        .await
+        .unwrap();
+    let again = users::create(
+        &pool,
+        &NewUser {
+            username: &Username::new("carol").unwrap(),
+            display_name: "Carol",
+            password_hash: "x",
+            is_admin: false,
+        },
+        |_| Ok(()),
+    )
+    .await;
+    assert!(
+        matches!(again, Err(gono_server_core::Error::UsernameRetired(_))),
+        "{again:?}"
+    );
+    // An account that never registered a device leaves its name free.
+    user(&pool, "dave").await;
+    users::delete(&pool, &Username::new("dave").unwrap())
+        .await
+        .unwrap();
+    user(&pool, "dave").await;
+}
+
+#[tokio::test]
 async fn an_app_password_in_use_by_a_device_cannot_be_deleted_directly() {
     let (_dir, pool) = fixture().await;
     let alice = user(&pool, "alice").await;

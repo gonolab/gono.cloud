@@ -383,6 +383,18 @@ pub(crate) async fn register(
     .bind(&new.endpoint_id.0[..])
     .fetch_optional(&mut **tx)
     .await?;
+    // A key revoked in an account that was deleted since has no entry any more, but stays
+    // revoked (protocol 9.1).
+    if existing.is_none() {
+        let revoked: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM revoked_keys WHERE endpoint_id = ?1")
+                .bind(&new.endpoint_id.0[..])
+                .fetch_optional(&mut **tx)
+                .await?;
+        if revoked.is_some() {
+            return Ok(Registration::Revoked);
+        }
+    }
     let label = new.name.clone();
     let app_password = app_passwords::generate_device_token();
     let pairing_until = now.saturating_add(PAIRING_WINDOW_SECS);
@@ -806,6 +818,12 @@ pub async fn revoke(
                 .execute(&mut *tx)
                 .await?;
         }
+        // Kept after the account is deleted, which removes the entry (protocol 9.1).
+        sqlx::query("INSERT OR IGNORE INTO revoked_keys (endpoint_id, revoked_at) VALUES (?1, ?2)")
+            .bind(&endpoint_id.0[..])
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
         append_event(
             &mut tx,
             user_id,

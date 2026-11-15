@@ -108,6 +108,13 @@ pub enum Error {
     #[error("user {0} already exists")]
     UserExists(Username),
 
+    /// The name belonged to a deleted account that registered devices for remote access, whose
+    /// statements name it; it is never given to another account (protocol 9.1).
+    #[error(
+        "the name {0} belonged to a deleted account that used remote access and cannot be used again"
+    )]
+    UsernameRetired(Username),
+
     /// No account has this name.
     #[error("user {0} does not exist")]
     UserNotFound(Username),

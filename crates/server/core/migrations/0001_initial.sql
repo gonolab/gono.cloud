@@ -281,7 +281,7 @@ CREATE TABLE devices (
     registered_at      INTEGER NOT NULL,
     last_seen_at       INTEGER,
     -- Set once and never cleared: a revoked key never comes back (protocol 9.1). The row stays
-    -- as a tombstone until the account is deleted.
+    -- as a tombstone until the account is deleted; `revoked_keys` keeps the key after that.
     revoked_at         INTEGER,
     -- Set when the device signed out (protocol 9.4), cleared when it registers again. The row
     -- stays, so that the key remains bound to this account and can still be revoked.
@@ -290,6 +290,23 @@ CREATE TABLE devices (
 ) STRICT;
 
 CREATE INDEX devices_user_id ON devices (user_id);
+
+-- Every key that was ever revoked, also after its account was deleted, so that a revoked key
+-- never registers again on this server, into any account (protocol 9.1). Keys only, no
+-- account data.
+CREATE TABLE revoked_keys (
+    endpoint_id BLOB    PRIMARY KEY CHECK (length(endpoint_id) = 32),
+    revoked_at  INTEGER NOT NULL
+) STRICT;
+
+-- Usernames of deleted accounts that had devices registered for remote access. Statements name
+-- the account by its username (protocol 8.3, 8.4), so such a name is never given to a new
+-- account: an approval issued for the old account would match the new one until it expired.
+-- Accounts that never registered a device leave their names free.
+CREATE TABLE retired_usernames (
+    username   TEXT    PRIMARY KEY COLLATE BINARY,
+    retired_at INTEGER NOT NULL
+) STRICT;
 
 -- Events that must reach devices that are offline when they happen (protocol 5.6). `seq` is
 -- the event's number on the control channel; it only grows.

@@ -198,7 +198,7 @@ user's directories, would belong to root and could no longer be written by the s
 | `user set-display-name NAME DISPLAY_NAME` | Change the name clients show. |
 | `user promote NAME`, `user demote NAME` | Grant or withdraw access to the admin UI. |
 | `user disable NAME`, `user enable NAME` | Block or allow signing in; disabling stops the user's app passwords too. |
-| `user delete NAME` | Delete the account; its files move to `data/deleted/`. |
+| `user delete NAME` | Delete the account; its files move to `data/deleted/`. The name of an account that registered devices for remote access cannot be given to a new account afterwards, and its revoked devices stay revoked. |
 | `app-password add NAME --label LABEL [--scope ...] [--expires-in-days N]` | Create an app password, shown once. |
 | `app-password list NAME`, `app-password delete NAME ID` | List or revoke app passwords. |
 | `user reset-two-factor NAME` | Turn the user's two-step verification off (a lost phone without recovery codes). |

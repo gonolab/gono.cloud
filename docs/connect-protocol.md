@@ -1079,9 +1079,15 @@ model weighs this choice (5.4).
 **What it means.** Revocation is for a device that is lost, stolen, compromised or retired for
 good.
 - **It is final for the key.** The directory entry stays as a tombstone with `revoked_at`, and
-  the key can never be registered again on this server.
+  the key can never be registered again on this server, into any account.
 - **To come back**, a device needs a new key, and with it new pairings.
-- **Account deletion** removes the tombstones too.
+- **Account deletion** removes the tombstones with the account, but the server keeps every
+  revoked key in a list of its own (keys only, no account data), so that the promise holds
+  after the account is gone.
+- **Account names are not reused.** Statements name the account by its username (8.3, 8.4). When
+  an account that registered devices is deleted, its username is retired and never given to a
+  new account, so an approval issued for the old account cannot match a new one. Accounts that
+  never registered a device leave their names free.
 
 **Second confirmation.** Because it cannot be undone, revocation is never one click. The first
 action opens a confirmation step, and nothing changes until it is confirmed:

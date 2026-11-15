@@ -566,7 +566,9 @@ remotely (R8 mitigated), one approval per request on the new device, the rule th
 only gain information, display-safe names, the address filter (protocol 7.1), "stop remote
 access" next to revocation on the account page (protocol 9.4), per-source handshake budgets
 (C8), the reverse proxy in the trusted base (2), a hostile device inside the account (5.11),
-NAT-traversal frames from strangers (5.6), and C13's limit. The answers to the questions above:
+NAT-traversal frames from strangers (5.6), C13's limit, revoked keys kept after their account
+is deleted, and the retired usernames of deleted accounts that registered devices (protocol
+9.1). The answers to the questions above:
 C4, C8, C9, C10 and C13 fit `inputshow-net`; the trust list gains `remote` and the consumed
 approvals; acceptance of vouched devices is **on** by default, because only `remote` entries
 can vouch; Input Show adopts C14 for incoming remote sessions.

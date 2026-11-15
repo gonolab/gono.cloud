@@ -363,6 +363,7 @@ pub(crate) fn core_message(t: &Text, err: &CoreError) -> String {
         }
         CoreError::InvalidPassword(_) => t.err_password_policy.to_owned(),
         CoreError::UserExists(name) => fill(t.err_user_exists, &[name.as_str()]),
+        CoreError::UsernameRetired(name) => fill(t.err_username_retired, &[name.as_str()]),
         CoreError::LastAdmin(name) => fill(t.err_last_admin, &[name.as_str()]),
         CoreError::InvalidLabel(_) => t.err_label_invalid.to_owned(),
         CoreError::InvalidScopes(detail) => fill(t.err_scopes, &[detail]),
@@ -1222,9 +1223,11 @@ async fn create_user(
                 admin.user_url(username.as_str())
             ))
         }
-        Err(err @ (CoreError::UserExists(_) | CoreError::UserDirNotEmpty { .. })) => {
-            show_error(core_message(session.chrome.t, &err))
-        }
+        Err(
+            err @ (CoreError::UserExists(_)
+            | CoreError::UsernameRetired(_)
+            | CoreError::UserDirNotEmpty { .. }),
+        ) => show_error(core_message(session.chrome.t, &err)),
         Err(err) => internal_error(&session.chrome, &err),
     }
 }

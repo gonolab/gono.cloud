@@ -466,6 +466,7 @@ texts! {
     err_password_policy: "The password must be at most 1024 bytes long and must not contain control characters.", "密码不能超过 1024 字节，也不能包含控制字符。";
     err_username: "Usernames use lowercase letters, digits, \".\", \"_\", \"-\" and \"@\", at most 64 characters.", "用户名只能使用小写字母、数字、\".\"、\"_\"、\"-\" 和 \"@\"，最多 64 个字符。";
     err_user_exists: "A user named {} already exists.", "已经有名为 {} 的用户。";
+    err_username_retired: "The name {} belonged to a deleted account that used remote access; its devices' statements name it, so it cannot be given to a new account. Choose another name.", "{} 曾属于一个已删除、用过远程访问的账号；它的设备签过的声明里写着这个名字，所以不能再分给新账号。请换一个名字。";
     err_last_admin: "{} is the last enabled admin. Make another account an admin first.", "{} 是最后一个启用的管理员，请先把其他账号设为管理员。";
     err_label_invalid: "The label must not be empty, longer than 100 characters or contain control characters.", "名称不能为空、不能超过 100 个字符，也不能包含控制字符。";
     err_expiry: "The expiry must be a number of days between 1 and 3650.", "有效期必须是 1 到 3650 之间的天数。";
