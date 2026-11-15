@@ -13,7 +13,8 @@
 //! - **QAD on a public UDP socket**, `relay.qad_bind`. QUIC needs a certificate of its own: the
 //!   relay reads the certificate of its host name from `relay.tls_cert` and `relay.tls_key`
 //!   and reads them again every `relay.tls_reload_interval_secs`, so that a renewal takes
-//!   effect without a restart.
+//!   effect without a restart (`tls.rs`: a new pair is served only once the key belongs to the
+//!   certificate).
 //! - **Access control**: only the devices of `relay.allowed_endpoints` and those an
 //!   [`Admission`] admits may connect (the allowlist in `access.rs`). `serve` passes the device
 //!   directory, and disconnects a device through [`RelayStatus::disconnect`] once it may no
@@ -24,6 +25,7 @@
 //! admin UI.
 
 mod access;
+mod tls;
 
 pub use access::Admission;
 
@@ -44,17 +46,21 @@ use gono_server_core::config::RelayConfig;
 use iroh_base::EndpointId;
 use iroh_relay::server::{
     ClientRateLimit, QuicConfig, RelayMetrics, Server, ServerConfig, clients::Clients,
-    reloading_resolver,
 };
 use url::Url;
 
-use self::access::Allowlist;
+use self::{
+    access::Allowlist,
+    tls::{CertificateFiles, ReloadTask},
+};
 
 /// The running relay.
 #[derive(Debug)]
 pub struct Relay {
     server: Server,
     status: RelayStatus,
+    /// Reads the certificate of QAD again; stops when the relay is dropped.
+    _certificate_reloads: Option<ReloadTask>,
 }
 
 impl Relay {
@@ -75,17 +81,28 @@ impl Relay {
         relay.access = access.clone();
         relay.limits.client_rx = client_rate_limit(config);
 
-        let quic = match config.qad_bind {
+        let (quic, certificate_reloads) = match config.qad_bind {
             Some(bind) => {
                 let (Some(cert), Some(key)) = (&config.tls_cert, &config.tls_key) else {
                     bail!("relay.qad_bind needs relay.tls_cert and relay.tls_key");
                 };
-                let interval = Duration::from_secs(config.tls_reload_interval_secs);
+                let provider = Arc::new(rustls::crypto::ring::default_provider());
+                let files = CertificateFiles::load(cert, key, provider.clone())
+                    .map(Arc::new)
+                    .with_context(|| {
+                        format!(
+                            "read the relay certificate {} and its key {}",
+                            cert.display(),
+                            key.display()
+                        )
+                    })?;
+                let reloads =
+                    files.spawn_reloads(Duration::from_secs(config.tls_reload_interval_secs));
                 let mut quic = QuicConfig::new(bind);
-                quic.server_config = Some(qad_tls_config(cert, key, interval).await?);
-                Some(quic)
+                quic.server_config = Some(qad_tls_config(provider, files)?);
+                (Some(quic), Some(reloads))
             }
-            None => None,
+            None => (None, None),
         };
 
         let mut server_config = ServerConfig::default();
@@ -116,7 +133,11 @@ impl Relay {
             devices = status.0.access.len(),
             "relay listening"
         );
-        Ok(Self { server, status })
+        Ok(Self {
+            server,
+            status,
+            _certificate_reloads: certificate_reloads,
+        })
     }
 
     /// A handle on the relay's settings and counters.
@@ -311,28 +332,16 @@ fn client_rate_limit(config: &RelayConfig) -> Option<ClientRateLimit> {
     Some(limit)
 }
 
-/// The TLS configuration of the QAD socket: TLS 1.3 (QUIC needs it) with the certificate in
-/// `cert` and `key`, read again every `interval`.
-async fn qad_tls_config(
-    cert: &Path,
-    key: &Path,
-    interval: Duration,
+/// The TLS configuration of the QAD socket: TLS 1.3 (QUIC needs it) with the certificate that
+/// `files` serves.
+fn qad_tls_config(
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    files: Arc<CertificateFiles>,
 ) -> anyhow::Result<rustls::ServerConfig> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let resolver = reloading_resolver(&provider, cert.to_path_buf(), key.to_path_buf(), interval)
-        .await
-        .map_err(|err| anyhow!("{err}"))
-        .with_context(|| {
-            format!(
-                "read the relay certificate {} and its key {}",
-                cert.display(),
-                key.display()
-            )
-        })?;
     let config = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .context("configure TLS 1.3 for QUIC address discovery")?
         .with_no_client_auth()
-        .with_cert_resolver(resolver);
+        .with_cert_resolver(files);
     Ok(config)
 }

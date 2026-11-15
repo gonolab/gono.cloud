@@ -19,7 +19,9 @@ compatible within a major version: released clients keep working with newer serv
   plain HTTP on `relay.bind` (`127.0.0.1:16103`) behind the reverse proxy, which needs a host
   name of its own for it (`relay.public_url`); QUIC address discovery (`relay.qad_bind`, UDP
   7842) uses a copy of that host name's certificate (`relay.tls_cert`, `relay.tls_key`) and
-  reads it again every `relay.tls_reload_interval_secs`. Only the devices listed in
+  reads it again every `relay.tls_reload_interval_secs`, taking a renewal up once the key
+  belongs to the certificate (a hook caught between copying the two files leaves the previous
+  pair in service, with a warning in the log). Only the devices listed in
   `relay.allowed_endpoints` may connect; `relay.max_client_bytes_per_sec` limits each
   connection. The packets are encrypted end to end between the devices. The admin UI's
   overview shows the relay, and its Relay page (`/apps/manage/relay`) the settings, the

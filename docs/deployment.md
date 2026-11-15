@@ -361,8 +361,11 @@ relay reads from one device connection.
 The reverse proxy owns the certificate of the relay's host name, and the service user cannot
 read it (certbot keeps private keys readable by root only). Copy the certificate and the key
 into `/etc/gono-cloud/relay-tls/` after every renewal; the relay reads them again every
-`relay.tls_reload_interval_secs` (an hour by default), so a renewal needs no restart. The relay
-does not start while `qad_bind` is set and the files are missing.
+`relay.tls_reload_interval_secs` (an hour by default), so a renewal needs no restart. It takes a
+renewal up only once the key belongs to the certificate: a read that falls between the copies
+of the two files keeps the previous pair in service and logs `relay certificate not reloaded`,
+and the next read picks the renewal up. The relay does not start while `qad_bind` is set and the
+files are missing or do not belong together.
 
 With **certbot**, a deploy hook does it after each renewal. Save it as
 `/etc/letsencrypt/renewal-hooks/deploy/gono-cloud-relay` and make it executable:
