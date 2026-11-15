@@ -10,6 +10,8 @@
 //! - [`Remote`]: the endpoint and the channel together, with the product API of plan 3.3:
 //!   connect to a device, accept connections from trusted keys
 //!   ([`Remote::accept_trusted`]), forward network changes.
+//! - [`approval`]: the checks of protocol 8.5 on a received approval, and the approver's
+//!   statement.
 //!
 //! The server is bound to the origin the user entered: `https` (plain `http` only on a
 //! loopback host), every URL it names on that origin, no redirects, and every statement naming
@@ -18,10 +20,11 @@
 //! refused, and a relay other than the discovery document's is dropped (C15).
 //!
 //! Trust stays with the product: this crate never decides whether a peer may connect or
-//! control anything. It carries the server's messages and checks nothing the product must
-//! check itself (the statements of protocol 8.5, the trust list, unattended access);
-//! [`Remote::accept_trusted`] applies the product's own predicate.
+//! control anything, and keeps no trust list. It carries the server's messages;
+//! [`approval::check`] runs the checks of protocol 8.5 against the product's state and says
+//! what to store, and [`Remote::accept_trusted`] applies the product's own predicate.
 
+pub mod approval;
 mod channel;
 pub mod endpoint;
 mod lookup;

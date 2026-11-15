@@ -992,7 +992,9 @@ A device D that receives `pair.approved` accepts it only if all of these hold:
      still keeps (8.1); and D's user confirmed the `remote-sas` pairing with `approver` for
      that request (8.2 step 3). D accepts at most one approval per request nonce: the first
      that passes every check.
-6. `subject.endpoint_id` is not in D's revoked set, and is not D.
+6. No device the approval would add is in D's revoked set: on an introduced device, the
+   newcomer `subject.endpoint_id`; on N, each introduced device. N is not among the
+   introduced devices, and an introduced device is not the newcomer.
 7. D's clock is before `expires_at`, and after `issued_at` minus 10 minutes (to allow for
    clock skew).
 8. D's local policy allows vouched devices. This is a setting that the device's user can turn
