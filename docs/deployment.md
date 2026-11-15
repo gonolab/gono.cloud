@@ -402,6 +402,13 @@ On macOS the directory is `/usr/local/etc/gono-cloud/relay-tls/` and the group `
 - The admin UI's overview shows the relay's host name, the allowed devices connected now, the
   traffic it relayed and the connections it refused, or "no address discovery" while QAD is
   off.
+- The admin UI's **Relay** page (`/apps/manage/relay`) shows more:
+  - its settings: who may connect, address discovery, the certificate and the rate limit;
+  - its counters;
+  - the devices connected right now, with their accounts and whether their control channel
+    is open;
+  - the last sessions devices reported, with the path they took (direct or relayed);
+  - the revoked devices that tried to connect.
 - [reverse-proxy.md](reverse-proxy.md#checking-the-relay) has `curl` checks for the proxy.
 
 ### Remote access

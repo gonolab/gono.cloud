@@ -188,7 +188,7 @@ Control      gono-cloud: accounts, device directory, presence, authorization,
 | Relay | Embeds `iroh_relay::server::Server`. `AccessControl` admits only registered, unrevoked `EndpointId`s; `ClientRateLimit` limits each client. `Limits::accept_conn_limit` is not implemented in 1.4.1, so new connections are limited at the reverse proxy or in `AccessControl` |
 | Audit | Who connected to which device, when, direct or relayed, for how long and how much traffic. Never content |
 | Two-factor authentication | Required for accounts with remote control enabled |
-| UI | The account page lists the user's devices, their presence and revocation. The admin UI shows relay load and sessions (`RelayMetrics`) |
+| UI | The account page lists the user's devices, their presence and revocation. The admin UI shows relay load and sessions (`RelayMetrics`): a Relay page at `/apps/manage/relay` with the settings, the counters, the connected devices, the reported sessions and the refused tombstones |
 
 ### 3.3 Devices
 

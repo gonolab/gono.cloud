@@ -362,4 +362,5 @@ curl -si --http1.1 -o /dev/null -w '%{http_code}\n' \
 ```
 
 The admin UI's overview shows the relay's host name, the allowed devices connected right now,
-the traffic it relayed and the connections it refused.
+the traffic it relayed and the connections it refused; its Relay page lists the connected
+devices and the sessions devices reported.

@@ -22,7 +22,10 @@ compatible within a major version: released clients keep working with newer serv
   reads it again every `relay.tls_reload_interval_secs`. Only the devices listed in
   `relay.allowed_endpoints` may connect; `relay.max_client_bytes_per_sec` limits each
   connection. The packets are encrypted end to end between the devices. The admin UI's
-  overview shows the relay, `config check` its settings, and the install script takes
+  overview shows the relay, and its Relay page (`/apps/manage/relay`) the settings, the
+  counters, the devices connected right now, the sessions devices reported with their path,
+  and the revoked devices that tried to connect; `config check` shows its settings, and the
+  install script takes
   `--relay-host` for fresh installs. See "The relay" in `docs/deployment.md` and
   `docs/reverse-proxy.md`. The binary grows by about 6.6 MB (static Linux build).
 - Remote access for devices, the server side of `docs/connect-protocol.md`: with the relay
