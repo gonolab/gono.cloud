@@ -6,7 +6,12 @@
 //! - no address lookup but the control channel's ([`crate::ControlLookup`]);
 //! - DNS without the public fallback resolvers, or the platform's own resolver
 //!   ([`SystemResolver`]) where the app cannot read the network's DNS (HarmonyOS);
-//! - both address families bound, on a free port unless the product needs a fixed one.
+//! - both address families bound, on a free port unless the product needs a fixed one;
+//! - no captive-portal check: iroh would send a plain-HTTP request to port 80 of the relay's
+//!   host name (`/generate_204`), whose answer only decides whether the next network report is
+//!   a full one. Hosts in mainland China whose domain is not ICP-registered have port 80
+//!   intercepted, which reads as a captive portal everywhere; without the check, the relay's
+//!   host needs no port 80 for devices. Relay latency still comes from QAD and HTTPS (`/ping`).
 //!
 //! Incoming connections: iroh 1.4.1 has no builder option for the endpoint's limit of pending
 //! connection attempts (noq's `max_incoming`, 65536 by default; `ServerConfigBuilder` only
@@ -21,7 +26,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use iroh::{
-    Endpoint, RelayMode, RelayUrl, SecretKey,
+    Endpoint, NetReportConfig, RelayMode, RelayUrl, SecretKey,
     address_lookup::AddressLookup,
     dns::{BoxIter, DnsError, DnsResolver, Resolver, TxtRecordData},
     endpoint::presets,
@@ -86,11 +91,14 @@ async fn bind_families(
             .build(),
         Dns::Platform => DnsResolver::custom(SystemResolver),
     };
+    let mut net_report = NetReportConfig::default();
+    net_report.captive_portal_check = false;
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(options.secret_key.clone())
         .alpns(options.alpns.clone())
         .dns_resolver(dns)
         .relay_mode(RelayMode::custom([options.relay_url.clone()]))
+        .net_report_config(net_report)
         .clear_address_lookup()
         .address_lookup(lookup)
         // Drops the default sockets of both families; one bind per family follows.
