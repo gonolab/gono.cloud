@@ -97,7 +97,9 @@ impl Server {
     pub fn new(origin: &str) -> Result<Self> {
         let origin = Origin::parse(origin)?;
         let http = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls::client_config(&[b"h2", b"http/1.1"]))
+            // HTTP/1.1 only: reqwest is built without HTTP/2, and offering `h2` makes a server
+            // that picks it (nginx with `http2 on`) crash the client.
+            .tls_backend_preconfigured(tls::client_config(&[b"http/1.1"]))
             .timeout(REQUEST_TIMEOUT)
             // A redirect could leave the origin, or TLS (`https` to `http`).
             .redirect(reqwest::redirect::Policy::none())
