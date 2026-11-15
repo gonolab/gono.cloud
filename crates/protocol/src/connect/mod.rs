@@ -130,16 +130,16 @@ pub struct LoginStart {
     pub version: String,
 }
 
-/// Where and how to poll.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Where and how to poll. `Debug` leaves the token out.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollEndpoint {
     /// The poll URL.
     pub endpoint: String,
-    /// The poll token.
+    /// The poll token. Secret.
     pub token: String,
 }
 
-/// The answer to [`LoginStart`].
+/// The answer to [`LoginStart`]. `Debug` leaves the poll token out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoginStarted {
     /// The URL to open in a browser.
@@ -152,18 +152,18 @@ pub struct LoginStarted {
     pub expires_at: i64,
 }
 
-/// `POST /gono/v1/login/poll` (protocol 4.3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `POST /gono/v1/login/poll` (protocol 4.3). `Debug` leaves the token out.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollRequest {
-    /// The poll token.
+    /// The poll token. Secret.
     pub token: String,
     /// The signed `login` statement.
     #[serde(default)]
     pub proof: Option<Signed>,
 }
 
-/// A completed registration (protocol 4.3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A completed registration (protocol 4.3). `Debug` leaves the app password out.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Registered {
     /// `registered`.
     pub status: String,
@@ -171,11 +171,99 @@ pub struct Registered {
     pub server: String,
     /// The account's username.
     pub username: String,
-    /// The device's app password, returned once.
+    /// The device's app password, returned once. Secret.
     pub app_password: String,
     /// Its directory entry.
     pub device: DeviceEntry,
     /// The device may send pairing requests until then.
     #[serde(default)]
     pub pairing_open_until: Option<i64>,
+}
+
+/// What `Debug` shows in place of a secret.
+const REDACTED: &str = "<redacted>";
+
+impl std::fmt::Debug for PollEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PollEndpoint")
+            .field("endpoint", &self.endpoint)
+            .field("token", &REDACTED)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PollRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PollRequest")
+            .field("token", &REDACTED)
+            .field("proof", &self.proof)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Registered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Registered")
+            .field("status", &self.status)
+            .field("server", &self.server)
+            .field("username", &self.username)
+            .field("app_password", &REDACTED)
+            .field("device", &self.device)
+            .field("pairing_open_until", &self.pairing_open_until)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_leaves_secrets_out() {
+        let poll = PollEndpoint {
+            endpoint: "https://cloud.example.com/gono/v1/login/poll".to_owned(),
+            token: "poll-token-secret".to_owned(),
+        };
+        let started = LoginStarted {
+            login_url: "https://cloud.example.com/login/v2/flow/x".to_owned(),
+            poll: poll.clone(),
+            challenge: "c".to_owned(),
+            expires_at: 1,
+        };
+        let request = PollRequest {
+            token: "poll-token-secret".to_owned(),
+            proof: None,
+        };
+        let registered = Registered {
+            status: "registered".to_owned(),
+            server: "https://cloud.example.com".to_owned(),
+            username: "kim".to_owned(),
+            app_password: "app-password-secret".to_owned(),
+            device: DeviceEntry {
+                endpoint_id: iroh_base::SecretKey::from_bytes(&[1; 32]).public().into(),
+                name: "Home PC".to_owned(),
+                product: "input-show".to_owned(),
+                platform: "linux".to_owned(),
+                version: String::new(),
+                registered_at: 0,
+                online: false,
+                last_seen_at: None,
+                accept_remote: false,
+                unattended: false,
+                services: Vec::new(),
+                revoked_at: None,
+            },
+            pairing_open_until: None,
+        };
+        for text in [
+            format!("{poll:?}"),
+            format!("{started:?}"),
+            format!("{request:?}"),
+            format!("{registered:?}"),
+        ] {
+            assert!(!text.contains("secret"), "{text}");
+            assert!(text.contains(REDACTED), "{text}");
+        }
+        assert!(format!("{registered:?}").contains("kim"));
+    }
 }

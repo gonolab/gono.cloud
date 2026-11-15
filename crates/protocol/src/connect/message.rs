@@ -543,6 +543,10 @@ pub enum ServerMessage {
         /// Remote access is available.
         remote_access: bool,
     },
+    /// A type a newer server sent (protocol 2.4: version 1 may add message types). Receivers
+    /// ignore it (protocol 5.3); servers never send it.
+    #[serde(other)]
+    Unknown,
 }
 
 impl ServerMessage {
@@ -661,6 +665,18 @@ mod tests {
                 ..
             }
         ));
+        // A type of a newer server reads, also inside `welcome.events`, and is ignored there.
+        let future: ServerMessage =
+            serde_json::from_str(r#"{"type":"from.the.future","seq":4,"what":{"x":1}}"#).unwrap();
+        assert_eq!(future, ServerMessage::Unknown);
+        let events: Vec<ServerMessage> = serde_json::from_str(
+            r#"[{"type":"from.the.future"},{"type":"device.removed","endpoint_id":"$ID","at":1}]"#
+                .replace("$ID", &id(3).to_hex())
+                .as_str(),
+        )
+        .unwrap();
+        assert_eq!(events[0], ServerMessage::Unknown);
+        assert!(matches!(events[1], ServerMessage::DeviceRemoved { .. }));
         let revoked = ServerMessage::DeviceRevoked {
             seq: 3,
             endpoint_id: id(2),
