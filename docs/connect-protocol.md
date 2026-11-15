@@ -3,7 +3,8 @@
 - Status: draft for review. This is Phase 0 of `plan/remote-connect-iroh.md`. Part 2b implements
   it: the server side is in `crates/server/connect`, the device side in `crates/client/connect`
   (`gono-connect`), and the wire types are in `crates/protocol`.
-  Two-step verification enrolment (13) comes with part 2c.
+  Two-step verification (13) is part 2c, in `crates/server/core/src/two_factor.rs` and the
+  server's pages.
 - Protocol version: 1.
 - Reviewers: gono-cloud, and Input Show NE.
 - Companion document: [connect-threat-model.md](connect-threat-model.md). It explains why the
@@ -1221,13 +1222,16 @@ the feature `session-reports`.
 2. **The pending sign-in.** If the account has two-step verification, no session is created
    yet. The server sets a pending-sign-in cookie instead: a random token, bound to the
    account, valid for 5 minutes and usable once. It then shows the code form.
-3. **The code.** The form takes a TOTP code or a recovery code, and only a correct one creates
-   the session.
+3. **The code.** The form at `/login/two-step`, shared by every sign-in form, takes a TOTP code
+   or a recovery code, and only a correct one creates the session; the sign-in then continues
+   where it started (the file UI, the admin UI, a consent page). Five wrong codes end the
+   pending sign-in, and the password must be entered again.
 
 **Limits.**
 - The per-client limiter of the sign-in applies.
-- Failed codes are also counted **per account**: after 5 in 15 minutes or 20 in 24 hours, the
-  second step is locked for that account until the window passes or an admin resets it.
+- Failed codes are also counted **per account**, from the audit log: after 5 in 15 minutes or
+  20 in 24 hours, the second step is locked for that account until the window passes. The
+  same codes guard the forms that renew recovery codes and turn verification off.
 - The account page shows failures to its user: "your password was entered correctly but the
   second step failed, at … from …". They are recorded as `two_factor.failed` and
   `two_factor.locked`.
@@ -1244,8 +1248,8 @@ the feature `session-reports`.
 ### 13.5 Turning it off, and resets
 
 - **Turning it off** needs the password and a code (TOTP or recovery).
-- **Resetting.** An admin resets it in the admin UI or with
-  `gono-cloud user reset-two-factor <user>`.
+- **Resetting.** An admin resets it in the admin UI, and the operator with
+  `gono-cloud user reset-two-factor <user>`; a running server picks either up within seconds.
 - **Effects of either:**
   - remote access becomes unavailable;
   - the account's devices are disconnected from the relay (11.2);
@@ -1257,17 +1261,21 @@ the feature `session-reports`.
 ### 13.6 Storage of the secret
 
 **Encryption.** TOTP secrets are encrypted with a 32-byte key that lives outside the database
-directory, in a file in the configuration directory created by `init` and the install script:
-- mode 0640, owner root, group `gono-cloud`;
-- AES-256-GCM or ChaCha20-Poly1305 from ring;
-- a random 96-bit nonce;
-- associated data `gono-cloud totp v1` and the user ID.
+directory, in `two_factor.key_file` (`two-factor.key` next to the configuration file by
+default):
+- created by the install script as root (mode 0640, owner root, group `gono-cloud`), and by
+  `init` and `serve` when they can write there; never replaced once it exists;
+- ChaCha20-Poly1305 from ring;
+- a random 96-bit nonce, stored before the ciphertext;
+- associated data `gono-cloud totp v1` and the user ID, so a secret cannot be moved to another
+  account.
 
 **Why.** A copy of the database alone, a backup for example, does not give away the second
 factor.
 
-**If the key file is lost**, every account must have its verification reset. 2c documents
-this next to backups.
+**If the key file is lost**, every account must have its verification reset: `serve` refuses to
+start while accounts use it and the file is missing, and says so. `docs/deployment.md`
+describes it next to backups.
 
 **Later.** WebAuthn and passkeys come after version 1.
 

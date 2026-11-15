@@ -31,6 +31,8 @@ listed under "In scope" is deferred until after v1.
     through which the mobile apps stream media that is not downloaded yet (Android video and
     audio, iOS video). A link acts with the app password that asked for it and ends with it.
 - **Multiple users** with per-app-password mount scopes (`view` or `full`).
+- **Two-step verification** (TOTP and recovery codes) of every web sign-in; app passwords are
+  unaffected.
 - **notify_push** for real-time change notifications.
 - **Web admin UI**: server overview, accounts (create, enable and disable, admin role, display
   name, web login password, delete) and app passwords. On by default since 1.2.

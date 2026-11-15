@@ -153,3 +153,12 @@ allowed_endpoints = []
 # reads at once. Unlimited unless set.
 # max_client_bytes_per_sec = 2097152
 # max_client_burst_bytes = 262144
+
+[two_factor]
+# The key the TOTP secrets of two-step verification are encrypted with: 32 random bytes (or 64
+# hex digits), readable by the service. Keep it outside the data directory and back it up with
+# this file, apart from the database: without it, accounts with two-step verification cannot
+# sign in, and `serve` refuses to start while any account uses it. Relative paths are resolved
+# against this file's directory. `init` and the install script create it. Default:
+# "two-factor.key".
+key_file = "two-factor.key"

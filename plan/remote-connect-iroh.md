@@ -462,7 +462,10 @@ and 2; Phase 4 needs the gates listed in it. The sizes are estimates.
   - the account page;
   - the `gono-connect` crate (3.3).
 - **2c. Two-factor authentication.** Starts now and runs alongside 2b. About one and a half to two
-  weeks.
+  weeks. **Implemented**: TOTP with recovery codes, the second step at `/login/two-step` for every
+  web sign-in, enrolment and renewal on the account page, resets in the admin UI and the CLI,
+  the secrets encrypted with `two_factor.key_file`, which the install script creates. Remote
+  access now works end to end for accounts that turn it on.
   - TOTP with recovery codes;
   - the second step at every web sign-in: the file UI, the admin UI and Login Flow v2's consent
     page (app passwords of devices are unaffected);

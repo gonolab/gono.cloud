@@ -33,11 +33,20 @@ compatible within a major version: released clients keep working with newer serv
   forward like `/push/ws`), sees the account's other devices and their presence, gets their
   addresses only through recorded connection requests, and passes pairing requests and signed
   approvals between devices. The relay admits these devices besides `relay.allowed_endpoints`.
-  Only accounts with two-step verification enrolled have remote access; enrolment comes in a
-  later release, so no account can register a device yet. The account page lists the devices;
+  Only accounts with two-step verification on have remote access. The account page lists the
+  devices;
   revoking one (account page, admin UI, `gono-cloud device revoke`) is final for its key, needs
   a second confirmation, disconnects it at once and tells the account's other devices. An audit
   log records registrations, revocations, connection requests, pairings and reported sessions.
+
+- **Two-step verification** (TOTP) of web sign-ins. Users turn it on on the account page with a
+  QR code and keep ten recovery codes; every web sign-in (file UI, admin UI, the sign-in pages of
+  Nextcloud apps and devices) then asks for a code at `/login/two-step`. Codes work once;
+  wrong codes lock the step of the account for a while, and the account page shows them. Admins
+  reset it in the admin UI, operators with `gono-cloud user reset-two-factor`. The secrets are
+  encrypted with a key in the configuration directory, `two_factor.key_file`
+  (`two-factor.key`), which the install script, `init` and `serve` create when missing; back it
+  up with the configuration. App passwords are unaffected.
 
 ### Changed
 

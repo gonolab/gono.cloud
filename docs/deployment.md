@@ -201,9 +201,37 @@ user's directories, would belong to root and could no longer be written by the s
 | `user delete NAME` | Delete the account; its files move to `data/deleted/`. |
 | `app-password add NAME --label LABEL [--scope ...] [--expires-in-days N]` | Create an app password, shown once. |
 | `app-password list NAME`, `app-password delete NAME ID` | List or revoke app passwords. |
+| `user reset-two-factor NAME` | Turn the user's two-step verification off (a lost phone without recovery codes). |
+| `device list NAME`, `device revoke NAME ENDPOINT_ID` | List or revoke the devices registered for remote access ("Remote access"). |
 
 At least one enabled admin always remains: disabling, demoting or deleting the last one is
 refused. `gono-cloud <command> --help` explains every command and option.
+
+### Two-step verification
+
+Users turn two-step verification on themselves, on the account page: they scan a QR code with
+an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password, ...), enter a
+code, and keep the ten recovery codes it shows once. From then on every web sign-in (the file
+UI, the admin UI, the sign-in pages of Nextcloud apps and devices) asks for a code after the
+password. App passwords do not change: devices and Nextcloud apps keep working. Remote access
+for devices is available only on accounts that have it on.
+
+- **The server's clock must be right** (NTP): codes change every 30 seconds.
+- **The key file.** The TOTP secrets are encrypted with the key in `two_factor.key_file`,
+  `/etc/gono-cloud/two-factor.key` (on macOS `/usr/local/etc/gono-cloud/two-factor.key`). The
+  install script creates it (32 random bytes, `root:gono-cloud`, mode 0640) and never
+  replaces it; `config check` shows whether it exists. **Back it up with the configuration,
+  apart from the database**: a copy of the database alone does not give the second factor
+  away. Without the file, accounts with two-step verification cannot sign in, so `serve`
+  refuses to start while any account uses it; restore the file, or reset those accounts with
+  `gono-cloud user reset-two-factor`.
+- **A lost phone.** The user signs in with a recovery code and turns two-step verification off
+  and on again, or an admin resets it (the account's page in the admin UI, or
+  `user reset-two-factor`). The account then signs in with its password alone until it turns it
+  on again.
+- **Failures.** After 5 wrong codes in 15 minutes, or 20 in a day, the second step of the
+  account is locked until the window passes. The account page shows its user when the password
+  was right but the code was not.
 
 ## Service management
 
@@ -383,9 +411,9 @@ protocol is [connect-protocol.md](connect-protocol.md), and
   client: it opens a link, the user signs in with the web login password, and the consent page
   names the device, its platform and its short device ID, which the device shows as well. The
   device gets a credential of its own, without access to files.
-- **Two-step verification is required.** Only accounts with two-step verification enrolled
-  register devices, reach each other's addresses and use the relay. Its enrolment is not part
-  of this version yet, so no account can register a device yet.
+- **Two-step verification is required.** Only accounts with two-step verification on
+  ("Two-step verification" above) register devices, reach each other's addresses and use the
+  relay. The consent page of a device leads through turning it on and comes back.
 - **The account page** lists the account's devices, whether they are online, and lets a device
   ask the account's other devices to pair for an hour.
 - **Revoking a device** (lost, stolen, retired) is final for its key: the account's other
@@ -481,7 +509,8 @@ the service.
 
 A complete backup consists of:
 
-- the configuration, `/etc/gono-cloud/config.toml`;
+- the configuration, `/etc/gono-cloud/config.toml`, and the key of two-step verification next
+  to it, `/etc/gono-cloud/two-factor.key` (keep it apart from copies of the database);
 - the database, `/var/lib/gono-cloud/gono-cloud.db`: accounts, app passwords, file metadata
   (ids, ETags, favorites, locks) and the instance id;
 - the data directory, `/var/lib/gono-cloud/data/`: the users' files.
