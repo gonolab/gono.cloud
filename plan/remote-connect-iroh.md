@@ -406,7 +406,7 @@ and 2; Phase 4 needs the gates listed in it. The sizes are estimates.
 - **Work**:
   - On an Input Show spike branch (not merged), the second endpoint on iroh carries the same wire
     protocol. Addresses come from a stub directory.
-  - The relay is `iroh-relay` on a VPS, with an allowlist or HTTP-callout access control.
+  - The relay is the user's own `iroh-relay`, already deployed (decided 2026-11-15), with an allowlist or HTTP-callout access control.
   - V8 (section 5) on real networks:
     - home broadband from China Telecom, China Unicom and China Mobile;
     - 4G and 5G;
@@ -602,7 +602,6 @@ and 2; Phase 4 needs the gates listed in it. The sizes are estimates.
 
 ## 8. Open questions
 
-- Where does Phase 1's test relay run: an existing VPS, or a gono-cloud deployment?
 - Is screen viewing in a browser needed? If so, WebRTC comes in for that path.
 - Does gono.md need direct device-to-device connections (LAN sync, large files)?
 - What are the relay bandwidth quotas and rate-limit policy?
