@@ -367,8 +367,11 @@ of the two files keeps the previous pair in service and logs `relay certificate 
 and the next read picks the renewal up. The relay does not start while `qad_bind` is set and the
 files are missing or do not belong together.
 
-With **certbot**, a deploy hook does it after each renewal. Save it as
-`/etc/letsencrypt/renewal-hooks/deploy/gono-cloud-relay` and make it executable:
+With **certbot**, a deploy hook does it after each renewal. The certificate itself comes from
+certbot's nginx plugin (`certbot --nginx -d relay.example.com`) or from
+`certbot certonly --webroot -w /var/www/letsencrypt -d relay.example.com`, whose challenges the
+relay's server block in [reverse-proxy.md](reverse-proxy.md#the-relay) serves on port 80. Save
+the hook as `/etc/letsencrypt/renewal-hooks/deploy/gono-cloud-relay` and make it executable:
 
 ```sh
 #!/bin/sh

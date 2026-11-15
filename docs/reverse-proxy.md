@@ -252,6 +252,7 @@ the settings, the allowed devices and the certificate. The relay serves plain HT
 | A host name of its own, `relay.public_url` (for example `relay.example.com`) | The relay cannot run below a path, so it cannot share `base_url`'s host name. |
 | Forward everything on that host name to `relay.bind`, upgrading WebSockets | Devices hold a WebSocket open on `/relay` and probe `/ping`. |
 | Answer `/generate_204` over **plain HTTP** on port 80 instead of redirecting it | Devices use it to detect captive portals. The usual "redirect all of port 80 to HTTPS" breaks it. |
+| Keep the ACME challenges of the relay's certificate away from the relay | Everything else on the host name goes to the relay, which answers `/.well-known/acme-challenge/` with 404: a renewal that proves the host name over HTTP (certbot `--webroot`) needs a location of its own. |
 | Keep idle WebSockets open | A device keeps its relay connection while it is online, quiet between pings. |
 | No HTTP/2 needed | Devices open the WebSocket over HTTP/1.1. |
 
@@ -282,6 +283,11 @@ server {
         proxy_pass http://gono_relay;
         proxy_http_version 1.1;
         proxy_set_header Connection "";
+    }
+    # Renewals of the relay's certificate: `certbot certonly --webroot -w /var/www/letsencrypt`.
+    # (certbot's nginx plugin adds a location of its own and needs none.)
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
     }
     location / {
         return 301 https://$host$request_uri;
@@ -339,6 +345,12 @@ http://relay.example.com {
 ```sh
 # The captive-portal probe answers over plain HTTP: expect 204.
 curl -s -o /dev/null -w '%{http_code}\n' http://relay.example.com/generate_204
+
+# ACME challenges are served from the webroot, not redirected to the relay: expect 200.
+sudo install -d /var/www/letsencrypt/.well-known/acme-challenge
+echo probe | sudo tee /var/www/letsencrypt/.well-known/acme-challenge/probe >/dev/null
+curl -s -o /dev/null -w '%{http_code}\n' http://relay.example.com/.well-known/acme-challenge/probe
+sudo rm /var/www/letsencrypt/.well-known/acme-challenge/probe
 
 # The relay answers over HTTPS: expect 200.
 curl -s -o /dev/null -w '%{http_code}\n' https://relay.example.com/healthz
