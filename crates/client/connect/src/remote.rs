@@ -3,8 +3,9 @@
 //! - [`Remote::start`] binds the endpoint as in plan 3.5, with the server's relay, and opens
 //!   the control channel; its events go to the receiver it returns.
 //! - [`Remote::connect`] asks the server to connect (`connect`, recorded and announced to the
-//!   target) and dials the device by its key. [`Remote::connect_for_pairing`] does the same for
-//!   the approver of a pending pairing request (protocol 8.2).
+//!   target) and dials the device by its key, relay first ([`crate::endpoint::dial`]).
+//!   [`Remote::connect_for_pairing`] does the same for the approver of a pending pairing
+//!   request (protocol 8.2).
 //! - [`Remote::accept_trusted`] is how a product accepts connections: it hands out only the
 //!   peers whose key the product's predicate admits (its trust list, and the key of a pending
 //!   pairing that `incoming` announced), closes every other right after the handshake, and
@@ -136,6 +137,7 @@ impl Remote {
             lookup.clone(),
         )
         .await?;
+        lookup.watch_relay(&endpoint);
         Ok((
             Self {
                 endpoint,
@@ -186,10 +188,7 @@ impl Remote {
             .connect_to(device, &service, purpose, request_id)
             .await?;
         let addr = self.lookup.remember(device, &result)?;
-        self.endpoint
-            .connect(addr, alpn)
-            .await
-            .map_err(|err| Error::Connect(err.to_string()))
+        endpoint::dial(&self.endpoint, addr, alpn).await
     }
 
     /// The next incoming connection attempt, from any key, with no limit.

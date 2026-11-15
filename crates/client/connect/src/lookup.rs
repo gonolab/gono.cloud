@@ -10,6 +10,13 @@
 //!   answer is remembered here. iroh's later resolves are answered from that for up to
 //!   [`CACHE_TTL`], then with `lookup`, which the server allows only after a recent `connect`
 //!   or during a reported session.
+//! - **Relay first.** While the endpoint holds its relay connection
+//!   ([`ControlLookup::watch_relay`]), resolves name the relay alone, and the direct path is
+//!   left to iroh's NAT traversal inside the connection: a direct address handed to iroh
+//!   before the handshake makes it send the Initial there too, and a direct path that works one
+//!   way only then holds the handshake (see [`crate::endpoint::dial`]). Without the relay
+//!   (an outage of gono-cloud stops the embedded relay too), resolves name the cached direct
+//!   addresses, so that new connections can still use them (protocol 7.4).
 //! - **Checks.** An answer for another key than the one asked for is refused. A relay URL
 //!   other than the discovery document's is dropped, because iroh dials whatever relay it is
 //!   given and the endpoint must contact no relay but ours (plan 3.5, threat model C15).
@@ -29,7 +36,7 @@ use std::{
 
 use gono_protocol::connect::{DeviceId, ErrorCode, is_dialable, limits, message::AddressResult};
 use iroh::{
-    EndpointAddr, EndpointId, RelayUrl,
+    Endpoint, EndpointAddr, EndpointId, RelayUrl, Watcher as _,
     address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error as LookupError, Item},
 };
 use n0_future::boxed::BoxStream;
@@ -56,6 +63,15 @@ pub(crate) struct Addresses {
     pub(crate) direct: Vec<SocketAddr>,
 }
 
+/// Says whether the endpoint holds its relay connection right now.
+struct RelayCheck(Mutex<Box<dyn FnMut() -> bool + Send>>);
+
+impl std::fmt::Debug for RelayCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RelayCheck")
+    }
+}
+
 /// See the module documentation.
 #[derive(Debug, Clone)]
 pub struct ControlLookup {
@@ -65,6 +81,8 @@ pub struct ControlLookup {
     /// The latest addresses, for the task that publishes them; started by the first
     /// [`AddressLookup::publish`], and ended when the last clone of the lookup is dropped.
     published: Arc<OnceLock<watch::Sender<Option<Addresses>>>>,
+    /// The endpoint's relay status, once [`ControlLookup::watch_relay`] was called.
+    relay: Arc<OnceLock<RelayCheck>>,
 }
 
 impl ControlLookup {
@@ -76,7 +94,26 @@ impl ControlLookup {
             relay_url,
             cache: Arc::new(Mutex::new(Cache::default())),
             published: Arc::new(OnceLock::new()),
+            relay: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Lets resolves follow the relay status of `endpoint`, the endpoint this lookup serves:
+    /// the relay alone while it is connected, the cached direct addresses besides while it is
+    /// not. Until this is called, resolves name both. [`crate::Remote::start`] calls it.
+    pub fn watch_relay(&self, endpoint: &Endpoint) {
+        // A watcher of the status only: holding the endpoint here would keep it alive.
+        let mut status = endpoint.home_relay_status();
+        let check: Box<dyn FnMut() -> bool + Send> =
+            Box::new(move || status.get().iter().any(|relay| relay.is_connected()));
+        let _ = self.relay.set(RelayCheck(Mutex::new(check)));
+    }
+
+    /// Whether resolves leave the direct addresses to NAT traversal.
+    fn relay_first(&self) -> bool {
+        self.relay
+            .get()
+            .is_some_and(|check| (check.0.lock().unwrap_or_else(PoisonError::into_inner))())
     }
 
     /// Checks the answer of a `connect` or `lookup` for `target` (see the module
@@ -91,7 +128,7 @@ impl ControlLookup {
 
     fn check_and_remember(&self, target: DeviceId, result: &AddressResult) -> Result<EndpointInfo> {
         let result = checked(&self.relay_url, target.0, result)?;
-        let info = info(&result);
+        let info = info(&result, true);
         self.cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -169,9 +206,12 @@ fn checked(relay: &RelayUrl, target: EndpointId, result: &AddressResult) -> Resu
     })
 }
 
-/// The endpoint information of a checked answer.
-fn info(result: &AddressResult) -> EndpointInfo {
-    let mut info = EndpointInfo::new(result.target.0).with_ip_addrs(result.direct.clone());
+/// The endpoint information of a checked answer, with or without its direct addresses.
+fn info(result: &AddressResult, direct: bool) -> EndpointInfo {
+    let mut info = EndpointInfo::new(result.target.0);
+    if direct || result.relay_url.is_none() {
+        info = info.with_ip_addrs(result.direct.clone());
+    }
     if let Some(relay) = result
         .relay_url
         .as_deref()
@@ -206,20 +246,25 @@ impl AddressLookup for ControlLookup {
     }
 
     fn resolve(&self, endpoint_id: EndpointId) -> Option<BoxStream<Result<Item, LookupError>>> {
+        let direct = !self.relay_first();
         if let Some(result) = self.cached(&endpoint_id) {
-            let item = Item::new(info(&result), PROVENANCE, None);
+            let item = Item::new(info(&result, direct), PROVENANCE, None);
             return Some(Box::pin(n0_future::stream::once(Ok(item))));
         }
         let lookup = self.clone();
         Some(Box::pin(n0_future::stream::once_future(async move {
             let target = DeviceId::from(endpoint_id);
-            lookup
+            let result = lookup
                 .channel
                 .lookup(target)
                 .await
-                .and_then(|result| lookup.check_and_remember(target, &result))
-                .map(|info| Item::new(info, PROVENANCE, None))
-                .map_err(|err| LookupError::from_err(PROVENANCE, err))
+                .map_err(|err| LookupError::from_err(PROVENANCE, err))?;
+            lookup
+                .check_and_remember(target, &result)
+                .map_err(|err| LookupError::from_err(PROVENANCE, err))?;
+            let checked = checked(&lookup.relay_url, target.0, &result)
+                .map_err(|err| LookupError::from_err(PROVENANCE, err))?;
+            Ok(Item::new(info(&checked, direct), PROVENANCE, None))
         })))
     }
 }
@@ -370,8 +415,34 @@ mod tests {
             assert_eq!(result.relay_url, None, "{foreign}");
             assert_eq!(result.direct.len(), 1);
         }
-        let info = info(&ours);
+        let info = info(&ours, true);
         assert_eq!(info.data.relay_urls().count(), 1);
+    }
+
+    #[test]
+    fn resolves_leave_direct_addresses_out_while_the_relay_works() {
+        let target = device_id(1);
+        let relayed = checked(
+            &relay(),
+            target.0,
+            &answer(target, "https://relay.example.com/", 3),
+        )
+        .unwrap();
+        // Relay first: the relay alone, so that iroh does not send the Initial directly.
+        let first = info(&relayed, false);
+        assert_eq!(first.data.relay_urls().count(), 1);
+        assert_eq!(first.data.ip_addrs().count(), 0);
+        // Without the relay (an outage): the cached direct addresses (protocol 7.4).
+        let fallback = info(&relayed, true);
+        assert_eq!(fallback.data.ip_addrs().count(), 3);
+        // An answer without our relay keeps its direct addresses in any case.
+        let direct_only = checked(
+            &relay(),
+            target.0,
+            &answer(target, "https://evil.example.com/", 2),
+        )
+        .unwrap();
+        assert_eq!(info(&direct_only, false).data.ip_addrs().count(), 2);
     }
 
     #[test]

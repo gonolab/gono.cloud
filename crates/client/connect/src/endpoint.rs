@@ -8,6 +8,12 @@
 //!   ([`SystemResolver`]) where the app cannot read the network's DNS (HarmonyOS);
 //! - both address families bound, on a free port unless the product needs a fixed one;
 //! - for the LAN-only endpoint ([`bind_lan`]), no relay and no address lookup at all;
+//! - dialing relay first ([`dial`]): the handshake goes over the relay, and iroh's NAT
+//!   traversal inside the connection moves it to a direct path. A direct path that works in
+//!   one direction only (a host firewall that refuses outbound UDP, an asymmetric filter)
+//!   would otherwise hold the handshake until it times out, relay or not, because iroh sends
+//!   the Initial on every known path and the peer answers on the first one it heard. The direct
+//!   addresses of the control plane are used only when the relay fails (protocol 7.4);
 //! - no captive-portal check: iroh would send a plain-HTTP request to port 80 of the relay's
 //!   host name (`/generate_204`), whose answer only decides whether the next network report is
 //!   a full one. Hosts in mainland China whose domain is not ICP-registered have port 80
@@ -34,10 +40,10 @@ use std::{
 };
 
 use iroh::{
-    Endpoint, NetReportConfig, RelayMode, RelayUrl, SecretKey,
+    Endpoint, EndpointAddr, NetReportConfig, RelayMode, RelayUrl, SecretKey, Watcher as _,
     address_lookup::AddressLookup,
     dns::{BoxIter, DnsError, DnsResolver, Resolver, TxtRecordData},
-    endpoint::{QuicTransportConfig, VarInt, presets},
+    endpoint::{Connection, QuicTransportConfig, VarInt, presets},
 };
 use n0_future::boxed::BoxFuture;
 
@@ -248,6 +254,68 @@ async fn bind_families(
         .map_err(|err| Error::Bind(err.to_string()))
 }
 
+/// How long [`dial`] waits for the endpoint's relay connection (right after the endpoint was
+/// bound, or after a network change) before it dials the direct addresses instead.
+pub const RELAY_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the handshake over the relay may take before [`dial`] tries the direct addresses.
+pub const RELAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether `endpoint` holds a connection to its home relay.
+pub fn relay_connected(endpoint: &Endpoint) -> bool {
+    endpoint
+        .home_relay_status()
+        .get()
+        .iter()
+        .any(|status| status.is_connected())
+}
+
+/// Connects to `addr` for `alpn`, relay first.
+///
+/// When `addr` names a relay and the endpoint holds its relay connection (waiting up to
+/// [`RELAY_WAIT`] for it), the handshake goes over the relay alone, and iroh's NAT traversal
+/// inside the connection adds a direct path once one works in both directions. The direct
+/// addresses of `addr` are dialed only when the relay fails: no relay connection, no relay
+/// in `addr`, or no handshake over it within [`RELAY_HANDSHAKE_TIMEOUT`]. A refusal by the peer
+/// over a working relay is returned as it is.
+///
+/// Why not direct first: iroh sends the Initial on every path it knows, and the peer answers
+/// on the first copy it receives. If that direct path works one way only, the handshake hangs
+/// until it times out, and a relay-only retry fails the same way, because iroh keeps the
+/// peer's direct addresses for a minute after the last connection.
+pub async fn dial(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+    alpn: &[u8],
+) -> Result<Connection, Error> {
+    if let Some(relay) = addr.relay_urls().next().cloned()
+        && (relay_connected(endpoint)
+            || tokio::time::timeout(RELAY_WAIT, endpoint.online())
+                .await
+                .is_ok())
+    {
+        let relay_only = EndpointAddr::new(addr.id).with_relay_url(relay);
+        match tokio::time::timeout(RELAY_HANDSHAKE_TIMEOUT, endpoint.connect(relay_only, alpn))
+            .await
+        {
+            Ok(Ok(connection)) => return Ok(connection),
+            Ok(Err(err)) if relay_connected(endpoint) => {
+                return Err(Error::Connect(err.to_string()));
+            }
+            Ok(Err(err)) => {
+                tracing::info!(error = %err, "the relay failed during the handshake; dialing directly");
+            }
+            Err(_) => tracing::info!(
+                "no handshake over the relay within {RELAY_HANDSHAKE_TIMEOUT:?}; dialing directly"
+            ),
+        }
+    }
+    endpoint
+        .connect(addr, alpn)
+        .await
+        .map_err(|err| Error::Connect(err.to_string()))
+}
+
 /// Resolves host names with the platform's resolver (`getaddrinfo`, through
 /// [`tokio::net::lookup_host`]). It answers A and AAAA queries only; nothing in this
 /// configuration asks for TXT records.
@@ -360,7 +428,7 @@ mod tests {
             assert_eq!(endpoint.addr().relay_urls().count(), 0, "no relay");
         }
 
-        let addr = iroh::EndpointAddr::from_parts(
+        let addr = EndpointAddr::from_parts(
             server.id(),
             server
                 .bound_sockets()

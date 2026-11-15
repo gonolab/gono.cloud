@@ -265,6 +265,29 @@ async fn two_devices_register_reach_each_other_and_hear_of_a_revocation() {
     .expect("connected in time")
     .unwrap();
     assert_eq!(connection.remote_id(), home_key.public());
+    // Relay first: the handshake went over the relay, and NAT traversal inside the connection
+    // adds the direct path (gono-connect's endpoint::dial).
+    let path_kinds = |connection: &gono_connect::iroh::endpoint::Connection| {
+        connection
+            .paths()
+            .iter()
+            .map(|path| format!("{:?}", path.remote_addr()))
+            .collect::<Vec<_>>()
+    };
+    let first = path_kinds(&connection);
+    assert!(
+        first.first().is_some_and(|path| path.starts_with("Relay")),
+        "{first:?}"
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    while !path_kinds(&connection).iter().any(|path| path.starts_with("Ip")) {
+        assert!(
+            Instant::now() < deadline,
+            "no direct path: {:?}",
+            path_kinds(&connection)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let (mut send, mut recv) = connection.open_bi().await.unwrap();
     send.write_all(b"ping").await.unwrap();
     send.finish().unwrap();
