@@ -1,7 +1,11 @@
 //! iroh's address lookup backed by the control channel (protocol 7).
 //!
 //! - **Publishing.** iroh calls [`AddressLookup::publish`] whenever the endpoint's own
-//!   addresses change; they go to the server with `publish`.
+//!   addresses change. A task sends the latest of them to the server with `publish`: at most
+//!   once a second, which the server enforces (protocol 15), so changes in quick succession
+//!   (the local addresses, then the public one QUIC address discovery found) are coalesced
+//!   and a refusal for the rate is sent again; and again after every reconnect, because the
+//!   server keeps what a device published per connection (protocol 7.1).
 //! - **Resolving.** A connection starts with `connect` ([`crate::Remote::connect`]), whose
 //!   answer is remembered here. iroh's later resolves are answered from that for up to
 //!   [`CACHE_TTL`], then with `lookup`, which the server allows only after a recent `connect`
@@ -15,16 +19,18 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, PoisonError},
+    net::SocketAddr,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::{Duration, Instant},
 };
 
-use gono_protocol::connect::{DeviceId, limits, message::AddressResult};
+use gono_protocol::connect::{DeviceId, ErrorCode, limits, message::AddressResult};
 use iroh::{
     EndpointAddr, EndpointId, RelayUrl,
     address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error as LookupError, Item},
 };
 use n0_future::boxed::BoxStream;
+use tokio::sync::watch;
 
 use crate::{ControlChannel, Error, Result};
 
@@ -37,12 +43,25 @@ const MAX_CACHED: usize = 256;
 /// The provenance iroh records for these results.
 const PROVENANCE: &str = "gono-connect";
 
+/// The least time between two `publish` (protocol 15).
+const PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What a device publishes (protocol 7.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Addresses {
+    pub(crate) relay_url: Option<String>,
+    pub(crate) direct: Vec<SocketAddr>,
+}
+
 /// See the module documentation.
 #[derive(Debug, Clone)]
 pub struct ControlLookup {
     channel: ControlChannel,
     relay_url: RelayUrl,
     cache: Arc<Mutex<Cache>>,
+    /// The latest addresses, for the task that publishes them; started by the first
+    /// [`AddressLookup::publish`], and ended when the last clone of the lookup is dropped.
+    published: Arc<OnceLock<watch::Sender<Option<Addresses>>>>,
 }
 
 impl ControlLookup {
@@ -53,6 +72,7 @@ impl ControlLookup {
             channel,
             relay_url,
             cache: Arc::new(Mutex::new(Cache::default())),
+            published: Arc::new(OnceLock::new()),
         }
     }
 
@@ -166,12 +186,16 @@ impl AddressLookup for ControlLookup {
             .copied()
             .take(limits::MAX_DIRECT_ADDRESSES)
             .collect();
-        let channel = self.channel.clone();
-        tokio::spawn(async move {
-            if let Err(err) = channel.publish(relay_url, direct).await {
-                tracing::debug!(error = %err, "cannot publish the device's addresses");
-            }
+        let latest = self.published.get_or_init(|| {
+            let (latest, receiver) = watch::channel(None);
+            tokio::spawn(publish_latest(
+                self.channel.clone(),
+                receiver,
+                PUBLISH_INTERVAL,
+            ));
+            latest
         });
+        latest.send_replace(Some(Addresses { relay_url, direct }));
     }
 
     fn resolve(&self, endpoint_id: EndpointId) -> Option<BoxStream<Result<Item, LookupError>>> {
@@ -190,6 +214,66 @@ impl AddressLookup for ControlLookup {
                 .map(|info| Item::new(info, PROVENANCE, None))
                 .map_err(|err| LookupError::from_err(PROVENANCE, err))
         })))
+    }
+}
+
+/// Sends the latest addresses of `latest` with `publish` while `channel` is connected: at
+/// most one `publish` per `interval`, again after a refusal for the rate, and again after
+/// every reconnect. Ends when the sender of `latest` is dropped.
+pub(crate) async fn publish_latest(
+    channel: ControlChannel,
+    mut latest: watch::Receiver<Option<Addresses>>,
+    interval: Duration,
+) {
+    let mut connected = channel.connected();
+    // What the current connection has.
+    let mut sent: Option<Addresses> = None;
+    let mut last_sent: Option<tokio::time::Instant> = None;
+    loop {
+        let is_connected = *connected.borrow_and_update();
+        let pending = latest
+            .borrow_and_update()
+            .clone()
+            .filter(|addresses| sent.as_ref() != Some(addresses));
+        if let Some(addresses) = pending.filter(|_| is_connected) {
+            if let Some(at) = last_sent {
+                tokio::time::sleep_until(at + interval).await;
+            }
+            last_sent = Some(tokio::time::Instant::now());
+            let result = channel
+                .publish(addresses.relay_url.clone(), addresses.direct.clone())
+                .await;
+            match result {
+                Ok(()) => sent = Some(addresses),
+                // Sent again once the interval has passed.
+                Err(Error::Refused {
+                    code: ErrorCode::RateLimited,
+                    ..
+                }) => {}
+                // Not again: the same addresses would be refused the same way.
+                Err(Error::Refused { code, message }) => {
+                    tracing::debug!(?code, message, "the server refused the device's addresses");
+                    sent = Some(addresses);
+                }
+                // Not connected: sent again after the reconnect.
+                Err(err) => tracing::debug!(error = %err, "cannot publish the device's addresses"),
+            }
+            continue;
+        }
+        tokio::select! {
+            changed = latest.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            changed = connected.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                // A new connection knows nothing of what an earlier one published.
+                sent = None;
+            }
+        }
     }
 }
 

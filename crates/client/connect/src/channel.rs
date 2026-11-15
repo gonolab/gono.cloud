@@ -307,6 +307,12 @@ impl ControlChannel {
         *self.connected.borrow()
     }
 
+    /// Whether the channel is connected, as it changes: true from every `welcome` until that
+    /// connection breaks.
+    pub(crate) fn connected(&self) -> watch::Receiver<bool> {
+        self.connected.clone()
+    }
+
     /// Waits until the channel is connected, for at most `limit`. Returns whether it is.
     pub async fn wait_connected(&self, limit: Duration) -> bool {
         let mut connected = self.connected.clone();
@@ -1589,5 +1595,83 @@ mod tests {
             ChannelEvent::Ended(EndReason::ProtocolViolation(_))
         ));
         server.await.unwrap();
+    }
+
+    /// The `publish` frames the server receives on `socket`, answered with `answer`, until
+    /// `count` arrived: their addresses and when they arrived.
+    async fn publishes(
+        socket: &mut ServerSocket,
+        count: usize,
+        answer: impl Fn(u64, usize) -> ServerMessage,
+    ) -> Vec<(Vec<SocketAddr>, tokio::time::Instant)> {
+        let mut seen = Vec::new();
+        while seen.len() < count {
+            let frame = tokio::time::timeout(LIMIT, socket.next())
+                .await
+                .expect("a frame in time");
+            let Some(Ok(Message::Text(text))) = frame else {
+                continue;
+            };
+            let value: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+            if value["type"] != "publish" {
+                continue;
+            }
+            let direct: Vec<SocketAddr> = serde_json::from_value(value["direct"].clone()).unwrap();
+            let id = value["id"].as_u64().unwrap();
+            socket
+                .send(Message::text(answer(id, seen.len()).to_text()))
+                .await
+                .unwrap();
+            seen.push((direct, tokio::time::Instant::now()));
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn addresses_are_published_spaced_coalesced_and_again_after_a_reconnect() {
+        use crate::lookup::{Addresses, publish_latest};
+
+        let (listener, channel, mut events) = scripted().await;
+        let interval = Duration::from_millis(300);
+        let (latest, receiver) = watch::channel(None);
+        let addresses = |port: u16| {
+            Some(Addresses {
+                relay_url: None,
+                direct: vec![SocketAddr::from(([192, 0, 2, 1], port))],
+            })
+        };
+        latest.send_replace(addresses(1));
+        tokio::spawn(publish_latest(channel.clone(), receiver, interval));
+
+        let mut socket = accept_hello(&listener).await;
+        socket.send(Message::text(welcome(&[]))).await.unwrap();
+        assert!(matches!(
+            next(&mut events).await,
+            ChannelEvent::Connected(_)
+        ));
+        // The first is refused for the rate and sent again after the interval.
+        let seen = publishes(&mut socket, 2, |id, n| {
+            if n == 0 {
+                ServerMessage::error(Some(id), ErrorCode::RateLimited, "one per second")
+            } else {
+                ServerMessage::result(id, &())
+            }
+        })
+        .await;
+        assert_eq!(seen[0].0, seen[1].0);
+        assert!(seen[1].1 - seen[0].1 >= interval);
+        // Two changes in quick succession: only the last one goes out.
+        latest.send_replace(addresses(2));
+        latest.send_replace(addresses(3));
+        let seen = publishes(&mut socket, 1, |id, _| ServerMessage::result(id, &())).await;
+        assert_eq!(seen[0].0, vec![SocketAddr::from(([192, 0, 2, 1], 3))]);
+        // A new connection gets them again, without a change.
+        send_close(&mut socket, 1011).await;
+        drop(socket);
+        let mut socket = accept_hello(&listener).await;
+        socket.send(Message::text(welcome(&[]))).await.unwrap();
+        let seen = publishes(&mut socket, 1, |id, _| ServerMessage::result(id, &())).await;
+        assert_eq!(seen[0].0, vec![SocketAddr::from(([192, 0, 2, 1], 3))]);
+        drop(latest);
     }
 }
