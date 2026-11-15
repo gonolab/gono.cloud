@@ -4,20 +4,26 @@
 //!
 //! Addresses never leave this module except in `connect` and `lookup` answers (S3 of the
 //! threat model). Each connection has a bounded queue of frames; a device that does not read
-//! its frames loses its place, which ends its connection.
+//! its frames loses its place, which ends its connection at once.
+//!
+//! What a device is allowed and how much it has used are kept per device, not per connection,
+//! so that reconnecting resets neither: the `connect` grants that open `lookup` (protocol
+//! 7.3), the sessions it reported (12.2), and its rate limits (15).
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{
-        Mutex, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
-use gono_protocol::connect::{DeviceEntry, Signed};
+use gono_protocol::connect::{DeviceEntry, Signed, message::Purpose};
 use gono_server_core::devices::EndpointId;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
+
+use crate::limit::{DeviceLimits, Limit};
 
 /// Frames a connection may have queued before it counts as too slow.
 const QUEUE: usize = 256;
@@ -28,6 +34,12 @@ const FLAPPING_REPLACEMENTS: usize = 3;
 
 /// The window of [`FLAPPING_REPLACEMENTS`], in seconds.
 const FLAPPING_WINDOW_SECS: i64 = 10 * 60;
+
+/// How long a reported session keeps `lookup` open without an `ended` report, in seconds.
+const SESSION_MAX_SECS: i64 = 24 * 60 * 60;
+
+/// How long a `connect` grant is kept, in seconds; longer than any window that uses it.
+const GRANT_KEEP_SECS: i64 = 60 * 60;
 
 /// What a connection's task sends next.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,20 +78,71 @@ pub(crate) struct PendingPair {
     pub expires_at: i64,
 }
 
+/// A `connect` the server allowed (protocol 7.2), which later `lookup`s of the same target
+/// rely on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Grant {
+    pub at: i64,
+    pub purpose: Purpose,
+    pub service: String,
+    pub request_id: Option<String>,
+}
+
+/// Why a `lookup` may be answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LookupBasis {
+    /// A `connect` within the window, to be checked again as `connect` checks it.
+    Connect(Grant),
+    /// A reported session that has not ended.
+    Session,
+}
+
+/// Set by the hub when it drops a connection whose queue was full; the session then closes at
+/// once instead of draining the queue.
+#[derive(Debug, Default)]
+pub(crate) struct Dropped {
+    set: AtomicBool,
+    notify: Notify,
+}
+
+impl Dropped {
+    fn set(&self) {
+        self.set.store(true, Ordering::Relaxed);
+        // A stored permit: a session that is not waiting right now still sees it.
+        self.notify.notify_one();
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.set.load(Ordering::Relaxed)
+    }
+
+    /// Completes once the connection was dropped.
+    pub async fn wait(&self) {
+        if !self.is_set() {
+            self.notify.notified().await;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Conn {
     id: u64,
     tx: mpsc::Sender<Frame>,
     published: Option<Published>,
-    /// Targets of `connect`, with when.
-    connects: HashMap<EndpointId, i64>,
-    /// Peers of sessions reported as started and not yet ended.
-    sessions: HashSet<EndpointId>,
+    /// The device negotiated `pairing`, so it gets the pairing events.
+    pairing: bool,
+    dropped: Arc<Dropped>,
 }
 
 #[derive(Debug, Default)]
 struct Account {
     conns: HashMap<EndpointId, Conn>,
+    /// Allowed `connect`s by (caller, target).
+    grants: HashMap<(EndpointId, EndpointId), Grant>,
+    /// Sessions reported as started and not yet ended by (reporter, peer), with when.
+    sessions: HashMap<(EndpointId, EndpointId), i64>,
+    /// Each device's rate limits.
+    limits: HashMap<EndpointId, DeviceLimits>,
     requests: HashMap<String, PendingPair>,
     /// When the account's pairing requests were made, for the hourly limit.
     request_times: VecDeque<i64>,
@@ -98,6 +161,7 @@ struct Account {
 pub(crate) struct Registered {
     pub conn_id: u64,
     pub rx: mpsc::Receiver<Frame>,
+    pub dropped: Arc<Dropped>,
     /// The device connected from an address it did not use last time.
     pub new_address: bool,
     /// Its connections keep replacing each other from different addresses: the addresses.
@@ -116,14 +180,26 @@ impl Hub {
         self.accounts.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Counts one `limit` of `device`; `false` when it is over.
+    pub fn allow(&self, user_id: i64, device: EndpointId, limit: Limit, now: i64) -> bool {
+        self.lock()
+            .entry(user_id)
+            .or_default()
+            .limits
+            .entry(device)
+            .or_default()
+            .allow(limit, now)
+    }
+
     /// Registers a connection of `device`, closing an older one of the same device with
-    /// `replaced` (protocol 5.1).
+    /// `replaced` (protocol 5.1). `pairing` is whether it negotiated the feature.
     pub fn register(
         &self,
         user_id: i64,
         device: EndpointId,
         ip: IpAddr,
         now: i64,
+        pairing: bool,
         replaced: Outgoing,
     ) -> Registered {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -154,22 +230,32 @@ impl Hub {
             }
         }
         let new_address = account.last_ip.insert(device, ip) != Some(ip);
+        let dropped = Arc::new(Dropped::default());
         account.conns.insert(
             device,
             Conn {
                 id,
                 tx,
                 published: None,
-                connects: HashMap::new(),
-                sessions: HashSet::new(),
+                pairing,
+                dropped: Arc::clone(&dropped),
             },
         );
         Registered {
             conn_id: id,
             rx,
+            dropped,
             new_address,
             flapping,
         }
+    }
+
+    /// Whether connection `conn_id` is the one `device` is registered with.
+    pub fn is_current(&self, user_id: i64, device: EndpointId, conn_id: u64) -> bool {
+        self.lock()
+            .get(&user_id)
+            .and_then(|account| account.conns.get(&device))
+            .is_some_and(|conn| conn.id == conn_id)
     }
 
     /// Removes connection `conn_id` of `device`. Returns `false` if a newer connection had
@@ -207,8 +293,10 @@ impl Hub {
         match conn.tx.try_send(frame) {
             Ok(()) => true,
             Err(_) => {
-                // Full or closed: the connection's task ends when its queue runs dry.
-                account.conns.remove(&device);
+                // Full or closed: the connection ends at once.
+                if let Some(conn) = account.conns.remove(&device) {
+                    conn.dropped.set();
+                }
                 false
             }
         }
@@ -216,15 +304,25 @@ impl Hub {
 
     /// Queues `text` for every connected device of `user_id` except `except`.
     pub fn broadcast(&self, user_id: i64, text: &str, except: Option<EndpointId>) {
+        self.broadcast_to(user_id, text, except, false);
+    }
+
+    /// Queues `text` for every connected device of `user_id` that negotiated `pairing`,
+    /// except `except` (protocol 2.4: the pairing events go only to those).
+    pub fn broadcast_pairing(&self, user_id: i64, text: &str, except: Option<EndpointId>) {
+        self.broadcast_to(user_id, text, except, true);
+    }
+
+    fn broadcast_to(&self, user_id: i64, text: &str, except: Option<EndpointId>, pairing: bool) {
         let mut accounts = self.lock();
         let Some(account) = accounts.get_mut(&user_id) else {
             return;
         };
         let devices: Vec<EndpointId> = account
             .conns
-            .keys()
-            .copied()
-            .filter(|device| Some(*device) != except)
+            .iter()
+            .filter(|(device, conn)| Some(**device) != except && (conn.pairing || !pairing))
+            .map(|(device, _)| *device)
             .collect();
         for device in devices {
             Self::queue(account, device, Frame::Out(Outgoing::Text(text.to_owned())));
@@ -241,6 +339,33 @@ impl Hub {
         for device in devices {
             Self::queue(account, device, Frame::Logged(seq, text.to_owned()));
         }
+    }
+
+    /// Closes every connection of `user_id` with `frame` and forgets everything about the
+    /// account (disabled or deleted). Returns its pending pairing requests.
+    pub fn remove_account(&self, user_id: i64, frame: &Outgoing) -> Vec<PendingPair> {
+        let Some(account) = self.lock().remove(&user_id) else {
+            return Vec::new();
+        };
+        for conn in account.conns.values() {
+            let _ = conn.tx.try_send(Frame::Out(frame.clone()));
+        }
+        account.requests.into_values().collect()
+    }
+
+    /// Forgets the grants, sessions and limits of `device` (revoked or signed out).
+    pub fn forget_device(&self, user_id: i64, device: EndpointId) {
+        let mut accounts = self.lock();
+        let Some(account) = accounts.get_mut(&user_id) else {
+            return;
+        };
+        account
+            .grants
+            .retain(|(from, to), _| *from != device && *to != device);
+        account
+            .sessions
+            .retain(|(from, to), _| *from != device && *to != device);
+        account.limits.remove(&device);
     }
 
     /// Queues `frame` for every connection and forgets them all (shutdown).
@@ -278,6 +403,11 @@ impl Hub {
             .collect()
     }
 
+    /// Every account the hub holds state for: connections, pending requests, grants or limits.
+    pub fn known_accounts(&self) -> Vec<i64> {
+        self.lock().keys().copied().collect()
+    }
+
     /// Records what connection `conn_id` of `device` published.
     pub fn publish(&self, user_id: i64, device: EndpointId, conn_id: u64, published: Published) {
         if let Some(conn) = self.conn(user_id, device, conn_id).as_mut() {
@@ -294,66 +424,80 @@ impl Hub {
             .map(|conn| conn.published.clone())
     }
 
-    /// Remembers that connection `conn_id` of `device` sent `connect` for `target` at `now`.
-    pub fn connecting(
-        &self,
-        user_id: i64,
-        device: EndpointId,
-        conn_id: u64,
-        target: EndpointId,
-        now: i64,
-    ) {
+    /// Remembers that `device` was allowed `connect` to `target`.
+    pub fn grant(&self, user_id: i64, device: EndpointId, target: EndpointId, grant: Grant) {
         let mut accounts = self.lock();
-        if let Some(conn) = accounts
-            .get_mut(&user_id)
-            .and_then(|account| account.conns.get_mut(&device))
-            .filter(|conn| conn.id == conn_id)
-        {
-            conn.connects.retain(|_, at| now - *at < 3600);
-            conn.connects.insert(target, now);
-        }
+        let account = accounts.entry(user_id).or_default();
+        let now = grant.at;
+        account
+            .grants
+            .retain(|_, kept| now - kept.at < GRANT_KEEP_SECS);
+        account.grants.insert((device, target), grant);
     }
 
-    /// Whether `lookup` of `target` is allowed for connection `conn_id` of `device`: it sent
-    /// `connect` for it within `window` seconds, or has a session with it (protocol 7.3).
-    pub fn may_look_up(
+    /// Why `device` may `lookup` `target` (protocol 7.3): it was allowed `connect` for it
+    /// within `window` seconds, or reported a session with it that has not ended. `None` if
+    /// neither.
+    pub fn lookup_basis(
         &self,
         user_id: i64,
         device: EndpointId,
-        conn_id: u64,
         target: EndpointId,
         now: i64,
         window: i64,
-    ) -> bool {
+    ) -> Option<LookupBasis> {
         let accounts = self.lock();
-        accounts
-            .get(&user_id)
-            .and_then(|account| account.conns.get(&device))
-            .filter(|conn| conn.id == conn_id)
-            .is_some_and(|conn| {
-                conn.sessions.contains(&target)
-                    || conn
-                        .connects
-                        .get(&target)
-                        .is_some_and(|at| now - at <= window)
-            })
+        let account = accounts.get(&user_id)?;
+        if let Some(grant) = account
+            .grants
+            .get(&(device, target))
+            .filter(|grant| now - grant.at <= window)
+        {
+            return Some(LookupBasis::Connect(grant.clone()));
+        }
+        account
+            .sessions
+            .get(&(device, target))
+            .filter(|started| now - **started < SESSION_MAX_SECS)
+            .map(|_| LookupBasis::Session)
     }
 
-    /// Records a session of connection `conn_id` of `device` with `peer` as open or ended.
+    /// Records a session of `device` with `peer` as started or ended (protocol 12.2). A session
+    /// may start only between devices one of which was allowed `connect` to the other within
+    /// `window` seconds; a session already open may be reported again (after a reconnect).
+    /// Returns `false` when a start is refused.
     pub fn session(
         &self,
         user_id: i64,
         device: EndpointId,
-        conn_id: u64,
         peer: EndpointId,
         open: bool,
-    ) {
-        if let Some(conn) = self.conn(user_id, device, conn_id).as_mut() {
-            if open {
-                conn.sessions.insert(peer);
-            } else {
-                conn.sessions.remove(&peer);
-            }
+        now: i64,
+        window: i64,
+    ) -> bool {
+        let mut accounts = self.lock();
+        let account = accounts.entry(user_id).or_default();
+        if !open {
+            account.sessions.remove(&(device, peer));
+            return true;
+        }
+        account
+            .sessions
+            .retain(|_, started| now - *started < SESSION_MAX_SECS);
+        let granted = |from, to| {
+            account
+                .grants
+                .get(&(from, to))
+                .is_some_and(|grant| now - grant.at <= window)
+        };
+        if account.sessions.contains_key(&(device, peer))
+            || granted(device, peer)
+            || granted(peer, device)
+        {
+            account.sessions.entry((device, peer)).or_insert(now);
+            true
+        } else {
+            false
         }
     }
 
@@ -439,7 +583,8 @@ impl Hub {
         expired
     }
 
-    /// Removes the pending requests of `device` (revoked or signed out) and returns them.
+    /// Removes the pending requests of `device` (revoked or signed out, or the pairing window
+    /// closed) and returns them.
     pub fn drop_requests_of(&self, user_id: i64, device: EndpointId) -> Vec<PendingPair> {
         let mut accounts = self.lock();
         let Some(account) = accounts.get_mut(&user_id) else {
@@ -502,56 +647,150 @@ mod tests {
         EndpointId([seed; 32])
     }
 
+    fn register(hub: &Hub, device: EndpointId, ip: IpAddr, now: i64) -> Registered {
+        hub.register(1, device, ip, now, true, Outgoing::Close(4001, "replaced"))
+    }
+
+    fn grant(at: i64) -> Grant {
+        Grant {
+            at,
+            purpose: Purpose::Session,
+            service: "test/1".to_owned(),
+            request_id: None,
+        }
+    }
+
     #[tokio::test]
     async fn a_new_connection_replaces_the_old_one_and_flapping_is_noticed() {
         let hub = Hub::default();
         let a: IpAddr = "192.0.2.1".parse().unwrap();
         let b: IpAddr = "192.0.2.2".parse().unwrap();
         let replaced = || Outgoing::Close(4001, "replaced");
-        let mut first = hub.register(1, key(1), a, 0, replaced());
+        let mut first = register(&hub, key(1), a, 0);
         assert!(first.new_address);
-        let second = hub.register(1, key(1), a, 10, replaced());
+        let second = register(&hub, key(1), a, 10);
         assert!(!second.new_address);
         assert_eq!(first.rx.recv().await, Some(Frame::Out(replaced())));
         assert!(
             !hub.unregister(1, key(1), first.conn_id),
             "replaced already"
         );
-        let third = hub.register(1, key(1), b, 20, replaced());
+        assert!(!first.dropped.is_set(), "replaced is not dropped");
+        let third = register(&hub, key(1), b, 20);
         assert!(third.flapping.is_none());
-        let fourth = hub.register(1, key(1), a, 30, replaced());
+        let fourth = register(&hub, key(1), a, 30);
         assert_eq!(fourth.flapping, Some(vec![a, b]));
-        let fifth = hub.register(1, key(1), b, 40, replaced());
+        let fifth = register(&hub, key(1), b, 40);
         assert!(fifth.flapping.is_none(), "recorded once per window");
         assert!(hub.is_online(1, key(1)));
+        assert!(hub.is_current(1, key(1), fifth.conn_id));
         assert!(hub.unregister(1, key(1), fifth.conn_id));
         assert!(!hub.is_online(1, key(1)));
     }
 
     #[tokio::test]
-    async fn lookups_follow_a_recent_connect_or_an_open_session() {
+    async fn lookups_follow_a_recent_connect_or_an_open_session_across_reconnects() {
         let hub = Hub::default();
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
-        let conn = hub.register(1, key(1), ip, 0, Outgoing::Close(4001, ""));
-        assert!(!hub.may_look_up(1, key(1), conn.conn_id, key(2), 0, 600));
-        hub.connecting(1, key(1), conn.conn_id, key(2), 100);
-        assert!(hub.may_look_up(1, key(1), conn.conn_id, key(2), 700, 600));
-        assert!(!hub.may_look_up(1, key(1), conn.conn_id, key(2), 701, 600));
-        hub.session(1, key(1), conn.conn_id, key(2), true);
-        assert!(hub.may_look_up(1, key(1), conn.conn_id, key(2), 5000, 600));
-        hub.session(1, key(1), conn.conn_id, key(2), false);
-        assert!(!hub.may_look_up(1, key(1), conn.conn_id, key(2), 5000, 600));
+        let _conn = register(&hub, key(1), ip, 0);
+        assert_eq!(hub.lookup_basis(1, key(1), key(2), 0, 600), None);
+        hub.grant(1, key(1), key(2), grant(100));
+        // A reconnect keeps the grant.
+        let _again = register(&hub, key(1), ip, 200);
+        assert_eq!(
+            hub.lookup_basis(1, key(1), key(2), 700, 600),
+            Some(LookupBasis::Connect(grant(100)))
+        );
+        assert_eq!(hub.lookup_basis(1, key(1), key(2), 701, 600), None);
+        assert_eq!(
+            hub.lookup_basis(1, key(2), key(1), 200, 600),
+            None,
+            "the grant is one way"
+        );
     }
 
     #[tokio::test]
-    async fn a_connection_that_does_not_read_loses_its_place() {
+    async fn a_session_can_start_only_after_a_connect_between_the_two() {
+        let hub = Hub::default();
+        assert!(
+            !hub.session(1, key(1), key(2), true, 0, 600),
+            "no connect at all"
+        );
+        assert_eq!(hub.lookup_basis(1, key(1), key(2), 0, 600), None);
+        // Device 2 connected to device 1; either side may then report the session.
+        hub.grant(1, key(2), key(1), grant(100));
+        assert!(hub.session(1, key(1), key(2), true, 110, 600));
+        assert!(hub.session(1, key(2), key(1), true, 110, 600));
+        assert_eq!(
+            hub.lookup_basis(1, key(1), key(2), 5000, 600),
+            Some(LookupBasis::Session)
+        );
+        // Long after the connect, an open session may be reported again, a new one not.
+        assert!(hub.session(1, key(1), key(2), true, 5000, 600));
+        assert!(!hub.session(1, key(1), key(3), true, 5000, 600));
+        assert!(hub.session(1, key(1), key(2), false, 5000, 600));
+        assert_eq!(hub.lookup_basis(1, key(1), key(2), 5000, 600), None);
+        hub.forget_device(1, key(2));
+        assert_eq!(hub.lookup_basis(1, key(2), key(1), 110, 600), None);
+    }
+
+    #[tokio::test]
+    async fn limits_are_kept_per_device() {
+        let hub = Hub::default();
+        for _ in 0..crate::limit::HELLOS_PER_MINUTE {
+            assert!(hub.allow(1, key(1), Limit::Hello, 0));
+        }
+        assert!(!hub.allow(1, key(1), Limit::Hello, 0));
+        assert!(hub.allow(1, key(2), Limit::Hello, 0), "another device");
+        hub.forget_device(1, key(1));
+        assert!(hub.allow(1, key(1), Limit::Hello, 0));
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_does_not_read_is_dropped_at_once() {
         let hub = Hub::default();
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
-        let _conn = hub.register(1, key(1), ip, 0, Outgoing::Close(4001, ""));
+        let conn = register(&hub, key(1), ip, 0);
         for _ in 0..QUEUE {
             assert!(hub.send(1, key(1), Outgoing::Text("x".to_owned())));
         }
+        assert!(!conn.dropped.is_set());
         assert!(!hub.send(1, key(1), Outgoing::Text("x".to_owned())));
         assert!(!hub.is_online(1, key(1)));
+        assert!(conn.dropped.is_set());
+        tokio::time::timeout(std::time::Duration::from_secs(1), conn.dropped.wait())
+            .await
+            .expect("the session hears of it");
+    }
+
+    #[tokio::test]
+    async fn pairing_events_go_only_to_devices_that_negotiated_pairing() {
+        let hub = Hub::default();
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let mut with = register(&hub, key(1), ip, 0);
+        let mut without = hub.register(1, key(2), ip, 0, false, Outgoing::Close(4001, ""));
+        hub.broadcast_pairing(1, "p", None);
+        hub.broadcast(1, "b", None);
+        assert_eq!(
+            with.rx.recv().await,
+            Some(Frame::Out(Outgoing::Text("p".to_owned())))
+        );
+        assert_eq!(
+            without.rx.recv().await,
+            Some(Frame::Out(Outgoing::Text("b".to_owned())))
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_an_account_closes_its_connections_and_forgets_it() {
+        let hub = Hub::default();
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let mut conn = register(&hub, key(1), ip, 0);
+        hub.grant(1, key(1), key(2), grant(0));
+        let closed = Outgoing::Close(4004, "account disabled");
+        assert!(hub.remove_account(1, &closed).is_empty());
+        assert_eq!(conn.rx.recv().await, Some(Frame::Out(closed)));
+        assert!(hub.known_accounts().is_empty());
+        assert_eq!(hub.lookup_basis(1, key(1), key(2), 0, 600), None);
     }
 }

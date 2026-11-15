@@ -215,6 +215,20 @@ impl RelayStatus {
         disconnected
     }
 
+    /// Disconnects every device that holds a connection although the allowlist no longer
+    /// admits it, and returns how many there were.
+    ///
+    /// [`RelayStatus::disconnect`] cannot reach a connection that was admitted but is not yet
+    /// registered with the relay, and a caller may miss a change of the admission; sweeping
+    /// regularly ends such connections too.
+    pub fn sweep(&self) -> usize {
+        let stale = self.0.access.no_longer_admitted();
+        for device in &stale {
+            self.disconnect(device);
+        }
+        stale.len()
+    }
+
     /// `relay.max_client_bytes_per_sec`.
     pub fn client_rate_limit(&self) -> Option<u32> {
         self.0.client_rate_limit

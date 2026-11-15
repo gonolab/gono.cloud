@@ -25,6 +25,7 @@ pub const LOG_ENV: &str = "GONO_CLOUD_LOG";
 /// Crates whose events `logging.level` applies to.
 const OWN_CRATES: &[&str] = &[
     "gono_cloud",
+    "gono_server_connect",
     "gono_server_core",
     "gono_server_dav",
     "gono_server_nextcloud",
@@ -130,8 +131,9 @@ mod tests {
         let directives = default_directives(LogLevel::Debug);
         assert_eq!(
             directives,
-            "warn,gono_cloud=debug,gono_server_core=debug,gono_server_dav=debug,\
-             gono_server_nextcloud=debug,gono_server_relay=debug,iroh_relay=error"
+            "warn,gono_cloud=debug,gono_server_connect=debug,gono_server_core=debug,\
+             gono_server_dav=debug,gono_server_nextcloud=debug,gono_server_relay=debug,\
+             iroh_relay=error"
         );
         EnvFilter::try_new(directives).unwrap();
     }

@@ -44,8 +44,11 @@ INSERT INTO settings (name, value) VALUES ('instance_id', 'oc' || lower(hex(rand
 
 -- Accounts. Users authenticate devices with app passwords; the web login password below is
 -- used only for the server's HTML pages (sign-in, Login Flow v2, the file and admin UIs).
+-- Ids of accounts, credentials, sessions and devices are AUTOINCREMENT: in-memory state keyed
+-- by them (the control channel, pending sign-ins, the "shown once" pages) must never carry
+-- over to a newer row that reuses a deleted one's id.
 CREATE TABLE users (
-    id            INTEGER PRIMARY KEY,
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
     -- Validated by `gono_server_core::Username`: lowercase ASCII, appears verbatim in DAV URLs.
     username      TEXT    NOT NULL UNIQUE COLLATE BINARY,
     display_name  TEXT    NOT NULL,
@@ -60,7 +63,7 @@ CREATE TABLE users (
 -- Per-device credentials, minted by Login Flow v2, device registration, the CLI or the web
 -- admin UI.
 CREATE TABLE app_passwords (
-    id           INTEGER PRIMARY KEY,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id      INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     -- SHA-256 of the token. The plaintext is shown once at creation and never stored.
     token_hash   BLOB    NOT NULL UNIQUE CHECK (length(token_hash) = 32),
@@ -218,7 +221,7 @@ CREATE INDEX login_flows_expires_at ON login_flows (expires_at);
 -- Browser sessions of the server's HTML pages. Created only by signing in with the web login
 -- password; app passwords cannot create them.
 CREATE TABLE web_sessions (
-    id           INTEGER PRIMARY KEY,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
     -- SHA-256 of the session cookie value.
     token_hash   BLOB    NOT NULL UNIQUE CHECK (length(token_hash) = 32),
     user_id      INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
@@ -253,14 +256,14 @@ CREATE INDEX direct_downloads_expires_at ON direct_downloads (expires_at);
 -- Devices registered for remote access (docs/connect-protocol.md, sections 4 and 6). One row
 -- per Ed25519 key: the key is the device's identity and its iroh `EndpointId`.
 CREATE TABLE devices (
-    id                 INTEGER PRIMARY KEY,
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id            INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     -- The 32-byte Ed25519 public key. Unique across accounts: a key belongs to one account.
     endpoint_id        BLOB    NOT NULL UNIQUE CHECK (length(endpoint_id) = 32),
     -- The device's credential for the control channel; NULL exactly when the device is
-    -- revoked. No ON DELETE action: an app password that a device still uses cannot be deleted
-    -- on its own (revocation clears this column first), while deleting the account removes
-    -- both rows in one statement.
+    -- revoked or signed out. No ON DELETE action: an app password that a device still uses
+    -- cannot be deleted on its own (revocation and signing out clear this column first), while
+    -- deleting the account removes both rows in one statement.
     app_password_id    INTEGER UNIQUE REFERENCES app_passwords (id),
     -- `[a-z0-9-]{1,32}`: input-show, gono-md, ...
     product            TEXT    NOT NULL,
@@ -280,7 +283,10 @@ CREATE TABLE devices (
     -- Set once and never cleared: a revoked key never comes back (protocol 9.1). The row stays
     -- as a tombstone until the account is deleted.
     revoked_at         INTEGER,
-    CHECK ((revoked_at IS NULL) = (app_password_id IS NOT NULL))
+    -- Set when the device signed out (protocol 9.4), cleared when it registers again. The row
+    -- stays, so that the key remains bound to this account and can still be revoked.
+    left_at            INTEGER,
+    CHECK ((app_password_id IS NOT NULL) = (revoked_at IS NULL AND left_at IS NULL))
 ) STRICT;
 
 CREATE INDEX devices_user_id ON devices (user_id);

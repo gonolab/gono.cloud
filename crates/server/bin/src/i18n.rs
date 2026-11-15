@@ -435,6 +435,7 @@ texts! {
     last_seen: "Last seen {}", "最近在线：{}";
     never_connected: "Never connected", "从未连接";
     revoked_on: "Revoked {}", "已吊销：{}";
+    signed_out_on: "Signed out {}", "已退出登录：{}";
     accepts_remote: "Accepts remote connections", "接受远程连接";
     unattended_on: "Unattended access is on", "已开启无人值守访问";
     allow_pairing: "Allow pairing", "允许配对";

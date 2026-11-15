@@ -8,10 +8,10 @@ use std::{sync::Arc, time::Duration};
 use gono_protocol::connect::{
     ClientMessage, DeviceId, ErrorCode, LoginStart, LoginStarted, PollRequest, Registered,
     ServerMessage, Signed, Statement,
-    message::{HelloMessage, Purpose, SettingsChange},
+    message::{HelloMessage, Purpose, SessionEvent, SessionReport, SettingsChange},
     statement::{self, DeviceSummary, Hello, Introduced, Login, PairApproval, PairRequest},
 };
-use gono_server_connect::{Connect, ConnectConfig, DeviceLogin, Outgoing, Session};
+use gono_server_connect::{Connect, ConnectConfig, DeviceLogin, Outgoing, Refusal, Session};
 use gono_server_core::{
     Username, app_passwords,
     config::DbConfig,
@@ -203,6 +203,20 @@ impl Device {
         connect: &Arc<Connect>,
         settings: Option<SettingsChange>,
     ) -> ServerMessage {
+        let login = self.login(connect).await;
+        let settings = settings.unwrap_or(SettingsChange {
+            accept_remote: Some(true),
+            services: Some(vec!["inputshow/1".to_owned()]),
+            ..SettingsChange::default()
+        });
+        match self.hello(connect, login, Some(settings)).await {
+            Ok(welcome) => welcome,
+            Err(refusal) => serde_json::from_str(&refusal.frame).unwrap(),
+        }
+    }
+
+    /// Authenticates the upgrade, as the HTTP server does.
+    async fn login(&self, connect: &Arc<Connect>) -> DeviceLogin {
         let now = db::unix_now();
         let authenticated = app_passwords::authenticate(
             connect.pool(),
@@ -218,6 +232,22 @@ impl Device {
             .await
             .unwrap()
             .expect("a device's app password");
+        DeviceLogin {
+            user_id: self.user_id,
+            username: self.username.clone(),
+            display_name: self.username.clone(),
+            device,
+            client_ip: "192.0.2.10".parse().unwrap(),
+        }
+    }
+
+    /// Sends the hello on an authenticated upgrade; returns the welcome or the refusal.
+    async fn hello(
+        &mut self,
+        connect: &Arc<Connect>,
+        login: DeviceLogin,
+        settings: Option<SettingsChange>,
+    ) -> Result<ServerMessage, Refusal> {
         let (handshake, challenge) = connect.challenge();
         let ServerMessage::Challenge { nonce, .. } = serde_json::from_str(&challenge).unwrap()
         else {
@@ -236,29 +266,13 @@ impl Device {
             since: 0,
             version: "1.0.0".to_owned(),
             features: vec!["pairing".to_owned(), "session-reports".to_owned()],
-            settings: Some(settings.unwrap_or(SettingsChange {
-                accept_remote: Some(true),
-                services: Some(vec!["inputshow/1".to_owned()]),
-                ..SettingsChange::default()
-            })),
+            settings,
         });
-        let login = DeviceLogin {
-            user_id: self.user_id,
-            username: self.username.clone(),
-            display_name: self.username.clone(),
-            device,
-            client_ip: "192.0.2.10".parse().unwrap(),
-        };
-        match connect
+        let (session, welcome) = connect
             .hello(handshake, login, &serde_json::to_string(&hello).unwrap())
-            .await
-        {
-            Ok((session, welcome)) => {
-                self.session = Some(session);
-                serde_json::from_str(&welcome).unwrap()
-            }
-            Err(error) => serde_json::from_str(&error).unwrap(),
-        }
+            .await?;
+        self.session = Some(session);
+        Ok(serde_json::from_str(&welcome).unwrap())
     }
 
     /// Sends a request built by `build` with the next id and returns the answer.
@@ -403,7 +417,8 @@ async fn the_hello_must_prove_the_key_for_this_connection() {
         .hello(handshake, login, &serde_json::to_string(&hello).unwrap())
         .await
         .unwrap_err();
-    assert!(refused.contains("bad_signature"), "{refused}");
+    assert!(refused.frame.contains("bad_signature"), "{refused:?}");
+    assert_eq!(refused.code, 4000);
 
     // The working device is still alone and online.
     let answer = home.request(|id| ClientMessage::Ack { id, seq: 0 }).await;
@@ -520,6 +535,107 @@ async fn devices_see_each_other_and_get_addresses_only_through_connect() {
         2,
         "every connect is recorded, refused ones too: {kinds:?}"
     );
+}
+
+fn report(peer: DeviceId, event: SessionEvent) -> SessionReport {
+    SessionReport {
+        event,
+        session_id: statement::encode_bytes(&[7; 16]),
+        peer,
+        role: "controller".to_owned(),
+        service: "inputshow/1".to_owned(),
+        started_at: db::unix_now(),
+        ended_at: None,
+        path: "direct".to_owned(),
+        bytes_direct: None,
+        bytes_relayed: None,
+    }
+}
+
+#[tokio::test]
+async fn neither_session_reports_nor_reconnects_get_around_connect() {
+    let f = fixture().await;
+    let alice = f.user("alice", true).await;
+    let mut home = f.device(alice, "alice", &key(1), "Home PC").await;
+    let mut phone = f.device(alice, "alice", &key(2), "Phone").await;
+    let home_id = home.id();
+
+    // A session report does not stand in for a connect.
+    let reported = phone
+        .request(|id| ClientMessage::Session {
+            id,
+            report: report(home_id, SessionEvent::Started),
+        })
+        .await;
+    assert_eq!(error_code(&reported), Some(ErrorCode::NotPermitted));
+    let lookup = phone
+        .request(|id| ClientMessage::Lookup {
+            id,
+            target: home_id,
+        })
+        .await;
+    assert_eq!(error_code(&lookup), Some(ErrorCode::NotPermitted));
+    // Malformed fields never reach the audit log.
+    let mut malformed = report(home_id, SessionEvent::Started);
+    malformed.session_id = "x".repeat(2000);
+    let answer = phone
+        .request(|id| ClientMessage::Session {
+            id,
+            report: malformed,
+        })
+        .await;
+    assert_eq!(error_code(&answer), Some(ErrorCode::BadRequest));
+
+    let connect = |id| ClientMessage::Connect {
+        id,
+        target: home_id,
+        service: "inputshow/1".to_owned(),
+        purpose: Purpose::Session,
+        request_id: None,
+    };
+    let answer = phone.request(connect).await;
+    assert!(matches!(answer, ServerMessage::Result { .. }), "{answer:?}");
+    // The target stops accepting remote sessions: lookups that relied on the connect stop.
+    let changed = home
+        .request(|id| ClientMessage::Settings {
+            id,
+            change: SettingsChange {
+                accept_remote: Some(false),
+                ..SettingsChange::default()
+            },
+        })
+        .await;
+    assert!(
+        matches!(changed, ServerMessage::Result { .. }),
+        "{changed:?}"
+    );
+    let lookup = phone
+        .request(|id| ClientMessage::Lookup {
+            id,
+            target: home_id,
+        })
+        .await;
+    assert_eq!(error_code(&lookup), Some(ErrorCode::NotPermitted));
+    // A session after an allowed connect is fine, and opens lookups.
+    let reported = phone
+        .request(|id| ClientMessage::Session {
+            id,
+            report: report(home_id, SessionEvent::Started),
+        })
+        .await;
+    assert!(
+        matches!(reported, ServerMessage::Result { .. }),
+        "{reported:?}"
+    );
+
+    // The per-minute limit of connect survives a reconnect.
+    for _ in 1..gono_protocol::connect::limits::CONNECTS_PER_MINUTE {
+        phone.request(connect).await;
+    }
+    let welcome = phone.open(&f.connect, None).await;
+    assert!(matches!(welcome, ServerMessage::Welcome(_)), "{welcome:?}");
+    let limited = phone.request(connect).await;
+    assert_eq!(error_code(&limited), Some(ErrorCode::RateLimited));
 }
 
 #[tokio::test]
@@ -642,7 +758,7 @@ async fn an_approval_reaches_the_introduced_devices_and_the_newcomer() {
 
     let now = db::unix_now();
     let (phone_id, phone_key, home_id) = (phone.id(), phone.key.clone(), home.id());
-    let approval = |nonce: &str| {
+    let approval_at = |nonce: &str, issued_at: i64, expires_at: i64| {
         Signed::sign(
             &Statement::PairApproval(PairApproval {
                 server: SERVER.to_owned(),
@@ -662,12 +778,13 @@ async fn an_approval_reaches_the_introduced_devices_and_the_newcomer() {
                     allow_incoming: true,
                     allow_outgoing: false,
                 }],
-                issued_at: now,
-                expires_at: now + 3600,
+                issued_at,
+                expires_at,
             }),
             &phone_key,
         )
     };
+    let approval = |nonce: &str| approval_at(nonce, now, now + 3600);
     let wrong_nonce = phone
         .request(|id| ClientMessage::PairApprove {
             id,
@@ -676,6 +793,25 @@ async fn an_approval_reaches_the_introduced_devices_and_the_newcomer() {
         })
         .await;
     assert_eq!(error_code(&wrong_nonce), Some(ErrorCode::BadRequest));
+    // Lifetimes from the device must neither overflow nor dodge the 30-day cap.
+    for (issued_at, expires_at) in [
+        (-1, i64::MAX),
+        (i64::MIN, now + 60),
+        (now - 86_400, now + 60),
+    ] {
+        let unbounded = phone
+            .request(|id| ClientMessage::PairApprove {
+                id,
+                request_id: request_id.clone(),
+                approval: approval_at(&nonce, issued_at, expires_at),
+            })
+            .await;
+        assert_eq!(
+            error_code(&unbounded),
+            Some(ErrorCode::BadRequest),
+            "{issued_at} {expires_at}"
+        );
+    }
     let approved = phone
         .request(|id| ClientMessage::PairApprove {
             id,
@@ -769,9 +905,10 @@ async fn a_revoked_device_is_closed_and_the_others_hear_of_it() {
 }
 
 #[tokio::test]
-async fn signing_out_removes_the_device_without_revoking_it() {
+async fn signing_out_keeps_the_key_bound_to_the_account() {
     let f = fixture().await;
     let alice = f.user("alice", true).await;
+    let bob = f.user("bob", true).await;
     let mut home = f.device(alice, "alice", &key(1), "Home PC").await;
     let mut phone = f.device(alice, "alice", &key(2), "Phone").await;
     let left = phone.request(|id| ClientMessage::Leave { id }).await;
@@ -782,8 +919,94 @@ async fn signing_out_removes_the_device_without_revoking_it() {
     assert!(
         matches!(removed, ServerMessage::DeviceRemoved { endpoint_id, .. } if endpoint_id == phone.id())
     );
-    assert_eq!(devices::list(&f.pool, alice).await.unwrap().len(), 1);
-    // The key can register again.
+    // The entry stays, signed out, and is not in the devices' directory.
+    let listed = devices::list(&f.pool, alice).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(listed[1].is_signed_out());
+    let ServerMessage::Welcome(welcome) = home.open(&f.connect, None).await else {
+        panic!("expected a welcome");
+    };
+    assert_eq!(welcome.devices.len(), 1);
+    // Another account cannot take the key over.
+    let (status, body) = f.register(bob, &key(2), "Not Bob's").await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("endpoint_taken"))
+    );
+    // The same account can register it again, and the other devices hear of it.
     let (status, body) = f.register(alice, &key(2), "Phone").await;
     assert_eq!(status, 200, "{body}");
+    let added = home
+        .expect(|m| matches!(m, ServerMessage::DeviceAdded { .. }))
+        .await;
+    assert!(matches!(added, ServerMessage::DeviceAdded { .. }));
+    assert!(
+        devices::list(&f.pool, alice).await.unwrap()[1].is_active(),
+        "registered again"
+    );
+}
+
+#[tokio::test]
+async fn a_signed_out_device_can_still_be_revoked() {
+    let f = fixture().await;
+    let alice = f.user("alice", true).await;
+    let mut home = f.device(alice, "alice", &key(1), "Home PC").await;
+    let mut phone = f.device(alice, "alice", &key(2), "Phone").await;
+    let left = phone.request(|id| ClientMessage::Leave { id }).await;
+    assert!(matches!(left, ServerMessage::Result { .. }));
+    let revoked = devices::revoke(
+        &f.pool,
+        alice,
+        &[EndpointId(*key(2).public().as_bytes())],
+        RevokedBy::AccountPage,
+        None,
+        db::unix_now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(revoked.len(), 1);
+    home.expect(|m| matches!(m, ServerMessage::DeviceRevoked { .. }))
+        .await;
+    let (status, body) = f.register(alice, &key(2), "Phone").await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("endpoint_revoked"))
+    );
+}
+
+#[tokio::test]
+async fn a_revocation_during_the_handshake_refuses_the_hello() {
+    let f = fixture().await;
+    let alice = f.user("alice", true).await;
+    let mut home = f.device(alice, "alice", &key(1), "Home PC").await;
+    // The upgrade is authenticated, then the device is revoked before its hello.
+    let login = home.login(&f.connect).await;
+    devices::revoke(
+        &f.pool,
+        alice,
+        &[EndpointId(*key(1).public().as_bytes())],
+        RevokedBy::Cli,
+        None,
+        db::unix_now(),
+    )
+    .await
+    .unwrap();
+    // Without settings, nothing reads the device again before the connection is registered.
+    let mut second = Device {
+        session: None,
+        app_password: home.app_password.clone(),
+        key: home.key.clone(),
+        username: home.username.clone(),
+        user_id: home.user_id,
+        next_id: 1,
+    };
+    let refusal = second.hello(&f.connect, login, None).await.unwrap_err();
+    assert_eq!(refusal.code, 4003, "{refusal:?}");
+    assert!(
+        !f.connect
+            .is_online(alice, EndpointId(*key(1).public().as_bytes()))
+    );
+    // The first connection was replaced by the refused one; it ends either way.
+    let code = home.expect_close().await;
+    assert!(code == 4001 || code == 4003, "{code}");
 }

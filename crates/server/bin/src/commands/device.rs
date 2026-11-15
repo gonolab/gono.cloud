@@ -40,6 +40,7 @@ pub async fn run(config_path: &Path, command: DeviceCommand) -> anyhow::Result<(
                             format!("{} on {}", device.product, device.platform),
                             format_time(device.registered_at),
                             format_optional_time(device.last_seen_at, "never"),
+                            format_optional_time(device.left_at, "-"),
                             format_optional_time(device.revoked_at, "-"),
                         ]
                     })
@@ -51,6 +52,7 @@ pub async fn run(config_path: &Path, command: DeviceCommand) -> anyhow::Result<(
                         "PRODUCT",
                         "REGISTERED",
                         "LAST SEEN",
+                        "SIGNED OUT",
                         "REVOKED",
                     ],
                     &rows,

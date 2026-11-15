@@ -128,6 +128,8 @@ pub struct RemoteRow {
     pub status: String,
     pub online: bool,
     pub revoked: bool,
+    /// Registered: neither revoked nor signed out.
+    pub active: bool,
     /// What the device reported about remote access.
     pub remote: Vec<&'static str>,
     /// "May ask to pair until …".
@@ -728,7 +730,7 @@ async fn remote_rows(
                     .map(|(other, _)| other)
                     .filter(|other| {
                         other.id != device.id
-                            && !other.is_revoked()
+                            && other.is_active()
                             && other.registered_at <= revoked_at
                             && !applied.contains(&(device.id, other.id))
                     })
@@ -755,14 +757,20 @@ fn remote_row(
 ) -> RemoteRow {
     let t = visitor.t();
     let lang = visitor.lang();
-    let status = match (device.revoked_at, online, device.last_seen_at) {
-        (Some(at), _, _) => fill(t.revoked_on, &[&when(lang, now, at).0]),
-        (None, true, _) => t.online.to_owned(),
-        (None, false, Some(at)) => fill(t.last_seen, &[&when(lang, now, at).0]),
-        (None, false, None) => t.never_connected.to_owned(),
+    let status = match (
+        device.revoked_at,
+        device.left_at,
+        online,
+        device.last_seen_at,
+    ) {
+        (Some(at), _, _, _) => fill(t.revoked_on, &[&when(lang, now, at).0]),
+        (None, Some(at), _, _) => fill(t.signed_out_on, &[&when(lang, now, at).0]),
+        (None, None, true, _) => t.online.to_owned(),
+        (None, None, false, Some(at)) => fill(t.last_seen, &[&when(lang, now, at).0]),
+        (None, None, false, None) => t.never_connected.to_owned(),
     };
     let mut remote = Vec::new();
-    if !device.is_revoked() {
+    if device.is_active() {
         if device.accept_remote {
             remote.push(t.accepts_remote);
         }
@@ -782,6 +790,7 @@ fn remote_row(
         status,
         online,
         revoked: device.is_revoked(),
+        active: device.is_active(),
         remote,
         pairing: device
             .pairing_open(now)

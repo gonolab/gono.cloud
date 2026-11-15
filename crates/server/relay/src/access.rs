@@ -94,17 +94,36 @@ impl Allowlist {
     pub(crate) fn denied(&self) -> u64 {
         self.denied.load(Ordering::Relaxed)
     }
+
+    /// Whether `device` is admitted now: by the static list or by the admission.
+    fn admits(&self, device: &EndpointId) -> bool {
+        self.allowed.contains(device)
+            || self
+                .admission
+                .as_ref()
+                .is_some_and(|admission| admission.admits(device))
+    }
+
+    /// The devices with open connections that are no longer admitted.
+    pub(crate) fn no_longer_admitted(&self) -> Vec<EndpointId> {
+        let devices: HashSet<EndpointId> = self
+            .connected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .copied()
+            .collect();
+        devices
+            .into_iter()
+            .filter(|device| !self.admits(device))
+            .collect()
+    }
 }
 
 impl AccessControl for Allowlist {
     async fn on_connect(&self, request: &ClientRequest) -> Access {
         let device = request.endpoint_id();
-        let admitted = self.allowed.contains(&device)
-            || self
-                .admission
-                .as_ref()
-                .is_some_and(|admission| admission.admits(&device));
-        if admitted {
+        if self.admits(&device) {
             self.connected
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

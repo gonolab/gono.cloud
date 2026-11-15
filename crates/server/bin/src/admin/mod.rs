@@ -1110,11 +1110,17 @@ async fn reset_two_factor(
 
 /// A device registered for remote access, as the admin UI lists it.
 fn remote_row(t: &Text, device: &Device, online: bool, now: i64) -> RemoteDeviceRow {
-    let status = match (device.revoked_at, online, device.last_seen_at) {
-        (Some(at), _, _) => fill(t.revoked_on, &[&pages::date(at)]),
-        (None, true, _) => t.online.to_owned(),
-        (None, false, Some(at)) => fill(t.last_seen, &[&ago(t, now, at, pages::date)]),
-        (None, false, None) => t.never_connected.to_owned(),
+    let status = match (
+        device.revoked_at,
+        device.left_at,
+        online,
+        device.last_seen_at,
+    ) {
+        (Some(at), _, _, _) => fill(t.revoked_on, &[&pages::date(at)]),
+        (None, Some(at), _, _) => fill(t.signed_out_on, &[&pages::date(at)]),
+        (None, None, true, _) => t.online.to_owned(),
+        (None, None, false, Some(at)) => fill(t.last_seen, &[&ago(t, now, at, pages::date)]),
+        (None, None, false, None) => t.never_connected.to_owned(),
     };
     RemoteDeviceRow {
         hex: device.endpoint_id.to_hex(),

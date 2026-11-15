@@ -29,17 +29,31 @@ use gono_server_core::{
 };
 use rand::RngExt as _;
 use serde_json::json;
-use tokio::{sync::mpsc, time::Instant};
+use tokio::sync::mpsc;
 use url::Url;
 
 use crate::{
     Connect, device_id, entry,
-    hub::{Frame, Outgoing, PendingPair, Published, RequestRefusal},
+    hub::{Dropped, Frame, Grant, LookupBasis, Outgoing, PendingPair, Published, RequestRefusal},
+    limit::Limit,
     logged_message,
 };
 
 /// How often `last_seen_at` is written while a device stays connected.
 const SEEN_SECS: i64 = 5 * 60;
+
+/// How far an approval's `issued_at` may be from the server's clock, in seconds. Devices learn
+/// the server's time from `challenge` and `welcome`.
+const APPROVAL_SKEW_SECS: u64 = 10 * 60;
+
+/// The logged events a `welcome` carries, in bytes; the rest of the backlog follows as
+/// ordinary event messages, in order, before live ones. Keeps every message well below the
+/// 4 MiB devices accept.
+const WELCOME_EVENT_BYTES: usize = 512 * 1024;
+
+/// The values of a session report's `role` and `path` (protocol 12.2).
+const ROLES: &[&str] = &["controller", "controlled", "initiator", "acceptor"];
+const PATHS: &[&str] = &["direct", "relayed", "mixed"];
 
 /// A `challenge` waiting for its `hello`.
 #[derive(Debug)]
@@ -80,66 +94,6 @@ impl Reply {
     }
 }
 
-/// A token bucket: `rate` per second, at most `burst` at once.
-#[derive(Debug)]
-struct Bucket {
-    tokens: f64,
-    rate: f64,
-    burst: f64,
-    at: Instant,
-}
-
-impl Bucket {
-    fn new(rate: u32, burst: u32) -> Self {
-        Self {
-            tokens: f64::from(burst),
-            rate: f64::from(rate),
-            burst: f64::from(burst),
-            at: Instant::now(),
-        }
-    }
-
-    fn take(&mut self) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.at).as_secs_f64();
-        self.at = now;
-        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-/// At most `max` events per minute.
-#[derive(Debug)]
-struct PerMinute {
-    max: usize,
-    times: VecDeque<i64>,
-}
-
-impl PerMinute {
-    fn new(max: u32) -> Self {
-        Self {
-            max: usize::try_from(max).unwrap_or(usize::MAX),
-            times: VecDeque::new(),
-        }
-    }
-
-    fn allow(&mut self, now: i64) -> bool {
-        while self.times.front().is_some_and(|at| now - at >= 60) {
-            self.times.pop_front();
-        }
-        if self.times.len() >= self.max {
-            return false;
-        }
-        self.times.push_back(now);
-        true
-    }
-}
-
 /// An open control connection. Dropping it ends the device's presence.
 #[derive(Debug)]
 pub struct Session {
@@ -151,21 +105,57 @@ pub struct Session {
     id: DeviceId,
     conn_id: u64,
     rx: mpsc::Receiver<Frame>,
+    /// Set when the hub dropped this connection for not reading its frames.
+    dropped: Arc<Dropped>,
+    /// Logged events the `welcome` had no room for, sent before anything else.
+    backlog: VecDeque<String>,
     /// The last logged event the `welcome` carried or covered; later copies are dropped.
     cursor: i64,
     features: Vec<String>,
-    requests: Bucket,
-    connects: PerMinute,
-    lookups: PerMinute,
-    reports: PerMinute,
     seen_at: i64,
+}
+
+/// Why a `hello` was refused: the `error` frame to send, and the close code and reason that
+/// follow it (protocol 5.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// The `error` frame.
+    pub frame: String,
+    /// The close code.
+    pub code: u16,
+    /// The close reason.
+    pub reason: &'static str,
+}
+
+impl Refusal {
+    fn new(code: ErrorCode, message: &str) -> Self {
+        let (close, reason) = match code {
+            // The server's own trouble: the device reconnects.
+            ErrorCode::Unavailable => (1011, "try again later"),
+            ErrorCode::RateLimited => (close::RATE_LIMITED, "reconnecting too often"),
+            _ => (close::HANDSHAKE_FAILED, "handshake failed"),
+        };
+        Self {
+            frame: error(None, code, message).to_text(),
+            code: close,
+            reason,
+        }
+    }
+
+    fn revoked() -> Self {
+        Self {
+            frame: error(None, ErrorCode::NotPermitted, "the device was revoked").to_text(),
+            code: close::REVOKED,
+            reason: "revoked",
+        }
+    }
 }
 
 fn error(id: Option<u64>, code: ErrorCode, message: &str) -> ServerMessage {
     ServerMessage::error(id, code, message)
 }
 
-fn refused(id: u64, code: ErrorCode, message: &str) -> Result<ServerMessage, ServerMessage> {
+fn refused<T>(id: u64, code: ErrorCode, message: &str) -> Result<T, ServerMessage> {
     Err(error(Some(id), code, message))
 }
 
@@ -182,15 +172,14 @@ impl Connect {
     }
 
     /// Checks the device's `hello` and opens its session. Returns the session and the
-    /// `welcome` frame, or the `error` frame to send before closing with
-    /// [`close::HANDSHAKE_FAILED`].
+    /// `welcome` frame, or the [`Refusal`] to send before closing.
     pub async fn hello(
         self: &Arc<Self>,
         handshake: Handshake,
         login: DeviceLogin,
         text: &str,
-    ) -> Result<(Session, String), String> {
-        let fail = |code, message: &str| error(None, code, message).to_text();
+    ) -> Result<(Session, String), Refusal> {
+        let fail = Refusal::new;
         if self.is_stopping() {
             return Err(fail(ErrorCode::Unavailable, "the server is shutting down"));
         }
@@ -221,6 +210,12 @@ impl Connect {
         }
 
         let now = db::unix_now();
+        if !self
+            .hub
+            .allow(login.user_id, login.device.endpoint_id, Limit::Hello, now)
+        {
+            return Err(fail(ErrorCode::RateLimited, "reconnecting too often"));
+        }
         let mut device = login.device.clone();
         if let Some(change) = &hello.settings {
             match devices::update_settings(
@@ -233,7 +228,19 @@ impl Connect {
             .await
             {
                 Ok(Some(updated)) => device = updated,
-                Ok(None) => return Err(fail(ErrorCode::NotFound, "the device is gone")),
+                // No longer registered: revoked or signed out since the upgrade.
+                Ok(None) => {
+                    let revoked = devices::get(&self.pool, device.id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|current| current.is_revoked());
+                    return Err(if revoked {
+                        Refusal::revoked()
+                    } else {
+                        fail(ErrorCode::NotFound, "the device signed out")
+                    });
+                }
                 Err(Error::InvalidDevice { .. }) => {
                     return Err(fail(ErrorCode::BadRequest, "invalid settings"));
                 }
@@ -256,8 +263,29 @@ impl Connect {
             key,
             login.client_ip,
             now,
+            features.iter().any(|feature| feature == features::PAIRING),
             Outgoing::Close(close::REPLACED, "replaced by a newer connection"),
         );
+        // The device was read at the upgrade. A revocation or sign-out since then must not
+        // leave it a session: read it again now that the connection is registered, so that
+        // whatever happens after this read reaches the connection through the hub.
+        let refusal = match devices::get(&self.pool, device.id).await {
+            Ok(Some(current))
+                if current.is_active() && current.app_password_id == device.app_password_id =>
+            {
+                None
+            }
+            Ok(Some(current)) if current.is_revoked() => Some(Refusal::revoked()),
+            Ok(_) => Some(fail(ErrorCode::NotFound, "the device signed out")),
+            Err(err) => {
+                tracing::error!(error = %err, "cannot read the device directory");
+                Some(fail(ErrorCode::Unavailable, "try again later"))
+            }
+        };
+        if let Some(refusal) = refusal {
+            self.hub.unregister(login.user_id, key, registered.conn_id);
+            return Err(refusal);
+        }
         if registered.new_address {
             self.record(
                 Record::new(login.user_id, "device.connected", Actor::Device)
@@ -292,12 +320,10 @@ impl Connect {
             id,
             conn_id: registered.conn_id,
             rx: registered.rx,
+            dropped: registered.dropped,
+            backlog: VecDeque::new(),
             cursor: 0,
             features,
-            requests: Bucket::new(limits::REQUESTS_PER_SECOND, limits::REQUEST_BURST),
-            connects: PerMinute::new(limits::CONNECTS_PER_MINUTE),
-            lookups: PerMinute::new(limits::LOOKUPS_PER_MINUTE),
-            reports: PerMinute::new(limits::SESSIONS_PER_MINUTE),
             seen_at: now,
         };
         let welcome = match session.welcome(&login, hello.since, now).await {
@@ -349,13 +375,23 @@ impl Session {
     ) -> gono_server_core::Result<String> {
         let pool = &self.connect.pool;
         let remote_access = devices::remote_access(pool, self.user_id).await?;
-        self.connect
+        if self
+            .connect
             .hub
-            .set_remote_access(self.user_id, remote_access);
+            .set_remote_access(self.user_id, remote_access)
+        {
+            // Noticed here before the background task: the other devices hear of it now.
+            let message = ServerMessage::Account { remote_access };
+            self.connect
+                .hub
+                .broadcast(self.user_id, &message.to_text(), Some(self.key));
+        }
         let online = self.connect.hub.online(self.user_id);
+        // Signed-out devices are not in the directory that devices see (protocol 9.4).
         let devices: Vec<_> = devices::list(pool, self.user_id)
             .await?
             .iter()
+            .filter(|device| !device.is_signed_out())
             .filter_map(|device| entry(device, online.contains(&device.endpoint_id)))
             .collect();
         let pair_requests = if self.has(features::PAIRING) {
@@ -376,7 +412,18 @@ impl Session {
             devices::events_since(pool, self.user_id, since.max(0), limits::MAX_WELCOME_EVENTS)
                 .await?;
         self.cursor = events.iter().map(|event| event.seq).fold(cursor, i64::max);
-        let events: Vec<ServerMessage> = events.iter().filter_map(logged_message).collect();
+        let mut carried = Vec::new();
+        let mut bytes = 0;
+        for message in events.iter().filter_map(logged_message) {
+            let text = message.to_text();
+            bytes += text.len();
+            if bytes <= WELCOME_EVENT_BYTES && self.backlog.is_empty() {
+                carried.push(message);
+            } else {
+                self.backlog.push_back(text);
+            }
+        }
+        let events = carried;
         let welcome = Welcome {
             server_time: now,
             account: AccountInfo {
@@ -427,15 +474,22 @@ impl Session {
     /// The next frame to send to the device. When the hub dropped this connection (its queue
     /// was full), the answer is to close it.
     pub async fn next_outgoing(&mut self) -> Outgoing {
+        if let Some(text) = self.backlog.pop_front() {
+            return Outgoing::Text(text);
+        }
         loop {
-            match self.rx.recv().await {
-                Some(Frame::Out(frame)) => return frame,
-                Some(Frame::Logged(seq, text)) if seq > self.cursor => {
-                    return Outgoing::Text(text);
-                }
-                // The welcome carried it already.
-                Some(Frame::Logged(..)) => {}
-                None => return Outgoing::Close(close::TIMED_OUT, "too slow"),
+            tokio::select! {
+                biased;
+                () = self.dropped.wait() => return Outgoing::Close(close::TIMED_OUT, "too slow"),
+                frame = self.rx.recv() => match frame {
+                    Some(Frame::Out(frame)) => return frame,
+                    Some(Frame::Logged(seq, text)) if seq > self.cursor => {
+                        return Outgoing::Text(text);
+                    }
+                    // The welcome carried it already.
+                    Some(Frame::Logged(..)) => {}
+                    None => return Outgoing::Close(close::TIMED_OUT, "too slow"),
+                },
             }
         }
     }
@@ -446,9 +500,9 @@ impl Session {
         let now = db::unix_now();
         let pool = &self.connect.pool;
         match devices::get(pool, self.device.id).await {
-            Ok(None) => return Some((1000, "signed out")),
             Ok(Some(device)) if device.is_revoked() => return Some((close::REVOKED, "revoked")),
-            Ok(Some(_)) => {}
+            Ok(Some(device)) if device.app_password_id == self.device.app_password_id => {}
+            Ok(_) => return Some((1000, "signed out")),
             // A database problem never ends the connection; the next check tries again.
             Err(err) => {
                 tracing::warn!(error = %err, "cannot check a device");
@@ -473,13 +527,35 @@ impl Session {
 
     /// Answers one text frame of the device.
     pub async fn handle(&mut self, text: &str) -> Reply {
+        if self.dropped.is_set() {
+            return Reply {
+                text: None,
+                close: Some((close::TIMED_OUT, "too slow")),
+            };
+        }
+        if !self
+            .connect
+            .hub
+            .is_current(self.user_id, self.key, self.conn_id)
+        {
+            // Replaced: its `4001` is on the way; the newer connection is the device's session.
+            return Reply {
+                text: None,
+                close: Some((close::REPLACED, "replaced by a newer connection")),
+            };
+        }
         let envelope: Envelope = match serde_json::from_str(text) {
             Ok(envelope) => envelope,
             Err(_) => {
                 return Reply::message(error(None, ErrorCode::BadRequest, "malformed message"));
             }
         };
-        if !self.requests.take() {
+        let now = db::unix_now();
+        if !self
+            .connect
+            .hub
+            .allow(self.user_id, self.key, Limit::Request, now)
+        {
             let mut limited = error(envelope.id, ErrorCode::RateLimited, "too many requests");
             if let ServerMessage::Error { retry_after, .. } = &mut limited {
                 *retry_after = Some(1);
@@ -505,7 +581,6 @@ impl Session {
                 ));
             }
         };
-        let now = db::unix_now();
         let leaving = matches!(message, ClientMessage::Leave { .. });
         let answer = match message {
             ClientMessage::Hello(_) => unreachable!("handled above"),
@@ -555,12 +630,11 @@ impl Session {
         }
     }
 
-    /// `not_found` for keys that are not active devices of this account; the device itself.
+    /// `not_found` for keys that are not registered devices of this account; the device
+    /// itself.
     async fn account_device(&self, target: DeviceId) -> Result<Device, ErrorCode> {
         match devices::find(&self.connect.pool, EndpointId(*target.as_bytes())).await {
-            Ok(Some(device)) if device.user_id == self.user_id && !device.is_revoked() => {
-                Ok(device)
-            }
+            Ok(Some(device)) if device.user_id == self.user_id && device.is_active() => Ok(device),
             Ok(_) => Err(ErrorCode::NotFound),
             Err(err) => {
                 tracing::warn!(error = %err, "cannot read the device directory");
@@ -569,13 +643,44 @@ impl Session {
         }
     }
 
-    async fn remote_access(&self) -> Result<(), ErrorCode> {
+    /// What every request that reaches another device checks again: this device is still
+    /// registered with the credential it connected with, so that a revocation or sign-out that
+    /// the connection has not heard of yet takes effect here (protocol 9.2), and remote access
+    /// is available on the account.
+    async fn authorized(&self, id: u64) -> Result<(), ServerMessage> {
+        match devices::get(&self.connect.pool, self.device.id).await {
+            Ok(Some(device))
+                if device.is_active() && device.app_password_id == self.device.app_password_id => {}
+            Ok(found) => {
+                let (code, reason) = if found.is_some_and(|device| device.is_revoked()) {
+                    (close::REVOKED, "revoked")
+                } else {
+                    (1000, "signed out")
+                };
+                self.connect
+                    .hub
+                    .send(self.user_id, self.key, Outgoing::Close(code, reason));
+                return refused(
+                    id,
+                    ErrorCode::NotPermitted,
+                    "this device is no longer registered",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "cannot read the device directory");
+                return refused(id, ErrorCode::Unavailable, "try again later");
+            }
+        }
         match devices::remote_access(&self.connect.pool, self.user_id).await {
             Ok(true) => Ok(()),
-            Ok(false) => Err(ErrorCode::TwoFactorRequired),
+            Ok(false) => refused(
+                id,
+                ErrorCode::TwoFactorRequired,
+                "remote access is not available",
+            ),
             Err(err) => {
                 tracing::warn!(error = %err, "cannot read remote access of an account");
-                Err(ErrorCode::Unavailable)
+                refused(id, ErrorCode::Unavailable, "try again later")
             }
         }
     }
@@ -632,6 +737,17 @@ impl Session {
         }
         if direct.len() > limits::MAX_DIRECT_ADDRESSES {
             return refused(id, ErrorCode::BadRequest, "too many direct addresses");
+        }
+        if !self
+            .connect
+            .hub
+            .allow(self.user_id, self.key, Limit::Publish, now)
+        {
+            let mut limited = error(Some(id), ErrorCode::RateLimited, "one publish per second");
+            if let ServerMessage::Error { retry_after, .. } = &mut limited {
+                *retry_after = Some(1);
+            }
+            return Err(limited);
         }
         self.connect.hub.publish(
             self.user_id,
@@ -694,8 +810,16 @@ impl Session {
         request_id: Option<String>,
         now: i64,
     ) -> Result<ServerMessage, ServerMessage> {
-        if !self.connects.allow(now) {
+        if !self
+            .connect
+            .hub
+            .allow(self.user_id, self.key, Limit::Connect, now)
+        {
             return refused(id, ErrorCode::RateLimited, "too many connect requests");
+        }
+        // Checked before anything is recorded: the audit log takes only well-formed values.
+        if devices::check_services(&[service.to_owned()]).is_err() {
+            return refused(id, ErrorCode::BadRequest, "invalid service");
         }
         if target == self.id {
             return refused(
@@ -740,13 +864,50 @@ impl Session {
         request_id: Option<&str>,
         now: i64,
     ) -> Result<ServerMessage, ServerMessage> {
-        self.remote_access()
-            .await
-            .map_err(|code| error(Some(id), code, "remote access is not available"))?;
+        self.authorized(id).await?;
         let device = self
             .account_device(target)
             .await
             .map_err(|code| error(Some(id), code, "no such device"))?;
+        self.permitted(id, &device, purpose, service, request_id)?;
+        let answer = self.addresses(id, target, &device)?;
+        self.connect.hub.grant(
+            self.user_id,
+            self.key,
+            device.endpoint_id,
+            Grant {
+                at: now,
+                purpose,
+                service: service.to_owned(),
+                request_id: request_id.map(str::to_owned),
+            },
+        );
+        let incoming = ServerMessage::Incoming {
+            from: self.id,
+            service: service.to_owned(),
+            purpose,
+            request_id: request_id
+                .filter(|_| purpose == Purpose::Pair)
+                .map(str::to_owned),
+        };
+        self.connect.hub.send(
+            self.user_id,
+            device.endpoint_id,
+            Outgoing::Text(incoming.to_text()),
+        );
+        Ok(answer)
+    }
+
+    /// Whether `connect` to `device` with `purpose` and `service` is permitted now (protocol
+    /// 10); `lookup` checks it again for the `connect` it relies on.
+    fn permitted(
+        &self,
+        id: u64,
+        device: &Device,
+        purpose: Purpose,
+        service: &str,
+        request_id: Option<&str>,
+    ) -> Result<(), ServerMessage> {
         match purpose {
             Purpose::Session => {
                 if !device.accept_remote || !device.services.iter().any(|known| known == service) {
@@ -770,28 +931,7 @@ impl Session {
                 }
             }
         }
-        let answer = self.addresses(id, target, &device)?;
-        self.connect.hub.connecting(
-            self.user_id,
-            self.key,
-            self.conn_id,
-            device.endpoint_id,
-            now,
-        );
-        let incoming = ServerMessage::Incoming {
-            from: self.id,
-            service: service.to_owned(),
-            purpose,
-            request_id: request_id
-                .filter(|_| purpose == Purpose::Pair)
-                .map(str::to_owned),
-        };
-        self.connect.hub.send(
-            self.user_id,
-            device.endpoint_id,
-            Outgoing::Text(incoming.to_text()),
-        );
-        Ok(answer)
+        Ok(())
     }
 
     async fn lookup(
@@ -800,26 +940,34 @@ impl Session {
         target: DeviceId,
         now: i64,
     ) -> Result<ServerMessage, ServerMessage> {
-        if !self.lookups.allow(now) {
+        if !self
+            .connect
+            .hub
+            .allow(self.user_id, self.key, Limit::Lookup, now)
+        {
             return refused(id, ErrorCode::RateLimited, "too many lookups");
         }
-        self.remote_access()
-            .await
-            .map_err(|code| error(Some(id), code, "remote access is not available"))?;
+        self.authorized(id).await?;
         let device = self
             .account_device(target)
             .await
             .map_err(|code| error(Some(id), code, "no such device"))?;
         let window = i64::try_from(limits::LOOKUP_WINDOW_SECS).unwrap_or(i64::MAX);
-        if !self.connect.hub.may_look_up(
-            self.user_id,
-            self.key,
-            self.conn_id,
-            device.endpoint_id,
-            now,
-            window,
-        ) {
-            return refused(id, ErrorCode::NotPermitted, "send connect first");
+        match self
+            .connect
+            .hub
+            .lookup_basis(self.user_id, self.key, device.endpoint_id, now, window)
+        {
+            None => return refused(id, ErrorCode::NotPermitted, "send connect first"),
+            // As `connect` would check it now: the target may have stopped accepting it.
+            Some(LookupBasis::Connect(grant)) => self.permitted(
+                id,
+                &device,
+                grant.purpose,
+                &grant.service,
+                grant.request_id.as_deref(),
+            )?,
+            Some(LookupBasis::Session) => {}
         }
         self.addresses(id, target, &device)
     }
@@ -837,22 +985,46 @@ impl Session {
                 "session-reports was not negotiated",
             );
         }
-        if !self.reports.allow(now) {
+        if !self
+            .connect
+            .hub
+            .allow(self.user_id, self.key, Limit::Report, now)
+        {
             return refused(id, ErrorCode::RateLimited, "too many session reports");
         }
+        // The audit log takes only the formats of protocol 12.2.
+        let well_formed = statement::decode_bytes(&report.session_id)
+            .is_some_and(|session_id| session_id.len() == 16)
+            && ROLES.contains(&report.role.as_str())
+            && PATHS.contains(&report.path.as_str())
+            && devices::check_services(std::slice::from_ref(&report.service)).is_ok()
+            && report.peer != self.id;
+        if !well_formed {
+            return refused(id, ErrorCode::BadRequest, "malformed session report");
+        }
+        let open = report.event == SessionEvent::Started;
         let peer = EndpointId(*report.peer.as_bytes());
         match devices::find(&self.connect.pool, peer).await {
-            Ok(Some(device)) if device.user_id == self.user_id => {}
+            Ok(Some(device)) if device.user_id == self.user_id && (device.is_active() || !open) => {
+            }
             Ok(_) => return refused(id, ErrorCode::NotFound, "no such device"),
             Err(err) => {
                 tracing::warn!(error = %err, "cannot read the device directory");
                 return refused(id, ErrorCode::Unavailable, "try again later");
             }
         }
-        let open = report.event == SessionEvent::Started;
-        self.connect
+        let window = i64::try_from(limits::LOOKUP_WINDOW_SECS).unwrap_or(i64::MAX);
+        if !self
+            .connect
             .hub
-            .session(self.user_id, self.key, self.conn_id, peer, open);
+            .session(self.user_id, self.key, peer, open, now, window)
+        {
+            return refused(
+                id,
+                ErrorCode::NotPermitted,
+                "no connect between the two devices",
+            );
+        }
         let kind = if open {
             "session.started"
         } else {
@@ -887,9 +1059,7 @@ impl Session {
         if !self.has(features::PAIRING) {
             return refused(id, ErrorCode::NotPermitted, "pairing was not negotiated");
         }
-        self.remote_access()
-            .await
-            .map_err(|code| error(Some(id), code, "remote access is not available"))?;
+        self.authorized(id).await?;
         let statement = request.open().map_err(|_| {
             error(
                 Some(id),
@@ -957,7 +1127,7 @@ impl Session {
                 );
             }
         }
-        self.connect.hub.broadcast(
+        self.connect.hub.broadcast_pairing(
             self.user_id,
             &ServerMessage::PairRequested(requested).to_text(),
             Some(self.key),
@@ -988,9 +1158,7 @@ impl Session {
         if !self.has(features::PAIRING) {
             return refused(id, ErrorCode::NotPermitted, "pairing was not negotiated");
         }
-        self.remote_access()
-            .await
-            .map_err(|code| error(Some(id), code, "remote access is not available"))?;
+        self.authorized(id).await?;
         let Some(pending) = self.connect.hub.request(self.user_id, request_id) else {
             return refused(id, ErrorCode::NotFound, "no such pending request");
         };
@@ -1017,8 +1185,13 @@ impl Session {
             && statement.server == self.connect.origin
             && statement.account == self.username
             && statement.method == "remote-sas"
+            && statement.issued_at.abs_diff(now) <= APPROVAL_SKEW_SECS
             && statement.expires_at > now
-            && statement.expires_at - statement.issued_at <= limits::MAX_APPROVAL_SECS
+            // Both come from the device: no overflow, and a positive, bounded lifetime.
+            && statement
+                .expires_at
+                .checked_sub(statement.issued_at)
+                .is_some_and(|lifetime| 0 < lifetime && lifetime <= limits::MAX_APPROVAL_SECS)
             && statement.introduced.len() <= limits::MAX_INTRODUCED;
         if !valid {
             return refused(
@@ -1056,7 +1229,7 @@ impl Session {
         };
         self.connect
             .hub
-            .broadcast(self.user_id, &closed.to_text(), None);
+            .broadcast_pairing(self.user_id, &closed.to_text(), None);
         let introduced: Vec<String> = statement
             .introduced
             .iter()
@@ -1127,7 +1300,7 @@ impl Session {
             };
             self.connect
                 .hub
-                .broadcast(self.user_id, &closed.to_text(), None);
+                .broadcast_pairing(self.user_id, &closed.to_text(), None);
             self.record(
                 Record::new(self.user_id, kind, Actor::Device)
                     .device(self.key)
@@ -1182,11 +1355,15 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if !self
+        let was_current = self
             .connect
             .hub
-            .unregister(self.user_id, self.key, self.conn_id)
-        {
+            .unregister(self.user_id, self.key, self.conn_id);
+        // Dropped for not reading, the hub forgot the connection already; unless the device
+        // reconnected since, this was its presence.
+        let dropped_last =
+            self.dropped.is_set() && !self.connect.hub.online(self.user_id).contains(&self.key);
+        if !was_current && !dropped_last {
             // Replaced by a newer connection, which is the device's presence now.
             return;
         }

@@ -209,7 +209,7 @@ pub struct Device {
     pub user_id: i64,
     /// The key.
     pub endpoint_id: EndpointId,
-    /// The device's app password; `None` once revoked.
+    /// The device's app password; `None` once revoked or signed out.
     pub app_password_id: Option<i64>,
     /// `input-show`, ...
     pub product: String,
@@ -233,6 +233,8 @@ pub struct Device {
     pub last_seen_at: Option<i64>,
     /// When it was revoked.
     pub revoked_at: Option<i64>,
+    /// When it signed out (protocol 9.4), unless it registered again since.
+    pub left_at: Option<i64>,
 }
 
 impl Device {
@@ -241,9 +243,20 @@ impl Device {
         self.revoked_at.is_some()
     }
 
+    /// Whether the device signed out and was not revoked since.
+    pub fn is_signed_out(&self) -> bool {
+        self.left_at.is_some() && !self.is_revoked()
+    }
+
+    /// Whether the device is registered: it has its credential, so it is neither revoked nor
+    /// signed out.
+    pub fn is_active(&self) -> bool {
+        self.app_password_id.is_some()
+    }
+
     /// Whether the device may send pairing requests at `now`.
     pub fn pairing_open(&self, now: i64) -> bool {
-        !self.is_revoked() && self.pairing_open_until.is_some_and(|until| now < until)
+        self.is_active() && self.pairing_open_until.is_some_and(|until| now < until)
     }
 
     /// The directory entry of protocol 6.1, with `online` as given.
@@ -282,6 +295,7 @@ struct DeviceRow {
     registered_at: i64,
     last_seen_at: Option<i64>,
     revoked_at: Option<i64>,
+    left_at: Option<i64>,
 }
 
 impl From<DeviceRow> for Device {
@@ -303,13 +317,14 @@ impl From<DeviceRow> for Device {
             registered_at: row.registered_at,
             last_seen_at: row.last_seen_at,
             revoked_at: row.revoked_at,
+            left_at: row.left_at,
         }
     }
 }
 
 const COLUMNS: &str = "id, user_id, endpoint_id, app_password_id, product, platform, name, \
      version, accept_remote, unattended, services, pairing_open_until, registered_at, \
-     last_seen_at, revoked_at";
+     last_seen_at, revoked_at, left_at";
 
 /// What a registering device reported about itself, validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,26 +357,25 @@ pub enum Registration {
     Taken,
     /// The key was revoked.
     Revoked,
-    /// The account has [`MAX_DEVICES_PER_ACCOUNT`] unrevoked devices.
+    /// The account has [`MAX_DEVICES_PER_ACCOUNT`] registered devices.
     TooMany,
 }
 
-/// The number of unrevoked devices of `user_id`.
+/// The number of registered devices of `user_id`: neither revoked nor signed out.
 pub async fn count_active(pool: &Pool, user_id: i64) -> Result<i64> {
-    Ok(
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM devices WHERE user_id = ?1 AND revoked_at IS NULL",
-        )
-        .bind(user_id)
-        .fetch_one(pool)
-        .await?,
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM devices WHERE user_id = ?1 AND app_password_id IS NOT NULL",
     )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?)
 }
 
 /// Registers `new` for `user_id` inside `tx`: creates the directory entry and its app password,
-/// or replaces the app password of an entry the account already has (protocol 4.3, 4.4).
-/// Appends `device.added` for a new entry and records the audit record with `granted_from`, the
-/// browser that granted the registration.
+/// replaces the app password of an entry the account already has (protocol 4.3, 4.4), or brings
+/// back an entry of the account that signed out (9.4). A key stays bound to the account it was
+/// first registered to. Appends `device.added` when the entry (re)enters the directory and
+/// records the audit record with `granted_from`, the browser that granted the registration.
 pub(crate) async fn register(
     tx: &mut Tx,
     user_id: i64,
@@ -383,8 +397,11 @@ pub(crate) async fn register(
         if existing.user_id != user_id {
             return Ok(Registration::Taken);
         }
-        let Some(old_password) = existing.app_password_id else {
+        if existing.revoked_at.is_some() {
             return Ok(Registration::Revoked);
+        }
+        let Some(old_password) = existing.app_password_id else {
+            return come_back(tx, existing.id, user_id, new, granted_from, now).await;
         };
         let password_id =
             app_passwords::insert(tx, user_id, &label, &[], None, &app_password).await?;
@@ -426,13 +443,7 @@ pub(crate) async fn register(
         });
     }
 
-    let active: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM devices WHERE user_id = ?1 AND revoked_at IS NULL",
-    )
-    .bind(user_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    if active >= MAX_DEVICES_PER_ACCOUNT {
+    if count_active_in(tx, user_id).await? >= MAX_DEVICES_PER_ACCOUNT {
         return Ok(Registration::TooMany);
     }
     let password_id = app_passwords::insert(tx, user_id, &label, &[], None, &app_password).await?;
@@ -479,6 +490,74 @@ pub(crate) async fn register(
         app_password,
         new: true,
     })
+}
+
+/// Registers the signed-out entry `id` of `user_id` again (protocol 9.4): it gets a new app
+/// password and enters the directory again, so the account's devices get `device.added`.
+async fn come_back(
+    tx: &mut Tx,
+    id: i64,
+    user_id: i64,
+    new: &NewDevice,
+    granted_from: Option<IpAddr>,
+    now: i64,
+) -> Result<Registration> {
+    if count_active_in(tx, user_id).await? >= MAX_DEVICES_PER_ACCOUNT {
+        return Ok(Registration::TooMany);
+    }
+    let app_password = app_passwords::generate_device_token();
+    let password_id =
+        app_passwords::insert(tx, user_id, &new.name, &[], None, &app_password).await?;
+    sqlx::query(
+        "UPDATE devices SET app_password_id = ?2, left_at = NULL, product = ?3, platform = ?4, \
+         name = ?5, version = ?6, pairing_open_until = ?7 WHERE id = ?1",
+    )
+    .bind(id)
+    .bind(password_id)
+    .bind(&new.product)
+    .bind(&new.platform)
+    .bind(&new.name)
+    .bind(&new.version)
+    .bind(now.saturating_add(PAIRING_WINDOW_SECS))
+    .execute(&mut **tx)
+    .await?;
+    let device = get_in(tx, id).await?;
+    append_event(
+        tx,
+        user_id,
+        "device.added",
+        &json!({ "device": device.entry(false), "at": now }),
+        now,
+    )
+    .await?;
+    audit::record(
+        &mut **tx,
+        &Record::new(user_id, "device.reregistered", Actor::User)
+            .device(new.endpoint_id)
+            .client_ip(granted_from)
+            .details(json!({
+                "product": new.product,
+                "platform": new.platform,
+                "name": new.name,
+                "after_sign_out": true,
+            })),
+        now,
+    )
+    .await?;
+    Ok(Registration::Registered {
+        device: Box::new(device),
+        app_password,
+        new: true,
+    })
+}
+
+async fn count_active_in(tx: &mut Tx, user_id: i64) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM devices WHERE user_id = ?1 AND app_password_id IS NOT NULL",
+    )
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await?)
 }
 
 async fn get_in(tx: &mut Tx, id: i64) -> Result<Device> {
@@ -577,7 +656,7 @@ pub async fn update_settings(
         .map(|services| serde_json::Value::from(services).to_string());
     let mut tx = db::begin_immediate(pool).await?;
     let Some(before) = sqlx::query_as::<_, DeviceRow>(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM devices WHERE id = ?1 AND revoked_at IS NULL"
+        "SELECT {COLUMNS} FROM devices WHERE id = ?1 AND app_password_id IS NOT NULL"
     )))
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -650,7 +729,7 @@ pub async fn open_pairing(
     let mut tx = db::begin_immediate(pool).await?;
     let opened = sqlx::query(
         "UPDATE devices SET pairing_open_until = ?3 \
-         WHERE user_id = ?1 AND endpoint_id = ?2 AND revoked_at IS NULL",
+         WHERE user_id = ?1 AND endpoint_id = ?2 AND app_password_id IS NOT NULL",
     )
     .bind(user_id)
     .bind(&endpoint_id.0[..])
@@ -693,10 +772,10 @@ impl RevokedBy {
     }
 }
 
-/// Revokes the unrevoked devices `endpoint_ids` of `user_id` in one transaction (protocol 9.2):
-/// marks them revoked, deletes their app passwords, appends `device.revoked` for each, and
-/// records the audit records. Keys that are not unrevoked devices of the account are skipped.
-/// Returns the revoked entries.
+/// Revokes the unrevoked devices `endpoint_ids` of `user_id` in one transaction (protocol 9.2),
+/// signed-out ones included: marks them revoked, deletes their app passwords, appends
+/// `device.revoked` for each, and records the audit records. Keys that are not unrevoked
+/// devices of the account are skipped. Returns the revoked entries.
 pub async fn revoke(
     pool: &Pool,
     user_id: i64,
@@ -708,7 +787,7 @@ pub async fn revoke(
     let mut tx = db::begin_immediate(pool).await?;
     let mut revoked = Vec::new();
     for endpoint_id in endpoint_ids {
-        let row: Option<(i64, i64)> = sqlx::query_as(
+        let row: Option<(i64, Option<i64>)> = sqlx::query_as(
             "SELECT id, app_password_id FROM devices \
              WHERE user_id = ?1 AND endpoint_id = ?2 AND revoked_at IS NULL",
         )
@@ -727,10 +806,12 @@ pub async fn revoke(
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM app_passwords WHERE id = ?1")
-            .bind(app_password_id)
-            .execute(&mut *tx)
-            .await?;
+        if let Some(app_password_id) = app_password_id {
+            sqlx::query("DELETE FROM app_passwords WHERE id = ?1")
+                .bind(app_password_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         append_event(
             &mut tx,
             user_id,
@@ -761,12 +842,14 @@ pub async fn revoke(
     Ok(revoked)
 }
 
-/// Signs device `id` out (protocol 9.4): deletes its entry and its app password, without a
-/// tombstone. Returns the deleted entry, or `None` if it was gone or revoked.
+/// Signs device `id` out (protocol 9.4): deletes its app password and marks the entry signed
+/// out. The entry stays, so that the key remains bound to the account and can still be
+/// revoked; the device may register again into the same account. Returns the entry, or `None`
+/// if it was not registered.
 pub async fn leave(pool: &Pool, id: i64, now: i64) -> Result<Option<Device>> {
     let mut tx = db::begin_immediate(pool).await?;
     let Some(device) = sqlx::query_as::<_, DeviceRow>(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM devices WHERE id = ?1 AND revoked_at IS NULL"
+        "SELECT {COLUMNS} FROM devices WHERE id = ?1 AND app_password_id IS NOT NULL"
     )))
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -774,10 +857,14 @@ pub async fn leave(pool: &Pool, id: i64, now: i64) -> Result<Option<Device>> {
     .map(Device::from) else {
         return Ok(None);
     };
-    sqlx::query("DELETE FROM devices WHERE id = ?1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE devices SET app_password_id = NULL, left_at = ?2, pairing_open_until = NULL \
+         WHERE id = ?1",
+    )
+    .bind(id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("DELETE FROM app_passwords WHERE id = ?1")
         .bind(device.app_password_id)
         .execute(&mut *tx)
@@ -788,8 +875,9 @@ pub async fn leave(pool: &Pool, id: i64, now: i64) -> Result<Option<Device>> {
         now,
     )
     .await?;
+    let left = get_in(&mut tx, id).await?;
     tx.commit().await?;
-    Ok(Some(device))
+    Ok(Some(left))
 }
 
 /// The unrevoked devices of `user_id` that `approver` introduced through approvals (protocol
@@ -915,25 +1003,28 @@ pub(crate) async fn append_event(
 }
 
 /// Up to `limit` events of `user_id` after `since`, oldest first, and whether events after
-/// `since` were already removed (so the device cannot catch up from the log alone).
+/// `since` are missing (so the device cannot catch up from the log alone): removed already, or
+/// more than `limit`. When there are more, the newest `limit` are returned: the directory
+/// snapshot covers the older additions and revocations, and the newest approvals are the ones
+/// still valid.
 pub async fn events_since(
     pool: &Pool,
     user_id: i64,
     since: i64,
     limit: i64,
 ) -> Result<(Vec<Event>, bool)> {
-    let events: Vec<Event> = sqlx::query_as(
+    let mut events: Vec<Event> = sqlx::query_as(
         "SELECT seq, user_id, kind, body, created_at FROM device_events \
-         WHERE user_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+         WHERE user_id = ?1 AND seq > ?2 ORDER BY seq DESC LIMIT ?3",
     )
     .bind(user_id)
     .bind(since)
     .bind(limit.saturating_add(1))
     .fetch_all(pool)
     .await?;
-    let mut events = events;
     let mut truncated = i64::try_from(events.len()).unwrap_or(i64::MAX) > limit;
     events.truncate(usize::try_from(limit).unwrap_or(0));
+    events.reverse();
     // `since` is the last event the device processed, one of this account's. Events are purged
     // oldest first, so if that one is still there, nothing after it is missing. If it is gone,
     // events after it may have been purged too. `since == 0` is a device that never saw any
@@ -998,13 +1089,13 @@ pub async fn remote_access(pool: &Pool, user_id: i64) -> Result<bool> {
     Ok(available.is_some())
 }
 
-/// The keys the relay admits from the directory (protocol 11.1): unrevoked devices of enabled
-/// accounts with two-step verification.
+/// The keys the relay admits from the directory (protocol 11.1): registered devices (neither
+/// revoked nor signed out) of enabled accounts with two-step verification.
 pub async fn admissible(pool: &Pool) -> Result<Vec<EndpointId>> {
     let keys: Vec<Vec<u8>> = sqlx::query_scalar(
         "SELECT d.endpoint_id FROM devices d JOIN users u ON u.id = d.user_id \
          JOIN two_factor t ON t.user_id = u.id \
-         WHERE d.revoked_at IS NULL AND u.enabled = 1",
+         WHERE d.app_password_id IS NOT NULL AND u.enabled = 1",
     )
     .fetch_all(pool)
     .await?;
@@ -1024,6 +1115,13 @@ pub async fn revoked_keys(pool: &Pool) -> Result<Vec<(EndpointId, i64)>> {
         .into_iter()
         .filter_map(|(key, user_id)| Some((EndpointId::from_slice(&key)?, user_id)))
         .collect())
+}
+
+/// The enabled accounts.
+pub async fn enabled_accounts(pool: &Pool) -> Result<Vec<i64>> {
+    Ok(sqlx::query_scalar("SELECT id FROM users WHERE enabled = 1")
+        .fetch_all(pool)
+        .await?)
 }
 
 /// The accounts on which remote access is available: enabled, with two-step verification.

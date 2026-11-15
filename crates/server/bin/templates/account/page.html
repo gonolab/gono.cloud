@@ -23,7 +23,7 @@
           <tr><td><b>{{ device.name }}</b><div class="muted small nowrap">{{ device.what }}</div>{% for note in device.remote %}<div class="muted small">{{ note }}</div>{% endfor %}</td>
             <td><code>{{ device.short }}</code></td>
             <td>{% if device.online %}<b>{{ device.status }}</b>{% else %}{{ device.status }}{% endif %}{% if let Some(pairing) = device.pairing %}<div class="muted small">{{ pairing }}</div>{% endif %}{% if let Some(applied) = device.applied %}<div class="muted small">{{ applied }}</div>{% endif %}</td>
-            <td class="end">{% if !device.revoked %}<div class="actions"><form method="post" action="/apps/account/devices/{{ device.hex }}/pairing"><input type="hidden" name="csrf" value="{{ chrome.csrf }}"><button class="btn sm" type="submit">{{ chrome.t.allow_pairing }}</button></form><a class="btn danger sm" href="/apps/account/devices/{{ device.hex }}/revoke">{{ chrome.t.revoke_device }}</a></div>{% endif %}</td></tr>
+            <td class="end">{% if !device.revoked %}<div class="actions">{% if device.active %}<form method="post" action="/apps/account/devices/{{ device.hex }}/pairing"><input type="hidden" name="csrf" value="{{ chrome.csrf }}"><button class="btn sm" type="submit">{{ chrome.t.allow_pairing }}</button></form>{% endif %}<a class="btn danger sm" href="/apps/account/devices/{{ device.hex }}/revoke">{{ chrome.t.revoke_device }}</a></div>{% endif %}</td></tr>
         {%- endfor %}
         </tbody>
       </table></div>

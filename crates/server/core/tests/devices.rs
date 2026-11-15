@@ -276,7 +276,54 @@ async fn revocation_is_final_and_keeps_a_tombstone() {
 }
 
 #[tokio::test]
-async fn signing_out_leaves_no_tombstone() {
+async fn signing_out_keeps_the_key_bound_to_the_account() {
+    let (_dir, pool) = fixture().await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let Registration::Registered { device, .. } =
+        register(&pool, alice, &new_device(1, "Phone"), 100).await
+    else {
+        panic!()
+    };
+    let left = devices::leave(&pool, device.id, 110)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(left.is_signed_out() && !left.is_active());
+    assert!(
+        devices::leave(&pool, device.id, 111)
+            .await
+            .unwrap()
+            .is_none(),
+        "signed out already"
+    );
+    // The entry stays: not counted, and not another account's to take.
+    assert_eq!(devices::list(&pool, alice).await.unwrap().len(), 1);
+    assert_eq!(devices::count_active(&pool, alice).await.unwrap(), 0);
+    assert!(matches!(
+        register(&pool, bob, &new_device(1, "Not Bob's"), 115).await,
+        Registration::Taken
+    ));
+    // It comes back into its own account, as a new directory entry for the other devices.
+    let Registration::Registered { device, new, .. } =
+        register(&pool, alice, &new_device(1, "Phone"), 120).await
+    else {
+        panic!()
+    };
+    assert!(new && device.is_active() && device.left_at.is_none());
+    assert_eq!(devices::count_active(&pool, alice).await.unwrap(), 1);
+    let (events, _) = devices::events_since(&pool, alice, 0, 10).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "device.added")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_signed_out_device_can_be_revoked() {
     let (_dir, pool) = fixture().await;
     let alice = user(&pool, "alice").await;
     let Registration::Registered { device, .. } =
@@ -284,17 +331,39 @@ async fn signing_out_leaves_no_tombstone() {
     else {
         panic!()
     };
-    assert!(
-        devices::leave(&pool, device.id, 110)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(devices::list(&pool, alice).await.unwrap().is_empty());
+    devices::leave(&pool, device.id, 110).await.unwrap();
+    let revoked = devices::revoke(
+        &pool,
+        alice,
+        &[device.endpoint_id],
+        RevokedBy::AccountPage,
+        None,
+        120,
+    )
+    .await
+    .unwrap();
+    assert_eq!(revoked.len(), 1);
+    assert!(revoked[0].is_revoked() && !revoked[0].is_signed_out());
     assert!(matches!(
-        register(&pool, alice, &new_device(1, "Phone"), 120).await,
-        Registration::Registered { new: true, .. }
+        register(&pool, alice, &new_device(1, "Phone"), 130).await,
+        Registration::Revoked
     ));
+}
+
+#[tokio::test]
+async fn a_welcome_over_the_event_limit_gets_the_newest_events() {
+    let (_dir, pool) = fixture().await;
+    let alice = user(&pool, "alice").await;
+    for seed in 1..=5 {
+        register(&pool, alice, &new_device(seed, "x"), 100).await;
+    }
+    let (all, truncated) = devices::events_since(&pool, alice, 0, 10).await.unwrap();
+    assert!(!truncated);
+    let (newest, truncated) = devices::events_since(&pool, alice, 0, 3).await.unwrap();
+    assert!(truncated);
+    let seqs: Vec<i64> = newest.iter().map(|event| event.seq).collect();
+    let expected: Vec<i64> = all[2..].iter().map(|event| event.seq).collect();
+    assert_eq!(seqs, expected, "the newest three, oldest first");
 }
 
 #[tokio::test]
@@ -430,6 +499,12 @@ async fn the_relay_admits_active_devices_of_accounts_with_two_step_verification(
     devices::revoke(&pool, alice, &[key(2)], RevokedBy::Cli, None, 110)
         .await
         .unwrap();
+    assert_eq!(devices::admissible(&pool).await.unwrap(), [key(1)]);
+    // A signed-out device is not admitted either.
+    let a1 = devices::find(&pool, key(1)).await.unwrap().unwrap();
+    devices::leave(&pool, a1.id, 115).await.unwrap();
+    assert!(devices::admissible(&pool).await.unwrap().is_empty());
+    register(&pool, alice, &new_device(1, "a1"), 116).await;
     assert_eq!(devices::admissible(&pool).await.unwrap(), [key(1)]);
     users::set_enabled(&pool, &Username::new("alice").unwrap(), false)
         .await

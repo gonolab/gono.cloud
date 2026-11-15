@@ -230,9 +230,14 @@ async fn serve(mut socket: WebSocket, connect: Arc<Connect>, login: DeviceLogin)
     let (session, welcome) = match connect.hello(handshake, login, &hello).await {
         Ok(opened) => opened,
         Err(refusal) => {
-            tracing::info!(%client, "device control connection refused at the handshake");
-            if send_within(&mut socket, Message::text(refusal), CLOSE_TIMEOUT).await {
-                close_with(&mut socket, close::HANDSHAKE_FAILED, "handshake failed").await;
+            tracing::info!(
+                %client,
+                code = refusal.code,
+                reason = refusal.reason,
+                "device control connection refused at the handshake"
+            );
+            if send_within(&mut socket, Message::text(refusal.frame), CLOSE_TIMEOUT).await {
+                close_with(&mut socket, refusal.code, refusal.reason).await;
             }
             return;
         }
@@ -289,7 +294,11 @@ async fn stream(socket: &mut WebSocket, mut session: Session, client: IpAddr) ->
                         return "binary frame";
                     }
                     Some(Ok(Message::Close(_))) | None => return "closed by the device",
-                    Some(Err(_)) => return "connection broke or a frame was too large",
+                    Some(Err(err)) if too_large(&err) => {
+                        close_with(socket, 1009, "frame too large").await;
+                        return "frame too large";
+                    }
+                    Some(Err(_)) => return "connection broke",
                 }
             }
             outgoing = session.next_outgoing() => match outgoing {
@@ -320,6 +329,13 @@ async fn stream(socket: &mut WebSocket, mut session: Session, client: IpAddr) ->
             }
         }
     }
+}
+
+/// Whether a read failed because the device sent a frame or message over the limit.
+fn too_large(err: &axum::Error) -> bool {
+    std::error::Error::source(err)
+        .and_then(|source| source.downcast_ref::<tungstenite::Error>())
+        .is_some_and(|err| matches!(err, tungstenite::Error::Capacity(_)))
 }
 
 /// Sends a close frame (best effort).
@@ -754,12 +770,30 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        assert!(
-            devices::list(&f.state.db, f.alice)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        // The entry stays, signed out, and the credential is gone.
+        let listed = devices::list(&f.state.db, f.alice).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].is_signed_out());
+        let (status, _) = f
+            .send(
+                "DELETE",
+                paths::DEVICE,
+                &[("Authorization", &basic(&password))],
+                String::new(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_frame_over_the_limit_is_closed_with_1009() {
+        let f = fixture(true).await;
+        let password = f.register(&key(4), "Laptop").await;
+        let (mut client, welcome) = f.open(&key(4), &password).await;
+        assert!(matches!(welcome, ServerMessage::Welcome(_)), "{welcome:?}");
+        let huge = "x".repeat(limits::MAX_FRAME_BYTES + 1);
+        let _ = client.send(tungstenite::Message::text(huge)).await;
+        assert_eq!(closed(&mut client).await, Some(1009));
     }
 
     #[tokio::test]

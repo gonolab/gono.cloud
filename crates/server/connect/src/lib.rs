@@ -18,6 +18,7 @@
 //! statements, and refuses only what the authorization rules of protocol 10 refuse.
 
 mod hub;
+mod limit;
 mod session;
 
 use std::{
@@ -45,7 +46,7 @@ use tokio::sync::Notify;
 use url::Url;
 
 pub use hub::Outgoing;
-pub use session::{DeviceLogin, Handshake, Reply, Session};
+pub use session::{DeviceLogin, Handshake, Refusal, Reply, Session};
 
 /// How often the background task runs when nothing pokes it.
 const TICK: Duration = Duration::from_secs(2);
@@ -345,8 +346,8 @@ impl Connect {
             .collect())
     }
 
-    /// Signs device `device` out (protocol 9.4): deletes it, tells the account's other
-    /// devices, and ends its access.
+    /// Signs device `device` out (protocol 9.4): deletes its credential, tells the account's
+    /// other devices, and ends its access. The entry stays, bound to the account.
     pub async fn sign_out(&self, device: &Device) -> gono_server_core::Result<bool> {
         let now = db::unix_now();
         let Some(left) = devices::leave(&self.pool, device.id, now).await? else {
@@ -368,22 +369,30 @@ impl Connect {
             left.endpoint_id,
             Outgoing::Close(1000, "signed out"),
         );
-        self.end_relay_access(&[left.endpoint_id]).await;
+        self.hub.forget_device(left.user_id, left.endpoint_id);
+        self.end_relay_access().await;
         Ok(true)
     }
 
-    /// Ends the relay access of `keys` that the directory no longer admits.
-    async fn end_relay_access(&self, keys: &[EndpointId]) {
+    /// Reads the directory again and ends the relay connections of every device it no longer
+    /// admits.
+    async fn end_relay_access(&self) {
         if let Err(err) = self.directory.refresh().await {
             tracing::warn!(error = %err, "cannot read the device directory");
         }
+        self.sweep_relay();
+    }
+
+    /// Ends the relay connections of devices the directory no longer admits. Cheap: it reads
+    /// only memory.
+    fn sweep_relay(&self) {
         if let Some(relay) = self.relay.get() {
-            for key in keys {
-                if !self.directory.admits_key(key)
-                    && let Some(id) = device_id(*key)
-                {
-                    relay.disconnect(&id.0);
-                }
+            let swept = relay.sweep();
+            if swept > 0 {
+                tracing::info!(
+                    devices = swept,
+                    "ended the relay access of devices no longer admitted"
+                );
             }
         }
     }
@@ -395,7 +404,7 @@ impl Connect {
                 request_id: pending.request_id,
                 outcome: outcome.to_owned(),
             };
-            self.hub.broadcast(user_id, &closed.to_text(), None);
+            self.hub.broadcast_pairing(user_id, &closed.to_text(), None);
         }
     }
 
@@ -421,6 +430,9 @@ impl Connect {
                 refreshed_at = now;
                 self.refresh_access().await;
             }
+            // Also catches connections admitted just before a change, which a disconnect at
+            // the time could not reach yet.
+            self.sweep_relay();
             self.expire_requests(now).await;
             if now - purged_at >= PURGE_SECS {
                 purged_at = now;
@@ -466,28 +478,42 @@ impl Connect {
                     Outgoing::Close(gono_protocol::connect::close::REVOKED, "revoked"),
                 );
                 self.close_requests_of(*user_id, *key, "withdrawn");
+                self.hub.forget_device(*user_id, *key);
             }
             if !revoked.is_empty() {
-                let keys: Vec<EndpointId> = revoked.iter().map(|(_, key)| *key).collect();
-                self.end_relay_access(&keys).await;
+                self.end_relay_access().await;
             }
         }
     }
 
     /// Reads the directory again, disconnects the devices it no longer admits from the relay,
-    /// and tells connected devices when remote access on their account changed.
+    /// closes the control connections of accounts that were disabled or deleted, and tells
+    /// connected devices when remote access on their account changed.
     async fn refresh_access(&self) {
-        let before = self.directory.admitted_keys();
         if let Err(err) = self.directory.refresh().await {
             tracing::warn!(error = %err, "cannot read the device directory");
             return;
         }
-        let after = self.directory.admitted_keys();
-        if let Some(relay) = self.relay.get() {
-            for key in before.difference(&after) {
-                if let Some(id) = device_id(*key) {
-                    relay.disconnect(&id.0);
-                }
+        self.sweep_relay();
+        let enabled: HashSet<i64> = match devices::enabled_accounts(&self.pool).await {
+            Ok(accounts) => accounts.into_iter().collect(),
+            Err(err) => {
+                tracing::warn!(error = %err, "cannot read the enabled accounts");
+                return;
+            }
+        };
+        for user_id in self.hub.known_accounts() {
+            if !enabled.contains(&user_id) {
+                let closed = Outgoing::Close(
+                    gono_protocol::connect::close::ACCOUNT_DISABLED,
+                    "account disabled",
+                );
+                let requests = self.hub.remove_account(user_id, &closed);
+                tracing::info!(
+                    user_id,
+                    requests = requests.len(),
+                    "closed the control connections of a disabled or deleted account"
+                );
             }
         }
         let available: HashSet<i64> = match devices::remote_access_accounts(&self.pool).await {
@@ -513,7 +539,7 @@ impl Connect {
                 request_id: pending.request_id.clone(),
                 outcome: "expired".to_owned(),
             };
-            self.hub.broadcast(user_id, &closed.to_text(), None);
+            self.hub.broadcast_pairing(user_id, &closed.to_text(), None);
             let record = Record::new(user_id, "pair.expired", Actor::Server)
                 .device(pending.requester)
                 .details(json!({ "request_id": pending.request_id }));
@@ -579,6 +605,8 @@ pub fn entry(device: &Device, online: bool) -> Option<DeviceEntry> {
 #[derive(Debug)]
 pub struct Directory {
     pool: Pool,
+    /// Held while the directory is read, so that an older read never replaces a newer one.
+    refreshing: tokio::sync::Mutex<()>,
     admitted: RwLock<HashSet<EndpointId>>,
     /// Tombstones, with their accounts, so that a revoked key that tries the relay is recorded.
     revoked: RwLock<HashMap<EndpointId, i64>>,
@@ -590,6 +618,7 @@ impl Directory {
     fn new(pool: Pool) -> Self {
         Self {
             pool,
+            refreshing: tokio::sync::Mutex::new(()),
             admitted: RwLock::new(HashSet::new()),
             revoked: RwLock::new(HashMap::new()),
             recorded: Mutex::new(HashMap::new()),
@@ -598,6 +627,7 @@ impl Directory {
 
     /// Reads the admitted keys and the tombstones from the database.
     pub async fn refresh(&self) -> gono_server_core::Result<()> {
+        let _serialized = self.refreshing.lock().await;
         let admitted: HashSet<EndpointId> =
             devices::admissible(&self.pool).await?.into_iter().collect();
         let revoked: HashMap<EndpointId, i64> = devices::revoked_keys(&self.pool)
@@ -610,13 +640,6 @@ impl Directory {
             .unwrap_or_else(PoisonError::into_inner) = admitted;
         *self.revoked.write().unwrap_or_else(PoisonError::into_inner) = revoked;
         Ok(())
-    }
-
-    fn admitted_keys(&self) -> HashSet<EndpointId> {
-        self.admitted
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
     }
 
     fn admits_key(&self, key: &EndpointId) -> bool {

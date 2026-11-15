@@ -219,6 +219,45 @@ async fn an_admission_admits_devices_and_disconnect_ends_their_connections() {
     assert!(!status.disconnect(&alice.public()), "nothing left to close");
 }
 
+#[tokio::test]
+async fn a_sweep_ends_the_connections_of_devices_no_longer_admitted() {
+    let (alice, bob) = (device(8), device(9));
+    let directory = Arc::new(Directory::default());
+    directory
+        .admitted
+        .lock()
+        .unwrap()
+        .extend([alice.public(), bob.public()]);
+    let relay = Relay::spawn(&relay_config(&[]), Some(directory.clone()))
+        .await
+        .unwrap();
+    let status = relay.status();
+    let addr = status.http_addr();
+    let mut alices = connect(addr, &alice).await.unwrap();
+    let _bobs = connect(addr, &bob).await.unwrap();
+    wait_for(&status, |snapshot| snapshot.connections == 2).await;
+    assert_eq!(status.sweep(), 0, "both are admitted");
+
+    // The directory drops Alice without anyone calling `disconnect` for her.
+    directory.admitted.lock().unwrap().remove(&alice.public());
+    assert_eq!(status.sweep(), 1);
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match alices.next().await {
+                None | Some(Err(_)) => break,
+                Some(Ok(RelayToClientMsg::Ping(payload))) => {
+                    let _ = alices.send(ClientToRelayMsg::Pong(payload)).await;
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .expect("the connection ends");
+    wait_for(&status, |snapshot| snapshot.connections == 1).await;
+    assert_eq!(status.sweep(), 0, "Bob stays");
+}
+
 /// Writes a self-signed certificate for `localhost` into `dir`.
 fn write_certificate(dir: &Path) -> (rustls::pki_types::CertificateDer<'static>, RelayConfig) {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
