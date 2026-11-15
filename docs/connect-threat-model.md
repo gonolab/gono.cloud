@@ -454,13 +454,13 @@ These are the rules the analysis depends on. V9, the security review, checks eac
 | C5 | On a revocation: add the key to the revoked set, close sessions, remove the entry (LAN pairings included), list the entries it vouched for and offer to remove them, and report `revocations.applied` | 9.3 |
 | C6 | On `4003`: stop using the credentials and never register the key again. On `503` or `1011`: never treat it as signed out | 5.1, 5.4, 9.3 |
 | C7 | Nothing is granted because of `incoming`, presence, or any claim the server makes; revocation is the only thing taken on the server's word | 7.2 |
-| C8 | On the remote endpoint, keys outside the trust list are closed right after the handshake. The only exception is the pairing connection that `incoming` announced for a pending request. Pending handshakes and the handshake rate are limited | 8.2, 11.3 |
+| C8 | On the remote endpoint, keys outside the trust list are closed right after the handshake. The only exception is the pairing connection that `incoming` announced for a pending request. Pending handshakes and the handshake rate are limited. `gono-connect`'s `Remote::accept_trusted` applies the product's predicate right after the handshake and limits pending handshakes; iroh 1.4.1 has no endpoint-wide limit on connection attempts | 8.2, 11.3 |
 | C9 | `accept_remote` and unattended access (plan D6) are enforced on the device. The controlled device shows "being controlled by …" with one-click disconnect | 6.1 |
 | C10 | Every device added by an approval is announced on the device that accepted it, naming the approver. A setting turns acceptance of vouched devices off | 8.5 |
 | C11 | Only remote sessions are reported; LAN sessions never are | 12.2 |
 | C12 | Logged events are processed in order, and the cursor is stored only after acting on them | 5.6 |
 | C13 | The device key and the app password are kept in the operating system's protected storage where it has one: Keychain; DPAPI, or TPM-backed storage, on Windows; a key wrapped by the Android Keystore; HUKS on HarmonyOS. Otherwise a file with mode 0600, as Input Show does today | — |
-| C14 | (SHOULD) Remote sessions are refused when the last `welcome` is older than 24 hours (configurable). LAN use is unaffected | 16 |
+| C14 | (SHOULD) Remote sessions are refused when the last `welcome` is older than 24 hours (configurable). LAN use is unaffected. `gono-connect` tells when the server was last heard from (`ControlChannel::last_heard`) | 16 |
 | C15 | The iroh endpoint is configured as in plan 3.5, with exactly the discovery document's `relay_url` | 3 |
 | C16 | Every signature made with the device key outside TLS and iroh uses a context of protocol 2.3. No data from the server is ever signed as it is | 2.3 |
 

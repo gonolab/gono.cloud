@@ -99,7 +99,8 @@ The words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 - A frame or body that a device sends over 64 KiB is refused; on the control channel, with
   the close code `1009` (5.4).
 - Messages the server sends stay below 4 MiB, and devices refuse larger ones. The `welcome`
-  keeps to that by sending part of the event backlog after it (5.6).
+  keeps to that by sending part of the event backlog after it (5.6). HTTP answers stay below
+  1 MiB, and devices refuse larger ones.
 
 ### 2.3 Signed statements
 
@@ -182,6 +183,14 @@ origin the user entered.
 - **`server`** is the server origin that devices put into their statements.
 - **`relay_url`** is the relay's `relay.public_url`. Devices configure their iroh endpoint
   with exactly this relay (`RelayMode::custom`) and no other (plan 3.5).
+- **What devices check.** A device refuses a discovery document:
+  - whose `version` it does not implement;
+  - whose `server` is not the origin it fetched the document from, serialized as in 2.1;
+  - whose `login` or `websocket` URL is not on that origin: the same host and port, with
+    `https` and `wss`, or `http` and `ws` on a loopback host.
+
+  Devices follow no redirects. They name the origin they talk to in every statement, never a
+  value the server sends.
 - **Capabilities.** The Nextcloud capabilities document carries the same object as
   `capabilities.gono_cloud.connect`, for clients that already read capabilities (gono.md).
 
@@ -314,6 +323,11 @@ The answer:
 The app password is returned exactly once. Only its SHA-256 digest is stored, as for every app
 password.
 
+**What the device checks.** `poll.endpoint` must be on the server origin, and `server` in the
+answer must be the origin the device talks to; the device refuses the answer otherwise. It
+stops polling at `expires_at`, which it reads against the server's clock from the `Date`
+header of the 4.1 answer.
+
 ### 4.4 Registering again
 
 The endpoint ID decides what happens:
@@ -431,6 +445,10 @@ again: a revocation or sign-out that happened after the upgrade was authenticate
 | Over 20 connections a minute | `rate_limited` | `4029` | Reconnect after 60 seconds |
 | The server's own trouble | `unavailable` | `1011` | Reconnect with backoff |
 
+The device decides by the close code that follows the `error`. If none arrives within 2
+seconds, it decides by the `error` code: `bad_signature`, `bad_request`, `not_found` and
+`not_permitted` are final for these credentials, and any other code is retried with backoff.
+
 **Other fields of `hello`:**
 - `since` is the last event sequence number the device has processed (5.6); `0` on first use.
 - `settings` is optional; it is applied as in 6.3.
@@ -502,9 +520,12 @@ accounts: a device of another account gets `not_found`, exactly like one that do
 - **Pings.** The server sends a WebSocket ping every 30 seconds. At each ping it also checks
   that the app password is still valid and the account enabled.
 - **Timeouts.** A device that has sent nothing by the next ping, not even a pong, is
-  disconnected (`4002`). So is one that does not read a frame within one ping interval.
+  disconnected (`4002`). So is one that does not read a frame within one ping interval. A
+  device that receives nothing, pings included, for 75 seconds (two and a half ping
+  intervals) treats the connection as dead and reconnects.
 - **Reconnects.** Devices reconnect with exponential backoff from 1 to 60 seconds with
-  jitter, except where the table says otherwise.
+  jitter, except where the table says otherwise. A device keeps a `Retry-After` or
+  `retry_after` between 1 second and 1 hour.
 
 | Close code | Meaning | Device |
 |---|---|---|
@@ -517,7 +538,7 @@ accounts: a device of another account gets `not_found`, exactly like one that do
 | `4002` | Timed out | Reconnect |
 | `4003` | The device was revoked | Stop, delete the app password, tell the user (9.3) |
 | `4004` | The account was disabled | Retry after an hour |
-| `4008` | Protocol violation | Reconnect once; then report the bug |
+| `4008` | Protocol violation | Reconnect once; if that connection also ends with `4008`, stop and report the bug |
 | `4029` | Rate limited | Reconnect after 60 seconds |
 
 ### 5.5 Message reference
@@ -707,6 +728,10 @@ peer, or a product feature needs it.
 - For `pair`, `incoming` also carries `request_id`, and the new device accepts pairing
   connections only from the key that `incoming` named (8.2).
 
+**What the caller checks.** A device refuses a result whose `target` is not the device it
+asked about, ignores a `relay_url` other than the discovery document's, and uses at most 16
+direct addresses.
+
 **Recorded.** Every `connect` is recorded in the audit log as `connect.requested`, refused
 ones included.
 
@@ -734,8 +759,8 @@ per connection, so reconnecting changes neither.
 
 ### 7.4 Caching and outages
 
-- **Caching.** `gono-connect` caches the last result per peer for 10 minutes, and the relay
-  URL until the next `welcome`.
+- **Caching.** `gono-connect` caches the last result per peer for 10 minutes, for at most
+  256 peers, and the relay URL until the next `welcome`.
 - **During an outage of gono-cloud:**
   - the embedded relay is down too, so relayed paths fail;
   - established direct paths continue;
