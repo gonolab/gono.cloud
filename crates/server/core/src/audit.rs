@@ -200,6 +200,21 @@ pub async fn list(
     Ok(rows.into_iter().map(Entry::from).collect())
 }
 
+/// The newest `limit` records of any account whose kind is one of `kinds`, newest first: what
+/// the admin UI shows of one subject, such as the sessions devices reported.
+pub async fn list_kinds(pool: &Pool, kinds: &[&str], limit: i64) -> Result<Vec<Entry>> {
+    let kinds = serde_json::Value::from(kinds.to_vec()).to_string();
+    let rows: Vec<EntryRow> = sqlx::query_as(
+        "SELECT id, user_id, at, kind, actor, device, peer, client_ip, details FROM audit_log \
+         WHERE kind IN (SELECT value FROM json_each(?1)) ORDER BY id DESC LIMIT ?2",
+    )
+    .bind(kinds)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Entry::from).collect())
+}
+
 /// Removes every record written before `before`. Returns how many there were.
 pub async fn purge(pool: &Pool, before: i64) -> Result<u64> {
     let mut tx = db::begin_immediate(pool).await?;

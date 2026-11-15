@@ -80,6 +80,32 @@ impl Allowlist {
                 .map_or(0, |admission| admission.count())
     }
 
+    /// Number of devices in `relay.allowed_endpoints`.
+    pub(crate) fn listed(&self) -> usize {
+        self.allowed.len()
+    }
+
+    /// Whether `device` is in `relay.allowed_endpoints`.
+    pub(crate) fn is_listed(&self, device: &EndpointId) -> bool {
+        self.allowed.contains(device)
+    }
+
+    /// The devices holding open connections, with how many each, ordered by device.
+    pub(crate) fn connected_devices(&self) -> Vec<(EndpointId, usize)> {
+        let mut counts: HashMap<EndpointId, usize> = HashMap::new();
+        for device in self
+            .connected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+        {
+            *counts.entry(*device).or_default() += 1;
+        }
+        let mut devices: Vec<(EndpointId, usize)> = counts.into_iter().collect();
+        devices.sort_unstable_by_key(|(device, _)| *device.as_bytes());
+        devices
+    }
+
     /// Open connections and the number of distinct devices holding them.
     pub(crate) fn connected(&self) -> (usize, usize) {
         let connected = self

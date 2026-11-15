@@ -1,0 +1,81 @@
+{%- extends "admin/frame.html" -%}
+{%- block title %}{{ chrome.t.a_relay }}{% endblock -%}
+{%- block content %}
+{%- match relay %}
+{%- when None %}
+<div class="page-head"><div><h1>{{ chrome.t.a_relay }}</h1></div></div>
+<div class="panel"><div class="panel-body"><p>{{ chrome.t.a_relay_page_off }}</p></div></div>
+{%- when Some(relay) %}
+<div class="page-head">
+  <div><h1>{{ relay.host }}</h1>
+    <p class="sub">{% if relay.running %}<span class="badge ok dot">{{ chrome.t.a_running }}</span>{% else %}<span class="badge warn dot">{{ chrome.t.a_relay_stopped }}</span>{% endif %} &nbsp;{{ chrome.t.a_relay_note }}</p></div>
+</div>
+<div class="tiles">
+  <div class="panel tile"><div class="label">{{ chrome.t.a_relay_connections }}</div><div class="value">{{ relay.connections }}</div><div class="note">{{ relay.connections_note }}</div></div>
+  <div class="panel tile"><div class="label">{{ chrome.t.a_relay_traffic }}</div><div class="value">{{ relay.traffic }}</div><div class="note">{{ relay.traffic_note }}</div></div>
+  <div class="panel tile"><div class="label">{{ chrome.t.a_relay_refused }}</div><div class="value">{{ relay.refused }}</div><div class="note">{{ chrome.t.a_relay_refused_note }}</div></div>
+  <div class="panel tile"><div class="label">{{ chrome.t.a_relay_dropped }}</div><div class="value">{{ relay.dropped }}</div><div class="note">{{ relay.dropped_note }}</div></div>
+</div>
+<div class="stack">
+<div class="panel">
+  <div class="panel-head"><div><h2>{{ chrome.t.a_relay_settings }}</h2></div></div>
+  <div class="panel-body"><dl class="facts">
+    {%- for fact in relay.settings %}
+    <dt>{{ fact.label }}</dt><dd{% if fact.mono %} class="mono"{% endif %}>{{ fact.value }}</dd>
+    {%- endfor %}
+  </dl></div>
+</div>
+<div class="panel">
+  <div class="panel-head"><div><h2>{{ chrome.t.a_relay_devices }}</h2><p class="muted small">{{ chrome.t.a_relay_devices_note }}</p></div></div>
+  {%- if relay.devices.is_empty() %}
+  <div class="panel-body"><p class="muted">{{ chrome.t.a_relay_no_devices }}</p></div>
+  {%- else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>{{ chrome.t.a_relay_device }}</th><th>{{ chrome.t.a_account }}</th><th>{{ chrome.t.a_relay_control }}</th><th>{{ chrome.t.a_relay_conns }}</th><th>{{ chrome.t.a_relay_source }}</th></tr></thead>
+    <tbody>
+    {%- for device in relay.devices %}
+      <tr><td><div class="who"><b>{{ device.name }}</b><span class="mono">{{ device.short }}</span>{% if !device.what.is_empty() %}<span class="muted small">{{ device.what }}</span>{% endif %}</div></td>
+        <td>{% if let Some(account) = device.account %}<a href="{{ frame.prefix }}/users/{{ account }}">{{ account }}</a>{% else %}<span class="muted">–</span>{% endif %}</td>
+        <td>{% match device.control %}{% when Some(true) %}<span class="badge ok dot">{{ chrome.t.online }}</span>{% when Some(false) %}<span class="badge off dot">{{ chrome.t.a_relay_offline }}</span>{% when None %}<span class="muted">–</span>{% endmatch %}</td>
+        <td class="num">{{ device.connections }}</td>
+        <td>{{ device.source }}</td></tr>
+    {%- endfor %}
+    </tbody>
+  </table></div>
+  {%- endif %}
+</div>
+<div class="panel">
+  <div class="panel-head"><div><h2>{{ chrome.t.a_relay_sessions }}</h2><p class="muted small">{{ chrome.t.a_relay_sessions_note }}</p></div></div>
+  {%- if relay.sessions.is_empty() %}
+  <div class="panel-body"><p class="muted">{{ chrome.t.a_relay_no_sessions }}</p></div>
+  {%- else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>{{ chrome.t.a_relay_when }}</th><th>{{ chrome.t.a_relay_event }}</th><th>{{ chrome.t.a_account }}</th><th>{{ chrome.t.a_relay_device }}</th><th>{{ chrome.t.a_relay_peer }}</th><th>{{ chrome.t.a_relay_service }}</th><th>{{ chrome.t.a_relay_path }}</th><th>{{ chrome.t.a_relay_bytes }}</th></tr></thead>
+    <tbody>
+    {%- for row in relay.sessions %}
+      <tr><td class="num">{{ row.when }}</td><td class="nowrap">{{ row.event }}</td><td>{{ row.account }}</td><td>{{ row.device }}</td><td>{{ row.peer }}</td><td class="mono">{{ row.service }}</td>
+        <td>{% if row.relayed %}<span class="badge warn">{{ row.path }}</span>{% else %}<span class="badge ok">{{ row.path }}</span>{% endif %}</td>
+        <td class="num">{{ row.bytes }}</td></tr>
+    {%- endfor %}
+    </tbody>
+  </table></div>
+  {%- endif %}
+</div>
+<div class="panel">
+  <div class="panel-head"><div><h2>{{ chrome.t.a_relay_refusals }}</h2><p class="muted small">{{ chrome.t.a_relay_refusals_note }}</p></div></div>
+  {%- if relay.refusals.is_empty() %}
+  <div class="panel-body"><p class="muted">{{ chrome.t.a_relay_no_refusals }}</p></div>
+  {%- else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>{{ chrome.t.a_relay_when }}</th><th>{{ chrome.t.a_account }}</th><th>{{ chrome.t.a_relay_device }}</th></tr></thead>
+    <tbody>
+    {%- for row in relay.refusals %}
+      <tr><td class="num">{{ row.when }}</td><td>{{ row.account }}</td><td>{{ row.device }}</td></tr>
+    {%- endfor %}
+    </tbody>
+  </table></div>
+  {%- endif %}
+</div>
+</div>
+{%- endmatch %}
+{%- endblock %}

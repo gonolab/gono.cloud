@@ -57,7 +57,7 @@ use axum::{
 use gono_server_core::{
     Error as CoreError, Permission, RelPath, Username,
     app_passwords::{self, Scope},
-    db,
+    audit, db,
     devices::{self, Device, EndpointId, RevokedBy},
     password, stats,
     users::{self, NewUser, User},
@@ -75,8 +75,9 @@ use serde::Deserialize;
 pub(crate) use self::pages::{AppPasswordForm, ScopeChip};
 use self::pages::{
     AppPasswordRow, CreatedPage, DeletePage, Fact, Feature, Frame, LoginPage, MOUNT_ROWS,
-    MessagePage, MountInput, NewUserPage, NotAdminPage, OverviewPage, RemoteDeviceRow,
-    RevokeDevicePage, UserPage, UserRow, UserView, UsersPage,
+    MessagePage, MountInput, NewUserPage, NotAdminPage, OverviewPage, RefusalRow, RelayDeviceRow,
+    RelayPage, RelayView, RemoteDeviceRow, RevokeDevicePage, SessionRow, UserPage, UserRow,
+    UserView, UsersPage,
 };
 use crate::{
     app::AppState,
@@ -175,6 +176,8 @@ impl Admin {
             prefix: self.prefix.clone(),
             on_overview,
             on_users,
+            relay_tab: self.info.relay.is_some(),
+            on_relay: false,
             csrf: session.csrf.clone(),
             version: env!("CARGO_PKG_VERSION"),
             nextcloud: status::version_string(),
@@ -231,6 +234,7 @@ pub fn routes(prefix: &str) -> Router<AppState> {
         .route(&format!("{p}/login"), get(login_page).post(login))
         .route(&format!("{p}/logout"), post(logout))
         .route(&format!("{p}/users"), get(users_page).post(create_user))
+        .route(&format!("{p}/relay"), get(relay_page))
         .route(&format!("{p}/new-user"), get(new_user_page))
         .route(&format!("{p}/users/{{name}}"), get(user_page))
         .route(&format!("{p}/users/{{name}}/enable"), post(enable))
@@ -564,6 +568,265 @@ async fn logout(
 // ---------------------------------------------------------------------------------------------
 // Overview
 // ---------------------------------------------------------------------------------------------
+
+/// The audit records the relay page lists, newest first, at most.
+const RELAY_PAGE_RECORDS: i64 = 100;
+
+/// `GET /relay`: the relay's settings and counters, the devices connected to it, the sessions
+/// devices reported and the revoked devices that tried it (plan 3.2; protocol 11, 12).
+async fn relay_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let admin = match admin(&state) {
+        Ok(admin) => admin,
+        Err(halt) => return *halt,
+    };
+    let session = match session(&state, &admin, &headers).await {
+        Ok(session) => session,
+        Err(halt) => return *halt,
+    };
+    let mut frame = admin.frame(&session, false, false);
+    frame.on_relay = true;
+    let relay = match &admin.info.relay {
+        None => None,
+        Some(relay) => match relay_view(&state, session.chrome.t, relay).await {
+            Ok(view) => Some(view),
+            Err(err) => return internal_error(&session.chrome, &err),
+        },
+    };
+    web::render(
+        StatusCode::OK,
+        &RelayPage {
+            chrome: session.chrome,
+            frame,
+            relay,
+        },
+    )
+}
+
+async fn relay_view(
+    state: &AppState,
+    t: &'static Text,
+    relay: &RelayStatus,
+) -> gono_server_core::Result<RelayView> {
+    let now = relay.snapshot();
+    let records = audit::list_kinds(
+        &state.db,
+        &["session.started", "session.ended", "relay.refused_revoked"],
+        RELAY_PAGE_RECORDS,
+    )
+    .await?;
+    let usernames: HashMap<i64, String> = users::list(&state.db)
+        .await?
+        .into_iter()
+        .map(|user| (user.id, user.username.to_string()))
+        .collect();
+
+    // The directory entries of every key the page names, read once each.
+    let connected = relay.connected_devices();
+    let mut entries: HashMap<EndpointId, Option<Device>> = HashMap::new();
+    let mut keys: Vec<EndpointId> = connected
+        .iter()
+        .map(|(device, _)| EndpointId(*device.as_bytes()))
+        .collect();
+    for record in &records {
+        keys.extend(record.device);
+        keys.extend(record.peer);
+    }
+    for key in keys {
+        if let std::collections::hash_map::Entry::Vacant(slot) = entries.entry(key) {
+            slot.insert(devices::find(&state.db, key).await?);
+        }
+    }
+    let name_of = |key: Option<EndpointId>| match key {
+        None => String::new(),
+        Some(key) => match entries.get(&key).and_then(Option::as_ref) {
+            Some(device) => format!("{} ({})", device.name, key.short()),
+            None => key.short(),
+        },
+    };
+    let account_of = |user_id: Option<i64>| {
+        user_id
+            .and_then(|id| usernames.get(&id).cloned())
+            .unwrap_or_default()
+    };
+
+    let devices = connected
+        .iter()
+        .map(|(device, connections)| {
+            let key = EndpointId(*device.as_bytes());
+            let entry = entries.get(&key).and_then(Option::as_ref);
+            let registered = entry.filter(|entry| entry.is_active());
+            RelayDeviceRow {
+                name: entry.map_or_else(
+                    || t.a_relay_not_registered.to_owned(),
+                    |entry| entry.name.clone(),
+                ),
+                short: key.short(),
+                what: entry.map_or_else(String::new, |entry| {
+                    format!(
+                        "{} · {}",
+                        crate::login_flow::product_name(&entry.product),
+                        crate::login_flow::platform_name(&entry.platform)
+                    )
+                }),
+                account: entry.and_then(|entry| usernames.get(&entry.user_id).cloned()),
+                control: entry.map(|entry| {
+                    state
+                        .connect
+                        .as_ref()
+                        .is_some_and(|connect| connect.is_online(entry.user_id, key))
+                }),
+                connections: *connections,
+                // Admitted by the directory, or else by relay.allowed_endpoints.
+                source: if registered.is_some() {
+                    t.a_relay_source_registered
+                } else {
+                    t.a_relay_source_listed
+                },
+            }
+        })
+        .collect();
+
+    let detail = |record: &audit::Entry, field: &str| -> Option<serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(&record.details)
+            .ok()
+            .and_then(|details| details.get(field).cloned())
+    };
+    let text = |record: &audit::Entry, field: &str| {
+        detail(record, field)
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default()
+    };
+    let bytes = |record: &audit::Entry, field: &str| {
+        detail(record, field)
+            .and_then(|value| value.as_u64())
+            .map_or_else(|| "–".to_owned(), format_bytes)
+    };
+    let mut sessions = Vec::new();
+    let mut refusals = Vec::new();
+    for record in &records {
+        match record.kind.as_str() {
+            "relay.refused_revoked" => refusals.push(RefusalRow {
+                when: pages::time(record.at),
+                account: account_of(record.user_id),
+                device: name_of(record.device),
+            }),
+            kind => {
+                let ended = kind == "session.ended";
+                let path = text(record, "path");
+                sessions.push(SessionRow {
+                    when: pages::time(record.at),
+                    account: account_of(record.user_id),
+                    device: name_of(record.device),
+                    peer: name_of(record.peer),
+                    service: text(record, "service"),
+                    relayed: path != "direct",
+                    path: match path.as_str() {
+                        "direct" => t.a_relay_path_direct.to_owned(),
+                        "relayed" => t.a_relay_path_relayed.to_owned(),
+                        "mixed" => t.a_relay_path_mixed.to_owned(),
+                        _ => path.clone(),
+                    },
+                    event: if ended {
+                        t.a_relay_ended
+                    } else {
+                        t.a_relay_started
+                    },
+                    bytes: if ended {
+                        format!(
+                            "{} / {}",
+                            bytes(record, "bytes_direct"),
+                            bytes(record, "bytes_relayed")
+                        )
+                    } else {
+                        String::new()
+                    },
+                });
+            }
+        }
+    }
+
+    let fact = |label: &'static str, value: String, mono: bool| Fact { label, value, mono };
+    let listed = relay.listed_devices().to_string();
+    let mut settings = vec![
+        fact(
+            t.a_relay_public_url,
+            relay.public_url().as_str().to_owned(),
+            true,
+        ),
+        fact(t.a_relay_listening, relay.http_addr().to_string(), true),
+        fact(
+            t.a_relay_qad,
+            relay.qad_addr().map_or_else(
+                || t.a_relay_qad_off.to_owned(),
+                |addr| {
+                    fill(
+                        t.a_relay_qad_on,
+                        &[&addr.to_string(), &now.qad_connections.to_string()],
+                    )
+                },
+            ),
+            false,
+        ),
+    ];
+    if let Some(cert) = relay.tls_cert() {
+        settings.push(fact(
+            t.a_relay_certificate,
+            fill(
+                t.a_relay_cert_reload,
+                &[
+                    &cert.display().to_string(),
+                    &duration(
+                        t,
+                        i64::try_from(relay.tls_reload_interval_secs()).unwrap_or(i64::MAX),
+                    ),
+                ],
+            ),
+            false,
+        ));
+    }
+    settings.push(fact(
+        t.a_relay_admission,
+        if state.connect.is_some() {
+            fill(t.a_relay_admits_registered, &[&listed])
+        } else {
+            fill(t.a_relay_admits_listed, &[&listed])
+        },
+        false,
+    ));
+    settings.push(fact(
+        t.a_relay_rate_limit,
+        relay.client_rate_limit().map_or_else(
+            || t.a_relay_unlimited.to_owned(),
+            |limit| fill(t.a_relay_per_second, &[&format_bytes(u64::from(limit))]),
+        ),
+        false,
+    ));
+
+    Ok(RelayView {
+        host: relay.public_url().host_str().unwrap_or_default().to_owned(),
+        running: relay.is_running(),
+        settings,
+        connections: now.connections,
+        connections_note: fill(t.a_relay_connections_note, &[&now.devices.to_string()]),
+        traffic: format_bytes(now.bytes_sent),
+        traffic_note: fill(
+            t.a_relay_traffic_note,
+            &[
+                &format_bytes(now.bytes_received),
+                &format_bytes(now.bytes_sent),
+            ],
+        ),
+        refused: now.denied,
+        dropped: now.packets_dropped,
+        dropped_note: fill(
+            t.a_relay_dropped_note,
+            &[&format_bytes(now.bytes_rate_limited)],
+        ),
+        devices,
+        sessions,
+        refusals,
+    })
+}
 
 /// The relay's line among the features: its host name, the allowed devices connected now, what
 /// it has carried and refused.

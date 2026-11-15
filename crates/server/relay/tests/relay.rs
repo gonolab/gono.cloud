@@ -237,6 +237,13 @@ async fn a_sweep_ends_the_connections_of_devices_no_longer_admitted() {
     let _bobs = connect(addr, &bob).await.unwrap();
     wait_for(&status, |snapshot| snapshot.connections == 2).await;
     assert_eq!(status.sweep(), 0, "both are admitted");
+    let mut connected = vec![(alice.public(), 1), (bob.public(), 1)];
+    connected.sort_unstable_by_key(|(device, _)| *device.as_bytes());
+    assert_eq!(status.connected_devices(), connected);
+    assert!(
+        !status.is_listed(&alice.public()),
+        "admitted by the directory"
+    );
 
     // The directory drops Alice without anyone calling `disconnect` for her.
     directory.admitted.lock().unwrap().remove(&alice.public());

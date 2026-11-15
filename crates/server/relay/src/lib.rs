@@ -31,7 +31,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     num::NonZeroU32,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -104,6 +104,8 @@ impl Relay {
             public_url,
             http_addr: server.http_addr().unwrap_or(config.bind),
             qad_addr: server.quic_addr(),
+            tls_cert: config.qad_bind.and(config.tls_cert.clone()),
+            tls_reload_interval_secs: config.tls_reload_interval_secs,
             client_rate_limit: config.max_client_bytes_per_sec,
             running: AtomicBool::new(true),
         }));
@@ -170,6 +172,9 @@ struct Shared {
     public_url: Url,
     http_addr: SocketAddr,
     qad_addr: Option<SocketAddr>,
+    /// The certificate QAD serves, when QAD is on.
+    tls_cert: Option<PathBuf>,
+    tls_reload_interval_secs: u64,
     client_rate_limit: Option<u32>,
     /// Cleared when [`Relay::run_until`] returns, whether the relay was stopped or failed.
     running: AtomicBool,
@@ -199,6 +204,32 @@ impl RelayStatus {
     /// Number of allowed devices: `relay.allowed_endpoints` and the admission.
     pub fn allowed_devices(&self) -> usize {
         self.0.access.len()
+    }
+
+    /// Number of devices in `relay.allowed_endpoints`.
+    pub fn listed_devices(&self) -> usize {
+        self.0.access.listed()
+    }
+
+    /// Whether `device` is in `relay.allowed_endpoints`.
+    pub fn is_listed(&self, device: &EndpointId) -> bool {
+        self.0.access.is_listed(device)
+    }
+
+    /// The devices with open connections right now, each with its number of connections,
+    /// ordered by device.
+    pub fn connected_devices(&self) -> Vec<(EndpointId, usize)> {
+        self.0.access.connected_devices()
+    }
+
+    /// The certificate file QAD serves, when QAD is on (`relay.tls_cert`).
+    pub fn tls_cert(&self) -> Option<&Path> {
+        self.0.tls_cert.as_deref()
+    }
+
+    /// How often QAD reads its certificate again, in seconds.
+    pub fn tls_reload_interval_secs(&self) -> u64 {
+        self.0.tls_reload_interval_secs
     }
 
     /// Disconnects every connection of `device` at once. Returns `false` if it had none. A

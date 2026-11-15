@@ -23,6 +23,7 @@ page!(
     CreatedPage,
     DeletePage,
     RevokeDevicePage,
+    RelayPage,
 );
 
 /// What every page of the signed-in admin UI shows around its content.
@@ -34,6 +35,10 @@ pub struct Frame {
     pub on_overview: bool,
     /// Highlight "Users" in the navigation.
     pub on_users: bool,
+    /// Show "Relay" in the navigation: the relay is enabled.
+    pub relay_tab: bool,
+    /// Highlight "Relay" in the navigation.
+    pub on_relay: bool,
     /// CSRF token of the session, for every form.
     pub csrf: String,
     /// Server version.
@@ -126,6 +131,73 @@ pub struct OverviewPage {
     pub db_path: String,
     pub db_size: String,
     pub features: Vec<Feature>,
+}
+
+/// `admin/relay.html`: the relay's settings, counters, connected devices, reported sessions
+/// and refused tombstones. `relay` is `None` when the relay is off.
+#[derive(Template)]
+#[template(path = "admin/relay.html")]
+pub struct RelayPage {
+    pub chrome: Chrome,
+    pub frame: Frame,
+    pub relay: Option<RelayView>,
+}
+
+/// What the relay page shows of a running or stopped relay.
+#[derive(Debug, Clone)]
+pub struct RelayView {
+    pub host: String,
+    pub running: bool,
+    pub settings: Vec<Fact>,
+    pub connections: usize,
+    pub connections_note: String,
+    pub traffic: String,
+    pub traffic_note: String,
+    pub refused: u64,
+    pub dropped: u64,
+    pub dropped_note: String,
+    pub devices: Vec<RelayDeviceRow>,
+    pub sessions: Vec<SessionRow>,
+    pub refusals: Vec<RefusalRow>,
+}
+
+/// A device connected to the relay.
+#[derive(Debug, Clone)]
+pub struct RelayDeviceRow {
+    /// Its name, or "Not registered".
+    pub name: String,
+    pub short: String,
+    /// "Input Show · Windows", empty when not registered.
+    pub what: String,
+    /// The account's username, when registered.
+    pub account: Option<String>,
+    /// Whether its control channel is open; `None` when not registered.
+    pub control: Option<bool>,
+    pub connections: usize,
+    pub source: &'static str,
+}
+
+/// A reported session.
+#[derive(Debug, Clone)]
+pub struct SessionRow {
+    pub when: String,
+    pub account: String,
+    pub device: String,
+    pub peer: String,
+    pub service: String,
+    pub path: String,
+    pub relayed: bool,
+    pub event: &'static str,
+    /// "1.0 MB / 2 KB" for an ended session, empty otherwise.
+    pub bytes: String,
+}
+
+/// A revoked device that tried the relay.
+#[derive(Debug, Clone)]
+pub struct RefusalRow {
+    pub when: String,
+    pub account: String,
+    pub device: String,
 }
 
 /// One row of the user list.

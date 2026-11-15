@@ -26,7 +26,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use tower::ServiceExt as _;
 use url::Url;
 
-use super::{Admin, ServerInfo};
+use super::{Admin, ServerInfo, format_bytes};
 use crate::{
     app::{self, AppState},
     auth::Authenticator,
@@ -1013,6 +1013,122 @@ async fn the_overview_shows_the_relay() {
         "{}",
         stopped.body
     );
+}
+
+#[tokio::test]
+async fn the_relay_page_shows_settings_sessions_and_refusals() {
+    use gono_server_core::{
+        audit::{self, Actor, Record},
+        devices::EndpointId,
+    };
+
+    let mut f = fixture().await;
+    let mut browser = Browser::new(&f.state);
+    browser.root().await;
+    let off = browser.get(&path("/relay")).await;
+    assert!(off.body.contains("The relay is off"), "{}", off.body);
+    let overview = browser.get(&path("/")).await;
+    assert!(
+        !overview
+            .body
+            .contains(&format!("href=\"{}\"", path("/relay"))),
+        "no tab while the relay is off"
+    );
+
+    let listed = EndpointId([9; 32]);
+    let relay = Relay::spawn(
+        &RelayConfig {
+            enabled: true,
+            public_url: Some("https://relay.example.com".parse().unwrap()),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            allowed_endpoints: vec![listed.to_hex()],
+            max_client_bytes_per_sec: Some(1_000_000),
+            ..RelayConfig::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let mut info = f.state.admin.as_ref().unwrap().info.clone();
+    info.relay = Some(relay.status());
+    f.state.admin = Some(Arc::new(Admin::new(PREFIX, info)));
+
+    // Two reported sessions and a refused tombstone, as the control channel and the relay
+    // record them.
+    let (mac, phone) = (EndpointId([7; 32]), EndpointId([8; 32]));
+    let now = db::unix_now();
+    for (kind, details) in [
+        (
+            "session.started",
+            serde_json::json!({ "service": "inputshow/1", "path": "relayed" }),
+        ),
+        (
+            "session.ended",
+            serde_json::json!({
+                "service": "inputshow/1",
+                "path": "direct",
+                "bytes_direct": 1_048_576,
+                "bytes_relayed": 2048,
+            }),
+        ),
+    ] {
+        audit::record(
+            &f.state.db,
+            &Record::new(f.alice, kind, Actor::Device)
+                .device(mac)
+                .peer(phone)
+                .details(details),
+            now,
+        )
+        .await
+        .unwrap();
+    }
+    audit::record(
+        &f.state.db,
+        &Record::new(f.alice, "relay.refused_revoked", Actor::Server).device(phone),
+        now,
+    )
+    .await
+    .unwrap();
+
+    let mut browser = Browser::new(&f.state);
+    browser.root().await;
+    let page = browser.get(&path("/relay")).await;
+    assert_eq!(page.status, StatusCode::OK);
+    let body = &page.body;
+    assert!(
+        body.contains(&format!(
+            "href=\"{}\" aria-current=\"page\">Relay",
+            path("/relay")
+        )),
+        "{body}"
+    );
+    assert!(body.contains("<h1>relay.example.com</h1>"), "{body}");
+    assert!(body.contains("Only relay.allowed_endpoints (1)"), "{body}");
+    assert!(
+        body.contains("No device is connected to the relay."),
+        "{body}"
+    );
+    assert!(
+        body.contains("Relayed") && body.contains("Direct"),
+        "{body}"
+    );
+    assert!(body.contains("inputshow/1"), "{body}");
+    assert!(
+        body.contains(&format!("{} / ", format_bytes(1_048_576))),
+        "{body}"
+    );
+    assert!(body.contains(&phone.short()), "{body}");
+    assert!(
+        body.contains("Revoked devices that tried the relay"),
+        "{body}"
+    );
+    let zh = [("Accept-Language", "zh-CN")];
+    let chinese = browser
+        .send("GET", &path("/relay"), &zh, String::new())
+        .await;
+    assert!(chinese.body.contains("已连接的设备"), "{}", chinese.body);
+    relay.run_until(async {}).await.unwrap();
 }
 
 #[tokio::test]
