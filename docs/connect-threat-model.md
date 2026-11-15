@@ -492,3 +492,21 @@ reviews:
 - whether to adopt C14.
 
 The review is done when both projects have signed it off (plan 4.1).
+
+**Review of the implementation (November 2026).** Before the first deployment, the server side
+(parts 2b and 2c) and `gono-connect` were reviewed against this document, area by area:
+registration and revocation, the control channel, two-step verification, and the client crate.
+The findings were fixed together with the review; the main ones:
+- signing out deleted the entry, so a leaked key and app password could hide a device from
+  revocation and move its key to another account (now 9.4 of the protocol keeps the entry);
+- relay disconnects could be lost when two directory changes met (now a regular sweep, S7);
+- a revocation during the handshake left a working session (now 5.2 and 9.2);
+- a session report opened `lookup` without a `connect`, and limits reset on reconnect (S4,
+  S10);
+- codes sent in parallel passed the failure lock of the second step, and sessions from before
+  enrolment survived it (13.2, 13.3);
+- `gono-connect` stopped for good on a transient handshake error, took relay URLs from the
+  server unchecked, and did not bind its URLs and statements to the origin it talks to (C6,
+  C15, C16).
+
+This covers our own code, not iroh and noq, which V9 of the plan reviews.
