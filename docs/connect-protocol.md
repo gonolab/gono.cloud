@@ -87,7 +87,7 @@ The words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 | Server origin | `scheme://host[:port]`: lower-case host, no default port, no path, no trailing slash. It is gono-cloud's `server.base_url`, which never has a path |
 | Relay URL | An iroh `RelayUrl` as a string, for example `https://relay.example.com/` |
 | Direct address | `ip:port`, with IPv6 in brackets: `192.0.2.10:51820`, `[2001:db8::1]:51820` |
-| Names | UTF-8, trimmed, 1–64 characters; no control characters, no bidirectional controls (U+202A–U+202E, U+2066–U+2069), and no invisible characters (U+00AD, U+034F, U+061C, U+115F, U+1160, U+17B4, U+17B5, U+180B–U+180F, U+200B–U+200F, U+2028–U+202F, U+205F–U+206F, U+3164, U+FE00–U+FE0F, U+FEFF, U+FFA0, U+FFF0–U+FFFB, U+E0000–U+E0FFF). Names are self-asserted: every prompt and notice that shows another device's name shows its short ID next to it |
+| Names | UTF-8, trimmed, 1–64 characters; no control characters, no bidirectional controls (U+202A–U+202E, U+2066–U+2069), and no invisible characters (U+00AD, U+034F, U+061C, U+115F, U+1160, U+17B4, U+17B5, U+180B–U+180F, U+200B–U+200F, U+2028, U+2029, U+2060–U+206F, U+3164, U+FE00–U+FE0F, U+FEFF, U+FFA0, U+FFF0–U+FFFB, U+E0000–U+E0FFF). Names are self-asserted: every prompt and notice that shows another device's name shows its short ID next to it |
 | `product` | `[a-z0-9-]{1,32}`: `input-show`, later `gono-md`, … |
 | `platform` | `[a-z0-9-]{1,32}`: `macos`, `windows`, `linux`, `harmonyos`, `ios`, `android`, … |
 | Service | An ALPN as a string, for example `inputshow/1` |

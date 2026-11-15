@@ -40,7 +40,7 @@ pub const PAIRING_WINDOW_SECS: i64 = 60 * 60;
 pub const EVENT_RETENTION_SECS: i64 = 45 * 24 * 60 * 60;
 
 /// Longest device name, in characters.
-pub const MAX_NAME_CHARS: usize = 64;
+pub const MAX_NAME_CHARS: usize = gono_protocol::connect::name::MAX_NAME_CHARS;
 
 /// Most services (ALPNs) a device may list.
 pub const MAX_SERVICES: usize = 16;
@@ -142,22 +142,16 @@ pub fn check_slug(field: &'static str, value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
-/// Checks a device name: trimmed, 1 to [`MAX_NAME_CHARS`] characters, no control characters.
+/// Checks a device name as protocol 2.1 says: trimmed, 1 to [`MAX_NAME_CHARS`] characters, no
+/// control characters, bidirectional controls or invisible characters, since other devices show
+/// it in approval prompts and notices.
 pub fn check_name(value: &str) -> Result<String> {
-    let name = value.trim();
-    if name.is_empty() || name.chars().count() > MAX_NAME_CHARS {
-        return Err(Error::InvalidDevice {
+    gono_protocol::connect::name::check_name(value)
+        .map(str::to_owned)
+        .map_err(|err| Error::InvalidDevice {
             field: "name",
-            reason: "must be 1 to 64 characters long",
-        });
-    }
-    if name.chars().any(char::is_control) {
-        return Err(Error::InvalidDevice {
-            field: "name",
-            reason: "must not contain control characters",
-        });
-    }
-    Ok(name.to_owned())
+            reason: err.reason(),
+        })
 }
 
 /// Checks a version string: at most [`MAX_VERSION_CHARS`] characters, no control characters.
@@ -1156,6 +1150,8 @@ mod tests {
         assert!(check_slug("platform", &"a".repeat(33)).is_err());
         assert_eq!(check_name("  Home PC ").unwrap(), "Home PC");
         assert!(check_name("a\u{7}b").is_err());
+        assert!(check_name("Home \u{202E}CP").is_err());
+        assert!(check_name("Home\u{200B}PC").is_err());
         assert!(check_name(&"x".repeat(65)).is_err());
         assert_eq!(check_version("").unwrap(), "");
         assert_eq!(

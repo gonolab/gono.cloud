@@ -7,10 +7,12 @@
 //!   (4.1), [`PollRequest`] / [`Registered`] (4.3).
 //! - [`paths`], [`close`], [`features`] and [`limits`]: the constants of the protocol.
 //! - [`is_dialable`]: the direct addresses that may be published and dialed (protocol 7.1).
+//! - [`name`]: the rules for device names that other devices show (protocol 2.1).
 
 mod addr;
 mod id;
 pub mod message;
+pub mod name;
 pub mod statement;
 
 pub use addr::is_dialable;

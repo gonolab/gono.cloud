@@ -19,7 +19,7 @@ use gono_protocol::connect::{
         PairRequested, Purpose, SessionEvent, SessionReport, SettingsChange, SettingsResult,
         Welcome,
     },
-    statement,
+    name, statement,
 };
 use gono_server_core::{
     app_passwords,
@@ -1083,6 +1083,8 @@ impl Session {
             || statement.server != self.connect.origin
             || statement.account != self.username
             || statement::decode_bytes(&statement.nonce).is_none_or(|nonce| nonce.len() != 32)
+            // Approvers show the name in their prompt (protocol 2.1).
+            || name::check_name(&statement.requester.name).is_err()
         {
             return refused(
                 id,
@@ -1201,7 +1203,13 @@ impl Session {
                 .expires_at
                 .checked_sub(statement.issued_at)
                 .is_some_and(|lifetime| 0 < lifetime && lifetime <= limits::MAX_APPROVAL_SECS)
-            && statement.introduced.len() <= limits::MAX_INTRODUCED;
+            && statement.introduced.len() <= limits::MAX_INTRODUCED
+            // Every device shows these names in its notice (protocol 2.1).
+            && name::check_name(&statement.subject.name).is_ok()
+            && statement
+                .introduced
+                .iter()
+                .all(|device| name::check_name(&device.name).is_ok());
         if !valid {
             return refused(
                 id,
