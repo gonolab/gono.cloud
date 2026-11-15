@@ -43,14 +43,17 @@ use n0_future::boxed::BoxFuture;
 
 use crate::Error;
 
-/// How the endpoint resolves host names (the relay's).
-#[derive(Debug, Clone, Default)]
+/// How the endpoint resolves host names (the relay's). The default is [`Dns::Platform`] on
+/// HarmonyOS and Android, where an app cannot read the network's DNS servers, and
+/// [`Dns::System`] elsewhere, so that a product cannot forget the condition of plan 3.3.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Dns {
     /// The system's configured nameservers, without the public fallback resolvers.
-    #[default]
+    #[cfg_attr(not(any(target_env = "ohos", target_os = "android")), default)]
     System,
     /// The platform's own resolver (`getaddrinfo`): for HarmonyOS, where the app sees a static
-    /// `/etc/resolv.conf` instead of the network's DNS (plan 3.3).
+    /// `/etc/resolv.conf` instead of the network's DNS (plan 3.3), and Android.
+    #[cfg_attr(any(target_env = "ohos", target_os = "android"), default)]
     Platform,
 }
 
@@ -311,6 +314,16 @@ mod tests {
             dns: Dns::System,
             transport,
         }
+    }
+
+    #[test]
+    fn the_platform_resolver_is_the_default_where_apps_cannot_read_the_dns_servers() {
+        let expected = if cfg!(any(target_env = "ohos", target_os = "android")) {
+            Dns::Platform
+        } else {
+            Dns::System
+        };
+        assert_eq!(Dns::default(), expected);
     }
 
     #[test]
