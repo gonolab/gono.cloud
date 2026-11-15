@@ -12,7 +12,8 @@
 use std::{collections::VecDeque, net::IpAddr, sync::Arc};
 
 use gono_protocol::connect::{
-    ClientMessage, DeviceId, ErrorCode, ServerMessage, Statement, close, features, limits,
+    ClientMessage, DeviceId, ErrorCode, ServerMessage, Statement, close, features, is_dialable,
+    limits,
     message::{
         AccountInfo, AddressResult, ConnectionLimits, Envelope, HelloMessage, PairRequestResult,
         PairRequested, Purpose, SessionEvent, SessionReport, SettingsChange, SettingsResult,
@@ -737,6 +738,14 @@ impl Session {
         }
         if direct.len() > limits::MAX_DIRECT_ADDRESSES {
             return refused(id, ErrorCode::BadRequest, "too many direct addresses");
+        }
+        // Loopback, multicast, port 0 and the like: iroh would probe whatever it is given.
+        if !direct.iter().all(is_dialable) {
+            return refused(
+                id,
+                ErrorCode::BadRequest,
+                "direct addresses must be reachable by peers",
+            );
         }
         if !self
             .connect

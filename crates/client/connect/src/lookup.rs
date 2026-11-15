@@ -13,7 +13,10 @@
 //! - **Checks.** An answer for another key than the one asked for is refused. A relay URL
 //!   other than the discovery document's is dropped, because iroh dials whatever relay it is
 //!   given and the endpoint must contact no relay but ours (plan 3.5, threat model C15).
-//!   At most [`limits::MAX_DIRECT_ADDRESSES`] direct addresses are kept.
+//!   Direct addresses no peer can reach ([`is_dialable`]: loopback, multicast, port 0, …) are
+//!   dropped, because iroh would probe them, and at most [`limits::MAX_DIRECT_ADDRESSES`] are
+//!   kept. The same filter applies to what the device publishes, which the server would refuse
+//!   otherwise (protocol 7.1).
 //!
 //! Addresses are hints (protocol 1.1, rule 3): iroh dials by key, so a wrong address only fails.
 
@@ -24,7 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gono_protocol::connect::{DeviceId, ErrorCode, limits, message::AddressResult};
+use gono_protocol::connect::{DeviceId, ErrorCode, is_dialable, limits, message::AddressResult};
 use iroh::{
     EndpointAddr, EndpointId, RelayUrl,
     address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error as LookupError, Item},
@@ -138,7 +141,8 @@ impl Cache {
 }
 
 /// The answer for `target`, with the relay URL dropped unless it is `relay`, and at most
-/// [`limits::MAX_DIRECT_ADDRESSES`] direct addresses. An answer for another key is refused.
+/// [`limits::MAX_DIRECT_ADDRESSES`] dialable direct addresses. An answer for another key is
+/// refused.
 fn checked(relay: &RelayUrl, target: EndpointId, result: &AddressResult) -> Result<AddressResult> {
     if result.target.0 != target {
         return Err(Error::Channel(format!(
@@ -155,6 +159,7 @@ fn checked(relay: &RelayUrl, target: EndpointId, result: &AddressResult) -> Resu
         ours.then(|| relay.to_string())
     });
     let mut direct = result.direct.clone();
+    direct.retain(is_dialable);
     direct.truncate(limits::MAX_DIRECT_ADDRESSES);
     Ok(AddressResult {
         target: result.target,
@@ -180,10 +185,12 @@ fn info(result: &AddressResult) -> EndpointInfo {
 impl AddressLookup for ControlLookup {
     fn publish(&self, data: &EndpointData) {
         let relay_url = data.relay_urls().next().map(ToString::to_string);
-        // The server refuses a `publish` with more (protocol 7.1).
+        // The server refuses a `publish` with more, or with an address no peer can reach
+        // (protocol 7.1).
         let direct: Vec<_> = data
             .ip_addrs()
             .copied()
+            .filter(is_dialable)
             .take(limits::MAX_DIRECT_ADDRESSES)
             .collect();
         let latest = self.published.get_or_init(|| {
@@ -297,6 +304,31 @@ mod tests {
                 .collect(),
             published_at: Some(1),
         }
+    }
+
+    #[test]
+    fn addresses_no_peer_can_reach_are_dropped_before_the_cap() {
+        let target = device_id(1);
+        let mut result = answer(target, "https://relay.example.com/", 0);
+        result.direct = [
+            "127.0.0.1:24850",
+            "[::ffff:127.0.0.1]:24850",
+            "224.0.0.251:5353",
+            "0.0.0.0:24850",
+            "192.0.2.10:0",
+            "[::1]:24850",
+        ]
+        .iter()
+        .map(|addr| addr.parse().unwrap())
+        .chain(answer(target, "https://relay.example.com/", 20).direct)
+        .collect();
+        let checked = checked(&relay(), target.0, &result).unwrap();
+        assert_eq!(checked.direct.len(), limits::MAX_DIRECT_ADDRESSES);
+        assert!(
+            checked.direct.iter().all(is_dialable),
+            "{:?}",
+            checked.direct
+        );
     }
 
     #[test]

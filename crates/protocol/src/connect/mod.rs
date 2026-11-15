@@ -6,11 +6,14 @@
 //! - The HTTP documents: [`Discovery`] (protocol 3), [`LoginStart`] / [`LoginStarted`]
 //!   (4.1), [`PollRequest`] / [`Registered`] (4.3).
 //! - [`paths`], [`close`], [`features`] and [`limits`]: the constants of the protocol.
+//! - [`is_dialable`]: the direct addresses that may be published and dialed (protocol 7.1).
 
+mod addr;
 mod id;
 pub mod message;
 pub mod statement;
 
+pub use addr::is_dialable;
 pub use id::{DeviceId, InvalidDeviceId};
 pub use message::{ClientMessage, DeviceEntry, ErrorCode, ServerMessage};
 use serde::{Deserialize, Serialize};

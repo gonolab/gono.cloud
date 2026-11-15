@@ -463,6 +463,29 @@ async fn devices_see_each_other_and_get_addresses_only_through_connect() {
         })
         .await;
     assert_eq!(error_code(&foreign), Some(ErrorCode::BadRequest));
+    // Addresses no peer can reach are refused (protocol 7.1); the refusal checks before the
+    // rate limit, so this does not use up the one publish per second either.
+    for unreachable in [
+        "127.0.0.1:24850",
+        "[::ffff:127.0.0.1]:24850",
+        "224.0.0.251:5353",
+    ] {
+        let refused = home
+            .request(|id| ClientMessage::Publish {
+                id,
+                relay_url: Some("https://relay.example.com/".to_owned()),
+                direct: vec![
+                    "192.0.2.10:51820".parse().unwrap(),
+                    unreachable.parse().unwrap(),
+                ],
+            })
+            .await;
+        assert_eq!(
+            error_code(&refused),
+            Some(ErrorCode::BadRequest),
+            "{unreachable}"
+        );
+    }
 
     // No lookup before connect.
     let home_id = home.id();
