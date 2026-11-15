@@ -7,7 +7,8 @@
 #
 # Without a SHA256SUMS file, one is written for a copy of the archive. The test installs a
 # system service and creates a system user, so it only runs where CI=true (GitHub Actions sets
-# it); never run it on a machine you care about. It needs sudo without a password.
+# it, and so does packaging/server/test-in-container.sh); never run it on a machine you care
+# about. It needs sudo without a password.
 
 set -eu
 

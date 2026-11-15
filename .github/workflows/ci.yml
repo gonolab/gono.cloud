@@ -159,6 +159,59 @@ jobs:
       - name: Install, upgrade and uninstall
         run: packaging/server/test-install.sh packaging/server/cloud.server.sh dist/*.tar.gz
 
+  # Installs a static build with --relay-host, so that the relay runs in the hardened systemd
+  # unit, behind nginx configured with the relay's server blocks of docs/reverse-proxy.md, and
+  # hands its certificate over with the certbot deploy hook of docs/deployment.md. Then checks the
+  # relay's own probes as devices use them: /generate_204 over plain HTTP on port 80 (not
+  # redirected), HTTPS and the relay WebSocket, and QUIC address discovery on UDP 7842 with the
+  # copied certificate, also after a renewal, without a restart. See
+  # packaging/server/test-relay.sh; packaging/server/test-in-container.sh runs it locally.
+  relay:
+    name: Relay behind nginx under systemd (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "$(uname -m)-unknown-linux-musl"
+
+      - name: Install zig and cargo-zigbuild
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/zigbuild"
+          "${RUNNER_TEMP}/zigbuild/bin/pip" install --require-hashes --no-deps \
+            -r packaging/server/zigbuild-requirements.txt
+          echo "${RUNNER_TEMP}/zigbuild/bin" >> "${GITHUB_PATH}"
+
+      - name: Install nginx
+        run: |
+          command -v nginx >/dev/null || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends nginx
+          }
+          nginx -v
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: |
+          target="$(uname -m)-unknown-linux-musl"
+          cargo zigbuild --locked -p gono-server --target "${target}"
+          cargo build --locked -p gono-server-relay --example relay-probe
+          echo "TARGET=${target}" >> "${GITHUB_ENV}"
+
+      - name: Package
+        run: packaging/server/package.sh "${TARGET}" "target/${TARGET}/debug/gono-cloud" dist
+
+      - name: Relay probes under systemd
+        run: |
+          packaging/server/test-relay.sh packaging/server/cloud.server.sh dist/*.tar.gz \
+            target/debug/examples/relay-probe
+
   msrv:
     name: Minimum supported Rust version
     runs-on: ubuntu-latest

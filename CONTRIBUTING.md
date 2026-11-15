@@ -61,6 +61,17 @@ plutil -lint packaging/server/launchd/*.plist   # macOS
 
 `packaging/server/test-install.sh` installs a system service and creates a system user, so it
 runs only in CI, where the `install` job exercises the install script on Linux and macOS.
+`packaging/server/test-relay.sh` sets the relay up behind nginx in the same way and checks its
+probes (the `relay` job). To run either on a Linux workstation, use a throwaway container with
+systemd as its init (podman, rootless works), with an archive and the probe built for Linux:
+
+```sh
+cargo zigbuild --release -p gono-server --target x86_64-unknown-linux-musl
+cargo zigbuild --release -p gono-server-relay --example relay-probe --target x86_64-unknown-linux-musl
+packaging/server/package.sh x86_64-unknown-linux-musl target/x86_64-unknown-linux-musl/release/gono-cloud dist
+packaging/server/test-in-container.sh packaging/server/test-relay.sh packaging/server/cloud.server.sh \
+  dist/gono-cloud-*-x86_64-unknown-linux-musl.tar.gz target/x86_64-unknown-linux-musl/release/examples/relay-probe
+```
 
 ## Code
 

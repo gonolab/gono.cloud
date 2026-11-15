@@ -61,6 +61,8 @@ backups and uninstalling:
 | `cloud.server.sh` | Installer for Linux (systemd) and macOS (launchd); `--help` lists its options |
 | `package.sh` | Packs a compiled binary into a release archive |
 | `test-install.sh` | End-to-end test of `cloud.server.sh`; installs a service, so it only runs in CI |
+| `test-relay.sh` | End-to-end test of the relay behind nginx under systemd: its probes, QAD and a certificate renewal; CI only too |
+| `test-in-container.sh` | Runs `test-install.sh` or `test-relay.sh` in a throwaway systemd container (podman) |
 | `test-static.sh` | Checks that a Linux archive's binary is static and runs without glibc (containers) |
 | `systemd/`, `launchd/` | Service definitions shipped in the archives |
 | `zigbuild-requirements.txt` | Pinned zig toolchain for the static Linux builds |

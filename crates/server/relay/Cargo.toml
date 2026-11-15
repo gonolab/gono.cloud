@@ -19,12 +19,15 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+# Also used by examples/relay-probe.rs, the probe of the relay install test and the load numbers.
+bytes.workspace = true
 futures-util = { workspace = true, features = ["sink"] }
 iroh-dns = "=1.4.1"
 noq = { version = "=1.4.0", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
 rcgen = "0.14"
+sha2.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

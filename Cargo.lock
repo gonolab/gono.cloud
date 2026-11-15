@@ -1611,6 +1611,7 @@ name = "gono-server-relay"
 version = "1.2.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "futures-util",
  "gono-server-core",
  "iroh-base",
@@ -1619,6 +1620,7 @@ dependencies = [
  "noq",
  "rcgen",
  "rustls",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
  "tracing",
