@@ -1,7 +1,9 @@
 //! Remote connectivity for Gono products: the client side of `docs/connect-protocol.md`.
 //!
-//! - [`endpoint::bind`]: the one iroh configuration of plan 3.5. Products never configure
-//!   iroh themselves.
+//! - [`endpoint::bind`] and [`endpoint::bind_lan`]: the one iroh configuration of plan 3.5,
+//!   for the remote endpoint and for the LAN-only one (no relay, no address lookup). Products
+//!   never configure iroh themselves; they tune only the transport parameters of
+//!   [`endpoint::TransportOptions`] and the addresses of [`endpoint::BindAddresses`].
 //! - [`Server`]: discovery and device registration through the browser (protocol 3 and 4).
 //! - [`ControlChannel`]: the control channel (protocol 5): presence, connection requests,
 //!   addresses, pairing requests and approvals, revocations. It reconnects on its own and
@@ -39,7 +41,7 @@ pub use gono_protocol::connect as protocol;
 pub use iroh;
 pub use lookup::ControlLookup;
 pub use register::{Credentials, DeviceInfo, PendingRegistration, Server};
-pub use remote::{CLOSE_NOT_TRUSTED, Remote, RemoteOptions};
+pub use remote::{Admit, CLOSE_NOT_TRUSTED, Remote, RemoteOptions};
 
 use gono_protocol::connect::{ErrorCode, VERSION};
 

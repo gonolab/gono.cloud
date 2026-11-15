@@ -306,7 +306,9 @@ async fn start(
         key: key.clone(),
         alpns: vec![ALPN.to_vec()],
         port: 0,
+        bind: Default::default(),
         dns: Dns::System,
+        transport: Default::default(),
         channel: Some(channel),
     })
     .await

@@ -30,7 +30,7 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::{
     ChannelEvent, ChannelOptions, ControlChannel, ControlLookup, Credentials, Error, Result,
-    endpoint::{self, Dns, EndpointOptions},
+    endpoint::{self, BindAddresses, Dns, EndpointOptions, TransportOptions},
 };
 
 /// The QUIC application error code with which [`Remote::accept_trusted`] closes connections
@@ -70,8 +70,12 @@ pub struct RemoteOptions {
     pub alpns: Vec<Vec<u8>>,
     /// The UDP port; 0 picks a free one.
     pub port: u16,
+    /// The addresses to bind (all interfaces, both families, by default).
+    pub bind: BindAddresses,
     /// Name resolution.
     pub dns: Dns,
+    /// The product's QUIC transport parameters (plan 3.7: the remote profile).
+    pub transport: TransportOptions,
     /// The channel's options beyond the credential: cursor, version, settings, features.
     pub channel: Option<ChannelOptions>,
 }
@@ -122,10 +126,12 @@ impl Remote {
         let endpoint = endpoint::bind(
             EndpointOptions {
                 secret_key: options.key,
-                relay_url,
+                relay_url: Some(relay_url),
                 alpns: options.alpns,
                 port: options.port,
+                bind: options.bind,
                 dns: options.dns,
+                transport: options.transport,
             },
             lookup.clone(),
         )
@@ -207,7 +213,23 @@ impl Remote {
     where
         F: Fn(&EndpointId) -> bool + Send + Sync + 'static,
     {
-        accept_trusted(self.endpoint.clone(), Arc::new(allow))
+        self.accept_trusted_with(move |key| {
+            if allow(key) {
+                Admit::Accept
+            } else {
+                Admit::not_trusted()
+            }
+        })
+    }
+
+    /// [`Remote::accept_trusted`] with the product's own close codes: `admit` says for each
+    /// key whether to hand the connection out, or how to close it (for example a code that
+    /// tells a revoked key apart from an unknown one).
+    pub fn accept_trusted_with<F>(&self, admit: F) -> mpsc::Receiver<Connection>
+    where
+        F: Fn(&EndpointId) -> Admit + Send + Sync + 'static,
+    {
+        accept_trusted(self.endpoint.clone(), Arc::new(admit))
     }
 
     /// Tells the endpoint that the network changed.
@@ -221,8 +243,32 @@ impl Remote {
     }
 }
 
-/// A predicate over the remote key.
-type Allow = Arc<dyn Fn(&EndpointId) -> bool + Send + Sync>;
+/// What [`Remote::accept_trusted_with`] does with a connection once its handshake is done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admit {
+    /// Hand it to the product.
+    Accept,
+    /// Close it with this QUIC application error code and reason.
+    Close {
+        /// The application error code.
+        code: u32,
+        /// The reason, at most a few bytes the peer may show or log.
+        reason: Vec<u8>,
+    },
+}
+
+impl Admit {
+    /// Close with [`CLOSE_NOT_TRUSTED`], as [`Remote::accept_trusted`] does.
+    pub fn not_trusted() -> Self {
+        Self::Close {
+            code: CLOSE_NOT_TRUSTED,
+            reason: b"not trusted".to_vec(),
+        }
+    }
+}
+
+/// The product's decision over the remote key.
+type Allow = Arc<dyn Fn(&EndpointId) -> Admit + Send + Sync>;
 
 /// At most `limit` events per second, counted in fixed one-second windows.
 #[derive(Debug)]
@@ -403,12 +449,13 @@ async fn handshake(incoming: Incoming, allow: &Allow) -> Option<Connection> {
         }
     };
     let remote = connection.remote_id();
-    if allow(&remote) {
-        Some(connection)
-    } else {
-        tracing::info!(peer = %remote.fmt_short(), "closing a connection from a key that is not trusted");
-        connection.close(CLOSE_NOT_TRUSTED.into(), b"not trusted");
-        None
+    match allow(&remote) {
+        Admit::Accept => Some(connection),
+        Admit::Close { code, reason } => {
+            tracing::info!(peer = %remote.fmt_short(), code, "closing a connection from a key the product does not admit");
+            connection.close(code.into(), &reason);
+            None
+        }
     }
 }
 
@@ -434,7 +481,9 @@ mod tests {
             key: SecretKey::from_bytes(&[1; 32]),
             alpns: vec![b"inputshow/1".to_vec()],
             port: 0,
+            bind: Default::default(),
             dns: Dns::System,
+            transport: Default::default(),
             channel,
         }
     }
@@ -540,6 +589,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn the_product_chooses_the_close_code() {
+        const ALPN: &[u8] = b"test/1";
+        let bind = |seed: u8| {
+            Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .secret_key(SecretKey::from_bytes(&[seed; 32]))
+                .alpns(vec![ALPN.to_vec()])
+                .relay_mode(iroh::RelayMode::Disabled)
+                .clear_ip_transports()
+                .bind_addr("127.0.0.1:0")
+                .unwrap()
+                .bind()
+        };
+        let (server, revoked) = (bind(5).await.unwrap(), bind(6).await.unwrap());
+        let _accepted = accept_trusted(
+            server.clone(),
+            Arc::new(|_: &EndpointId| Admit::Close {
+                code: 4403,
+                reason: b"revoked".to_vec(),
+            }),
+        );
+        let addr = iroh::EndpointAddr::from_parts(
+            server.id(),
+            server
+                .bound_sockets()
+                .into_iter()
+                .map(iroh::TransportAddr::Ip),
+        );
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            revoked.connect(addr, ALPN).await.unwrap().closed().await
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(&closed, iroh::endpoint::ConnectionError::ApplicationClosed(close) if close.error_code == 4403u32.into() && close.reason.as_ref() == b"revoked"),
+            "{closed:?}"
+        );
+        for endpoint in [server, revoked] {
+            endpoint.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn untrusted_keys_are_closed_after_the_handshake() {
         const ALPN: &[u8] = b"test/1";
         let bind = |seed: u8| {
@@ -558,7 +649,16 @@ mod tests {
             bind(3).await.unwrap(),
         );
         let trusted_key = trusted.id();
-        let mut accepted = accept_trusted(server.clone(), Arc::new(move |key| *key == trusted_key));
+        let mut accepted = accept_trusted(
+            server.clone(),
+            Arc::new(move |key| {
+                if *key == trusted_key {
+                    Admit::Accept
+                } else {
+                    Admit::not_trusted()
+                }
+            }),
+        );
         let addr = iroh::EndpointAddr::from_parts(
             server.id(),
             server
