@@ -29,7 +29,7 @@ use crate::{
     app::{self, AppState},
     auth::Authenticator,
     ratelimit::RateLimiter,
-    web::Web,
+    web::{self, Web},
 };
 
 const ORIGIN: &str = "https://cloud.example.com";
@@ -1007,7 +1007,7 @@ async fn theme_switch_and_assets() {
         .await;
     assert_eq!(away.location(), "/", "only local pages");
 
-    let style = crate::web::style_url();
+    let style = web::style_url();
     let reply = browser.get(style).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(
@@ -1390,11 +1390,19 @@ async fn two_step_verification_guards_every_later_sign_in() {
         "the pending sign-in is gone"
     );
 
-    // A recovery code signs in once.
+    // A recovery code signs in once, and the page after it says how many are left.
     let mut third = Browser::new(&f.state);
     password_step(&mut third).await;
     let recovered = code_step(&mut third, &codes[0].to_ascii_lowercase()).await;
-    assert_eq!(recovered.location(), "/apps/files/");
+    assert_eq!(recovered.status, StatusCode::OK, "{}", recovered.text());
+    let notice = recovered.text();
+    assert!(
+        notice.contains("Signed in with a recovery code")
+            && notice.contains("You have 9 recovery codes left.")
+            && notice.contains("href=\"/apps/files/\""),
+        "{notice}"
+    );
+    assert_eq!(third.get("/apps/files/").await.status, StatusCode::OK);
     let mut fourth = Browser::new(&f.state);
     password_step(&mut fourth).await;
     let again = code_step(&mut fourth, &codes[0]).await;
@@ -1404,6 +1412,15 @@ async fn two_step_verification_guards_every_later_sign_in() {
     assert!(
         page.contains("the second step failed"),
         "failures are shown: {page}"
+    );
+    // The use of the recovery code is shown too, with the client's address.
+    let used = page
+        .split("Recovery codes were used to sign in")
+        .nth(1)
+        .unwrap_or_else(|| panic!("recovery code uses are shown: {page}"));
+    assert!(
+        used[..used.find("</div></div>").unwrap()].contains("from 192.0.2.7"),
+        "{used}"
     );
 
     // Turning it off needs the password and a code.
@@ -1460,5 +1477,386 @@ async fn wrong_codes_lock_the_second_step() {
         locked.text().contains("Too many wrong codes"),
         "{}",
         locked.text()
+    );
+}
+
+/// Turns two-step verification on for alice directly; returns her account and the secret.
+async fn enrolled_alice(f: &Fixture) -> (users::User, [u8; 20]) {
+    use gono_server_core::two_factor;
+    let alice = users::get(&f.state.db, &Username::new("alice").unwrap())
+        .await
+        .unwrap();
+    let key = f.state.web.two_factor_key().unwrap().clone();
+    let secret = two_factor::new_secret();
+    two_factor::enable(
+        &f.state.db,
+        &key,
+        alice.id,
+        &secret,
+        0,
+        None,
+        None,
+        db::unix_now(),
+    )
+    .await
+    .unwrap();
+    (alice, secret)
+}
+
+/// Starts a sign-in of `user` waiting for its second step directly; returns the `Cookie`
+/// header that names it.
+async fn pending_cookie(f: &Fixture, user: &users::User) -> HeaderMap {
+    let web::Started::SecondStep(cookie) = f
+        .state
+        .web
+        .start_session("192.0.2.9".parse().unwrap(), user, "/apps/files/")
+        .await
+    else {
+        panic!("a second step");
+    };
+    let pair = cookie
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let mut headers = HeaderMap::new();
+    headers.insert("cookie", pair.parse().unwrap());
+    headers
+}
+
+/// The failed second steps recorded for `user_id`.
+async fn recorded_failures(f: &Fixture, user_id: i64) -> usize {
+    gono_server_core::audit::list(&f.state.db, Some(user_id), None, 1000)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.kind == "two_factor.failed")
+        .count()
+}
+
+/// A code that is never right: a recovery code nobody was given.
+const NEVER_RIGHT: &str = "0000-0000-0000-0000";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_wrong_codes_are_checked_no_more_than_the_limit() {
+    let f = fixture().await;
+    let (alice, _) = enrolled_alice(&f).await;
+    // As many pending sign-ins as one account may have, each good for five codes.
+    let mut cookies = Vec::new();
+    for _ in 0..5 {
+        cookies.push(pending_cookie(&f, &alice).await);
+    }
+    let tasks: Vec<_> = (0..300_usize)
+        .map(|index| {
+            let web = f.state.web.clone();
+            let headers = cookies[index % cookies.len()].clone();
+            // Many clients, so that the per-client limiter does not stop them first.
+            let client =
+                std::net::IpAddr::from([198, 51, (index / 200) as u8, (index % 200) as u8]);
+            tokio::spawn(async move { web.second_step(client, &headers, NEVER_RIGHT).await })
+        })
+        .collect();
+    let mut wrong = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            web::SecondStep::Wrong => wrong += 1,
+            web::SecondStep::Locked | web::SecondStep::Expired => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    let limit = usize::try_from(gono_server_core::two_factor::FAILURES_PER_WINDOW).unwrap();
+    assert_eq!(recorded_failures(&f, alice.id).await, limit);
+    assert_eq!(wrong, limit, "only the codes before the lock were checked");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_wrong_codes_on_the_account_page_are_limited_too() {
+    let f = fixture().await;
+    let (alice, _) = enrolled_alice(&f).await;
+    let tasks: Vec<_> = (0..100_u8)
+        .map(|index| {
+            let web = f.state.web.clone();
+            let client = std::net::IpAddr::from([203, 0, 113, index]);
+            tokio::spawn(async move { web.check_code(client, alice.id, NEVER_RIGHT).await })
+        })
+        .collect();
+    let mut wrong = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            web::CodeCheck::Wrong => wrong += 1,
+            web::CodeCheck::Locked => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    let limit = usize::try_from(gono_server_core::two_factor::FAILURES_PER_WINDOW).unwrap();
+    assert_eq!(wrong, limit);
+    assert_eq!(recorded_failures(&f, alice.id).await, limit);
+}
+
+#[tokio::test]
+async fn a_failure_that_cannot_be_recorded_does_not_pass_as_a_wrong_code() {
+    let f = fixture().await;
+    let (alice, _) = enrolled_alice(&f).await;
+    // The database refuses the record of a failure, as it would when it stays busy.
+    sqlx::query(
+        "CREATE TRIGGER refuse_failures BEFORE INSERT ON audit_log \
+         WHEN NEW.kind = 'two_factor.failed' BEGIN SELECT RAISE(ABORT, 'database is locked'); END",
+    )
+    .execute(&f.state.db)
+    .await
+    .unwrap();
+    let headers = pending_cookie(&f, &alice).await;
+    let client = "198.51.100.1".parse().unwrap();
+    assert!(matches!(
+        f.state.web.second_step(client, &headers, NEVER_RIGHT).await,
+        web::SecondStep::Unavailable
+    ));
+    assert_eq!(
+        f.state.web.check_code(client, alice.id, NEVER_RIGHT).await,
+        web::CodeCheck::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn one_pending_sign_in_takes_five_codes_at_most() {
+    let f = fixture().await;
+    let (alice, _) = enrolled_alice(&f).await;
+    let headers = pending_cookie(&f, &alice).await;
+    let mut outcomes = Vec::new();
+    for index in 0..7_u8 {
+        // A client of its own each time: only the pending sign-in's count stops them.
+        let client = std::net::IpAddr::from([198, 51, 100, index]);
+        outcomes.push(f.state.web.second_step(client, &headers, NEVER_RIGHT).await);
+    }
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [
+                web::SecondStep::Wrong,
+                web::SecondStep::Wrong,
+                web::SecondStep::Wrong,
+                web::SecondStep::Wrong,
+                web::SecondStep::Expired,
+                web::SecondStep::Expired,
+                web::SecondStep::Expired,
+            ]
+        ),
+        "{outcomes:?}"
+    );
+}
+
+#[tokio::test]
+async fn pending_sign_ins_end_with_the_state_they_were_started_in() {
+    use gono_server_core::two_factor::{self, TurnedOff};
+    let f = fixture().await;
+    let (alice, secret) = enrolled_alice(&f).await;
+    let client: std::net::IpAddr = "192.0.2.9".parse().unwrap();
+
+    // Each account keeps its newest five; a sixth ends the oldest instead of being refused.
+    let oldest = pending_cookie(&f, &alice).await;
+    for _ in 0..5 {
+        pending_cookie(&f, &alice).await;
+    }
+    assert_eq!(f.state.web.pending_sign_ins(alice.id), 5);
+    assert!(matches!(
+        f.state
+            .web
+            .second_step(client, &oldest, &code(&secret, 0))
+            .await,
+        web::SecondStep::Expired
+    ));
+
+    // A new password, even one set with the CLI (no process to tell): the sign-in that waits
+    // for its code with the old one ends, although the code is right.
+    let headers = pending_cookie(&f, &alice).await;
+    // `updated_at` counts seconds.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let hash = password::hash(&SecretString::from("a new password".to_owned())).unwrap();
+    users::set_password_hash(&f.state.db, &alice.username, &hash)
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.state
+            .web
+            .second_step(client, &headers, &code(&secret, 0))
+            .await,
+        web::SecondStep::Expired
+    ));
+    let alice = users::get(&f.state.db, &alice.username).await.unwrap();
+
+    // Disabled with the CLI: refused at the end.
+    let headers = pending_cookie(&f, &alice).await;
+    users::set_enabled(&f.state.db, &alice.username, false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.state
+            .web
+            .second_step(client, &headers, &code(&secret, 1))
+            .await,
+        web::SecondStep::Expired
+    ));
+    users::set_enabled(&f.state.db, &alice.username, true)
+        .await
+        .unwrap();
+    let alice = users::get(&f.state.db, &alice.username).await.unwrap();
+
+    // Reset with the CLI: the password has to be entered again.
+    let headers = pending_cookie(&f, &alice).await;
+    two_factor::disable(&f.state.db, alice.id, TurnedOff::Cli, None, db::unix_now())
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.state
+            .web
+            .second_step(client, &headers, &code(&secret, 1))
+            .await,
+        web::SecondStep::Expired
+    ));
+}
+
+#[tokio::test]
+async fn account_page_changes_end_the_pending_sign_ins() {
+    let f = fixture().await;
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+    let (secret, _) = enrol(&mut browser, &csrf).await;
+    let alice = users::get(&f.state.db, &Username::new("alice").unwrap())
+        .await
+        .unwrap();
+
+    // Someone with the password waits at the second step; the user changes it.
+    let mut other = Browser::new(&f.state);
+    assert_eq!(
+        password_step(&mut other).await.location(),
+        "/login/two-step"
+    );
+    assert_eq!(f.state.web.pending_sign_ins(alice.id), 1);
+    let changed = browser
+        .post(
+            "/apps/account/password",
+            &[
+                ("csrf", &csrf),
+                ("current", ALICE_PASSWORD),
+                ("password", "a new password"),
+                ("password_repeat", "a new password"),
+            ],
+        )
+        .await;
+    assert_eq!(changed.location(), "/apps/account/?done=password");
+    assert_eq!(f.state.web.pending_sign_ins(alice.id), 0);
+    assert_eq!(
+        other.get("/login/two-step").await.status,
+        StatusCode::NOT_FOUND
+    );
+
+    // Turning two-step verification off ends them as well.
+    let alice = users::get(&f.state.db, &alice.username).await.unwrap();
+    pending_cookie(&f, &alice).await;
+    let off = browser
+        .post(
+            "/apps/account/two-factor/disable",
+            &[
+                ("csrf", &csrf),
+                ("password", "a new password"),
+                ("code", &code(&secret, 1)),
+            ],
+        )
+        .await;
+    assert_eq!(off.location(), "/apps/account/?done=two-factor-off");
+    assert_eq!(f.state.web.pending_sign_ins(alice.id), 0);
+}
+
+#[tokio::test]
+async fn enrolment_signs_out_sessions_opened_with_the_password_alone() {
+    let f = fixture().await;
+    // Someone who knows the password signs in while two-step verification is off.
+    let mut earlier = Browser::new(&f.state);
+    earlier.sign_in().await;
+    assert_eq!(earlier.get("/apps/account/").await.status, StatusCode::OK);
+    let mut owner = Browser::new(&f.state);
+    let csrf = owner.sign_in().await;
+    enrol(&mut owner, &csrf).await;
+    assert_eq!(
+        earlier.get("/apps/account/").await.status,
+        StatusCode::SEE_OTHER,
+        "the session from before the enrolment ended"
+    );
+    assert_eq!(
+        owner.get("/apps/account/").await.status,
+        StatusCode::OK,
+        "the enrolling session stays"
+    );
+}
+
+#[tokio::test]
+async fn secrets_shown_once_stay_with_the_account_of_their_session() {
+    use gono_server_core::web_sessions::SessionUser;
+    let f = fixture().await;
+    // Another account's session that got the same row id after a sign-out.
+    let session = |user_id, name: &str| SessionUser {
+        session_id: 7,
+        user_id,
+        username: Username::new(name).unwrap(),
+        display_name: name.to_owned(),
+        is_admin: false,
+    };
+    let (alice, bob) = (session(1, "alice"), session(2, "bob"));
+    f.state.web.start_enrolment(&alice, None);
+    assert!(f.state.web.enrolment(&bob).is_none());
+    f.state.web.end_enrolment(&bob);
+    assert!(
+        f.state.web.enrolment(&alice).is_some(),
+        "not ended by another account"
+    );
+    f.state.web.show_once(&alice, vec!["CODE".into()], None);
+    assert!(f.state.web.take_shown(&bob).is_none());
+    assert_eq!(f.state.web.take_shown(&alice).unwrap().codes, ["CODE"]);
+
+    // A new app password through the pages: alice creates one and signs out before reading
+    // it; bob signs in on the same browser and finds nothing, whatever row id he gets.
+    let layout = DataLayout::new(f._dir.path().join("data"));
+    let hash = password::hash(&SecretString::from("bob password".to_owned())).unwrap();
+    users::create(
+        &f.state.db,
+        &NewUser {
+            username: &Username::new("bob").unwrap(),
+            display_name: "Bob",
+            password_hash: &hash,
+            is_admin: false,
+        },
+        |id| layout.create_user(id),
+    )
+    .await
+    .unwrap();
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+    let created = browser
+        .post(
+            "/apps/account/app-passwords",
+            &[("csrf", &csrf), ("label", "rclone")],
+        )
+        .await;
+    assert_eq!(created.location(), "/apps/account/created");
+    browser.post("/logout", &[("csrf", &csrf)]).await;
+    let form = browser.get("/login").await;
+    let login_csrf = form.field("name=\"csrf\" value=\"");
+    let signed_in = browser
+        .post(
+            "/login",
+            &[
+                ("csrf", &login_csrf),
+                ("user", "bob"),
+                ("password", "bob password"),
+            ],
+        )
+        .await;
+    assert_eq!(signed_in.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        browser.get("/apps/account/created").await.location(),
+        "/apps/account/",
+        "nothing to show to bob"
     );
 }

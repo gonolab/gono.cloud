@@ -392,18 +392,43 @@ ensure_dir() {
 	[ -d "$1" ] || install -d -m "$2" -o "$3" -g "$4" "$1"
 }
 
-# The key the TOTP secrets of two-step verification are encrypted with (two_factor.key_file):
-# 32 random bytes, readable by the service, created once and never replaced. Losing it means
-# resetting the two-step verification of every account, so it belongs in backups of
-# $CONFIG_DIR, apart from the database.
+# The key the TOTP secrets of two-step verification are encrypted with (two_factor.key_file of
+# the configuration, resolved against $CONFIG_DIR as the server does): 32 random bytes,
+# readable by the service, created once and never replaced. Losing it means resetting the
+# two-step verification of every account, so it belongs in backups of $CONFIG_DIR, apart from
+# the database.
 ensure_two_factor_key() {
-	key="$CONFIG_DIR/two-factor.key"
+	key=$(setting "$BIN" "$CONFIG_FILE" two_factor.key_file)
+	key=${key% (missing)}
+	case $key in
+	/*) ;;
+	*) die "cannot read two_factor.key_file from $CONFIG_FILE" ;;
+	esac
+	if [ -L "$key" ]; then
+		# A link is the operator's choice: keep it, even when its target is gone.
+		[ -e "$key" ] || warn "$key is a symbolic link to a missing file; left alone. Restore its target, or remove the link to have a new key created"
+		return 0
+	fi
 	[ -e "$key" ] && return 0
-	(umask 077 && head -c 32 /dev/urandom >"$key.new")
-	chown "root:$SERVICE_GROUP" "$key.new"
-	chmod 0640 "$key.new"
-	mv "$key.new" "$key"
-	log "Created $key, the key of two-step verification (back it up with $CONFIG_DIR)"
+	key_dir=$(dirname "$key")
+	if ! [ -d "$key_dir" ]; then
+		warn "the directory of two_factor.key_file $key does not exist; create it and run the installer again, or two-step verification stays unavailable"
+		return 0
+	fi
+	# A new name in the same directory, then a hard link, which fails if the key appeared
+	# meanwhile: an existing key is never replaced, and a crash leaves no partial key behind.
+	key_tmp=$(mktemp "$key.XXXXXX")
+	head -c 32 /dev/urandom >"$key_tmp"
+	chown "root:$SERVICE_GROUP" "$key_tmp"
+	chmod 0640 "$key_tmp"
+	sync
+	if ln "$key_tmp" "$key" 2>/dev/null; then
+		log "Created $key, the key of two-step verification (back it up with $CONFIG_DIR)"
+	elif ! [ -e "$key" ] && ! [ -L "$key" ]; then
+		rm -f "$key_tmp"
+		die "cannot create $key"
+	fi
+	rm -f "$key_tmp"
 }
 
 # ---------------------------------------------------------------------------------------------

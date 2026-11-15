@@ -13,6 +13,14 @@
 //!   It is not shared with device authentication, so failing devices behind the same address
 //!   do not keep a user from signing a new device in. Unknown accounts cost the same Argon2
 //!   work as known ones, so response times do not reveal which accounts exist.
+//! - **Second step** ([`Web::second_step`]): an account with two-step verification gets a
+//!   pending sign-in instead of a session, bound to the account (by id) and capped per account,
+//!   per client and in all; a new one ends the oldest rather than being refused. Codes of one
+//!   account are checked one at a time ([`Web::check_code`]): the lock after failures, the
+//!   verification and the record of a failure cannot interleave. The attempt of the pending
+//!   sign-in and the client's limiter token are taken before a code is verified, and a failure
+//!   that cannot be recorded makes the answer "unavailable". A pending sign-in ends when the
+//!   account's password changes, it is disabled or deleted, or its verification is turned off.
 //! - **Sessions**: a successful sign-in creates a `web_sessions` row
 //!   ([`gono_server_core::web_sessions`]) and sets the [`SESSION_COOKIE`] (`HttpOnly`,
 //!   `SameSite=Lax`, `Secure` when the public origin is HTTPS). App passwords never create a
@@ -32,7 +40,7 @@
 use std::{
     collections::HashMap,
     net::IpAddr,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{Arc, Mutex, OnceLock, PoisonError, Weak},
     time::Duration,
 };
 
@@ -50,6 +58,7 @@ use gono_server_core::{
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use sha2::{Digest as _, Sha256};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use url::Url;
 
 use crate::{
@@ -75,7 +84,16 @@ const TWO_STEP_TTL_SECS: i64 = 5 * 60;
 /// Wrong codes one pending sign-in may take before the password has to be entered again.
 const TWO_STEP_ATTEMPTS: u32 = 5;
 
-/// Sign-ins waiting for their second step, at most.
+/// Sign-ins waiting for their second step per account, at most: a new one ends the
+/// account's oldest.
+const MAX_PENDING_PER_ACCOUNT: usize = 5;
+
+/// Sign-ins waiting for their second step per client (see [`client_key`]), at most: a new one
+/// ends the client's oldest.
+const MAX_PENDING_PER_CLIENT: usize = 20;
+
+/// Sign-ins waiting for their second step in all, at most: a new one ends the oldest. Also the
+/// most enrolments and recovery code displays kept.
 const MAX_PENDING: usize = 1000;
 
 /// How long an enrolment waits for its first code, in seconds.
@@ -86,15 +104,94 @@ const ENROLMENT_TTL_SECS: i64 = 10 * 60;
 struct Pending {
     user_id: i64,
     username: String,
+    /// The account's `updated_at` when its password was checked: a change since (a new
+    /// password, also one set with the CLI) ends the sign-in.
+    updated_at: i64,
+    /// The client that entered the password, as [`client_key`] counts it.
+    client: IpAddr,
     /// Where to go once signed in: a local path.
     next: String,
     until: i64,
-    failures: u32,
+    /// Codes checked so far, each counted before it is verified.
+    attempts: u32,
+    /// Creation order, so that the oldest ends first.
+    seq: u64,
+}
+
+/// The sign-ins waiting for their second step, by the digest of their cookie token.
+#[derive(Debug, Default)]
+struct PendingSignIns {
+    entries: HashMap<[u8; 32], Pending>,
+    next_seq: u64,
+}
+
+impl PendingSignIns {
+    /// Adds `entry` under `digest`. Expired sign-ins go first, then the oldest past the caps
+    /// per account, per client and in all: a new sign-in is never refused, so that nobody can
+    /// keep the table full and block the sign-ins of others.
+    fn insert(&mut self, digest: [u8; 32], mut entry: Pending, now: i64) {
+        self.entries.retain(|_, pending| pending.until > now);
+        let (user_id, client) = (entry.user_id, entry.client);
+        self.trim(
+            |pending| pending.user_id == user_id,
+            MAX_PENDING_PER_ACCOUNT - 1,
+        );
+        self.trim(
+            |pending| pending.client == client,
+            MAX_PENDING_PER_CLIENT - 1,
+        );
+        self.trim(|_| true, MAX_PENDING - 1);
+        entry.seq = self.next_seq;
+        self.next_seq += 1;
+        self.entries.insert(digest, entry);
+    }
+
+    /// Ends the oldest of the sign-ins that `select` picks until at most `keep` of them remain.
+    fn trim(&mut self, select: impl Fn(&Pending) -> bool, keep: usize) {
+        let mut picked: Vec<([u8; 32], u64)> = self
+            .entries
+            .iter()
+            .filter(|(_, pending)| select(pending))
+            .map(|(digest, pending)| (*digest, pending.seq))
+            .collect();
+        if picked.len() <= keep {
+            return;
+        }
+        picked.sort_unstable_by_key(|(_, seq)| *seq);
+        for (digest, _) in &picked[..picked.len() - keep] {
+            self.entries.remove(digest);
+        }
+    }
+
+    /// The live sign-in of `digest`.
+    fn get(&self, digest: &[u8; 32], now: i64) -> Option<&Pending> {
+        self.entries.get(digest).filter(|entry| entry.until > now)
+    }
+}
+
+/// A client as the caps of pending sign-ins count it: IPv4 addresses one by one, IPv6
+/// addresses per `/64`, the block a single host usually controls (as the failed-attempt
+/// limiter does).
+fn client_key(client: IpAddr) -> IpAddr {
+    match client {
+        IpAddr::V4(_) => client,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let mut segments = v6.segments();
+                segments[4..].fill(0);
+                IpAddr::V6(segments.into())
+            }
+        },
+    }
 }
 
 /// A secret being enrolled, by the session that started it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Enrolment {
+    /// The account of that session: should a session of another account ever get the same
+    /// row id, it sees nothing.
+    user_id: i64,
     /// The TOTP secret.
     pub secret: [u8; two_factor::SECRET_BYTES],
     /// Where to go once it is on: a local path.
@@ -102,14 +199,62 @@ pub struct Enrolment {
     until: i64,
 }
 
+impl std::fmt::Debug for Enrolment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Enrolment")
+            .field("user_id", &self.user_id)
+            .field("secret", &"[redacted]")
+            .field("next", &self.next)
+            .field("until", &self.until)
+            .finish()
+    }
+}
+
 /// Recovery codes waiting to be shown once, by session.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Shown {
+    /// The account of that session (see [`Enrolment`]).
+    user_id: i64,
     /// The codes.
     pub codes: Vec<String>,
     /// Where to go after reading them.
     pub next: Option<String>,
     until: i64,
+}
+
+impl std::fmt::Debug for Shown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shown")
+            .field("user_id", &self.user_id)
+            .field(
+                "codes",
+                &format_args!("[{} codes, redacted]", self.codes.len()),
+            )
+            .field("next", &self.next)
+            .field("until", &self.until)
+            .finish()
+    }
+}
+
+/// Outcome of [`Web::check_code`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeCheck {
+    /// The code is right and used up: a TOTP code, or a recovery code with how many are left.
+    Right {
+        /// Recovery codes left, when the code was one.
+        recovery_left: Option<i64>,
+    },
+    /// The code is wrong; the failure is recorded.
+    Wrong,
+    /// The account has no two-step verification (any more).
+    NotEnrolled,
+    /// Too many wrong codes for this account; nothing was checked.
+    Locked,
+    /// Too many failures from this client; nothing was checked.
+    RateLimited(Duration),
+    /// The database failed, the key file is missing or does not open the secret, or a
+    /// failure could not be recorded (then the code counts as not checked: it never passes).
+    Unavailable,
 }
 
 /// Length of the pre-sign-in CSRF token.
@@ -192,8 +337,11 @@ pub struct Web {
     secure: bool,
     /// The key of the TOTP secrets; `None` while two-step verification is unavailable.
     two_factor_key: Option<Key>,
-    /// Sign-ins waiting for their second step, by the digest of their cookie token.
-    pending: Mutex<HashMap<[u8; 32], Pending>>,
+    /// Sign-ins waiting for their second step.
+    pending: Mutex<PendingSignIns>,
+    /// The locks of the accounts whose codes are being checked ([`Web::lock_account`]). An
+    /// entry lives only while a request holds or waits for its lock.
+    checking: Mutex<HashMap<i64, Weak<AsyncMutex<()>>>>,
     /// Enrolments waiting for their first code, by session id.
     enrolments: Mutex<HashMap<i64, Enrolment>>,
     /// Recovery codes waiting to be shown once, by session id.
@@ -242,7 +390,8 @@ impl Web {
             origin: base_url.origin().ascii_serialization(),
             secure: base_url.scheme() == "https",
             two_factor_key: None,
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(PendingSignIns::default()),
+            checking: Mutex::new(HashMap::new()),
             enrolments: Mutex::new(HashMap::new()),
             shown: Mutex::new(HashMap::new()),
         }
@@ -259,11 +408,6 @@ impl Web {
         self.two_factor_key.as_ref()
     }
 
-    /// The failed-attempt limiter of the HTML sign-in.
-    pub fn limiter(&self) -> &RateLimiter {
-        &self.limiter
-    }
-
     /// Opens a session for `user`, whose password was just verified, unless the account has
     /// two-step verification: then the sign-in waits for its code at [`TWO_STEP_PATH`] and
     /// continues to `next` (a local path).
@@ -271,10 +415,21 @@ impl Web {
         match two_factor::is_enrolled(&self.pool, user.id).await {
             Ok(true) => {}
             Ok(false) => {
-                return match self.open_session(client, user).await {
-                    Some(token) => Started::Session(token),
-                    None => Started::Unavailable,
+                let Some(token) = self.open_session(client, user).await else {
+                    return Started::Unavailable;
                 };
+                // An enrolment that committed between the check above and the new session
+                // ended the account's other sessions before this one existed. Look again, and
+                // keep the token to ourselves if it did: the password alone is not enough now.
+                match two_factor::is_enrolled(&self.pool, user.id).await {
+                    Ok(false) => return Started::Session(token),
+                    Ok(true) => self.sign_out(token.expose_secret()).await,
+                    Err(err) => {
+                        tracing::error!(error = %err, "cannot check two-step verification");
+                        self.sign_out(token.expose_secret()).await;
+                        return Started::Unavailable;
+                    }
+                }
             }
             Err(err) => {
                 tracing::error!(error = %err, "cannot check two-step verification");
@@ -283,23 +438,23 @@ impl Web {
         }
         let token = secret::random_token(43);
         let now = db::unix_now();
-        {
-            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-            pending.retain(|_, entry| entry.until > now);
-            if pending.len() >= MAX_PENDING {
-                return Started::Unavailable;
-            }
-            pending.insert(
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
                 secret::digest(token.expose_secret()),
                 Pending {
                     user_id: user.id,
                     username: user.username.to_string(),
+                    updated_at: user.updated_at,
+                    client: client_key(client),
                     next: next.to_owned(),
                     until: now + TWO_STEP_TTL_SECS,
-                    failures: 0,
+                    attempts: 0,
+                    seq: 0,
                 },
+                now,
             );
-        }
         tracing::info!(%client, user = %user.username, "web sign-in waits for its second step");
         Started::SecondStep(self.cookie_header(
             TWO_STEP_COOKIE,
@@ -312,13 +467,152 @@ impl Web {
     /// The username of the sign-in waiting for its second step in this request, if any.
     pub fn pending_user(&self, headers: &HeaderMap) -> Option<String> {
         let token = cookie(headers, TWO_STEP_COOKIE)?;
-        let now = db::unix_now();
         self.pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&secret::digest(&token))
-            .filter(|entry| entry.until > now)
+            .get(&secret::digest(&token), db::unix_now())
             .map(|entry| entry.username.clone())
+    }
+
+    /// Ends every sign-in of `user_id` waiting for its second step: its password changed, the
+    /// account was disabled or deleted, or two-step verification was turned off or reset.
+    pub fn end_pending_sign_ins(&self, user_id: i64) {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .retain(|_, entry| entry.user_id != user_id);
+    }
+
+    /// The sign-ins of `user_id` waiting for their second step, for tests.
+    #[cfg(test)]
+    pub fn pending_sign_ins(&self, user_id: i64) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .values()
+            .filter(|entry| entry.user_id == user_id)
+            .count()
+    }
+
+    /// Waits until no other code of `user_id` is being checked, and keeps others waiting until
+    /// the guard drops. The lock check, the verification and the record of a failure so happen
+    /// one request at a time per account: concurrent wrong codes cannot all pass the lock check
+    /// before the first failure is recorded.
+    async fn lock_account(&self, user_id: i64) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut checking = self.checking.lock().unwrap_or_else(PoisonError::into_inner);
+            // Entries nobody holds or waits for any more go, so the map stays as small as
+            // the number of requests in flight.
+            checking.retain(|_, lock| lock.strong_count() > 0);
+            match checking.get(&user_id).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(AsyncMutex::new(()));
+                    checking.insert(user_id, Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    /// What is checked before a code of `user_id` from `client`, under the account's lock: the
+    /// client's failed-attempt limiter, the account's lock after failures, and the key.
+    async fn before_code(&self, client: IpAddr, user_id: i64, now: i64) -> Result<Key, CodeCheck> {
+        if let Some(wait) = self.limiter.check(client) {
+            return Err(CodeCheck::RateLimited(wait));
+        }
+        match two_factor::locked(&self.pool, user_id, now).await {
+            Ok(false) => {}
+            Ok(true) => return Err(CodeCheck::Locked),
+            Err(err) => {
+                tracing::error!(error = %err, "cannot check two-step failures");
+                return Err(CodeCheck::Unavailable);
+            }
+        }
+        self.two_factor_key.clone().ok_or_else(|| {
+            tracing::error!("two-step verification is enrolled but the key file is missing");
+            CodeCheck::Unavailable
+        })
+    }
+
+    /// Verifies `code` of `user_id` from `client` while `guard` holds the account's lock, and
+    /// records a failure. The client's limiter token is taken before verifying, so a right
+    /// code costs one too.
+    ///
+    /// It runs on a task of its own: a client that goes away while its code is checked cannot
+    /// keep the failure from being recorded, and the lock is held until it is.
+    async fn verify_code(
+        &self,
+        guard: OwnedMutexGuard<()>,
+        key: Key,
+        client: IpAddr,
+        user_id: i64,
+        code: &str,
+        now: i64,
+    ) -> CodeCheck {
+        let pool = self.pool.clone();
+        let limiter = self.limiter.clone();
+        let code = code.to_owned();
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            limiter.record_failure(client);
+            let verified =
+                match two_factor::verify(&pool, &key, user_id, &code, Some(client), now).await {
+                    Ok(verified) => verified,
+                    Err(err) => {
+                        tracing::error!(error = %err, "cannot check a second step");
+                        return CodeCheck::Unavailable;
+                    }
+                };
+            match verified {
+                Verification::Code => CodeCheck::Right {
+                    recovery_left: None,
+                },
+                Verification::RecoveryCode { left } => CodeCheck::Right {
+                    recovery_left: Some(left),
+                },
+                Verification::NotEnrolled => CodeCheck::NotEnrolled,
+                Verification::WrongKey => {
+                    tracing::error!(
+                        user_id,
+                        "the TOTP secret does not open with the key file: was two_factor.key_file replaced?"
+                    );
+                    CodeCheck::Unavailable
+                }
+                Verification::Wrong => {
+                    match two_factor::record_failure(&pool, user_id, Some(client), now).await {
+                        Ok(()) => CodeCheck::Wrong,
+                        Err(err) => {
+                            // Unrecorded, the failure would not count towards the lock.
+                            tracing::error!(error = %err, "cannot record a failed second step");
+                            CodeCheck::Unavailable
+                        }
+                    }
+                }
+            }
+        });
+        task.await.unwrap_or_else(|err| {
+            tracing::error!(error = %err, "a second-step check failed");
+            CodeCheck::Unavailable
+        })
+    }
+
+    /// Checks a code (TOTP or recovery) of `user_id` from `client`, as the forms of the account
+    /// page that need one do: under the account's lock, behind the same limits as the second
+    /// step of a sign-in, and used up when right.
+    pub async fn check_code(&self, client: IpAddr, user_id: i64, code: &str) -> CodeCheck {
+        let now = db::unix_now();
+        let guard = self.lock_account(user_id).await;
+        match self.before_code(client, user_id, now).await {
+            Ok(key) => {
+                self.verify_code(guard, key, client, user_id, code, now)
+                    .await
+            }
+            Err(outcome) => outcome,
+        }
     }
 
     /// Checks the second step of the sign-in of this request: a TOTP code or a recovery code
@@ -329,88 +623,73 @@ impl Web {
         };
         let digest = secret::digest(&token);
         let now = db::unix_now();
-        let Some(entry) = self
+        let Some(user_id) = self
             .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&digest)
-            .filter(|entry| entry.until > now)
-            .cloned()
+            .get(&digest, now)
+            .map(|entry| entry.user_id)
         else {
             return SecondStep::Expired;
         };
-        if let Some(wait) = self.limiter.check(client) {
-            return SecondStep::RateLimited(wait);
-        }
-        match two_factor::locked(&self.pool, entry.user_id, now).await {
-            Ok(false) => {}
-            Ok(true) => return SecondStep::Locked,
-            Err(err) => {
-                tracing::error!(error = %err, "cannot check two-step failures");
-                return SecondStep::Unavailable;
-            }
-        }
-        let Some(key) = &self.two_factor_key else {
-            tracing::error!("two-step verification is enrolled but the key file is missing");
-            return SecondStep::Unavailable;
+        let guard = self.lock_account(user_id).await;
+        let key = match self.before_code(client, user_id, now).await {
+            Ok(key) => key,
+            Err(CodeCheck::Locked) => return SecondStep::Locked,
+            Err(CodeCheck::RateLimited(wait)) => return SecondStep::RateLimited(wait),
+            Err(_) => return SecondStep::Unavailable,
         };
-        let verified = match two_factor::verify(&self.pool, key, entry.user_id, code, now).await {
-            Ok(verified) => verified,
-            Err(err) => {
-                tracing::error!(error = %err, "cannot check a second step");
-                return SecondStep::Unavailable;
-            }
+        // The attempt counts before the code is verified.
+        let entry = {
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(entry) = pending
+                .entries
+                .get_mut(&digest)
+                .filter(|entry| entry.until > now && entry.attempts < TWO_STEP_ATTEMPTS)
+            else {
+                pending.entries.remove(&digest);
+                return SecondStep::Expired;
+            };
+            entry.attempts += 1;
+            entry.clone()
         };
-        let recovery_left = match verified {
-            Verification::Code | Verification::NotEnrolled => None,
-            Verification::RecoveryCode { left } => Some(left),
-            Verification::WrongKey => {
-                tracing::error!(
-                    user = %entry.username,
-                    "the TOTP secret does not open with the key file: was two_factor.key_file replaced?"
-                );
-                return SecondStep::Unavailable;
-            }
-            Verification::Wrong => {
-                self.limiter.record_failure(client);
+        let recovery_left = match self
+            .verify_code(guard, key, client, user_id, code, now)
+            .await
+        {
+            CodeCheck::Right { recovery_left } => recovery_left,
+            CodeCheck::Wrong => {
                 tracing::info!(%client, user = %entry.username, "wrong second step of a web sign-in");
-                if let Err(err) =
-                    two_factor::record_failure(&self.pool, entry.user_id, Some(client), now).await
-                {
-                    tracing::warn!(error = %err, "cannot record a failed second step");
-                }
-                let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-                if let Some(stored) = pending.get_mut(&digest) {
-                    stored.failures += 1;
-                    if stored.failures >= TWO_STEP_ATTEMPTS {
-                        pending.remove(&digest);
-                        return SecondStep::Expired;
-                    }
+                if entry.attempts >= TWO_STEP_ATTEMPTS {
+                    self.end_pending(&digest);
+                    return SecondStep::Expired;
                 }
                 return SecondStep::Wrong;
             }
+            // Turned off since the password was checked: it has to be entered again.
+            CodeCheck::NotEnrolled => {
+                self.end_pending(&digest);
+                return SecondStep::Expired;
+            }
+            CodeCheck::Locked => return SecondStep::Locked,
+            CodeCheck::RateLimited(wait) => return SecondStep::RateLimited(wait),
+            CodeCheck::Unavailable => return SecondStep::Unavailable,
         };
         // Used once.
-        if self
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&digest)
-            .is_none()
-        {
+        if !self.end_pending(&digest) {
             return SecondStep::Expired;
         }
-        let user = match users::get(
-            &self.pool,
-            &match Username::new(entry.username.clone()) {
-                Ok(name) => name,
-                Err(_) => return SecondStep::Unavailable,
-            },
-        )
-        .await
-        {
-            Ok(user) if user.enabled => user,
-            Ok(_) => return SecondStep::Expired,
+        // By id: the account must still be the one whose password was checked.
+        let user = match two_factor::sign_in_account(&self.pool, user_id).await {
+            Ok(Some(user)) if user.enabled && user.updated_at == entry.updated_at => user,
+            Ok(_) => {
+                tracing::info!(
+                    %client,
+                    user = %entry.username,
+                    "a sign-in ended at its second step: the account was changed, disabled or deleted"
+                );
+                return SecondStep::Expired;
+            }
             Err(err) => {
                 tracing::error!(error = %err, "cannot read the account of a sign-in");
                 return SecondStep::Unavailable;
@@ -426,15 +705,26 @@ impl Web {
         }
     }
 
+    /// Ends the sign-in of `digest`; `false` if there was none.
+    fn end_pending(&self, digest: &[u8; 32]) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .remove(digest)
+            .is_some()
+    }
+
     /// The `Set-Cookie` value that ends a pending sign-in.
     pub fn two_step_removal(&self) -> HeaderValue {
         self.cookie_header(TWO_STEP_COOKIE, "", "Strict", Some(0))
     }
 
-    /// Starts enrolling a new secret for session `session_id`.
-    pub fn start_enrolment(&self, session_id: i64, next: Option<String>) -> Enrolment {
+    /// Starts enrolling a new secret for `session`.
+    pub fn start_enrolment(&self, session: &SessionUser, next: Option<String>) -> Enrolment {
         let now = db::unix_now();
         let enrolment = Enrolment {
+            user_id: session.user_id,
             secret: two_factor::new_secret(),
             next,
             until: now + ENROLMENT_TTL_SECS,
@@ -447,31 +737,37 @@ impl Web {
         if enrolments.len() >= MAX_PENDING {
             enrolments.clear();
         }
-        enrolments.insert(session_id, enrolment.clone());
+        enrolments.insert(session.session_id, enrolment.clone());
         enrolment
     }
 
-    /// The enrolment of session `session_id`, if it has not expired.
-    pub fn enrolment(&self, session_id: i64) -> Option<Enrolment> {
+    /// The enrolment of `session`, if it has not expired.
+    pub fn enrolment(&self, session: &SessionUser) -> Option<Enrolment> {
         let now = db::unix_now();
         self.enrolments
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&session_id)
-            .filter(|entry| entry.until > now)
+            .get(&session.session_id)
+            .filter(|entry| entry.user_id == session.user_id && entry.until > now)
             .cloned()
     }
 
-    /// Ends the enrolment of session `session_id`.
-    pub fn end_enrolment(&self, session_id: i64) {
-        self.enrolments
+    /// Ends the enrolment of `session`.
+    pub fn end_enrolment(&self, session: &SessionUser) {
+        let mut enrolments = self
+            .enrolments
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&session_id);
+            .unwrap_or_else(PoisonError::into_inner);
+        if enrolments
+            .get(&session.session_id)
+            .is_some_and(|entry| entry.user_id == session.user_id)
+        {
+            enrolments.remove(&session.session_id);
+        }
     }
 
-    /// Keeps `codes` to be shown once to session `session_id`.
-    pub fn show_once(&self, session_id: i64, codes: Vec<String>, next: Option<String>) {
+    /// Keeps `codes` to be shown once to `session`.
+    pub fn show_once(&self, session: &SessionUser, codes: Vec<String>, next: Option<String>) {
         let now = db::unix_now();
         let mut shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
         shown.retain(|_, entry| entry.until > now);
@@ -479,8 +775,9 @@ impl Web {
             shown.clear();
         }
         shown.insert(
-            session_id,
+            session.session_id,
             Shown {
+                user_id: session.user_id,
                 codes,
                 next,
                 until: now + ENROLMENT_TTL_SECS,
@@ -488,13 +785,18 @@ impl Web {
         );
     }
 
-    /// The recovery codes waiting for session `session_id`, once.
-    pub fn take_shown(&self, session_id: i64) -> Option<Shown> {
+    /// The recovery codes waiting for `session`, once.
+    pub fn take_shown(&self, session: &SessionUser) -> Option<Shown> {
         let now = db::unix_now();
-        self.shown
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&session_id)
+        let mut shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
+        if !shown
+            .get(&session.session_id)
+            .is_some_and(|entry| entry.user_id == session.user_id)
+        {
+            return None;
+        }
+        shown
+            .remove(&session.session_id)
             .filter(|entry| entry.until > now)
     }
 
@@ -1192,6 +1494,93 @@ mod tests {
         assert_eq!(cookie(&headers, SESSION_COOKIE).as_deref(), Some("abc"));
         assert_eq!(cookie(&headers, CSRF_COOKIE).as_deref(), Some("xyz"));
         assert_eq!(cookie(&headers, "b"), None);
+    }
+
+    fn pending(user_id: i64, client: IpAddr) -> Pending {
+        Pending {
+            user_id,
+            username: String::new(),
+            updated_at: 0,
+            client: client_key(client),
+            next: "/".into(),
+            until: 1_300,
+            attempts: 0,
+            seq: 0,
+        }
+    }
+
+    fn digest(index: usize) -> [u8; 32] {
+        let mut digest = [0; 32];
+        digest[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        digest
+    }
+
+    #[test]
+    fn pending_sign_ins_are_capped_by_ending_the_oldest() {
+        let now = 1_000;
+        let client: IpAddr = "192.0.2.1".parse().unwrap();
+
+        // Per account: a new sign-in ends the account's oldest, never another account's.
+        let mut table = PendingSignIns::default();
+        table.insert(digest(100), pending(2, "192.0.2.2".parse().unwrap()), now);
+        for index in 0..7 {
+            table.insert(digest(index), pending(1, client), now);
+        }
+        assert_eq!(table.entries.len(), MAX_PENDING_PER_ACCOUNT + 1);
+        assert!(table.get(&digest(0), now).is_none() && table.get(&digest(1), now).is_none());
+        assert!(table.get(&digest(2), now).is_some() && table.get(&digest(6), now).is_some());
+        assert!(
+            table.get(&digest(100), now).is_some(),
+            "the other account's"
+        );
+
+        // Per client, over many accounts; IPv6 counts per /64.
+        let mut table = PendingSignIns::default();
+        for index in 0..30 {
+            let client: IpAddr = format!("2001:db8::{index:x}").parse().unwrap();
+            table.insert(digest(index), pending(index as i64, client), now);
+        }
+        assert_eq!(table.entries.len(), MAX_PENDING_PER_CLIENT);
+        assert!(table.get(&digest(9), now).is_none());
+        assert!(table.get(&digest(10), now).is_some() && table.get(&digest(29), now).is_some());
+
+        // In all: a full table ends its oldest rather than refusing the new one.
+        let mut table = PendingSignIns::default();
+        for index in 0..MAX_PENDING + 10 {
+            let client = IpAddr::from((index as u32 + 1).to_be_bytes());
+            table.insert(digest(index), pending(index as i64, client), now);
+        }
+        assert_eq!(table.entries.len(), MAX_PENDING);
+        assert!(table.get(&digest(9), now).is_none());
+        assert!(table.get(&digest(MAX_PENDING + 9), now).is_some());
+
+        // Expired ones go first, and are never found.
+        assert!(table.get(&digest(MAX_PENDING + 9), 1_300).is_none());
+        table.insert(digest(0), pending(1, client), 1_300);
+        assert_eq!(table.entries.len(), 1);
+    }
+
+    #[test]
+    fn secrets_are_left_out_of_debug_output() {
+        let enrolment = Enrolment {
+            user_id: 1,
+            secret: [0xab; two_factor::SECRET_BYTES],
+            next: None,
+            until: 0,
+        };
+        let text = format!("{enrolment:?}");
+        assert!(text.contains("redacted") && !text.contains("171"), "{text}");
+        let shown = Shown {
+            user_id: 1,
+            codes: vec!["ABCD-EFGH-JKMN-PQRS".into()],
+            next: None,
+            until: 0,
+        };
+        let text = format!("{shown:?}");
+        assert!(
+            text.contains("redacted") && !text.contains("ABCD"),
+            "{text}"
+        );
     }
 
     #[test]

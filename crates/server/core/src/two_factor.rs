@@ -33,6 +33,7 @@ use crate::{
     db::{self, Pool},
     error::{Error, Result},
     secret,
+    users::User,
 };
 
 /// Seconds per TOTP step.
@@ -108,25 +109,52 @@ impl Key {
     }
 
     /// Creates the key file at `path` with 32 random bytes, readable by its owner and group
-    /// only. Returns `false` if it exists already.
+    /// only. Returns `false` if it exists already (a dangling symbolic link counts as
+    /// existing): an existing key is never replaced, so read it with [`Key::load`].
+    ///
+    /// The key is written to a temporary file in the same directory, synced, and then linked
+    /// to `path`, which fails if the name is taken. So a crash never leaves a partial key
+    /// behind, and of two processes creating it at once, one wins and the other keeps its key.
     pub fn create(path: &Path) -> Result<bool> {
         let io_error = |source| Error::Io {
             path: path.to_path_buf(),
             source,
         };
+        if path.symlink_metadata().is_ok() {
+            return Ok(false);
+        }
+        let dir = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let temp = dir.join(format!(".{name}.{:016x}.tmp", rand::rng().random::<u64>()));
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o640);
-        let mut file = match options.open(path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
-            Err(err) => return Err(io_error(err)),
-        };
+        let mut file = options.open(&temp).map_err(io_error)?;
         let key: [u8; 32] = rand::rng().random();
-        file.write_all(&key).map_err(io_error)?;
-        file.sync_all().map_err(io_error)?;
-        Ok(true)
+        let linked = file
+            .write_all(&key)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| fs::hard_link(&temp, path));
+        drop(file);
+        // The key lives on under `path`, or the attempt failed: either way the temporary
+        // name goes.
+        let _ = fs::remove_file(&temp);
+        match linked {
+            Ok(()) => {
+                // Best effort: make the new name durable too.
+                #[cfg(unix)]
+                if let Ok(dir) = fs::File::open(dir) {
+                    let _ = dir.sync_all();
+                }
+                Ok(true)
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(err) => Err(io_error(err)),
+        }
     }
 
     fn aad(user_id: i64) -> aead::Aad<Vec<u8>> {
@@ -401,12 +429,18 @@ async fn replace_recovery_codes(tx: &mut db::Tx, user_id: i64) -> Result<Vec<Str
 /// Turns two-step verification on for `user_id` with `secret`, whose code of `step` the user
 /// just entered (so that code cannot be used again), and returns the new recovery codes.
 /// Fails with [`Error::TwoFactorEnrolled`] if it is on already.
+///
+/// Every browser session of the account except `keep_session` (the one that enrolled) ends
+/// in the same transaction: a session opened with the password alone before must not keep
+/// what only a second step gives from now on.
+#[allow(clippy::too_many_arguments)]
 pub async fn enable(
     pool: &Pool,
     key: &Key,
     user_id: i64,
     secret: &[u8],
     step: i64,
+    keep_session: Option<i64>,
     client_ip: Option<IpAddr>,
     now: i64,
 ) -> Result<Vec<String>> {
@@ -425,6 +459,11 @@ pub async fn enable(
     if inserted == 0 {
         return Err(Error::TwoFactorEnrolled);
     }
+    sqlx::query("DELETE FROM web_sessions WHERE user_id = ?1 AND id IS NOT ?2")
+        .bind(user_id)
+        .bind(keep_session)
+        .execute(&mut *tx)
+        .await?;
     let codes = replace_recovery_codes(&mut tx, user_id).await?;
     audit::record(
         &mut *tx,
@@ -434,6 +473,39 @@ pub async fn enable(
     .await?;
     tx.commit().await?;
     Ok(codes)
+}
+
+/// The account a sign-in waiting for its second step continues with, looked up by its id
+/// (the name may have been given to another account since): `None` if it was deleted. The
+/// caller checks that it is still enabled and unchanged.
+pub async fn sign_in_account(pool: &Pool, user_id: i64) -> Result<Option<User>> {
+    Ok(sqlx::query_as(
+        "SELECT id, username, display_name, enabled, is_admin, created_at, updated_at \
+         FROM users WHERE id = ?1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// The recent uses of recovery codes of `user_id`, newest first: when, and from which client
+/// address (`docs/connect-protocol.md`, 13.4).
+pub async fn recovery_code_uses(
+    pool: &Pool,
+    user_id: i64,
+    since: i64,
+    limit: i64,
+) -> Result<Vec<(i64, Option<String>)>> {
+    Ok(sqlx::query_as(
+        "SELECT at, client_ip FROM audit_log \
+         WHERE user_id = ?1 AND kind = 'recovery_code.used' AND at > ?2 \
+         ORDER BY id DESC LIMIT ?3",
+    )
+    .bind(user_id)
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
 }
 
 /// Replaces the recovery codes of `user_id` and returns the new ones.
@@ -521,12 +593,14 @@ pub enum Verification {
 }
 
 /// Checks `input`, a TOTP code or a recovery code, for account `user_id` at `now`, and uses it
-/// up if it is right. A failure is not recorded here; see [`record_failure`].
+/// up if it is right; the use of a recovery code is recorded with `client_ip`. A failure is
+/// not recorded here; see [`record_failure`].
 pub async fn verify(
     pool: &Pool,
     key: &Key,
     user_id: i64,
     input: &str,
+    client_ip: Option<IpAddr>,
     now: i64,
 ) -> Result<Verification> {
     let row: Option<(Vec<u8>, i64)> =
@@ -581,7 +655,7 @@ pub async fn verify(
         }
         audit::record(
             &mut *tx,
-            &Record::new(user_id, "recovery_code.used", Actor::User),
+            &Record::new(user_id, "recovery_code.used", Actor::User).client_ip(client_ip),
             now,
         )
         .await?;

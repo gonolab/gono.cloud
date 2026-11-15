@@ -248,6 +248,21 @@ sudo test -f "$state/backups/$backup/gono-cloud.db" || fail "no database backup"
 wait_until_healthy
 curl -fsS -u "admin:$token" "$dav/hello.txt" | cmp - "$work/hello.txt" || fail "the file is gone after the upgrade"
 
+step "An upgrade keeps a dangling link at the two-factor key, and warns"
+sudo mv "$key" "$key.saved"
+sudo ln -s "$key.gone" "$key"
+if ! run_installer </dev/null >"$work/out" 2>&1; then
+	cat "$work/out"
+	fail "the upgrade failed with a dangling key link"
+fi
+cat "$work/out"
+grep -q "symbolic link to a missing file" "$work/out" || fail "no warning about the dangling key link"
+sudo test -L "$key" || fail "the upgrade replaced the key link"
+if sudo test -e "$key.gone"; then fail "the upgrade created the target of the key link"; fi
+sudo rm "$key"
+sudo mv "$key.saved" "$key"
+wait_until_healthy
+
 step "Uninstall keeps the configuration, the data and the service user"
 sudo sh "$installer" --uninstall
 [ ! -e "$BIN" ] || fail "$BIN is still there"

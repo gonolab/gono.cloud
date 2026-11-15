@@ -270,12 +270,17 @@ pub struct TwoFactorConfig {
     /// outside the database directory, readable by the service. Relative paths are resolved
     /// against the configuration file's directory. `init` and the install script create it.
     pub key_file: PathBuf,
+    /// The configuration file's directory, where the key belongs, once
+    /// [`Config::resolve_relative_paths`] has run.
+    #[serde(skip)]
+    config_dir: Option<PathBuf>,
 }
 
 impl Default for TwoFactorConfig {
     fn default() -> Self {
         Self {
             key_file: crate::two_factor::default_key_file(),
+            config_dir: None,
         }
     }
 }
@@ -482,6 +487,7 @@ impl Config {
         resolve(&mut self.storage.data_dir);
         resolve(&mut self.db.path);
         resolve(&mut self.two_factor.key_file);
+        self.two_factor.config_dir = Some(base_dir.to_path_buf());
         for file in [
             self.logging.file.as_mut(),
             self.relay.tls_cert.as_mut(),
@@ -708,6 +714,19 @@ impl Config {
             warnings.push(format!(
                 "two_factor.key_file {} lies in the data directory: a copy of it would give the \
                  second factor of every account away; keep it in the configuration directory",
+                key.display()
+            ));
+        } else if let Some(db_dir) = self.db.path.parent().filter(|dir| {
+            // A database kept in the configuration directory itself (as in the example
+            // configuration) shares it with the key by design: that directory is backed up
+            // as the configuration, which the key belongs to.
+            !dir.as_os_str().is_empty() && self.two_factor.config_dir.as_deref() != Some(*dir)
+        }) && key.starts_with(db_dir)
+        {
+            warnings.push(format!(
+                "two_factor.key_file {} lies in the directory of the database: a copy of that \
+                 directory would give the second factor of every account away; keep the key in \
+                 the configuration directory",
                 key.display()
             ));
         }
@@ -1283,6 +1302,27 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("two_factor.key_file"))
         );
+
+        // Next to a database outside the configuration directory: warned about.
+        let raw = MINIMAL.replace(
+            "path = \"gono-cloud.db\"",
+            "path = \"/var/lib/gono-cloud/gono-cloud.db\"",
+        );
+        let mut config = parse(&raw);
+        config.resolve_relative_paths(Path::new("/etc/gono-cloud"));
+        assert!(config.warnings().iter().all(|w| !w.contains("two_factor")));
+        config.two_factor.key_file = PathBuf::from("/var/lib/gono-cloud/two-factor.key");
+        let warnings = config.warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("two_factor.key_file") && w.contains("database")),
+            "{warnings:?}"
+        );
+        // Not when the database lives in the configuration directory, next to the key.
+        config.db.path = PathBuf::from("/etc/gono-cloud/gono-cloud.db");
+        config.two_factor.key_file = PathBuf::from("/etc/gono-cloud/two-factor.key");
+        assert!(config.warnings().iter().all(|w| !w.contains("two_factor")));
     }
 
     #[test]

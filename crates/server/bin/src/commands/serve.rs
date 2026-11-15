@@ -336,9 +336,20 @@ async fn two_factor_key(
         );
     }
     match two_factor::Key::create(path) {
-        Ok(_) => {
-            tracing::info!(path = %path.display(), "created the two-step verification key");
-            read(path)
+        Ok(created) => {
+            if created {
+                tracing::info!(path = %path.display(), "created the two-step verification key");
+            }
+            // Another process may have created it meanwhile: then its key is the one to use.
+            let key = read(path)?;
+            if key.is_none() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "two-step verification is unavailable: two_factor.key_file is a symbolic \
+                     link to a missing file; restore its target or remove the link"
+                );
+            }
+            Ok(key)
         }
         Err(err) => {
             tracing::warn!(

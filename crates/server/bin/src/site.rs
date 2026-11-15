@@ -5,7 +5,7 @@
 //! | `GET /` | Redirects to the file UI, or to the admin UI when the file UI is off. |
 //! | `GET /login`, `POST /login` | Sign in with the web login password (file UI only). `?next=` names a local page to return to. |
 //! | `POST /logout` | Sign out (file UI only). |
-//! | `GET /login/two-step`, `POST /login/two-step` | The second step of every web sign-in of an account with two-step verification: a TOTP code or a recovery code. |
+//! | `GET /login/two-step`, `POST /login/two-step` | The second step of every web sign-in of an account with two-step verification: a TOTP code or a recovery code. A recovery code is followed by a page that says how many are left. |
 //! | `POST /apps/theme` | Switches the theme (system, light, dark) and returns to the page; a script asking for JSON gets the new theme instead. |
 //! | `GET /apps/assets/<name>` | The stylesheet and the script, under content-hashed names, cached for a year. |
 //!
@@ -28,7 +28,7 @@ use serde::Deserialize;
 use crate::{
     app::AppState,
     client_ip::client_ip,
-    i18n::Text,
+    i18n::{Text, count},
     web::{
         self, ASSETS_PATH, CSRF_COOKIE, Chrome, Message, SESSION_COOKIE, SecondStep, Started,
         Theme, Verified, page,
@@ -238,17 +238,28 @@ pub async fn two_step(
             next,
             recovery_left,
         } => {
-            if let Some(left) = recovery_left {
-                tracing::info!(%client, user = %username, left, "signed in with a recovery code");
+            let cookies = [
+                state.web.session_cookie(&token),
+                state.web.removal_cookie(CSRF_COOKIE),
+                state.web.two_step_removal(),
+            ];
+            let Some(left) = recovery_left else {
+                return web::see_other(&next, &cookies);
+            };
+            // A recovery code: say so, and how many are left, before going on
+            // (`docs/connect-protocol.md`, 13.4).
+            tracing::info!(%client, user = %username, left, "signed in with a recovery code");
+            let chrome = Chrome::for_request(&headers);
+            let t = chrome.t;
+            let lead = count(t.recovery_left_one, t.recovery_left_many, left, &[]);
+            let mut page = Message::new(chrome, t.recovery_signed_in, t.recovery_signed_in, &lead);
+            page.note = Some(t.recovery_left_note.to_owned());
+            page.link = Some((next, t.continue_on.to_owned()));
+            let mut response = page.respond(StatusCode::OK);
+            for cookie in cookies {
+                response.headers_mut().append(header::SET_COOKIE, cookie);
             }
-            web::see_other(
-                &next,
-                &[
-                    state.web.session_cookie(&token),
-                    state.web.removal_cookie(CSRF_COOKIE),
-                    state.web.two_step_removal(),
-                ],
-            )
+            response
         }
         SecondStep::Wrong => two_step_form(
             &state,

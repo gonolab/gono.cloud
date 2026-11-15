@@ -201,6 +201,11 @@ texts! {
     two_step_locked: "Too many wrong codes for this account. Try again later.", "这个账号输错验证码的次数太多，请稍后再试。";
     two_step_expired: "Sign in again", "请重新登录";
     two_step_expired_lead: "The sign-in waited too long for its code, or took too many wrong ones. Enter your password again.", "登录等待验证码超时，或者验证码输错次数太多。请重新输入密码。";
+    recovery_signed_in: "Signed in with a recovery code", "已用恢复码登录";
+    recovery_left_one: "That code is used up. You have 1 recovery code left.", "这个恢复码已经用掉了。你还剩 1 个恢复码。";
+    recovery_left_many: "That code is used up. You have {} recovery codes left.", "这个恢复码已经用掉了。你还剩 {} 个恢复码。";
+    recovery_left_note: "Each recovery code works once. If your authenticator app is gone, make new recovery codes on your account page, or turn two-step verification off and on again with a new app.", "每个恢复码只能用一次。如果身份验证器已经无法使用，请在账号页面生成新的恢复码，或者关闭两步验证后用新的 app 重新开启。";
+    continue_on: "Continue", "继续";
 
     // Login Flow v2
     connect_device: "Connect a device", "连接设备";
@@ -414,6 +419,7 @@ texts! {
     tf_code: "Code or recovery code", "验证码或恢复码";
     tf_failures: "Your password was entered correctly, but the second step failed:", "有人输对了你的密码，但两步验证失败了：";
     tf_failure_at: "{}, from {}", "{}，来自 {}";
+    tf_recovery_used: "Recovery codes were used to sign in. If that was not you, change your password and make new recovery codes:", "有人用恢复码登录了你的账号。如果不是你本人，请修改密码并生成新的恢复码：";
     tf_setup_title: "Set up two-step verification", "设置两步验证";
     tf_setup_scan: "Scan this code with an authenticator app (for example Google Authenticator, Microsoft Authenticator or 1Password), or enter the key by hand.", "用身份验证器 app（例如 Google Authenticator、Microsoft Authenticator 或 1Password）扫描这个二维码，或者手动输入密钥。";
     tf_key: "Key", "密钥";

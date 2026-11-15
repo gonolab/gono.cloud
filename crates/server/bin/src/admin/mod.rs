@@ -126,6 +126,9 @@ pub struct ServerInfo {
 /// A new app password waiting to be shown once.
 #[derive(Debug)]
 struct Created {
+    /// The admin account of the session that created it: should a session of another account
+    /// ever get the same row id, it sees nothing.
+    by: i64,
     username: String,
     label: String,
     token: SecretString,
@@ -202,11 +205,19 @@ impl Admin {
         waiting.insert(session_id, created);
     }
 
-    fn take(&self, session_id: i64) -> Option<Created> {
-        self.created
+    fn take(&self, session: &SessionUser) -> Option<Created> {
+        let mut waiting = self
+            .created
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&session_id)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !waiting
+            .get(&session.session_id)
+            .is_some_and(|entry| entry.by == session.user_id)
+        {
+            return None;
+        }
+        waiting
+            .remove(&session.session_id)
             .filter(|entry| entry.until > Instant::now())
     }
 }
@@ -1064,6 +1075,16 @@ async fn user_page_response(
     web::render(status, &page)
 }
 
+/// After an admin disabled or deleted account `user_id`, set its password or reset its
+/// two-step verification: its sign-ins waiting for their second step end, and remote access
+/// looks at the account again at once.
+fn account_changed(state: &AppState, user_id: i64) {
+    state.web.end_pending_sign_ins(user_id);
+    if let Some(connect) = &state.connect {
+        connect.poke();
+    }
+}
+
 /// `POST <admin>/users/<name>/two-factor/reset`.
 async fn reset_two_factor(
     State(state): State<AppState>,
@@ -1096,9 +1117,7 @@ async fn reset_two_factor(
     {
         Ok(_) => {
             tracing::info!(by = %session.user.username, user = %user.username, "admin reset two-step verification");
-            if let Some(connect) = &state.connect {
-                connect.poke();
-            }
+            account_changed(&state, user.id);
             see_other(&format!(
                 "{}?done=two-factor-reset",
                 admin.user_url(user.username.as_str())
@@ -1394,8 +1413,11 @@ async fn set_enabled(
         }
         Err(err) => return internal_error(&session.chrome, &err),
     }
-    if !enabled && let Err(err) = web_sessions::delete_for_user(&state.db, user.id, None).await {
-        tracing::warn!(error = %err, "cannot end the browser sessions of a disabled account");
+    if !enabled {
+        if let Err(err) = web_sessions::delete_for_user(&state.db, user.id, None).await {
+            tracing::warn!(error = %err, "cannot end the browser sessions of a disabled account");
+        }
+        account_changed(&state, user.id);
     }
     tracing::info!(by = %session.user.username, user = %user.username, enabled, "admin changed an account");
     let done = if enabled { "enabled" } else { "disabled" };
@@ -1556,6 +1578,7 @@ async fn set_password(
     if let Err(err) = web_sessions::delete_for_user(&state.db, user.id, keep).await {
         tracing::warn!(error = %err, "cannot end the browser sessions after a password change");
     }
+    account_changed(&state, user.id);
     tracing::info!(by = %session.user.username, user = %user.username, "admin set a web login password");
     see_other(&format!(
         "{}?done=password",
@@ -1654,6 +1677,7 @@ async fn delete_user(
         }
         Err(err) => return internal_error(&session.chrome, &err),
     };
+    account_changed(&state, deleted.id);
     let layout = state.dav.fs().layout().clone();
     let retired = tokio::task::spawn_blocking(move || {
         layout.retire_user(deleted.id, deleted.username.as_str(), db::unix_now())
@@ -1807,6 +1831,7 @@ async fn create_app_password(
     admin.remember(
         session.user.session_id,
         Created {
+            by: session.user.user_id,
             username: user.username.to_string(),
             label,
             token,
@@ -1828,7 +1853,7 @@ async fn created_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
         Ok(session) => session,
         Err(halt) => return *halt,
     };
-    let Some(created) = admin.take(session.user.session_id) else {
+    let Some(created) = admin.take(&session.user) else {
         let page = MessagePage {
             chrome: session.chrome.clone(),
             frame: admin.frame(&session, false, true),

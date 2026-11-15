@@ -17,7 +17,7 @@ use gono_server_core::{
     password,
     storage::DataLayout,
     users::{self, NewUser},
-    web_sessions,
+    web_sessions::{self, SessionUser},
 };
 use gono_server_nextcloud::chunking::ChunkedUploads;
 use gono_server_relay::Relay;
@@ -1154,4 +1154,104 @@ async fn admins_with_two_step_verification_pass_the_second_step_first() {
             .await
             .unwrap()
     );
+}
+
+/// Turns two-step verification on for alice (if it is not) and starts a sign-in of hers
+/// waiting for its second step.
+async fn alice_waits_for_her_second_step(f: &Fixture) {
+    sqlx::query(
+        "INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?1, x'00', 0) \
+         ON CONFLICT (user_id) DO NOTHING",
+    )
+    .bind(f.alice)
+    .execute(&f.state.db)
+    .await
+    .unwrap();
+    let alice = users::get(&f.state.db, &Username::new("alice").unwrap())
+        .await
+        .unwrap();
+    let started = f
+        .state
+        .web
+        .start_session("192.0.2.9".parse().unwrap(), &alice, "/")
+        .await;
+    assert!(
+        matches!(started, web::Started::SecondStep(_)),
+        "{started:?}"
+    );
+    assert_eq!(f.state.web.pending_sign_ins(f.alice), 1);
+}
+
+#[tokio::test]
+async fn new_app_passwords_are_shown_only_to_the_admin_who_created_them() {
+    let f = fixture().await;
+    let admin = f.state.admin.as_ref().unwrap();
+    // Two sessions with the same row id, as SQLite handed one out again after a sign-out
+    // before the ids were AUTOINCREMENT.
+    let session = |user_id, name: &str| SessionUser {
+        session_id: 7,
+        user_id,
+        username: Username::new(name).unwrap(),
+        display_name: name.to_owned(),
+        is_admin: true,
+    };
+    admin.remember(
+        7,
+        super::Created {
+            by: f.root,
+            username: "alice".into(),
+            label: "laptop".into(),
+            token: SecretString::from("secret".to_owned()),
+            scopes: Vec::new(),
+            expires_at: None,
+            until: std::time::Instant::now() + Duration::from_secs(60),
+        },
+    );
+    assert!(admin.take(&session(f.alice, "alice")).is_none());
+    assert!(admin.take(&session(f.root, "root")).is_some());
+}
+
+#[tokio::test]
+async fn admin_changes_end_the_pending_sign_ins_of_the_account() {
+    let f = fixture().await;
+    let mut admin = Browser::new(&f.state);
+    let csrf = admin.root().await;
+
+    alice_waits_for_her_second_step(&f).await;
+    let reset = admin
+        .post(&path("/users/alice/two-factor/reset"), &[("csrf", &csrf)])
+        .await;
+    assert_eq!(reset.location(), path("/users/alice?done=two-factor-reset"));
+    assert_eq!(f.state.web.pending_sign_ins(f.alice), 0, "reset");
+
+    alice_waits_for_her_second_step(&f).await;
+    let password = admin
+        .post(
+            &path("/users/alice/password"),
+            &[
+                ("csrf", &csrf),
+                ("password", "a new password"),
+                ("password_repeat", "a new password"),
+            ],
+        )
+        .await;
+    assert_eq!(password.location(), path("/users/alice?done=password"));
+    assert_eq!(f.state.web.pending_sign_ins(f.alice), 0, "new password");
+
+    alice_waits_for_her_second_step(&f).await;
+    let disabled = admin
+        .post(&path("/users/alice/disable"), &[("csrf", &csrf)])
+        .await;
+    assert_eq!(disabled.location(), path("/users/alice?done=disabled"));
+    assert_eq!(f.state.web.pending_sign_ins(f.alice), 0, "disabled");
+    admin
+        .post(&path("/users/alice/enable"), &[("csrf", &csrf)])
+        .await;
+
+    alice_waits_for_her_second_step(&f).await;
+    let deleted = admin
+        .post(&path("/users/alice/delete"), &[("csrf", &csrf)])
+        .await;
+    assert_eq!(deleted.location(), path("/users?done=deleted"));
+    assert_eq!(f.state.web.pending_sign_ins(f.alice), 0, "deleted");
 }

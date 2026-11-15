@@ -86,6 +86,9 @@
       {%- if !two_factor.failures.is_empty() %}
       <div class="flash bad" role="alert">{{ chrome.t.tf_failures }}{% for failure in two_factor.failures %}<div>{{ failure }}</div>{% endfor %}</div>
       {%- endif %}
+      {%- if !two_factor.recovery_used.is_empty() %}
+      <div class="flash warn" role="status">{{ chrome.t.tf_recovery_used }}{% for used in two_factor.recovery_used %}<div>{{ used }}</div>{% endfor %}</div>
+      {%- endif %}
       {%- if let Some(on) = two_factor.on %}
       <p>{{ on }} {{ two_factor.recovery_left }}</p>
       <form method="post" action="/apps/account/two-factor/renew">

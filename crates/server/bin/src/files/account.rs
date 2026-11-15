@@ -12,7 +12,7 @@
 //! | `POST /apps/account/devices/<endpoint id>/pairing` | Let the device send pairing requests for an hour. |
 //! | `POST /apps/account/two-factor/start` | Start enrolling two-step verification (needs the password). |
 //! | `GET /apps/account/two-factor` | The QR code and key of the enrolment, and the form for its first code. |
-//! | `POST /apps/account/two-factor/confirm` | Turn it on with the first code; the recovery codes follow once. |
+//! | `POST /apps/account/two-factor/confirm` | Turn it on with the first code; the recovery codes follow once. The other browser sessions end; this one stays. |
 //! | `GET /apps/account/two-factor/recovery-codes` | New recovery codes, shown once. |
 //! | `POST /apps/account/two-factor/renew` | New recovery codes (password and a code). |
 //! | `POST /apps/account/two-factor/disable` | Turn it off (password and a code). |
@@ -46,7 +46,7 @@ use gono_server_core::{
     audit, db,
     devices::{self, Device, EndpointId, RevokedBy},
     password,
-    two_factor::{self, TurnedOff, Verification},
+    two_factor::{self, TurnedOff},
     users, web_sessions,
 };
 use secrecy::{ExposeSecret as _, SecretString};
@@ -58,7 +58,7 @@ use crate::{
     app::AppState,
     client_ip::client_ip,
     i18n::{Text, fill},
-    web::{self, Chrome, Nav, Verified, page},
+    web::{self, Chrome, CodeCheck, Nav, Verified, page},
 };
 
 /// Where the account page lives.
@@ -73,6 +73,9 @@ const MAX_CREATED: usize = 1000;
 /// A new app password waiting to be shown once.
 #[derive(Debug)]
 pub struct Created {
+    /// The account of the session that created it: should a session of another account ever
+    /// get the same row id, it sees nothing.
+    user_id: i64,
     label: String,
     token: SecretString,
     scopes: Vec<Scope>,
@@ -95,11 +98,16 @@ impl CreatedStore {
         waiting.insert(session_id, created);
     }
 
-    fn take(&self, session_id: i64) -> Option<Created> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&session_id)
+    fn take(&self, session: &web_sessions::SessionUser) -> Option<Created> {
+        let mut waiting = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !waiting
+            .get(&session.session_id)
+            .is_some_and(|entry| entry.user_id == session.user_id)
+        {
+            return None;
+        }
+        waiting
+            .remove(&session.session_id)
             .filter(|entry| entry.until > Instant::now())
     }
 }
@@ -149,6 +157,8 @@ pub struct TwoFactorView {
     pub recovery_left: String,
     /// Recent failed second steps: "…, from …".
     pub failures: Vec<String>,
+    /// Recent uses of recovery codes: "…, from …".
+    pub recovery_used: Vec<String>,
     /// Where to continue once it is on (a local path).
     pub next: String,
 }
@@ -345,21 +355,25 @@ async fn two_factor_view(
     let t = visitor.t();
     let lang = visitor.lang();
     let status = two_factor::status(&state.db, visitor.user.user_id).await?;
+    let at_from = |at: i64, client_ip: Option<&str>| {
+        fill(
+            t.tf_failure_at,
+            &[&when(lang, now, at).0, client_ip.unwrap_or("?")],
+        )
+    };
     let failures = audit::list(&state.db, Some(visitor.user.user_id), None, 200)
         .await?
         .into_iter()
         .filter(|entry| entry.kind == "two_factor.failed" && entry.at > now - 30 * 86_400)
         .take(5)
-        .map(|entry| {
-            fill(
-                t.tf_failure_at,
-                &[
-                    &when(lang, now, entry.at).0,
-                    entry.client_ip.as_deref().unwrap_or("?"),
-                ],
-            )
-        })
+        .map(|entry| at_from(entry.at, entry.client_ip.as_deref()))
         .collect();
+    let recovery_used =
+        two_factor::recovery_code_uses(&state.db, visitor.user.user_id, now - 30 * 86_400, 5)
+            .await?
+            .into_iter()
+            .map(|(at, client_ip)| at_from(at, client_ip.as_deref()))
+            .collect();
     Ok(TwoFactorView {
         available: state.web.two_factor_key().is_some(),
         on: status.map(|status| fill(t.tf_on_since, &[&when(lang, now, status.enabled_at).0])),
@@ -372,6 +386,7 @@ async fn two_factor_view(
             })
             .unwrap_or_default(),
         failures,
+        recovery_used,
         next: next.unwrap_or_default(),
     })
 }
@@ -419,14 +434,13 @@ async fn check_password(
 }
 
 /// Checks a code (TOTP or recovery) of the visitor's account; `Err` is the page to answer with.
+/// The same limits as at the second step of a sign-in apply ([`web::Web::check_code`]).
 async fn check_code(
     state: &AppState,
     visitor: &Visitor,
     client: std::net::IpAddr,
     code: &str,
 ) -> Result<(), Box<Response>> {
-    let now = db::unix_now();
-    let user_id = visitor.user.user_id;
     let fail = |message: &'static str| async move {
         Box::new(
             render_page(
@@ -439,31 +453,20 @@ async fn check_code(
             .await,
         )
     };
-    match two_factor::locked(&state.db, user_id, now).await {
-        Ok(false) => {}
-        Ok(true) => return Err(fail(visitor.t().two_step_locked).await),
-        Err(err) => return Err(Box::new(internal(visitor, "two-step failures", &err))),
-    }
-    let Some(key) = state.web.two_factor_key() else {
-        return Err(Box::new(web::unavailable(visitor.chrome(Nav::Account))));
-    };
-    match two_factor::verify(&state.db, key, user_id, code, now).await {
-        Ok(Verification::Code | Verification::RecoveryCode { .. }) => Ok(()),
-        Ok(Verification::Wrong) => {
-            state.web.limiter().record_failure(client);
-            if let Err(err) =
-                two_factor::record_failure(&state.db, user_id, Some(client), now).await
-            {
-                tracing::warn!(error = %err, "cannot record a failed second step");
-            }
-            Err(fail(visitor.t().two_step_wrong).await)
-        }
-        Ok(Verification::NotEnrolled) => Err(Box::new(web::see_other(&format!("{ACCOUNT}/"), &[]))),
-        Ok(Verification::WrongKey) => {
-            tracing::error!("the TOTP secret does not open with the key file");
-            Err(Box::new(web::unavailable(visitor.chrome(Nav::Account))))
-        }
-        Err(err) => Err(Box::new(internal(visitor, "two-step verification", &err))),
+    match state
+        .web
+        .check_code(client, visitor.user.user_id, code)
+        .await
+    {
+        CodeCheck::Right { .. } => Ok(()),
+        CodeCheck::Wrong => Err(fail(visitor.t().two_step_wrong).await),
+        CodeCheck::Locked => Err(fail(visitor.t().two_step_locked).await),
+        CodeCheck::NotEnrolled => Err(Box::new(web::see_other(&format!("{ACCOUNT}/"), &[]))),
+        CodeCheck::RateLimited(wait) => Err(Box::new(web::too_many_attempts(
+            visitor.chrome(Nav::Account),
+            wait,
+        ))),
+        CodeCheck::Unavailable => Err(Box::new(web::unavailable(visitor.chrome(Nav::Account)))),
     }
 }
 
@@ -498,7 +501,7 @@ pub async fn two_factor_start(
     }
     state
         .web
-        .start_enrolment(visitor.user.session_id, next_path(Some(&form.next)));
+        .start_enrolment(&visitor.user, next_path(Some(&form.next)));
     web::see_other(&format!("{ACCOUNT}/two-factor"), &[])
 }
 
@@ -508,7 +511,7 @@ async fn enrol_page(
     status: StatusCode,
     error: Option<&'static str>,
 ) -> Response {
-    let Some(enrolment) = state.web.enrolment(visitor.user.session_id) else {
+    let Some(enrolment) = state.web.enrolment(&visitor.user) else {
         let message = Some(visitor.t().tf_setup_expired.to_owned());
         return render_page(state, visitor, AppPasswordForm::default(), None, message).await;
     };
@@ -567,7 +570,7 @@ pub async fn two_factor_confirm(
     let Some(key) = state.web.two_factor_key() else {
         return web::unavailable(visitor.chrome(Nav::Account));
     };
-    let Some(enrolment) = state.web.enrolment(visitor.user.session_id) else {
+    let Some(enrolment) = state.web.enrolment(&visitor.user) else {
         return enrol_page(&state, &visitor, StatusCode::OK, None).await;
     };
     let now = db::unix_now();
@@ -583,12 +586,16 @@ pub async fn two_factor_confirm(
         .await;
     };
     let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    // Every other browser session of the account ends with it, in the same transaction: one
+    // opened with the password alone before must not keep what needs a second step from now
+    // on (device registrations, revocations, pairing). This one stays.
     let codes = match two_factor::enable(
         &state.db,
         key,
         visitor.user.user_id,
         &enrolment.secret,
         step,
+        Some(visitor.user.session_id),
         Some(client),
         now,
     )
@@ -596,19 +603,18 @@ pub async fn two_factor_confirm(
     {
         Ok(codes) => codes,
         Err(gono_server_core::Error::TwoFactorEnrolled) => {
-            state.web.end_enrolment(visitor.user.session_id);
+            state.web.end_enrolment(&visitor.user);
             return web::see_other(&format!("{ACCOUNT}/"), &[]);
         }
         Err(err) => return internal(&visitor, "two-step verification", &err),
     };
-    state.web.end_enrolment(visitor.user.session_id);
+    state.web.end_enrolment(&visitor.user);
+    state.web.end_pending_sign_ins(visitor.user.user_id);
     tracing::info!(user = %visitor.user.username, "two-step verification turned on");
     if let Some(connect) = &state.connect {
         connect.poke();
     }
-    state
-        .web
-        .show_once(visitor.user.session_id, codes, enrolment.next);
+    state.web.show_once(&visitor.user, codes, enrolment.next);
     web::see_other(&format!("{ACCOUNT}/two-factor/recovery-codes"), &[])
 }
 
@@ -622,7 +628,7 @@ pub async fn recovery_codes(
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
-    let Some(shown) = state.web.take_shown(visitor.user.session_id) else {
+    let Some(shown) = state.web.take_shown(&visitor.user) else {
         return web::see_other(&format!("{ACCOUNT}/"), &[]);
     };
     let page = RecoveryCodesPage {
@@ -663,7 +669,7 @@ pub async fn two_factor_renew(
     .await
     {
         Ok(codes) => {
-            state.web.show_once(visitor.user.session_id, codes, None);
+            state.web.show_once(&visitor.user, codes, None);
             web::see_other(&format!("{ACCOUNT}/two-factor/recovery-codes"), &[])
         }
         Err(err) => internal(&visitor, "recovery codes", &err),
@@ -700,6 +706,7 @@ pub async fn two_factor_disable(
     {
         Ok(_) => {
             tracing::info!(user = %visitor.user.username, "two-step verification turned off");
+            state.web.end_pending_sign_ins(visitor.user.user_id);
             if let Some(connect) = &state.connect {
                 connect.poke();
             }
@@ -1086,6 +1093,8 @@ pub async fn set_password(
     if let Err(err) = users::set_password_hash(&state.db, &visitor.user.username, &hash).await {
         return internal(&visitor, "password change", &err);
     }
+    // Sign-ins that were waiting for their second step with the old password end.
+    state.web.end_pending_sign_ins(visitor.user.user_id);
     // Every other browser signs out; this one stays signed in.
     if let Err(err) = web_sessions::delete_for_user(
         &state.db,
@@ -1136,6 +1145,7 @@ pub async fn create_app_password(
     files.created.put(
         visitor.user.session_id,
         Created {
+            user_id: visitor.user.user_id,
             label,
             token,
             scopes,
@@ -1155,7 +1165,7 @@ pub async fn created(State(state): State<AppState>, headers: HeaderMap, uri: Uri
     let Some(files) = state.files.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(created) = files.created.take(visitor.user.session_id) else {
+    let Some(created) = files.created.take(&visitor.user) else {
         return web::see_other(&format!("{ACCOUNT}/"), &[]);
     };
     let t = visitor.t();
