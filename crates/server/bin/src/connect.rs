@@ -36,7 +36,7 @@ use axum::{
 };
 use gono_protocol::connect::{LoginStart, PollRequest, close, limits};
 use gono_server_connect::{Connect, DeviceLogin, Outgoing, Session};
-use gono_server_core::db;
+use gono_server_core::{audit::Actor, db};
 
 use crate::{
     app::{AppState, authenticate},
@@ -177,7 +177,7 @@ pub async fn sign_out(
         Ok(login) => login,
         Err(response) => return *response,
     };
-    match connect.sign_out(&login.device).await {
+    match connect.sign_out(&login.device, Actor::Device).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => {
             tracing::error!(error = %err, "cannot sign a device out");

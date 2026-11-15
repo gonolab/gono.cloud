@@ -9,6 +9,7 @@
 //! | `POST /apps/account/app-passwords/<id>/delete` | Revoke one of the user's app passwords. |
 //! | `GET /apps/account/devices/<endpoint id>/revoke` | The second confirmation of revoking a device for remote access. |
 //! | `POST /apps/account/devices/<endpoint id>/revoke` | Revoke it, and the devices it introduced that are ticked. |
+//! | `POST /apps/account/devices/<endpoint id>/sign-out` | Stop remote access for a device that stays in use: sign it out (protocol 9.4). |
 //! | `POST /apps/account/devices/<endpoint id>/pairing` | Let the device send pairing requests for an hour. |
 //! | `POST /apps/account/two-factor/start` | Start enrolling two-step verification (needs the password). |
 //! | `GET /apps/account/two-factor` | The QR code and key of the enrolment, and the form for its first code. |
@@ -43,7 +44,8 @@ use axum::{
 };
 use gono_server_core::{
     app_passwords::{self, Scope},
-    audit, db,
+    audit::{self, Actor},
+    db,
     devices::{self, Device, EndpointId, RevokedBy},
     password,
     two_factor::{self, TurnedOff},
@@ -922,6 +924,44 @@ pub async fn revoke_device(
     }
 }
 
+/// `POST /apps/account/devices/<endpoint id>/sign-out`: stops remote access for a device that
+/// is not lost, without revoking it (protocol 9.4). The device keeps its key, its pairings and
+/// its place in the account, and can register again; the entry stays revocable.
+pub async fn stop_remote_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(hex): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let visitor = match form_visitor(&state, &headers, &uri, &form.csrf).await {
+        Ok(visitor) => visitor,
+        Err(response) => return *response,
+    };
+    let device = match own_device(&state, &visitor, &hex).await {
+        Ok(device) => device,
+        Err(response) => return *response,
+    };
+    let result = match &state.connect {
+        // A running server also tells the other devices and ends the device's access at once.
+        Some(connect) => connect.sign_out(&device, Actor::User).await,
+        None => devices::leave(&state.db, device.id, Actor::User, db::unix_now())
+            .await
+            .map(|left| left.is_some()),
+    };
+    match result {
+        Ok(_) => {
+            tracing::info!(
+                user = %visitor.user.username,
+                device = %device.endpoint_id.short(),
+                "user stopped remote access for a device"
+            );
+            web::see_other(&format!("{ACCOUNT}/?done=device-signed-out"), &[])
+        }
+        Err(err) => internal(&visitor, "stop remote access", &err),
+    }
+}
+
 /// `POST /apps/account/devices/<endpoint id>/pairing`.
 pub async fn allow_pairing(
     State(state): State<AppState>,
@@ -968,6 +1008,7 @@ pub async fn show(
         Some("password") => Some(t.notice_password_changed.to_owned()),
         Some("revoked") => Some(t.notice_revoked.to_owned()),
         Some("device-revoked") => Some(t.notice_device_revoked.to_owned()),
+        Some("device-signed-out") => Some(t.notice_device_signed_out.to_owned()),
         Some("pairing") => Some(t.notice_pairing_open.to_owned()),
         Some("two-factor-on") => Some(t.notice_tf_on.to_owned()),
         Some("two-factor-off") => Some(t.notice_tf_off.to_owned()),

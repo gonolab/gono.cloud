@@ -435,7 +435,7 @@ texts! {
     a_tf_reset: "Reset two-step verification", "重置两步验证";
     a_notice_tf_reset: "Two-step verification was reset. The account signs in with its password alone until it turns it on again, and its devices have no remote access until then.", "两步验证已重置。在重新开启之前，这个账号只用密码登录，它的设备也无法远程访问。";
     remote_devices: "Remote devices", "远程设备";
-    remote_devices_note: "Devices registered for remote access. Revoke one that is lost or that you no longer use: its key can never be used again, and your other devices forget it.", "已注册远程访问的设备。设备丢失或不再使用时请吊销：它的密钥将永远作废，你的其他设备也会忘记它。";
+    remote_devices_note: "Devices registered for remote access. To stop remote access for a device you keep using, sign it out with “Stop remote access”: it keeps its pairings and can sign in again. Revoke a device that is lost, stolen or compromised: its key can never be used again, and your other devices forget it, on the local network as well.", "已注册远程访问的设备。只想停止某台仍在使用的设备的远程访问时，请点“停止远程访问”：它保留所有配对，之后可以重新登录。设备丢失、被盗或被入侵时请吊销：它的密钥将永远作废，你的其他设备也会忘记它，局域网上也一样。";
     no_remote_devices: "No device is registered for remote access yet.", "还没有设备注册远程访问。";
     online: "Online", "在线";
     last_seen: "Last seen {}", "最近在线：{}";
@@ -447,6 +447,7 @@ texts! {
     allow_pairing: "Allow pairing", "允许配对";
     pairing_open_until: "May ask to pair until {}", "可发起配对，截止 {}";
     revoke_device: "Revoke…", "吊销…";
+    stop_remote_access: "Stop remote access", "停止远程访问";
     applied_by_all: "All your devices have applied it.", "你的所有设备都已执行。";
     applied_pending: "Not applied yet by: {}", "尚未执行：{}";
     revoke_title: "Revoke this device?", "吊销这台设备？";
@@ -455,6 +456,7 @@ texts! {
     revoke_introduced_note: "They stay trusted unless you tick them to revoke them as well.", "除非勾选一并吊销，它们会继续被信任。";
     revoke_confirm: "Revoke for good", "永久吊销";
     notice_device_revoked: "Revoked. Your other devices forget it as soon as they hear of it.", "已吊销。你的其他设备收到通知后会忘记它。";
+    notice_device_signed_out: "Remote access stopped for this device. It keeps its pairings and can sign in again.", "已停止这台设备的远程访问。它保留所有配对，可以重新登录。";
     notice_pairing_open: "The device may ask your other devices to pair for one hour.", "一小时内，这台设备可以请求与你的其他设备配对。";
     notice_password_changed: "Your password was changed. Other browsers were signed out.", "密码已修改，其他浏览器已退出登录。";
     err_current_password: "The current password is wrong.", "当前密码不正确。";

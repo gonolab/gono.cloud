@@ -1218,6 +1218,57 @@ async fn remote_devices_are_revoked_after_a_second_confirmation() {
     assert!(!state(laptop.id).await);
 }
 
+#[tokio::test]
+async fn remote_access_stops_for_a_device_without_revoking_it() {
+    use gono_server_core::devices;
+
+    let mut f = fixture().await;
+    let connect = gono_server_connect::Connect::new(
+        f.state.db.clone(),
+        gono_server_connect::ConnectConfig {
+            base_url: ORIGIN.parse().unwrap(),
+            relay_url: "https://relay.example.com".parse().unwrap(),
+            audit_retention_secs: 3600,
+        },
+    )
+    .await
+    .unwrap();
+    f.state.connect = Some(connect);
+    let alice = users::get(&f.state.db, &Username::new("alice").unwrap())
+        .await
+        .unwrap()
+        .id;
+    let work = register_device(&f.state, alice, 4, "Work PC").await;
+
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+    let page = browser.get("/apps/account/").await;
+    let text = page.text();
+    assert!(text.contains("Stop remote access"), "{text}");
+    let csrf = page.csrf();
+    let hex = work.endpoint_id.to_hex();
+    let path = format!("/apps/account/devices/{hex}/sign-out");
+
+    let forged = browser.post(&path, &[("csrf", "forged")]).await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    let stopped = browser.post(&path, &[("csrf", &csrf)]).await;
+    assert_eq!(stopped.location(), "/apps/account/?done=device-signed-out");
+    let entry = devices::get(&f.state.db, work.id).await.unwrap().unwrap();
+    assert!(entry.is_signed_out(), "signed out");
+    assert!(!entry.is_revoked(), "not revoked");
+    let page = browser
+        .get("/apps/account/?done=device-signed-out")
+        .await
+        .text();
+    assert!(page.contains("It keeps its pairings"), "{page}");
+    // A signed-out entry stays on the page and stays revocable (protocol 9.4).
+    assert!(page.contains(&work.endpoint_id.short()), "{page}");
+    assert!(
+        page.contains(&format!("/apps/account/devices/{hex}/revoke")),
+        "{page}"
+    );
+}
+
 /// Decodes RFC 4648 base32 (spaces allowed), the key the enrolment page shows.
 fn base32_decode(text: &str) -> Vec<u8> {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";

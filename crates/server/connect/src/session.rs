@@ -1360,7 +1360,7 @@ impl Session {
     }
 
     async fn leave(&mut self, id: u64) -> Result<ServerMessage, ServerMessage> {
-        match self.connect.sign_out(&self.device).await {
+        match self.connect.sign_out(&self.device, Actor::Device).await {
             Ok(_) => Ok(ServerMessage::result(id, &())),
             Err(err) => {
                 tracing::error!(error = %err, "cannot sign a device out");

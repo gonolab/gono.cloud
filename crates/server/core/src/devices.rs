@@ -838,9 +838,10 @@ pub async fn revoke(
 
 /// Signs device `id` out (protocol 9.4): deletes its app password and marks the entry signed
 /// out. The entry stays, so that the key remains bound to the account and can still be
-/// revoked; the device may register again into the same account. Returns the entry, or `None`
-/// if it was not registered.
-pub async fn leave(pool: &Pool, id: i64, now: i64) -> Result<Option<Device>> {
+/// revoked; the device may register again into the same account. `actor` is the device itself,
+/// or its user on the account page ("stop remote access"). Returns the entry, or `None` if it
+/// was not registered.
+pub async fn leave(pool: &Pool, id: i64, actor: Actor, now: i64) -> Result<Option<Device>> {
     let mut tx = db::begin_immediate(pool).await?;
     let Some(device) = sqlx::query_as::<_, DeviceRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM devices WHERE id = ?1 AND app_password_id IS NOT NULL"
@@ -865,7 +866,7 @@ pub async fn leave(pool: &Pool, id: i64, now: i64) -> Result<Option<Device>> {
         .await?;
     audit::record(
         &mut *tx,
-        &Record::new(device.user_id, "device.removed", Actor::Device).device(device.endpoint_id),
+        &Record::new(device.user_id, "device.removed", actor).device(device.endpoint_id),
         now,
     )
     .await?;

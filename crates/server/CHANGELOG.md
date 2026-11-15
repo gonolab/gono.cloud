@@ -39,7 +39,8 @@ compatible within a major version: released clients keep working with newer serv
   addresses only through recorded connection requests, and passes pairing requests and signed
   approvals between devices. The relay admits these devices besides `relay.allowed_endpoints`.
   Only accounts with two-step verification on have remote access. The account page lists the
-  devices;
+  devices, and stops remote access for one that stays in use ("Stop remote access" signs it
+  out, keeping its pairings);
   revoking one (account page, admin UI, `gono-cloud device revoke`) is final for its key, needs
   a second confirmation, disconnects it at once and tells the account's other devices. A device
   that signs out stays listed as signed out and can still be revoked; its key can register

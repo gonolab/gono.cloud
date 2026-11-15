@@ -461,6 +461,8 @@ protocol is [connect-protocol.md](connect-protocol.md), and
   relay. The consent page of a device leads through turning it on and comes back.
 - **The account page** lists the account's devices, whether they are online, and lets a device
   ask the account's other devices to pair for an hour.
+- **Stopping remote access** for a device that stays in use: "Stop remote access" on the
+  account page signs it out. It keeps its key and its pairings, and can sign in again.
 - **Revoking a device** (lost, stolen, retired) is final for its key: the account's other
   devices forget it, on the local network as well, and it can never be registered again on
   this server. Revoke on the account page or the admin UI, both of which ask for confirmation

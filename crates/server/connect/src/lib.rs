@@ -347,10 +347,11 @@ impl Connect {
     }
 
     /// Signs device `device` out (protocol 9.4): deletes its credential, tells the account's
-    /// other devices, and ends its access. The entry stays, bound to the account.
-    pub async fn sign_out(&self, device: &Device) -> gono_server_core::Result<bool> {
+    /// other devices, and ends its access. The entry stays, bound to the account. `actor` is
+    /// the device itself, or its user on the account page.
+    pub async fn sign_out(&self, device: &Device, actor: Actor) -> gono_server_core::Result<bool> {
         let now = db::unix_now();
-        let Some(left) = devices::leave(&self.pool, device.id, now).await? else {
+        let Some(left) = devices::leave(&self.pool, device.id, actor, now).await? else {
             return Ok(false);
         };
         tracing::info!(device = %left.endpoint_id.short(), "device signed out");

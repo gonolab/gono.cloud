@@ -285,13 +285,13 @@ async fn signing_out_keeps_the_key_bound_to_the_account() {
     else {
         panic!()
     };
-    let left = devices::leave(&pool, device.id, 110)
+    let left = devices::leave(&pool, device.id, audit::Actor::Device, 110)
         .await
         .unwrap()
         .unwrap();
     assert!(left.is_signed_out() && !left.is_active());
     assert!(
-        devices::leave(&pool, device.id, 111)
+        devices::leave(&pool, device.id, audit::Actor::Device, 111)
             .await
             .unwrap()
             .is_none(),
@@ -331,7 +331,9 @@ async fn a_signed_out_device_can_be_revoked() {
     else {
         panic!()
     };
-    devices::leave(&pool, device.id, 110).await.unwrap();
+    devices::leave(&pool, device.id, audit::Actor::Device, 110)
+        .await
+        .unwrap();
     let revoked = devices::revoke(
         &pool,
         alice,
@@ -502,7 +504,9 @@ async fn the_relay_admits_active_devices_of_accounts_with_two_step_verification(
     assert_eq!(devices::admissible(&pool).await.unwrap(), [key(1)]);
     // A signed-out device is not admitted either.
     let a1 = devices::find(&pool, key(1)).await.unwrap().unwrap();
-    devices::leave(&pool, a1.id, 115).await.unwrap();
+    devices::leave(&pool, a1.id, audit::Actor::Device, 115)
+        .await
+        .unwrap();
     assert!(devices::admissible(&pool).await.unwrap().is_empty());
     register(&pool, alice, &new_device(1, "a1"), 116).await;
     assert_eq!(devices::admissible(&pool).await.unwrap(), [key(1)]);

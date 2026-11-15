@@ -178,6 +178,10 @@ pub fn routes() -> Router<AppState> {
             post(account::allow_pairing),
         )
         .route(
+            &format!("{ACCOUNT}/devices/{{id}}/sign-out"),
+            post(account::stop_remote_access),
+        )
+        .route(
             &format!("{ACCOUNT}/two-factor"),
             get(account::two_factor_page),
         )
