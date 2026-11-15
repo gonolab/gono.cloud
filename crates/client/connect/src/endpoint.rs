@@ -254,8 +254,9 @@ async fn bind_families(
         .map_err(|err| Error::Bind(err.to_string()))
 }
 
-/// How long [`dial`] waits for the endpoint's relay connection (right after the endpoint was
-/// bound, or after a network change) before it dials the direct addresses instead.
+/// How long [`dial`] waits for the endpoint's first relay connection, right after the endpoint
+/// was bound, before it dials the direct addresses instead. Once a relay connection failed,
+/// [`dial`] does not wait.
 pub const RELAY_WAIT: Duration = Duration::from_secs(5);
 
 /// How long the handshake over the relay may take before [`dial`] tries the direct addresses.
@@ -270,10 +271,20 @@ pub fn relay_connected(endpoint: &Endpoint) -> bool {
         .any(|status| status.is_connected())
 }
 
+/// Whether the last attempt to connect to the home relay failed, as in an outage of
+/// gono-cloud, whose relay stops with it.
+fn relay_failed(endpoint: &Endpoint) -> bool {
+    endpoint
+        .home_relay_status()
+        .get()
+        .iter()
+        .any(|status| !status.is_connected() && status.last_error().is_some())
+}
+
 /// Connects to `addr` for `alpn`, relay first.
 ///
 /// When `addr` names a relay and the endpoint holds its relay connection (waiting up to
-/// [`RELAY_WAIT`] for it), the handshake goes over the relay alone, and iroh's NAT traversal
+/// [`RELAY_WAIT`] for the first one), the handshake goes over the relay alone, and iroh's NAT traversal
 /// inside the connection adds a direct path once one works in both directions. The direct
 /// addresses of `addr` are dialed only when the relay fails: no relay connection, no relay
 /// in `addr`, or no handshake over it within [`RELAY_HANDSHAKE_TIMEOUT`]. A refusal by the peer
@@ -290,9 +301,10 @@ pub async fn dial(
 ) -> Result<Connection, Error> {
     if let Some(relay) = addr.relay_urls().next().cloned()
         && (relay_connected(endpoint)
-            || tokio::time::timeout(RELAY_WAIT, endpoint.online())
-                .await
-                .is_ok())
+            || (!relay_failed(endpoint)
+                && tokio::time::timeout(RELAY_WAIT, endpoint.online())
+                    .await
+                    .is_ok()))
     {
         let relay_only = EndpointAddr::new(addr.id).with_relay_url(relay);
         match tokio::time::timeout(RELAY_HANDSHAKE_TIMEOUT, endpoint.connect(relay_only, alpn))

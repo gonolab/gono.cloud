@@ -73,6 +73,15 @@ packaging/server/test-in-container.sh packaging/server/test-relay.sh packaging/s
   dist/gono-cloud-*-x86_64-unknown-linux-musl.tar.gz target/x86_64-unknown-linux-musl/release/examples/relay-probe
 ```
 
+For changes to how `gono-connect` dials (`crates/client/connect`), also run the dials under UDP
+filters on Linux, as root (`unshare`) or with pasta installed (rootless); CI runs it as the
+`udp-paths` job:
+
+```sh
+cargo build -p gono-connect --example udp-paths
+sudo crates/client/connect/scripts/test-udp-paths.sh target/debug/examples/udp-paths
+```
+
 ## Code
 
 - Format with `rustfmt` and keep clippy quiet; the workspace lints are in the root

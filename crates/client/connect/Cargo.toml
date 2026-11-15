@@ -46,6 +46,8 @@ webpki-roots = "1.0.12"
 [dev-dependencies]
 # Canned HTTP answers for the body limit.
 http.workspace = true
+# A relay on loopback for examples/udp-paths.rs (scripts/test-udp-paths.sh).
+iroh-relay.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 
 [lints]

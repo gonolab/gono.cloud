@@ -280,7 +280,10 @@ async fn two_devices_register_reach_each_other_and_hear_of_a_revocation() {
         "{first:?}"
     );
     let deadline = Instant::now() + TIMEOUT;
-    while !path_kinds(&connection).iter().any(|path| path.starts_with("Ip")) {
+    while !path_kinds(&connection)
+        .iter()
+        .any(|path| path.starts_with("Ip"))
+    {
         assert!(
             Instant::now() < deadline,
             "no direct path: {:?}",

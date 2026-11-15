@@ -742,6 +742,14 @@ peer, or a product feature needs it.
 asked about, ignores a `relay_url` other than the discovery document's, drops the direct
 addresses that 7.1 refuses, and uses at most 16 direct addresses.
 
+**Relay first.** `gono-connect` runs the handshake over the relay and leaves the direct path to
+iroh's NAT traversal inside the connection; it dials the direct addresses of the result only
+when the relay fails (no relay connection, or no handshake over it within 5 seconds). A direct
+path that works one way only, such as a host firewall that refuses outbound UDP, would
+otherwise hold the handshake until it times out, because iroh sends the first packet on every
+path it knows and the peer answers on the first copy it received. The addresses therefore
+matter mostly when the relay is down (7.4).
+
 **Recorded.** Every `connect` is recorded in the audit log as `connect.requested`, refused
 ones included.
 
@@ -774,7 +782,8 @@ per connection, so reconnecting changes neither.
 - **During an outage of gono-cloud:**
   - the embedded relay is down too, so relayed paths fail;
   - established direct paths continue;
-  - new connections can use cached direct addresses;
+  - new connections can use cached direct addresses, which `gono-connect` hands iroh only
+    while the relay is down;
   - LAN use is untouched.
 - **`not_online`.** The target has no control connection. The device should report "offline
   since `last_seen_at`" and not retry in a loop.

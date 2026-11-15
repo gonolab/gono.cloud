@@ -1445,6 +1445,7 @@ dependencies = [
  "http",
  "httpdate",
  "iroh",
+ "iroh-relay",
  "n0-error",
  "n0-future",
  "rand 0.10.3",

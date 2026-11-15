@@ -212,6 +212,41 @@ jobs:
           packaging/server/test-relay.sh packaging/server/cloud.server.sh dist/*.tar.gz \
             target/debug/examples/relay-probe
 
+  # gono-connect dials relay first, so that a direct path that works one way only (a host
+  # firewall refusing outbound UDP, an asymmetric filter) does not stop the connection. Runs
+  # dials in network namespaces under nftables filters on either side, with iroh's own dial
+  # as the control that must be stuck in exactly the one-way cases, and checks that a direct
+  # path follows the relay and that a relay outage falls back to direct addresses. See
+  # crates/client/connect/scripts/test-udp-paths.sh.
+  udp-paths:
+    name: Paths under UDP filters (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install nftables
+        run: |
+          command -v nft >/dev/null || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends nftables
+          }
+          nft --version
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --locked -p gono-connect --example udp-paths
+
+      - name: Dials under UDP filters
+        run: sudo crates/client/connect/scripts/test-udp-paths.sh target/debug/examples/udp-paths
+
   msrv:
     name: Minimum supported Rust version
     runs-on: ubuntu-latest
