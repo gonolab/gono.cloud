@@ -10,8 +10,13 @@ publish.workspace = true
 
 [features]
 default = []
-# UPnP / NAT-PMP / PCP port mapping on the local gateway (plan D3). It talks only to the gateway;
-# check again that nothing else is contacted (plan V4) before turning it on in a product.
+# UPnP / NAT-PMP / PCP port mapping (plan D3). Off by default, and keep it off in products for
+# now: NAT-PMP and PCP talk to the default gateway only, but UPnP follows the LOCATION of
+# whichever device answers its SSDP search first, so any device on the LAN can make the endpoint
+# send HTTP and SOAP requests to an address it names (Input Show's V4 test). Neither igd-next nor
+# the portmapper crate checks that host against the default gateway, and iroh 1.4.1's
+# PortmapperConfig cannot turn UPnP off alone. Turn it on only once upstream can, and run V4
+# again then.
 portmapper = ["iroh/portmapper"]
 
 [dependencies]
