@@ -780,6 +780,19 @@ impl GonoS3 {
         Ok(())
     }
 
+    /// The `x-amz-expiration` header of the object `key` of `bucket`, the file `entry` with
+    /// `tags` (see [`crate::lifecycle::expiration`]). Folders never expire.
+    async fn expiration(
+        &self,
+        bucket: &Bucket,
+        key: &str,
+        entry: &Entry,
+        tags: &BTreeMap<String, String>,
+    ) -> Option<String> {
+        let file_id = entry.file_id.filter(|_| !entry.is_dir())?;
+        crate::lifecycle::expiration(&self.state, bucket, key, entry.size, tags, file_id).await
+    }
+
     /// Writes the body of `PutObject` (or an empty folder marker).
     async fn put(&self, req: S3Request<dto::PutObjectInput>) -> S3Result<dto::PutObjectOutput> {
         let auth = authorized(&req)?;
@@ -873,6 +886,7 @@ impl GonoS3 {
         let content_md5 = upload::content_md5(&req.headers, input.content_md5.as_deref());
         let checksum = upload::verify(&received, content_md5, &claimed)?;
         let etag = received.etag();
+        let tags = crate::tags::from_header(input.tagging.as_deref())?;
         let meta = ObjectMeta {
             s3_etag: Some(etag.clone()),
             public_read: public,
@@ -883,14 +897,15 @@ impl GonoS3 {
             cache_control: input.cache_control,
             expires: input.expires,
             user_meta: user_meta(input.metadata),
-            tags: crate::tags::from_header(input.tagging.as_deref())?,
+            tags: tags.clone(),
             checksum: checksum.clone(),
             parts: Vec::new(),
         };
         if let Some(time) = upload::mtime_of(&meta) {
             upload::set_mtime(received.temp.path(), time).await?;
         }
-        self.state
+        let entry = self
+            .state
             .fs()
             .put_object(
                 identity,
@@ -905,6 +920,7 @@ impl GonoS3 {
         Ok(dto::PutObjectOutput {
             e_tag: Some(ETag::Strong(etag)),
             size: Some(i64::try_from(received.size).unwrap_or(i64::MAX)),
+            expiration: self.expiration(&bucket, &input.key, &entry, &tags).await,
             ..upload_output(checksum.as_ref())
         })
     }
@@ -1843,6 +1859,13 @@ impl S3 for GonoS3 {
             .as_ref()
             .and_then(|part| part.count)
             .and_then(|count| i32::try_from(count).ok());
+        let expiration = match &meta {
+            Some(meta) if meta.s3_etag.is_some() => {
+                self.expiration(auth.bucket()?, &input.key, &entry, &meta.tags)
+                    .await
+            }
+            _ => None,
+        };
         let meta = meta.unwrap_or_default();
         let tags = meta.tags.clone();
         let mut response = S3Response::new(dto::GetObjectOutput {
@@ -1880,6 +1903,7 @@ impl S3 for GonoS3 {
             checksum_type: checksum.checksum_type,
             parts_count,
             tag_count: crate::tags::count(&tags),
+            expiration,
             ..Default::default()
         });
         nosniff(&mut response.headers, anonymous);
@@ -1931,6 +1955,13 @@ impl S3 for GonoS3 {
             .as_ref()
             .and_then(|part| part.count)
             .and_then(|count| i32::try_from(count).ok());
+        let expiration = match &meta {
+            Some(meta) if meta.s3_etag.is_some() => {
+                self.expiration(auth.bucket()?, &input.key, &entry, &meta.tags)
+                    .await
+            }
+            _ => None,
+        };
         let meta = meta.unwrap_or_default();
         let tags = meta.tags.clone();
         let mut response = S3Response::new(dto::HeadObjectOutput {
@@ -1953,6 +1984,7 @@ impl S3 for GonoS3 {
             checksum_type: checksum.checksum_type,
             parts_count,
             tag_count: crate::tags::count(&tags),
+            expiration,
             ..Default::default()
         });
         nosniff(&mut response.headers, anonymous);
@@ -2233,12 +2265,20 @@ impl S3 for GonoS3 {
             )
             .await
             .map_err(|err| error::object(err, false))?;
+        // A copy of a file not written through S3 has no S3 ETag and never expires.
+        let expiration = if meta.s3_etag.is_some() {
+            self.expiration(&destination, &input.key, &entry, &meta.tags)
+                .await
+        } else {
+            None
+        };
         Ok(S3Response::new(dto::CopyObjectOutput {
             copy_object_result: Some(dto::CopyObjectResult {
                 e_tag: Some(ETag::Strong(entry.s3_etag(Some(&meta)))),
                 last_modified: Some(Timestamp::from(entry.modified)),
                 ..Default::default()
             }),
+            expiration,
             ..Default::default()
         }))
     }

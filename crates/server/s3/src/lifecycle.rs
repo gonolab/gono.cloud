@@ -17,6 +17,10 @@
 //! It deletes a file only while it is still the version it judged and not locked by a WebDAV
 //! client, and writes an audit record per bucket and pass that deleted something. Deleting is
 //! permanent: there is no trash.
+//!
+//! Writes and reads of an object that a rule will expire answer with S3's `x-amz-expiration`
+//! header ([`expiration`]): the date and the ID of the rule, the earliest of them when several
+//! rules match, judged as [`apply`] judges.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -381,6 +385,28 @@ impl Rule {
             && self.size_less_than.is_none_or(|less| size < less)
     }
 
+    /// Whether the rule expires objects (`Expiration` with `Days` or a `Date`) while enabled.
+    fn expires(&self) -> bool {
+        self.enabled && (self.expiration_days.is_some() || self.expiration_date.is_some())
+    }
+
+    /// When this rule expires the object `key` of `size` bytes with `tags`, written through S3
+    /// at `written_at` (UNIX seconds), if it does: `None` when the rule is disabled, does not
+    /// match the object or does not expire objects. What [`apply`] and the `x-amz-expiration`
+    /// header both go by.
+    fn expiry(
+        &self,
+        key: &str,
+        size: u64,
+        tags: &BTreeMap<String, String>,
+        written_at: i64,
+    ) -> Option<i64> {
+        if !self.enabled || !self.matches(key, size, tags) {
+            return None;
+        }
+        self.expires_at(written_at)
+    }
+
     /// When an object written at `written_at` (UNIX seconds) expires under this rule, if it
     /// does: after `Days`, at the next midnight UTC; on `Date`.
     fn expires_at(&self, written_at: i64) -> Option<i64> {
@@ -409,6 +435,70 @@ impl Rule {
             _ => None,
         }
     }
+}
+
+/// The `x-amz-expiration` header of the object `key` of `size` bytes with `tags`, written
+/// through S3 at `written_at` (UNIX seconds), under `rules`: when the earliest of the rules
+/// that expire it does so, and that rule's ID (the first in the configuration on a tie), as
+/// `expiry-date="Fri, 23 Dec 2026 00:00:00 GMT", rule-id="r1"`. `None` if no rule expires it.
+pub(crate) fn header(
+    rules: &[Rule],
+    key: &str,
+    size: u64,
+    tags: &BTreeMap<String, String>,
+    written_at: i64,
+) -> Option<String> {
+    let (at, rule) = rules
+        .iter()
+        .filter_map(|rule| {
+            rule.expiry(key, size, tags, written_at)
+                .map(|at| (at, rule))
+        })
+        .min_by_key(|(at, _)| *at)?;
+    let mut date = Vec::new();
+    dto::Timestamp::from(time::OffsetDateTime::from_unix_timestamp(at).ok()?)
+        .format(dto::TimestampFormat::HttpDate, &mut date)
+        .ok()?;
+    let value = format!(
+        "expiry-date=\"{}\", rule-id=\"{}\"",
+        String::from_utf8_lossy(&date),
+        rule.id
+    );
+    // The ID goes out as it is, as from S3; one with control characters cannot be a header
+    // value, and leaving the header out beats failing the request.
+    http::HeaderValue::from_str(&value).is_ok().then_some(value)
+}
+
+/// The `x-amz-expiration` header of the object `key` of `bucket`, `size` bytes with `tags`,
+/// whose current version is file `file_id` (see [`header`]). Only a version written through S3
+/// expires, so its S3 metadata says when it was written; any other version gets no header.
+/// That metadata is read only when the bucket has a rule that expires objects. A database
+/// failure only costs the header, as the request it belongs to has succeeded.
+pub async fn expiration(
+    state: &S3State,
+    bucket: &Bucket,
+    key: &str,
+    size: u64,
+    tags: &BTreeMap<String, String>,
+    file_id: i64,
+) -> Option<String> {
+    let rules = from_stored(bucket.lifecycle.as_deref());
+    if !rules.iter().any(Rule::expires) {
+        return None;
+    }
+    let written_at = match state.fs().meta().written_at(file_id).await {
+        Ok(written_at) => written_at?,
+        Err(err) => {
+            tracing::warn!(
+                bucket = %bucket.name,
+                key,
+                error = %err,
+                "cannot read when an object was written"
+            );
+            return None;
+        }
+    };
+    header(&rules, key, size, tags, written_at)
 }
 
 /// What one pass of [`apply`] did.
@@ -509,10 +599,14 @@ async fn apply_to_bucket(
                     else {
                         continue;
                     };
-                    if !rule.matches(key, candidate.file.size, &candidate.tags)
-                        || rule
-                            .expires_at(candidate.written_at)
-                            .is_none_or(|at| at > now)
+                    if rule
+                        .expiry(
+                            key,
+                            candidate.file.size,
+                            &candidate.tags,
+                            candidate.written_at,
+                        )
+                        .is_none_or(|at| at > now)
                     {
                         continue;
                     }
@@ -656,6 +750,66 @@ mod tests {
         assert_eq!(rules[0].written_before(1_763_251_199), None);
         assert_eq!(rules[0].written_before(1_763_251_200), Some(None));
         assert_eq!(rules[0].expires_at(0), Some(1_763_251_200));
+    }
+
+    #[test]
+    fn the_earliest_matching_rule_names_the_expiration_header() {
+        let named = |id: &str, days: i32| {
+            let mut rule = rule();
+            rule.id = Some(id.into());
+            rule.expiration = Some(dto::LifecycleExpiration {
+                days: Some(days),
+                ..Default::default()
+            });
+            rule
+        };
+        let dated = |id: &str, prefix: &str| {
+            let mut rule = rule();
+            rule.id = Some(id.into());
+            rule.filter = Some(dto::LifecycleRuleFilter {
+                prefix: Some(prefix.into()),
+                ..Default::default()
+            });
+            rule.expiration = Some(dto::LifecycleExpiration {
+                date: Some(dto::Timestamp::from(
+                    time::OffsetDateTime::from_unix_timestamp(1_763_251_200).unwrap(),
+                )),
+                ..Default::default()
+            });
+            rule
+        };
+        // Earlier dates come from a disabled rule and from one for another prefix.
+        let mut disabled = dated("disabled", "logs/");
+        disabled.status = dto::ExpirationStatus::from_static(dto::ExpirationStatus::DISABLED);
+        let rules = config(vec![
+            named("later", 3),
+            named("sooner", 1),
+            disabled,
+            dated("other", "tmp/"),
+        ])
+        .unwrap();
+        let tags = BTreeMap::new();
+        // Written at 2025-11-16 10:00 UTC.
+        let written = 1_763_287_200;
+        assert_eq!(
+            header(&rules, "logs/a", 3, &tags, written).as_deref(),
+            Some("expiry-date=\"Tue, 18 Nov 2025 00:00:00 GMT\", rule-id=\"sooner\"")
+        );
+        assert_eq!(
+            header(&rules, "tmp/a", 3, &tags, written).as_deref(),
+            Some("expiry-date=\"Sun, 16 Nov 2025 00:00:00 GMT\", rule-id=\"other\"")
+        );
+        assert_eq!(header(&rules, "a", 3, &tags, written), None);
+        // On a tie the first rule names it.
+        let rules = config(vec![named("first", 1), named("second", 1)]).unwrap();
+        assert!(
+            header(&rules, "logs/a", 3, &tags, written)
+                .unwrap()
+                .ends_with("rule-id=\"first\"")
+        );
+        // An ID that cannot be sent in a header leaves the header out.
+        let rules = config(vec![named("a\nb", 1)]).unwrap();
+        assert_eq!(header(&rules, "logs/a", 3, &tags, written), None);
     }
 
     #[test]

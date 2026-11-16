@@ -277,11 +277,13 @@ fi
 
 echo "==> running s3-tests (${S3_TESTS_SELECT}: ${#TESTS[@]} entries) at ${S3_TESTS_COMMIT:0:7}"
 set +e
-# The AWS SDK must not read the user's own configuration.
+# The AWS SDK must not read the user's own configuration. Some tests compare the server's
+# dates with the local clock (`datetime.now()` in the x-amz-expiration tests), so they run in
+# UTC, as on Ceph's test hosts.
 (
   cd "${S3_TESTS}" &&
     S3TEST_CONF="${S3TEST_CONF}" AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null \
-      AWS_EC2_METADATA_DISABLED=true AWS_DEFAULT_REGION=us-east-1 \
+      AWS_EC2_METADATA_DISABLED=true AWS_DEFAULT_REGION=us-east-1 TZ=UTC \
       "${S3_TESTS_PYTHON}" -m pytest -p no:cacheprovider -q -rN --tb=line \
       --junitxml="${JUNIT}" "${TESTS[@]}" ${PYTEST_ARGS[@]+"${PYTEST_ARGS[@]}"}
 ) >"${TEST_LOG}" 2>&1

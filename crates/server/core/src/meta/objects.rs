@@ -333,6 +333,21 @@ impl MetaStore {
         Ok(row.map(ObjectMeta::from))
     }
 
+    /// When the version of file `file_id` its S3 metadata describes was written through the S3
+    /// API (UNIX seconds), if it was: what lifecycle rules count its age from. `None` also for
+    /// a version that only got an ACL or tags (it has no S3 ETag then), as
+    /// [`Self::expiry_candidates`] leaves those out. Like [`Self::object_meta`], the caller
+    /// checks that the metadata belongs to the file's current version.
+    pub async fn written_at(&self, file_id: i64) -> Result<Option<i64>> {
+        let written_at: Option<Option<i64>> = sqlx::query_scalar(
+            "SELECT written_at FROM object_meta WHERE file_id = ?1 AND s3_etag IS NOT NULL",
+        )
+        .bind(file_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(written_at.flatten())
+    }
+
     /// Up to `limit` files of `owner` below the folder `folder` whose current version was
     /// written through the S3 API at or before `written_before` (any time if `None`), after
     /// file id `after`, by id: what the lifecycle rules of a bucket on that folder judge.

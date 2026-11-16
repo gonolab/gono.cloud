@@ -1224,6 +1224,16 @@ pub(crate) async fn complete(
     // the condition now, so that a failed one is a 412 (the install checks it again).
     s3.check_write_condition(&auth, &bucket, &client, &condition)
         .await?;
+    // The headers go out before the parts are assembled (s3s sends those of the finished
+    // answer as trailers, which clients ignore): the object's age counts from now, a moment
+    // before the install records it.
+    let expiration = crate::lifecycle::header(
+        &crate::lifecycle::from_stored(bucket.lifecycle.as_deref()),
+        &input.key,
+        total,
+        &meta.tags,
+        db::unix_now(),
+    );
 
     // From here on the answer is 200 with whitespace until the object is in place; failures
     // arrive as an error document in the body.
@@ -1305,6 +1315,7 @@ pub(crate) async fn complete(
     };
     Ok(S3Response::new(dto::CompleteMultipartUploadOutput {
         future: Some(Box::pin(future)),
+        expiration,
         ..Default::default()
     }))
 }

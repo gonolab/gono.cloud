@@ -142,6 +142,21 @@ impl Fixture {
             .exists()
     }
 
+    /// The `x-amz-expiration` header of the object `key` of the bucket, file `file_id` with
+    /// `tags`.
+    async fn expiration(
+        &self,
+        key: &str,
+        tags: &BTreeMap<String, String>,
+        file_id: i64,
+    ) -> Option<String> {
+        let bucket = s3::bucket(self.state.pool(), "logs")
+            .await
+            .unwrap()
+            .unwrap();
+        lifecycle::expiration(&self.state, &bucket, key, 1, tags, file_id).await
+    }
+
     async fn rules(&self, xml: &str) {
         let bucket = s3::bucket(self.state.pool(), "logs")
             .await
@@ -221,4 +236,71 @@ async fn expired_s3_objects_are_deleted_and_nothing_else() {
         lifecycle::apply(&f.state, db::unix_now()).await.unwrap(),
         lifecycle::Applied::default()
     );
+}
+
+/// The `x-amz-expiration` header of an object: the earliest rule that expires it, counted from
+/// when S3 wrote it; files written through WebDAV get none, even with tags.
+#[tokio::test]
+async fn expiration_headers_count_from_the_s3_write() {
+    let f = fixture().await;
+    f.put_s3("Buckets/logs/tmp/a", &[("kind", "cache")], 0)
+        .await;
+    let meta = f.state.fs().meta();
+    let object = meta
+        .get(f.owner, &RelPath::parse("Buckets/logs/tmp/a").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    // Written at 2025-11-16 10:00 UTC.
+    sqlx::query("UPDATE object_meta SET written_at = 1763287200 WHERE file_id = ?1")
+        .bind(object.id)
+        .execute(f.state.pool())
+        .await
+        .unwrap();
+    // Written through WebDAV, then tagged: S3 metadata without an S3 ETag.
+    let dav = RelPath::parse("Buckets/logs/tmp/dav").unwrap();
+    std::fs::write(dav.to_fs_path(&f.layout.user_files(f.owner)), "dav").unwrap();
+    let dav = meta
+        .record_write(
+            f.owner,
+            &dav,
+            gono_server_core::meta::DiskStat {
+                is_dir: false,
+                mtime_ns: 1,
+                size: 3,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let cache: BTreeMap<String, String> = [("kind".to_owned(), "cache".to_owned())].into();
+    assert!(
+        meta.set_object_tags(dav.id, &dav.etag, &cache)
+            .await
+            .unwrap()
+    );
+
+    // No rules: no header.
+    assert_eq!(f.expiration("tmp/a", &cache, object.id).await, None);
+
+    f.rules(
+        r#"[{"id":"week","enabled":true,"prefix":"","tags":{},
+            "size_greater_than":null,"size_less_than":null,"expiration_days":7,
+            "expiration_date":null,"expired_object_delete_marker":null,"abort_days":null},
+            {"id":"cache","enabled":true,"prefix":"tmp/","tags":{"kind":"cache"},
+            "size_greater_than":null,"size_less_than":null,"expiration_days":2,
+            "expiration_date":null,"expired_object_delete_marker":null,"abort_days":null}]"#,
+    )
+    .await;
+    assert_eq!(
+        f.expiration("tmp/a", &cache, object.id).await.as_deref(),
+        Some("expiry-date=\"Wed, 19 Nov 2025 00:00:00 GMT\", rule-id=\"cache\"")
+    );
+    assert_eq!(
+        f.expiration("tmp/a", &BTreeMap::new(), object.id)
+            .await
+            .as_deref(),
+        Some("expiry-date=\"Mon, 24 Nov 2025 00:00:00 GMT\", rule-id=\"week\"")
+    );
+    assert_eq!(f.expiration("tmp/dav", &cache, dav.id).await, None);
 }

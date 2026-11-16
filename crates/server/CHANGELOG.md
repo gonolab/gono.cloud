@@ -89,7 +89,8 @@ compatible within a major version: released clients keep working with newer serv
   (`PutObjectTagging`, `x-amz-tagging`, `PutBucketTagging` and the rest). Lifecycle rules
   (`PutBucketLifecycleConfiguration`) expire objects after days or on a date, by prefix, tags
   and size, and give up old multipart uploads; unlike S3 they expire only files written
-  through S3, counting from when they were written, never WebDAV files. With
+  through S3, counting from when they were written, never WebDAV files; writes and reads of
+  an object a rule will expire answer with the date and the rule (`x-amz-expiration`). With
   `s3.website_domain`, buckets with a website configuration (`PutBucketWebsite`) are static
   sites at `<bucket>.<domain>`, with index and error documents and redirects. The account page
   and the admin UI show, read-only, each bucket's tag count, its lifecycle rules with what they
