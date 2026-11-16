@@ -76,7 +76,7 @@ pub(crate) fn classify(name: &str) -> Class {
         | "GetBucketPolicyStatus"
         | "ListMultipartUploads" => Class::BucketRead,
         "ListObjects" | "ListObjectsV2" | "ListObjectVersions" => Class::List,
-        "GetObject" | "HeadObject" => Class::ObjectRead,
+        "GetObject" | "HeadObject" | "GetObjectAttributes" => Class::ObjectRead,
         "GetObjectAcl" => Class::ObjectAclRead,
         "PutObject"
         | "PostObject"

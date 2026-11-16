@@ -1677,6 +1677,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "crc-fast",
  "futures-util",
  "gono-server-core",
  "gono-server-dav",

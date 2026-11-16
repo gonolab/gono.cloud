@@ -45,8 +45,12 @@ pub struct ObjectMeta {
     pub expires: Option<String>,
     /// `x-amz-meta-*`: names in lowercase without the prefix.
     pub user_meta: BTreeMap<String, String>,
-    /// The `x-amz-checksum-*` the upload carried.
+    /// The `x-amz-checksum-*` the upload carried, or the checksum of a multipart upload.
     pub checksum: Option<Checksum>,
+    /// The parts of an object written by a multipart upload, in order (empty otherwise).
+    /// Written with the metadata; [`MetaStore::object_meta`] leaves them out, and
+    /// [`MetaStore::object_parts`] reads them.
+    pub parts: Vec<ObjectPart>,
 }
 
 impl ObjectMeta {
@@ -61,8 +65,20 @@ impl ObjectMeta {
 pub struct Checksum {
     /// `CRC32`, `CRC32C`, `CRC64NVME`, `SHA1` or `SHA256`.
     pub algorithm: String,
-    /// The value as sent (base64).
+    /// The value as sent (base64); for a composite checksum followed by `-<parts>`.
     pub value: String,
+    /// A checksum of the parts' checksums (S3's `COMPOSITE`), not of the content
+    /// (`FULL_OBJECT`).
+    pub composite: bool,
+}
+
+/// A part of an object written by a multipart upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectPart {
+    /// Length in bytes.
+    pub size: u64,
+    /// The part's checksum (base64) in the object's checksum algorithm, if it has one.
+    pub checksum: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -78,6 +94,7 @@ struct MetaRow {
     user_meta: String,
     checksum_algorithm: Option<String>,
     checksum_value: Option<String>,
+    checksum_type: Option<String>,
 }
 
 impl From<MetaRow> for ObjectMeta {
@@ -97,7 +114,12 @@ impl From<MetaRow> for ObjectMeta {
             checksum: row
                 .checksum_algorithm
                 .zip(row.checksum_value)
-                .map(|(algorithm, value)| Checksum { algorithm, value }),
+                .map(|(algorithm, value)| Checksum {
+                    algorithm,
+                    value,
+                    composite: row.checksum_type.as_deref() == Some("COMPOSITE"),
+                }),
+            parts: Vec::new(),
         }
     }
 }
@@ -110,11 +132,17 @@ pub(super) async fn store_object_meta(
 ) -> Result<()> {
     let user_meta =
         serde_json::to_string(&meta.user_meta).unwrap_or_else(|_| unreachable!("a string map"));
+    // The parts of the replaced version go first (REPLACE does not cascade without recursive
+    // triggers).
+    sqlx::query("DELETE FROM object_parts WHERE file_id = ?1")
+        .bind(file_id)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query(
         "INSERT OR REPLACE INTO object_meta (file_id, s3_etag, public_read, content_type, \
          content_encoding, content_disposition, content_language, cache_control, expires, \
-         user_meta, checksum_algorithm, checksum_value) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         user_meta, checksum_algorithm, checksum_value, checksum_type) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
     )
     .bind(file_id)
     .bind(meta.s3_etag.as_deref())
@@ -128,13 +156,33 @@ pub(super) async fn store_object_meta(
     .bind(user_meta)
     .bind(meta.checksum.as_ref().map(|c| c.algorithm.as_str()))
     .bind(meta.checksum.as_ref().map(|c| c.value.as_str()))
+    .bind(meta.checksum.as_ref().map(|c| {
+        if c.composite {
+            "COMPOSITE"
+        } else {
+            "FULL_OBJECT"
+        }
+    }))
     .execute(&mut **tx)
     .await?;
+    for (number, part) in (1_i64..).zip(&meta.parts) {
+        sqlx::query(
+            "INSERT INTO object_parts (file_id, part_number, size, checksum) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(file_id)
+        .bind(number)
+        .bind(i64::try_from(part.size).unwrap_or(i64::MAX))
+        .bind(part.checksum.as_deref())
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
 /// Deletes the `object_meta` row of `file_id` inside `tx`, if there is one.
 pub(super) async fn clear_object_meta(tx: &mut db::Tx, file_id: i64) -> Result<()> {
+    // Its parts go with it (`ON DELETE CASCADE`).
     sqlx::query("DELETE FROM object_meta WHERE file_id = ?1")
         .bind(file_id)
         .execute(&mut **tx)
@@ -247,12 +295,31 @@ impl MetaStore {
         let row: Option<MetaRow> = sqlx::query_as(
             "SELECT s3_etag, public_read, content_type, content_encoding, content_disposition, \
              content_language, cache_control, expires, user_meta, checksum_algorithm, \
-             checksum_value FROM object_meta WHERE file_id = ?1",
+             checksum_value, checksum_type FROM object_meta WHERE file_id = ?1",
         )
         .bind(file_id)
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(ObjectMeta::from))
+    }
+
+    /// The parts of file `file_id`'s current version, in order, if a multipart upload wrote
+    /// it (empty otherwise). Like [`Self::object_meta`], they describe the version the S3 API
+    /// wrote, which the caller checks.
+    pub async fn object_parts(&self, file_id: i64) -> Result<Vec<ObjectPart>> {
+        let rows: Vec<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT size, checksum FROM object_parts WHERE file_id = ?1 ORDER BY part_number",
+        )
+        .bind(file_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(size, checksum)| ObjectPart {
+                size: u64::try_from(size).unwrap_or(0),
+                checksum,
+            })
+            .collect())
     }
 
     /// Sets or clears the `public-read` ACL of the version of file `file_id` whose WebDAV ETag

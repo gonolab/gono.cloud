@@ -17,7 +17,7 @@ use s3s::{
     S3Error, S3ErrorCode, S3Result,
     checksum::ChecksumHasher,
     crypto::{Checksum as _, Md5},
-    dto::{Checksum, StreamingBlob},
+    dto::{self, Checksum, StreamingBlob},
     s3_error,
 };
 use tokio::io::AsyncWriteExt as _;
@@ -70,7 +70,7 @@ fn field_mut<'a>(checksum: &'a mut Checksum, algorithm: &str) -> &'a mut Option<
     }
 }
 
-/// A checksum stored with an object, as returned in a response.
+/// A checksum stored with an object, as returned in a response, with its type.
 pub(crate) fn stored_checksum(stored: Option<&meta::Checksum>) -> Checksum {
     let mut checksum = Checksum::default();
     if let Some(stored) = stored
@@ -79,6 +79,14 @@ pub(crate) fn stored_checksum(stored: Option<&meta::Checksum>) -> Checksum {
             .find(|(algorithm, _)| *algorithm == stored.algorithm)
     {
         *field_mut(&mut checksum, algorithm) = Some(stored.value.clone());
+        checksum.checksum_type = Some(dto::ChecksumType::from(
+            if stored.composite {
+                "COMPOSITE"
+            } else {
+                "FULL_OBJECT"
+            }
+            .to_owned(),
+        ));
     }
     checksum
 }
@@ -283,7 +291,8 @@ pub(crate) async fn receive(
     })
 }
 
-fn enable(hasher: &mut ChecksumHasher, algorithm: &str) {
+/// Turns on `algorithm` in `hasher`.
+pub(crate) fn enable(hasher: &mut ChecksumHasher, algorithm: &str) {
     match algorithm {
         "CRC32" => hasher.crc32 = Some(Default::default()),
         "CRC32C" => hasher.crc32c = Some(Default::default()),
@@ -357,6 +366,7 @@ pub(crate) fn verify(
         stored.get_or_insert_with(|| meta::Checksum {
             algorithm: algorithm.to_owned(),
             value: expected.clone(),
+            composite: false,
         });
     }
     Ok(stored)
@@ -510,6 +520,7 @@ mod tests {
         let checksum = stored_checksum(Some(&meta::Checksum {
             algorithm: "CRC32C".into(),
             value: "v".into(),
+            composite: false,
         }));
         assert_eq!(checksum.checksum_crc32c.as_deref(), Some("v"));
         assert_eq!(checksum.checksum_crc32, None);

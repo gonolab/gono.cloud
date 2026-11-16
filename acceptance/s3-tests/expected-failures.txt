@@ -63,18 +63,8 @@ s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_prefix_ends_with_del
 # nothing.
 s3tests/functional/test_s3.py::test_delete_marker_nonversioned
 
-# Not supported yet: checksums of multipart uploads (ChecksumAlgorithm on CreateMultipartUpload,
-# part checksums at completion, composite checksums).
-s3tests/functional/test_s3.py::test_multipart_checksum_sha256
-s3tests/functional/test_s3.py::test_multipart_reupload_checksum_and_etag
-s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc32
-s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc32c
-s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc64nvme
-s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_sha1
-s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_sha256
-
-# Design: objects keep no part boundaries, so GetObject with partNumber serves the whole object
-# as part 1 (no x-amz-mp-parts-count), and other part numbers answer 416 InvalidPartNumber.
+# A part number the object does not have answers 416 InvalidPartNumber, as S3 documents; RGW
+# answers 400 InvalidPart (the parts themselves are read as expected).
 s3tests/functional/test_s3.py::test_multipart_get_part
 s3tests/functional/test_s3.py::test_multipart_single_get_part
 s3tests/functional/test_s3.py::test_non_multipart_get_part

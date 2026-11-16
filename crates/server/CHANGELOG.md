@@ -83,6 +83,9 @@ compatible within a major version: released clients keep working with newer serv
   `If-Match` (an ETag or `*`). `ListBuckets` answers in pages. In `us-east-1`, a `CreateBucket` of one's own bucket
   succeeds and resets the bucket's ACL, as in S3. Responses carry a request id
   (`x-amz-request-id`, and `RequestId` in error documents), which the request log records.
+  Multipart uploads take a checksum algorithm and type (`COMPOSITE` or `FULL_OBJECT`, the
+  latter combined from the parts' CRCs), as current AWS SDKs send by default; objects keep
+  their parts for `partNumber` reads and `GetObjectAttributes`.
   `ListObjectVersions` lists each object as its only version, `null` (versioning is
   never enabled), which cleanup tools need. Keys need not be in Unicode NFC (names from older
   macOS are NFD): the tree stores the NFC name and S3 keeps the key's spelling

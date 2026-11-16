@@ -6,8 +6,8 @@ use gono_server_core::{
     config::DbConfig,
     db::{self, OpenMode, Pool},
     meta::{
-        Checksum, DeadProp, DiskStat, ListEntry, MetaStore, ObjectListing, ObjectMeta, ObjectQuery,
-        PropChange,
+        Checksum, DeadProp, DiskStat, ListEntry, MetaStore, ObjectListing, ObjectMeta, ObjectPart,
+        ObjectQuery, PropChange,
     },
     users::{self, NewUser},
 };
@@ -1037,6 +1037,7 @@ fn object(etag: &str) -> ObjectMeta {
         checksum: Some(Checksum {
             algorithm: "CRC32".to_owned(),
             value: "AAAAAA==".to_owned(),
+            composite: false,
         }),
         ..ObjectMeta::default()
     }
@@ -1147,6 +1148,54 @@ async fn object_meta_belongs_to_one_version() {
         .await
         .unwrap();
     assert_eq!(orphans, 0);
+}
+
+/// The parts of a multipart object are stored with its metadata, in order, and go with it.
+#[tokio::test]
+async fn object_parts_belong_to_one_version() {
+    let f = fixture().await;
+    f.mkdir("b").await;
+    let parts = vec![
+        ObjectPart {
+            size: 5,
+            checksum: Some("one".to_owned()),
+        },
+        ObjectPart {
+            size: 2,
+            checksum: Some("two".to_owned()),
+        },
+    ];
+    let multipart = ObjectMeta {
+        checksum: Some(Checksum {
+            algorithm: "SHA256".to_owned(),
+            value: "sum-2".to_owned(),
+            composite: true,
+        }),
+        parts: parts.clone(),
+        ..object("md5-2")
+    };
+    let id = f.put_object("b/big", 7, &multipart).await;
+    let stored = f.object_meta("b/big").await.unwrap();
+    assert_eq!(stored.checksum, multipart.checksum, "composite survives");
+    assert!(stored.parts.is_empty(), "read on their own");
+    assert_eq!(f.store.object_parts(id).await.unwrap(), parts);
+
+    // An ACL change keeps them, another S3 write replaces them, a WebDAV write removes them.
+    let etag = f
+        .store
+        .get(f.owner, &p("b/big"))
+        .await
+        .unwrap()
+        .unwrap()
+        .etag;
+    assert!(f.store.set_object_public(id, &etag, true).await.unwrap());
+    assert_eq!(f.store.object_parts(id).await.unwrap(), parts);
+    let single = object("md5-single");
+    f.put_object("b/big", 3, &single).await;
+    assert!(f.store.object_parts(id).await.unwrap().is_empty());
+    f.put_object("b/big", 7, &multipart).await;
+    assert_eq!(f.write("b/big", 9).await, id);
+    assert!(f.store.object_parts(id).await.unwrap().is_empty());
 }
 
 #[tokio::test]

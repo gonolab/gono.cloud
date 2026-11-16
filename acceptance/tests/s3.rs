@@ -23,8 +23,8 @@ use aws_sdk_s3::{
     presigning::PresigningConfig,
     primitives::{ByteStream, DateTime, DateTimeFormat},
     types::{
-        BucketCannedAcl, CompletedMultipartUpload, CompletedPart, CorsConfiguration, CorsRule,
-        ObjectCannedAcl,
+        BucketCannedAcl, ChecksumAlgorithm, ChecksumMode, ChecksumType, CompletedMultipartUpload,
+        CompletedPart, CorsConfiguration, CorsRule, ObjectAttributes, ObjectCannedAcl,
     },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -1777,6 +1777,177 @@ async fn the_download_policy_publishes_a_bucket() {
         .send()
         .await
         .unwrap();
+}
+
+/// A multipart upload with a full-object CRC32: the SDK checks the object's checksum when it
+/// downloads it, `partNumber` reads one part with its checksum, `GetObjectAttributes` lists the
+/// parts, and a WebDAV overwrite leaves a file of one part.
+#[tokio::test]
+async fn multipart_objects_keep_their_parts_and_checksums() {
+    let s3 = require!(S3::new(), "S3 is not configured");
+    let prefix = unique_name("s3");
+    let key = s3.key(&prefix, "parts.bin");
+    let parts = [vec![b'p'; 5 * 1024 * 1024], b"tail".to_vec()];
+    let created = s3
+        .client
+        .create_multipart_upload()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .checksum_type(ChecksumType::FullObject)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.checksum_type(), Some(&ChecksumType::FullObject));
+    let upload_id = created.upload_id().unwrap();
+    let mut completed = Vec::new();
+    let mut part_sums = Vec::new();
+    for (number, body) in (1..).zip(&parts) {
+        let uploaded = s3
+            .client
+            .upload_part()
+            .bucket(&s3.bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .part_number(number)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await
+            .unwrap();
+        let sum = uploaded.checksum_crc32().unwrap().to_owned();
+        completed.push(
+            CompletedPart::builder()
+                .part_number(number)
+                .e_tag(uploaded.e_tag().unwrap())
+                .checksum_crc32(&sum)
+                .build(),
+        );
+        part_sums.push(sum);
+    }
+    let done = s3
+        .client
+        .complete_multipart_upload()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed))
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(done.checksum_type(), Some(&ChecksumType::FullObject));
+    let object_sum = done.checksum_crc32().unwrap().to_owned();
+    assert!(
+        !object_sum.contains('-'),
+        "a full-object checksum: {object_sum}"
+    );
+
+    // The SDK compares the body with the full-object CRC32 as it reads it.
+    let whole = s3
+        .client
+        .get_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(whole.checksum_crc32(), Some(object_sum.as_str()));
+    assert_eq!(whole.checksum_type(), Some(&ChecksumType::FullObject));
+    let body = whole.body.collect().await.unwrap().to_vec();
+    assert_eq!(body, parts.concat());
+
+    let second = s3
+        .client
+        .get_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .part_number(2)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.parts_count(), Some(2));
+    assert_eq!(second.content_length(), Some(4));
+    assert_eq!(second.checksum_crc32(), Some(part_sums[1].as_str()));
+    assert_eq!(second.body.collect().await.unwrap().to_vec(), b"tail");
+    let head = s3
+        .client
+        .head_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .part_number(1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.content_length(), Some(5 * 1024 * 1024));
+    assert_eq!(head.parts_count(), Some(2));
+    let missing = s3
+        .client
+        .get_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .part_number(3)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        missing.raw_response().map(|r| r.status().as_u16()),
+        Some(416)
+    );
+
+    let attributes = s3
+        .client
+        .get_object_attributes()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .object_attributes(ObjectAttributes::Checksum)
+        .object_attributes(ObjectAttributes::ObjectParts)
+        .object_attributes(ObjectAttributes::ObjectSize)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(attributes.object_size(), Some(5 * 1024 * 1024 + 4));
+    assert_eq!(
+        attributes.checksum().and_then(|c| c.checksum_crc32()),
+        Some(object_sum.as_str())
+    );
+    let listed = attributes.object_parts().unwrap();
+    assert_eq!(listed.total_parts_count(), Some(2));
+    let sizes: Vec<Option<i64>> = listed.parts().iter().map(|part| part.size()).collect();
+    assert_eq!(sizes, [Some(5 * 1024 * 1024), Some(4)]);
+
+    // Written through WebDAV, the file is one part without a checksum.
+    let dav = s3.ctx.dav();
+    dav.put(&s3.webdav_path(&key), "via webdav")
+        .await
+        .expect_success();
+    let single = s3
+        .client
+        .get_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .part_number(1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(single.parts_count(), None);
+    assert_eq!(single.body.collect().await.unwrap().to_vec(), b"via webdav");
+    let gone = s3
+        .client
+        .get_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .part_number(2)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(gone.raw_response().map(|r| r.status().as_u16()), Some(416));
+    s3.clean(&s3.bucket, &prefix).await;
 }
 
 /// In us-east-1 (the region the suite signs for), S3 answers a CreateBucket of a bucket the

@@ -688,6 +688,48 @@ impl GonoS3 {
         }
     }
 
+    /// Part `number` of the file `entry` (with S3 metadata `meta`), for `partNumber` reads.
+    async fn object_part(
+        &self,
+        entry: &Entry,
+        meta: Option<&ObjectMeta>,
+        number: i32,
+    ) -> S3Result<PartRead> {
+        let parts = match (meta, entry.file_id) {
+            (Some(_), Some(file_id)) if !entry.is_dir() => self
+                .state
+                .fs()
+                .meta()
+                .object_parts(file_id)
+                .await
+                .map_err(error::database)?,
+            _ => Vec::new(),
+        };
+        let index = usize::try_from(number)
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .ok_or_else(invalid_part_number)?;
+        if parts.is_empty() {
+            return if index == 0 {
+                Ok(PartRead {
+                    start: 0,
+                    length: if entry.is_dir() { 0 } else { entry.size },
+                    checksum: None,
+                    count: None,
+                })
+            } else {
+                Err(invalid_part_number())
+            };
+        }
+        let part = parts.get(index).ok_or_else(invalid_part_number)?;
+        Ok(PartRead {
+            start: parts[..index].iter().map(|part| part.size).sum(),
+            length: part.size,
+            checksum: part.checksum.clone(),
+            count: Some(parts.len()),
+        })
+    }
+
     /// Writes the body of `PutObject` (or an empty folder marker).
     async fn put(&self, req: S3Request<dto::PutObjectInput>) -> S3Result<dto::PutObjectOutput> {
         let auth = authorized(&req)?;
@@ -792,6 +834,7 @@ impl GonoS3 {
             expires: input.expires,
             user_meta: user_meta(input.metadata),
             checksum: checksum.clone(),
+            parts: Vec::new(),
         };
         if let Some(time) = upload::mtime_of(&meta) {
             upload::set_mtime(received.temp.path(), time).await?;
@@ -830,7 +873,119 @@ fn upload_output(checksum: Option<&gono_server_core::meta::Checksum>) -> dto::Pu
         checksum_xxhash128: checksum.checksum_xxhash128,
         checksum_xxhash3: checksum.checksum_xxhash3,
         checksum_xxhash64: checksum.checksum_xxhash64,
+        checksum_type: checksum.checksum_type,
         ..Default::default()
+    }
+}
+
+/// One part of an object, as `partNumber` names it.
+#[derive(Debug)]
+struct PartRead {
+    /// Its first byte in the object.
+    start: u64,
+    /// Its length in bytes.
+    length: u64,
+    /// Its checksum (base64) in the object's algorithm.
+    checksum: Option<String>,
+    /// How many parts the object has; `None` if a multipart upload did not write it (it is its
+    /// own and only part then).
+    count: Option<usize>,
+}
+
+/// S3's answer to a part number the object does not have.
+fn invalid_part_number() -> S3Error {
+    let mut err = S3Error::with_message(
+        S3ErrorCode::Custom("InvalidPartNumber".into()),
+        "The requested partnumber is not satisfiable",
+    );
+    err.set_status_code(http::StatusCode::RANGE_NOT_SATISFIABLE);
+    err
+}
+
+/// The checksum to answer a read with (only with `x-amz-checksum-mode`): the object's for the
+/// whole object, a part's for one part of a multipart object, none for a byte range.
+fn read_checksum(
+    mode: bool,
+    meta: Option<&ObjectMeta>,
+    part: Option<&PartRead>,
+    whole: bool,
+) -> dto::Checksum {
+    let Some(stored) = meta
+        .and_then(|meta| meta.checksum.as_ref())
+        .filter(|_| mode)
+    else {
+        return dto::Checksum::default();
+    };
+    match part {
+        Some(PartRead {
+            count: Some(_),
+            checksum,
+            ..
+        }) => upload::stored_checksum(
+            checksum
+                .as_ref()
+                .map(|value| gono_server_core::meta::Checksum {
+                    value: value.clone(),
+                    ..stored.clone()
+                })
+                .as_ref(),
+        ),
+        _ if whole => upload::stored_checksum(Some(stored)),
+        _ => dto::Checksum::default(),
+    }
+}
+
+/// The page of `parts` `GetObjectAttributes` asks for (`part-number-marker`, `max-parts`, at most
+/// 1000), with their sizes and, if the object has a checksum, their checksums.
+fn object_parts_page(
+    parts: &[gono_server_core::meta::ObjectPart],
+    checksum: Option<&gono_server_core::meta::Checksum>,
+    input: &dto::GetObjectAttributesInput,
+) -> dto::GetObjectAttributesParts {
+    let marker = input
+        .part_number_marker
+        .and_then(|marker| usize::try_from(marker).ok())
+        .unwrap_or(0);
+    let max = input
+        .max_parts
+        .and_then(|max| usize::try_from(max).ok())
+        .map_or(1000, |max| max.min(1000));
+    let listed: Vec<dto::ObjectPart> = parts
+        .iter()
+        .enumerate()
+        .skip(marker)
+        .take(max)
+        .map(|(index, part)| {
+            let fields = upload::stored_checksum(
+                checksum
+                    .zip(part.checksum.as_ref())
+                    .map(|(checksum, value)| gono_server_core::meta::Checksum {
+                        value: value.clone(),
+                        ..checksum.clone()
+                    })
+                    .as_ref(),
+            );
+            dto::ObjectPart {
+                part_number: i32::try_from(index + 1).ok(),
+                size: i64::try_from(part.size).ok(),
+                checksum_crc32: fields.checksum_crc32,
+                checksum_crc32c: fields.checksum_crc32c,
+                checksum_crc64nvme: fields.checksum_crc64nvme,
+                checksum_sha1: fields.checksum_sha1,
+                checksum_sha256: fields.checksum_sha256,
+                ..Default::default()
+            }
+        })
+        .collect();
+    let next = marker + listed.len();
+    let truncated = next < parts.len();
+    dto::GetObjectAttributesParts {
+        total_parts_count: i32::try_from(parts.len()).ok(),
+        part_number_marker: input.part_number_marker,
+        next_part_number_marker: truncated.then(|| i32::try_from(next).ok()).flatten(),
+        max_parts: i32::try_from(max).ok(),
+        is_truncated: Some(truncated),
+        parts: Some(listed),
     }
 }
 
@@ -1568,14 +1723,11 @@ impl S3 for GonoS3 {
         {
             return Err(s3_error!(NoSuchVersion));
         }
-        if input.part_number.is_some_and(|part| part != 1) {
-            // Objects keep no part boundaries; the whole object is its only part.
-            let mut err = S3Error::with_message(
-                S3ErrorCode::Custom("InvalidPartNumber".into()),
-                "The object has a single part",
-            );
-            err.set_status_code(http::StatusCode::RANGE_NOT_SATISFIABLE);
-            return Err(err);
+        if input.part_number.is_some() && input.range.is_some() {
+            return Err(s3_error!(
+                InvalidRequest,
+                "Cannot specify both Range header and partNumber query parameter"
+            ));
         }
         let (client, entry, meta, file) = self.open_for_read(&auth, &input.key).await?;
         let etag = if entry.is_dir() {
@@ -1593,14 +1745,30 @@ impl S3 for GonoS3 {
         )
         .map_err(|err| with_validators(err, &etag, entry.modified))?;
         let size = if entry.is_dir() { 0 } else { entry.size };
-        let (start, length, content_range) = match input.range {
-            Some(range) => {
+        let part = match input.part_number {
+            Some(number) => Some(self.object_part(&entry, meta.as_ref(), number).await?),
+            None => None,
+        };
+        let (start, length, content_range) = match (&part, input.range) {
+            // A part of a multipart object is answered like a range of it.
+            (Some(part), _) if part.count.is_some() && part.length > 0 => (
+                part.start,
+                part.length,
+                Some(format!(
+                    "bytes {}-{}/{size}",
+                    part.start,
+                    part.start + part.length - 1
+                )),
+            ),
+            (Some(part), _) => (part.start, part.length, None),
+            (None, Some(range)) => {
                 let range = range.check(size)?;
                 let content_range = format!("bytes {}-{}/{size}", range.start, range.end - 1);
                 (range.start, range.end - range.start, Some(content_range))
             }
-            None => (0, size, None),
+            (None, None) => (0, size, None),
         };
+        let whole = start == 0 && length == size;
         let body = match file {
             Some(file) => {
                 let mut file = tokio::fs::File::from_std(file);
@@ -1614,12 +1782,16 @@ impl S3 for GonoS3 {
             }
             None => dto::StreamingBlob::from(Bytes::new()),
         };
-        let full = content_range.is_none();
-        let checksum = if full && input.checksum_mode.is_some() {
-            upload::stored_checksum(meta.as_ref().and_then(|meta| meta.checksum.as_ref()))
-        } else {
-            dto::Checksum::default()
-        };
+        let checksum = read_checksum(
+            input.checksum_mode.is_some(),
+            meta.as_ref(),
+            part.as_ref(),
+            whole,
+        );
+        let parts_count = part
+            .as_ref()
+            .and_then(|part| part.count)
+            .and_then(|count| i32::try_from(count).ok());
         let meta = meta.unwrap_or_default();
         let mut response = S3Response::new(dto::GetObjectOutput {
             body: Some(body),
@@ -1653,6 +1825,8 @@ impl S3 for GonoS3 {
             checksum_crc64nvme: checksum.checksum_crc64nvme,
             checksum_sha1: checksum.checksum_sha1,
             checksum_sha256: checksum.checksum_sha256,
+            checksum_type: checksum.checksum_type,
+            parts_count,
             ..Default::default()
         });
         nosniff(&mut response.headers, anonymous);
@@ -1689,14 +1863,24 @@ impl S3 for GonoS3 {
         )
         .map_err(|err| with_validators(err, &etag, entry.modified))?;
         let size = if entry.is_dir() { 0 } else { entry.size };
-        let checksum = if input.checksum_mode.is_some() {
-            upload::stored_checksum(meta.as_ref().and_then(|meta| meta.checksum.as_ref()))
-        } else {
-            dto::Checksum::default()
+        let part = match input.part_number {
+            Some(number) => Some(self.object_part(&entry, meta.as_ref(), number).await?),
+            None => None,
         };
+        let checksum = read_checksum(
+            input.checksum_mode.is_some(),
+            meta.as_ref(),
+            part.as_ref(),
+            true,
+        );
+        let length = part.as_ref().map_or(size, |part| part.length);
+        let parts_count = part
+            .as_ref()
+            .and_then(|part| part.count)
+            .and_then(|count| i32::try_from(count).ok());
         let meta = meta.unwrap_or_default();
         let mut response = S3Response::new(dto::HeadObjectOutput {
-            content_length: Some(i64::try_from(size).unwrap_or(i64::MAX)),
+            content_length: Some(i64::try_from(length).unwrap_or(i64::MAX)),
             accept_ranges: Some("bytes".to_owned()),
             last_modified: Some(Timestamp::from(entry.modified)),
             e_tag: Some(ETag::Strong(etag)),
@@ -1712,10 +1896,77 @@ impl S3 for GonoS3 {
             checksum_crc64nvme: checksum.checksum_crc64nvme,
             checksum_sha1: checksum.checksum_sha1,
             checksum_sha256: checksum.checksum_sha256,
+            checksum_type: checksum.checksum_type,
+            parts_count,
             ..Default::default()
         });
         nosniff(&mut response.headers, anonymous);
         Ok(response)
+    }
+
+    async fn get_object_attributes(
+        &self,
+        req: S3Request<dto::GetObjectAttributesInput>,
+    ) -> S3Result<S3Response<dto::GetObjectAttributesOutput>> {
+        let auth = authorized(&req)?;
+        let input = req.input;
+        if input
+            .version_id
+            .as_deref()
+            .is_some_and(|id| id != NULL_VERSION)
+        {
+            return Err(s3_error!(NoSuchVersion));
+        }
+        if input.sse_customer_algorithm.is_some() {
+            return Err(s3_error!(
+                NotImplemented,
+                "Server-side encryption is not supported"
+            ));
+        }
+        let (_, entry, meta, _) = self.open_for_read(&auth, &input.key).await?;
+        // Clients send the attributes in one header, separated by commas; s3s may hand them
+        // over as one value.
+        let wanted = |name: &str| {
+            input
+                .object_attributes
+                .iter()
+                .flat_map(|attribute| attribute.as_str().split(','))
+                .any(|attribute| attribute.trim().eq_ignore_ascii_case(name))
+        };
+        let size = if entry.is_dir() { 0 } else { entry.size };
+        let etag = if entry.is_dir() {
+            EMPTY_MD5.to_owned()
+        } else {
+            etag_of(&entry, meta.as_ref())
+        };
+        let stored = meta.as_ref().and_then(|meta| meta.checksum.as_ref());
+        let checksum =
+            (wanted("Checksum") && stored.is_some()).then(|| upload::stored_checksum(stored));
+        let object_parts = if wanted("ObjectParts") {
+            let parts = match (&meta, entry.file_id) {
+                (Some(_), Some(file_id)) if !entry.is_dir() => self
+                    .state
+                    .fs()
+                    .meta()
+                    .object_parts(file_id)
+                    .await
+                    .map_err(error::database)?,
+                _ => Vec::new(),
+            };
+            (!parts.is_empty()).then(|| object_parts_page(&parts, stored, &input))
+        } else {
+            None
+        };
+        Ok(S3Response::new(dto::GetObjectAttributesOutput {
+            e_tag: wanted("ETag").then_some(ETag::Strong(etag)),
+            last_modified: Some(Timestamp::from(entry.modified)),
+            object_size: wanted("ObjectSize").then(|| i64::try_from(size).unwrap_or(i64::MAX)),
+            storage_class: wanted("StorageClass")
+                .then(|| dto::StorageClass::from_static(dto::StorageClass::STANDARD)),
+            checksum,
+            object_parts,
+            ..Default::default()
+        }))
     }
 
     async fn delete_object(
@@ -1863,9 +2114,19 @@ impl S3 for GonoS3 {
                  without changing the object's metadata"
             ));
         }
-        let source_meta = source_meta.unwrap_or_default();
         // An S3 ETag of the content (an MD5) stays valid for an identical copy; a WebDAV ETag
-        // belongs to its version and does not.
+        // belongs to its version and does not. A multipart ETag keeps its parts.
+        let parts = match (&source_meta, source_entry.file_id) {
+            (Some(_), Some(file_id)) => self
+                .state
+                .fs()
+                .meta()
+                .object_parts(file_id)
+                .await
+                .map_err(error::database)?,
+            _ => Vec::new(),
+        };
+        let source_meta = source_meta.unwrap_or_default();
         let s3_etag = source_meta.s3_etag.clone();
         let meta = if replace {
             ObjectMeta {
@@ -1879,11 +2140,13 @@ impl S3 for GonoS3 {
                 expires: input.expires,
                 user_meta: user_meta(input.metadata),
                 checksum: source_meta.checksum,
+                parts,
             }
         } else {
             ObjectMeta {
                 s3_etag,
                 public_read: public,
+                parts,
                 ..source_meta
             }
         };

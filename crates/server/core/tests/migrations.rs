@@ -81,6 +81,7 @@ async fn migrations_apply_to_an_empty_database() {
             "locks",
             "login_flows",
             "object_meta",
+            "object_parts",
             "recovery_codes",
             "retired_usernames",
             "revocations_applied",

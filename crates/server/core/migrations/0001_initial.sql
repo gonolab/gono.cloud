@@ -199,7 +199,10 @@ CREATE TABLE s3_uploads (
     -- The ETag of the object, once the upload is completed. A completed upload has no parts
     -- left; it is kept for a while so that a client repeating the completion (a retry after a
     -- lost answer) gets the same answer, as from S3.
-    completed_etag TEXT
+    completed_etag TEXT,
+    -- The checksum of the object (base64, as answered), once the upload is completed, if the
+    -- upload has a checksum algorithm (in `meta`).
+    completed_checksum TEXT
 ) STRICT;
 
 CREATE INDEX s3_uploads_bucket_key ON s3_uploads (bucket_id, key);
@@ -215,6 +218,8 @@ CREATE TABLE s3_upload_parts (
     etag        TEXT    NOT NULL,
     size        INTEGER NOT NULL CHECK (size >= 0),
     uploaded_at INTEGER NOT NULL,
+    -- The part's checksum (base64) in the upload's checksum algorithm, if it has one.
+    checksum    TEXT,
     PRIMARY KEY (upload_id, part_number)
 ) STRICT;
 
@@ -253,10 +258,26 @@ CREATE TABLE object_meta (
     -- `x-amz-meta-*` as a JSON object of strings, names in lowercase without the prefix.
     user_meta           TEXT    NOT NULL DEFAULT '{}',
     -- The `x-amz-checksum-*` the upload carried: algorithm (`CRC32`, `CRC32C`, `CRC64NVME`,
-    -- `SHA1`, `SHA256`) and the value as sent (base64).
+    -- `SHA1`, `SHA256`) and the value as sent (base64). For a multipart upload, the checksum
+    -- of the whole content (`FULL_OBJECT`) or of the parts' checksums (`COMPOSITE`, value
+    -- `<base64>-<parts>`).
     checksum_algorithm  TEXT,
     checksum_value      TEXT,
-    CHECK ((checksum_algorithm IS NULL) = (checksum_value IS NULL))
+    checksum_type       TEXT    CHECK (checksum_type IN ('FULL_OBJECT', 'COMPOSITE')),
+    CHECK ((checksum_algorithm IS NULL) = (checksum_value IS NULL)),
+    CHECK (checksum_type IS NULL OR checksum_algorithm IS NOT NULL)
+) STRICT;
+
+-- The parts of an object written by a multipart upload, numbered 1 to the number of parts in
+-- the object's order: `GetObject` and `HeadObject` with `partNumber` read one of them, and
+-- `GetObjectAttributes` lists them. Written with the `object_meta` row and gone with it.
+CREATE TABLE object_parts (
+    file_id     INTEGER NOT NULL REFERENCES object_meta (file_id) ON DELETE CASCADE,
+    part_number INTEGER NOT NULL CHECK (part_number BETWEEN 1 AND 10000),
+    size        INTEGER NOT NULL CHECK (size >= 0),
+    -- The part's checksum (base64) in the object's checksum algorithm, if it has one.
+    checksum    TEXT,
+    PRIMARY KEY (file_id, part_number)
 ) STRICT;
 
 -- Append-only journal of changes per owner, written in the same transaction as the change.

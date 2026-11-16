@@ -17,6 +17,11 @@
 //!   upload takes no parts and no second completion. `If-Match` and `If-None-Match` are checked
 //!   before the answer starts, so a failed condition is a real `412` (the install checks them
 //!   again).
+//! - **Checksums** ([`crate::checksums`]): an upload created with a checksum algorithm gets
+//!   every part's checksum in it (computed here, and compared with what the client sent), and
+//!   its completion the object's checksum derived from the parts (`COMPOSITE` or
+//!   `FULL_OBJECT`), compared with the one the completion names. The object keeps its parts'
+//!   sizes and checksums, for `partNumber` reads and `GetObjectAttributes`.
 //! - **Repeated completions**: a completed upload is kept, without parts, for
 //!   [`COMPLETED_KEEP`], and a completion of it with the same parts answers as the first did,
 //!   as in S3, so that a client retrying after a lost answer does not fail. Every other
@@ -33,13 +38,13 @@ use std::{
 
 use gono_server_core::{
     db,
-    meta::{Checksum, ObjectMeta},
+    meta::{Checksum, ObjectMeta, ObjectPart},
     s3::{self, Bucket, Upload, UploadPart},
 };
 use gono_server_dav::ObjectError;
 use rand::RngExt as _;
 use s3s::{
-    S3Request, S3Response, S3Result,
+    S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     crypto::{Checksum as _, Md5},
     dto::{self, ETag, Timestamp},
     s3_error,
@@ -48,6 +53,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     access::{Authorized, Caller},
+    checksums::UploadChecksum,
     error,
     keys::{self, Target},
     ops::GonoS3,
@@ -82,8 +88,8 @@ fn timestamp_from_secs(seconds: i64) -> Timestamp {
     Timestamp::from(UNIX_EPOCH + Duration::from_secs(u64::try_from(seconds).unwrap_or(0)))
 }
 
-/// The metadata of the object to create, as stored with the upload.
-fn meta_to_json(meta: &ObjectMeta) -> String {
+/// The metadata of the object to create and the upload's checksum, as stored with the upload.
+fn meta_to_json(meta: &ObjectMeta, checksum: Option<UploadChecksum>) -> String {
     let user: Map<String, Value> = meta
         .user_meta
         .iter()
@@ -98,8 +104,19 @@ fn meta_to_json(meta: &ObjectMeta) -> String {
         "cache_control": meta.cache_control,
         "expires": meta.expires,
         "user_meta": user,
+        "checksum_algorithm": checksum.map(|checksum| checksum.algorithm),
+        "checksum_type": checksum.map(UploadChecksum::type_name),
     })
     .to_string()
+}
+
+/// The checksum algorithm and type stored with an upload, if it has one.
+fn checksum_from_json(value: &str) -> Option<UploadChecksum> {
+    let value: Value = serde_json::from_str(value).ok()?;
+    UploadChecksum::stored(
+        value.get("checksum_algorithm")?.as_str()?,
+        value.get("checksum_type")?.as_str()?,
+    )
 }
 
 fn meta_from_json(value: &str) -> ObjectMeta {
@@ -127,6 +144,7 @@ fn meta_from_json(value: &str) -> ObjectMeta {
             })
             .unwrap_or_default(),
         checksum: None::<Checksum>,
+        parts: Vec::new(),
     }
 }
 
@@ -210,6 +228,13 @@ pub(crate) async fn create(
         }
         Err(err) => return Err(error::key(&err)),
     }
+    let checksum = UploadChecksum::requested(
+        input
+            .checksum_algorithm
+            .as_ref()
+            .map(dto::ChecksumAlgorithm::as_str),
+        input.checksum_type.as_ref().map(dto::ChecksumType::as_str),
+    )?;
     let meta = ObjectMeta {
         public_read: public,
         content_type: input.content_type,
@@ -232,7 +257,7 @@ pub(crate) async fn create(
         state.pool(),
         bucket.id,
         &input.key,
-        &meta_to_json(&meta),
+        &meta_to_json(&meta, checksum),
         now,
         now.saturating_add(ttl),
     )
@@ -244,6 +269,10 @@ pub(crate) async fn create(
         bucket: Some(bucket.name.clone()),
         key: Some(input.key),
         upload_id: Some(upload_id),
+        checksum_algorithm: checksum
+            .map(|checksum| dto::ChecksumAlgorithm::from(checksum.algorithm.to_owned())),
+        checksum_type: checksum
+            .map(|checksum| dto::ChecksumType::from(checksum.type_name().to_owned())),
         ..Default::default()
     }))
 }
@@ -266,10 +295,11 @@ pub(crate) async fn upload_part(
     if input.sse_customer_algorithm.is_some() {
         return Err(s3_error!(NotImplemented));
     }
-    find_open_upload(state, bucket, &input.key, &input.upload_id).await?;
+    let upload = find_open_upload(state, bucket, &input.key, &input.upload_id).await?;
     if state.is_completing(&input.upload_id) {
         return Err(s3_error!(OperationAborted, "The upload is being completed"));
     }
+    let upload_checksum = checksum_from_json(&upload.meta);
     let body = input.body.ok_or_else(|| s3_error!(IncompleteBody))?;
     let mut claimed = dto::Checksum {
         checksum_crc32: input.checksum_crc32,
@@ -284,7 +314,7 @@ pub(crate) async fn upload_part(
         checksum_xxhash64: input.checksum_xxhash64,
         ..Default::default()
     };
-    let algorithms = upload::announced(
+    let mut algorithms = upload::announced(
         &claimed,
         input
             .checksum_algorithm
@@ -292,6 +322,12 @@ pub(crate) async fn upload_part(
             .map(dto::ChecksumAlgorithm::as_str),
         &req.headers,
     );
+    // The upload's algorithm, whether or not the client sent that checksum.
+    if let Some(upload_checksum) = upload_checksum
+        && !algorithms.contains(&upload_checksum.algorithm)
+    {
+        algorithms.push(upload_checksum.algorithm);
+    }
     let received = upload::receive(state, body, input.content_length, &algorithms).await?;
     let trailers = req
         .trailing_headers
@@ -301,6 +337,9 @@ pub(crate) async fn upload_part(
     let content_md5 = upload::content_md5(&req.headers, input.content_md5.as_deref());
     let checksum = upload::verify(&received, content_md5, &claimed)?;
     let etag = received.etag();
+    let part_checksum = upload_checksum.and_then(|upload_checksum| {
+        upload::field(&received.computed, upload_checksum.algorithm).clone()
+    });
     store_part(
         state,
         &input.upload_id,
@@ -308,8 +347,18 @@ pub(crate) async fn upload_part(
         &received.temp,
         received.size,
         &etag,
+        part_checksum.clone(),
     )
     .await?;
+    // The part's checksum in the upload's algorithm, else the one the client sent.
+    let checksum = match (upload_checksum, part_checksum) {
+        (Some(upload_checksum), Some(value)) => Some(Checksum {
+            algorithm: upload_checksum.algorithm.to_owned(),
+            value,
+            composite: false,
+        }),
+        _ => checksum,
+    };
     let checksum = upload::stored_checksum(checksum.as_ref());
     Ok(S3Response::new(dto::UploadPartOutput {
         e_tag: Some(ETag::Strong(etag)),
@@ -322,9 +371,9 @@ pub(crate) async fn upload_part(
     }))
 }
 
-/// Moves the part file `temp` (`size` bytes, ETag `etag`) into the staging directory of
-/// `upload_id` under a name of its own and records it, replacing an earlier part of the same
-/// number.
+/// Moves the part file `temp` (`size` bytes, ETag `etag`, `checksum` in the upload's
+/// algorithm) into the staging directory of `upload_id` under a name of its own and records
+/// it, replacing an earlier part of the same number.
 async fn store_part(
     state: &S3State,
     upload_id: &str,
@@ -332,6 +381,7 @@ async fn store_part(
     temp: &upload::Temp,
     size: u64,
     etag: &str,
+    checksum: Option<String>,
 ) -> S3Result<()> {
     let part_number = u32::try_from(part_number).unwrap_or(0);
     let file_name = format!("{part_number}.{:016x}", rand::rng().random::<u64>());
@@ -354,6 +404,7 @@ async fn store_part(
         etag: etag.to_owned(),
         size,
         uploaded_at: now,
+        checksum,
     };
     let recorded = s3::record_part(state.pool(), upload_id, &part, now.saturating_add(ttl))
         .await
@@ -398,13 +449,14 @@ fn copy_range(range: Option<&str>, size: u64) -> S3Result<(u64, u64)> {
 }
 
 /// Copies `length` bytes of `source` from `start` on into the new file `temp`, synced. Returns
-/// their MD5.
+/// their MD5 and their checksum in `algorithm` (base64), if one is named.
 fn copy_part(
     mut source: std::fs::File,
     start: u64,
     length: u64,
     temp: &Path,
-) -> std::io::Result<[u8; 16]> {
+    algorithm: Option<&'static str>,
+) -> std::io::Result<([u8; 16], Option<String>)> {
     use std::io::{Seek as _, SeekFrom};
 
     source.seek(SeekFrom::Start(start))?;
@@ -414,6 +466,10 @@ fn copy_part(
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut out = options.open(temp)?;
     let mut md5 = Md5::new();
+    let mut hasher = s3s::checksum::ChecksumHasher::default();
+    if let Some(algorithm) = algorithm {
+        upload::enable(&mut hasher, algorithm);
+    }
     let mut buffer = vec![0; 1024 * 1024];
     let mut remaining = length;
     while remaining > 0 {
@@ -426,11 +482,14 @@ fn copy_part(
             ));
         }
         md5.update(&buffer[..read]);
+        hasher.update(&buffer[..read]);
         out.write_all(&buffer[..read])?;
         remaining -= read as u64;
     }
     out.sync_all()?;
-    Ok(md5.finalize())
+    let checksum =
+        algorithm.and_then(|algorithm| upload::field(&hasher.finalize(), algorithm).clone());
+    Ok((md5.finalize(), checksum))
 }
 
 /// `UploadPartCopy`: a part from (a range of) an object the key may read, in this or another
@@ -475,10 +534,11 @@ pub(crate) async fn upload_part_copy(
     {
         return Err(s3_error!(NoSuchVersion));
     }
-    find_open_upload(state, &destination, &input.key, &input.upload_id).await?;
+    let upload = find_open_upload(state, &destination, &input.key, &input.upload_id).await?;
     if state.is_completing(&input.upload_id) {
         return Err(s3_error!(OperationAborted, "The upload is being completed"));
     }
+    let upload_checksum = checksum_from_json(&upload.meta);
     let (source, from) = s3
         .copy_source(&key, &destination, source_bucket, source_key)
         .await?;
@@ -508,10 +568,12 @@ pub(crate) async fn upload_part_copy(
 
     let temp = upload::Temp::new_in(&state.fs().layout().tmp_dir());
     let path = temp.path().to_path_buf();
-    let md5 = tokio::task::spawn_blocking(move || copy_part(file, start, length, &path))
-        .await
-        .map_err(|_| s3_error!(InternalError))?
-        .map_err(error::io)?;
+    let algorithm = upload_checksum.map(|upload_checksum| upload_checksum.algorithm);
+    let (md5, part_checksum) =
+        tokio::task::spawn_blocking(move || copy_part(file, start, length, &path, algorithm))
+            .await
+            .map_err(|_| s3_error!(InternalError))?
+            .map_err(error::io)?;
     let etag = upload::hex(&md5);
     store_part(
         state,
@@ -520,12 +582,19 @@ pub(crate) async fn upload_part_copy(
         &temp,
         length,
         &etag,
+        part_checksum.clone(),
     )
     .await?;
+    let checksum = part_checksum_dto(upload_checksum, part_checksum);
     Ok(S3Response::new(dto::UploadPartCopyOutput {
         copy_part_result: Some(dto::CopyPartResult {
             e_tag: Some(ETag::Strong(etag)),
             last_modified: Some(Timestamp::from(SystemTime::now())),
+            checksum_crc32: checksum.checksum_crc32,
+            checksum_crc32c: checksum.checksum_crc32c,
+            checksum_crc64nvme: checksum.checksum_crc64nvme,
+            checksum_sha1: checksum.checksum_sha1,
+            checksum_sha256: checksum.checksum_sha256,
             ..Default::default()
         }),
         ..Default::default()
@@ -540,7 +609,8 @@ pub(crate) async fn list_parts(
     let auth = authorized(&req)?;
     let bucket = auth.bucket()?;
     let input = req.input;
-    find_open_upload(state, bucket, &input.key, &input.upload_id).await?;
+    let upload = find_open_upload(state, bucket, &input.key, &input.upload_id).await?;
+    let upload_checksum = checksum_from_json(&upload.meta);
     let marker = input
         .part_number_marker
         .and_then(|marker| u32::try_from(marker).ok())
@@ -580,17 +650,47 @@ pub(crate) async fn list_parts(
         parts: Some(
             parts
                 .into_iter()
-                .map(|part| dto::Part {
-                    e_tag: Some(ETag::Strong(part.etag)),
-                    last_modified: Some(timestamp_from_secs(part.uploaded_at)),
-                    part_number: i32::try_from(part.part_number).ok(),
-                    size: i64::try_from(part.size).ok(),
-                    ..Default::default()
+                .map(|part| {
+                    let checksum = part_checksum_dto(upload_checksum, part.checksum);
+                    dto::Part {
+                        e_tag: Some(ETag::Strong(part.etag)),
+                        last_modified: Some(timestamp_from_secs(part.uploaded_at)),
+                        part_number: i32::try_from(part.part_number).ok(),
+                        size: i64::try_from(part.size).ok(),
+                        checksum_crc32: checksum.checksum_crc32,
+                        checksum_crc32c: checksum.checksum_crc32c,
+                        checksum_crc64nvme: checksum.checksum_crc64nvme,
+                        checksum_sha1: checksum.checksum_sha1,
+                        checksum_sha256: checksum.checksum_sha256,
+                        ..Default::default()
+                    }
                 })
                 .collect(),
         ),
+        checksum_algorithm: upload_checksum.map(|upload_checksum| {
+            dto::ChecksumAlgorithm::from(upload_checksum.algorithm.to_owned())
+        }),
+        checksum_type: upload_checksum
+            .map(|upload_checksum| dto::ChecksumType::from(upload_checksum.type_name().to_owned())),
         ..Default::default()
     }))
+}
+
+/// A part's checksum in the upload's algorithm, as the checksum fields of a response.
+fn part_checksum_dto(
+    upload_checksum: Option<UploadChecksum>,
+    checksum: Option<String>,
+) -> dto::Checksum {
+    upload::stored_checksum(
+        upload_checksum
+            .zip(checksum)
+            .map(|(upload_checksum, value)| Checksum {
+                algorithm: upload_checksum.algorithm.to_owned(),
+                value,
+                composite: false,
+            })
+            .as_ref(),
+    )
 }
 
 /// `ListMultipartUploads`: by key, then upload id, from the markers on, filtered by prefix.
@@ -707,10 +807,24 @@ async fn remove_staging(state: &S3State, upload_id: &str) {
     }
 }
 
-/// The parts a completion names, checked against the parts that arrived.
+/// The checksum in `algorithm` a completion names for one of its parts.
+fn completed_part_checksum<'a>(part: &'a dto::CompletedPart, algorithm: &str) -> Option<&'a str> {
+    match algorithm {
+        "CRC32" => part.checksum_crc32.as_deref(),
+        "CRC32C" => part.checksum_crc32c.as_deref(),
+        "CRC64NVME" => part.checksum_crc64nvme.as_deref(),
+        "SHA1" => part.checksum_sha1.as_deref(),
+        "SHA256" => part.checksum_sha256.as_deref(),
+        _ => None,
+    }
+}
+
+/// The parts a completion names, checked against the parts that arrived: their ETags, and
+/// their checksums in the upload's algorithm where the completion names them.
 fn chosen_parts(
     requested: &[dto::CompletedPart],
     stored: &[UploadPart],
+    upload_checksum: Option<UploadChecksum>,
 ) -> S3Result<Vec<UploadPart>> {
     if requested.is_empty() {
         return Err(s3_error!(
@@ -739,6 +853,16 @@ fn chosen_parts(
             return Err(s3_error!(
                 InvalidPart,
                 "The ETag of part {number} does not match"
+            ));
+        }
+        if let Some(upload_checksum) = upload_checksum
+            && let Some(named) = completed_part_checksum(part, upload_checksum.algorithm)
+            && found.checksum.as_deref() != Some(named)
+        {
+            return Err(s3_error!(
+                InvalidPart,
+                "The {} checksum of part {number} does not match",
+                upload_checksum.algorithm
             ));
         }
         chosen.push(found.clone());
@@ -780,10 +904,118 @@ fn etag_of_parts<'a>(etags: impl ExactSizeIterator<Item = &'a str>) -> Option<St
     Some(format!("{}-{count}", upload::hex(&md5.finalize())))
 }
 
+/// The checksum of the object a completion creates from `parts`, checked against the one the
+/// completion names in `claimed` (and its type, `claimed_type`): `None` for an upload without
+/// a checksum algorithm, which cannot be completed with a checksum (as in S3).
+fn completed_checksum(
+    upload_checksum: Option<UploadChecksum>,
+    parts: &[UploadPart],
+    claimed: &dto::Checksum,
+    claimed_type: Option<&str>,
+) -> S3Result<Option<Checksum>> {
+    let named: Vec<(&str, &str)> = upload::ALGORITHMS
+        .iter()
+        .filter_map(|(algorithm, _)| {
+            upload::field(claimed, algorithm)
+                .as_deref()
+                .map(|value| (*algorithm, value))
+        })
+        .collect();
+    let Some(upload_checksum) = upload_checksum else {
+        if !named.is_empty() || claimed_type.is_some() {
+            return Err(s3_error!(
+                InvalidRequest,
+                "The upload was created without a checksum algorithm"
+            ));
+        }
+        return Ok(None);
+    };
+    if claimed_type
+        .is_some_and(|claimed| !claimed.eq_ignore_ascii_case(upload_checksum.type_name()))
+    {
+        return Err(s3_error!(
+            InvalidRequest,
+            "The upload was created with the checksum type {}",
+            upload_checksum.type_name()
+        ));
+    }
+    if named
+        .iter()
+        .any(|(algorithm, _)| *algorithm != upload_checksum.algorithm)
+    {
+        return Err(s3_error!(
+            InvalidRequest,
+            "The upload was created with the checksum algorithm {}",
+            upload_checksum.algorithm
+        ));
+    }
+    let value = upload_checksum
+        .of_parts(
+            parts
+                .iter()
+                .map(|part| (part.size, part.checksum.as_deref())),
+        )
+        .ok_or_else(|| s3_error!(InternalError, "a part has no checksum"))?;
+    if let Some((_, named)) = named.first() {
+        // A composite checksum may be named with or without its `-<parts>`.
+        let matches = *named == value
+            || (upload_checksum.composite && format!("{named}-{}", parts.len()) == value);
+        if !matches {
+            return Err(S3Error::with_message(
+                S3ErrorCode::BadDigest,
+                format!(
+                    "The {} checksum you specified did not match the parts",
+                    upload_checksum.algorithm
+                ),
+            ));
+        }
+    }
+    Ok(Some(Checksum {
+        algorithm: upload_checksum.algorithm.to_owned(),
+        value,
+        composite: upload_checksum.composite,
+    }))
+}
+
+/// The answer to a completion that created the object `key` in `bucket` with `etag` and
+/// `checksum`.
+fn completion_output(
+    bucket: &str,
+    key: &str,
+    etag: String,
+    checksum: Option<&Checksum>,
+) -> dto::CompleteMultipartUploadOutput {
+    let fields = upload::stored_checksum(checksum);
+    dto::CompleteMultipartUploadOutput {
+        bucket: Some(bucket.to_owned()),
+        key: Some(key.to_owned()),
+        e_tag: Some(ETag::Strong(etag)),
+        location: Some(format!("/{bucket}/{key}")),
+        checksum_crc32: fields.checksum_crc32,
+        checksum_crc32c: fields.checksum_crc32c,
+        checksum_crc64nvme: fields.checksum_crc64nvme,
+        checksum_sha1: fields.checksum_sha1,
+        checksum_sha256: fields.checksum_sha256,
+        checksum_type: checksum.map(|checksum| {
+            dto::ChecksumType::from(
+                if checksum.composite {
+                    "COMPOSITE"
+                } else {
+                    "FULL_OBJECT"
+                }
+                .to_owned(),
+            )
+        }),
+        ..Default::default()
+    }
+}
+
 /// The answer to a repeated completion of an upload that created an object with ETag
-/// `completed`: the same as the first one if the same parts are named, `InvalidPart` otherwise.
+/// `completed` and checksum `checksum`: the same as the first one if the same parts are
+/// named, `InvalidPart` otherwise.
 fn repeated_completion(
     completed: &str,
+    checksum: Option<Checksum>,
     requested: &[dto::CompletedPart],
     bucket: &str,
     key: &str,
@@ -803,13 +1035,12 @@ fn repeated_completion(
             "The upload was completed with other parts"
         ));
     }
-    Ok(dto::CompleteMultipartUploadOutput {
-        bucket: Some(bucket.to_owned()),
-        key: Some(key.to_owned()),
-        e_tag: Some(ETag::Strong(completed.to_owned())),
-        location: Some(format!("/{bucket}/{key}")),
-        ..Default::default()
-    })
+    Ok(completion_output(
+        bucket,
+        key,
+        completed.to_owned(),
+        checksum.as_ref(),
+    ))
 }
 
 /// Assembles the parts in `dir` into a synced file at `temp` (in `tmp/`): the first part's file
@@ -897,12 +1128,20 @@ pub(crate) async fn complete(
     let bucket = auth.bucket()?.clone();
     let input = req.input;
     let upload = find_upload(&state, &bucket, &input.key, &input.upload_id).await?;
+    let upload_checksum = checksum_from_json(&upload.meta);
     if let Some(completed) = &upload.completed_etag {
         let requested = input
             .multipart_upload
             .and_then(|upload| upload.parts)
             .unwrap_or_default();
-        return repeated_completion(completed, &requested, &bucket.name, &input.key)
+        let checksum = upload_checksum.zip(upload.completed_checksum.clone()).map(
+            |(upload_checksum, value)| Checksum {
+                algorithm: upload_checksum.algorithm.to_owned(),
+                value,
+                composite: upload_checksum.composite,
+            },
+        );
+        return repeated_completion(completed, checksum, &requested, &bucket.name, &input.key)
             .map(S3Response::new);
     }
     let client = match keys::target(&bucket.name, &input.key) {
@@ -920,11 +1159,24 @@ pub(crate) async fn complete(
     let stored = s3::parts(state.pool(), &upload.upload_id)
         .await
         .map_err(error::database)?;
+    let claimed = dto::Checksum {
+        checksum_crc32: input.checksum_crc32.clone(),
+        checksum_crc32c: input.checksum_crc32c.clone(),
+        checksum_crc64nvme: input.checksum_crc64nvme.clone(),
+        checksum_md5: input.checksum_md5.clone(),
+        checksum_sha1: input.checksum_sha1.clone(),
+        checksum_sha256: input.checksum_sha256.clone(),
+        checksum_sha512: input.checksum_sha512.clone(),
+        checksum_xxhash128: input.checksum_xxhash128.clone(),
+        checksum_xxhash3: input.checksum_xxhash3.clone(),
+        checksum_xxhash64: input.checksum_xxhash64.clone(),
+        ..Default::default()
+    };
     let requested = input
         .multipart_upload
         .and_then(|upload| upload.parts)
         .unwrap_or_default();
-    let parts = chosen_parts(&requested, &stored)?;
+    let parts = chosen_parts(&requested, &stored, upload_checksum)?;
     let total: u64 = parts.iter().map(|part| part.size).sum();
     if input
         .mpu_object_size
@@ -936,8 +1188,22 @@ pub(crate) async fn complete(
         ));
     }
     let etag = multipart_etag(&parts)?;
+    let checksum = completed_checksum(
+        upload_checksum,
+        &parts,
+        &claimed,
+        input.checksum_type.as_ref().map(dto::ChecksumType::as_str),
+    )?;
     let mut meta = meta_from_json(&upload.meta);
     meta.s3_etag = Some(etag.clone());
+    meta.checksum = checksum.clone();
+    meta.parts = parts
+        .iter()
+        .map(|part| ObjectPart {
+            size: part.size,
+            checksum: part.checksum.clone(),
+        })
+        .collect();
     // Once the answer has started, a failure can only be an error document in a 200; check
     // the condition now, so that a failed one is a 412 (the install checks it again).
     s3.check_write_condition(&auth, &bucket, &client, &condition)
@@ -1008,18 +1274,18 @@ pub(crate) async fn complete(
             state.pool(),
             &upload.upload_id,
             &etag,
+            checksum.as_ref().map(|checksum| checksum.value.as_str()),
             db::unix_now().saturating_add(keep),
         )
         .await
         .map_err(error::database)?;
         remove_staging(&state, &upload.upload_id).await;
-        Ok(dto::CompleteMultipartUploadOutput {
-            bucket: Some(bucket_name.clone()),
-            key: Some(key.clone()),
-            e_tag: Some(ETag::Strong(etag)),
-            location: Some(format!("/{bucket_name}/{key}")),
-            ..Default::default()
-        })
+        Ok(completion_output(
+            &bucket_name,
+            &key,
+            etag,
+            checksum.as_ref(),
+        ))
     };
     Ok(S3Response::new(dto::CompleteMultipartUploadOutput {
         future: Some(Box::pin(future)),
@@ -1098,6 +1364,7 @@ mod tests {
             etag: etag.to_owned(),
             size,
             uploaded_at: 0,
+            checksum: Some(format!("sum-{number}")),
         }
     }
 
@@ -1120,29 +1387,105 @@ mod tests {
         let a = "a".repeat(32);
         let b = "b".repeat(32);
         let c = "c".repeat(32);
-        let chosen = chosen_parts(&[completed(1, &a), completed(3, &c)], &stored).unwrap();
+        let chosen = chosen_parts(&[completed(1, &a), completed(3, &c)], &stored, None).unwrap();
         assert_eq!(chosen.len(), 2);
         let code = |requested: &[dto::CompletedPart]| {
-            chosen_parts(requested, &stored).unwrap_err().code().clone()
+            chosen_parts(requested, &stored, None)
+                .unwrap_err()
+                .code()
+                .clone()
         };
-        assert_eq!(code(&[]), s3s::S3ErrorCode::MalformedXML);
+        assert_eq!(code(&[]), S3ErrorCode::MalformedXML);
         assert_eq!(
             code(&[completed(2, &b), completed(1, &a)]),
-            s3s::S3ErrorCode::InvalidPartOrder
+            S3ErrorCode::InvalidPartOrder
         );
-        assert_eq!(code(&[completed(4, &a)]), s3s::S3ErrorCode::InvalidPart);
-        assert_eq!(code(&[completed(1, &b)]), s3s::S3ErrorCode::InvalidPart);
+        assert_eq!(code(&[completed(4, &a)]), S3ErrorCode::InvalidPart);
+        assert_eq!(code(&[completed(1, &b)]), S3ErrorCode::InvalidPart);
         assert_eq!(
             code(&[completed(3, &c), completed(4, &c)]),
-            s3s::S3ErrorCode::InvalidPart
+            S3ErrorCode::InvalidPart
         );
         let small = [part(1, &a, 1), part(2, &b, 1)];
         assert_eq!(
-            chosen_parts(&[completed(1, &a), completed(2, &b)], &small)
+            chosen_parts(&[completed(1, &a), completed(2, &b)], &small, None)
                 .unwrap_err()
                 .code(),
-            &s3s::S3ErrorCode::EntityTooSmall
+            &S3ErrorCode::EntityTooSmall
         );
+    }
+
+    #[test]
+    fn completions_naming_part_checksums_must_match_them() {
+        let sha = UploadChecksum::requested(Some("SHA256"), None)
+            .unwrap()
+            .unwrap();
+        let a = "a".repeat(32);
+        let stored = [part(1, &a, 1)];
+        let named = |checksum: Option<&str>| dto::CompletedPart {
+            checksum_sha256: checksum.map(str::to_owned),
+            ..completed(1, &a)
+        };
+        assert!(chosen_parts(&[named(None)], &stored, Some(sha)).is_ok());
+        assert!(chosen_parts(&[named(Some("sum-1"))], &stored, Some(sha)).is_ok());
+        assert_eq!(
+            chosen_parts(&[named(Some("other"))], &stored, Some(sha))
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::InvalidPart
+        );
+        // Without an algorithm, part checksums are not compared.
+        assert!(chosen_parts(&[named(Some("other"))], &stored, None).is_ok());
+    }
+
+    #[test]
+    fn completions_get_the_checksum_of_their_parts() {
+        let sha = UploadChecksum::requested(Some("SHA256"), None).unwrap();
+        // The SHA-256 of 1024 'A's, and the composite checksum of it alone (s3-tests).
+        let mut one = part(1, &"a".repeat(32), 1024);
+        one.checksum = Some("arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0=".to_owned());
+        let parts = [one];
+        let composite = "Ok6Cs5b96ux6+MWQkJO7UBT5sKPBeXBLwvj/hK89smg=-1";
+        let none = dto::Checksum::default();
+        let claimed = |value: &str| dto::Checksum {
+            checksum_sha256: Some(value.to_owned()),
+            ..Default::default()
+        };
+        let checksum = completed_checksum(sha, &parts, &none, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checksum.value, composite);
+        assert!(checksum.composite);
+        assert!(completed_checksum(sha, &parts, &claimed(composite), None).is_ok());
+        assert!(
+            completed_checksum(
+                sha,
+                &parts,
+                &claimed(&composite[..composite.len() - 2]),
+                None
+            )
+            .is_ok(),
+            "without the part count"
+        );
+        let code = |claimed: &dto::Checksum, checksum_type: Option<&str>| {
+            completed_checksum(sha, &parts, claimed, checksum_type)
+                .unwrap_err()
+                .code()
+                .clone()
+        };
+        assert_eq!(code(&claimed("bad"), None), S3ErrorCode::BadDigest);
+        assert_eq!(
+            code(&none, Some("FULL_OBJECT")),
+            S3ErrorCode::InvalidRequest
+        );
+        let crc = dto::Checksum {
+            checksum_crc32: Some("AAAAAA==".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(code(&crc, None), S3ErrorCode::InvalidRequest);
+        // An upload without an algorithm has no checksum and takes none.
+        assert_eq!(completed_checksum(None, &parts, &none, None).unwrap(), None);
+        assert!(completed_checksum(None, &parts, &crc, None).is_err());
     }
 
     #[test]
@@ -1173,14 +1516,10 @@ mod tests {
         assert_eq!(copy_range(Some("bytes=0-9"), 10).unwrap(), (0, 10));
         assert_eq!(copy_range(Some("bytes=3-3"), 10).unwrap(), (3, 1));
         let code = |range: &str| copy_range(Some(range), 10).unwrap_err().code().clone();
-        assert_eq!(code("bytes=0-10"), s3s::S3ErrorCode::InvalidRange);
-        assert_eq!(code("bytes=5-4"), s3s::S3ErrorCode::InvalidRange);
+        assert_eq!(code("bytes=0-10"), S3ErrorCode::InvalidRange);
+        assert_eq!(code("bytes=5-4"), S3ErrorCode::InvalidRange);
         for malformed in ["0-9", "bytes=-5", "bytes=5-", "bytes=a-b", "items=0-1"] {
-            assert_eq!(
-                code(malformed),
-                s3s::S3ErrorCode::InvalidArgument,
-                "{malformed}"
-            );
+            assert_eq!(code(malformed), S3ErrorCode::InvalidArgument, "{malformed}");
         }
     }
 
@@ -1194,14 +1533,26 @@ mod tests {
         let source = dir.join("source");
         std::fs::write(&source, b"0123456789").unwrap();
         let part = dir.join("part");
-        let md5 = copy_part(std::fs::File::open(&source).unwrap(), 2, 5, &part).unwrap();
+        let (md5, crc) = copy_part(
+            std::fs::File::open(&source).unwrap(),
+            2,
+            5,
+            &part,
+            Some("CRC32"),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&part).unwrap(), b"23456");
         assert_eq!(md5, Md5::checksum(b"23456"));
+        let mut hasher = s3s::checksum::ChecksumHasher::default();
+        upload::enable(&mut hasher, "CRC32");
+        hasher.update(b"23456");
+        assert_eq!(crc, hasher.finalize().checksum_crc32);
         let short = copy_part(
             std::fs::File::open(&source).unwrap(),
             8,
             5,
             &dir.join("short"),
+            None,
         );
         assert_eq!(short.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1251,7 +1602,10 @@ mod tests {
             user_meta: [("mtime".to_owned(), "1".to_owned())].into(),
             ..ObjectMeta::default()
         };
-        assert_eq!(meta_from_json(&meta_to_json(&meta)), meta);
+        assert_eq!(meta_from_json(&meta_to_json(&meta, None)), meta);
         assert_eq!(meta_from_json("not json"), ObjectMeta::default());
+        assert_eq!(checksum_from_json(&meta_to_json(&meta, None)), None);
+        let crc = UploadChecksum::requested(Some("CRC32"), Some("FULL_OBJECT")).unwrap();
+        assert_eq!(checksum_from_json(&meta_to_json(&meta, crc)), crc);
     }
 }

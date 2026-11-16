@@ -25,6 +25,7 @@
 
 mod access;
 mod auth;
+mod checksums;
 mod cors;
 mod error;
 mod form;

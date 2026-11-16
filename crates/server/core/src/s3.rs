@@ -705,6 +705,9 @@ pub struct Upload {
     pub expires_at: i64,
     /// The ETag of the object it created, once it is completed.
     pub completed_etag: Option<String>,
+    /// The checksum of the object it created (base64, as answered), once it is completed, if
+    /// it has a checksum algorithm.
+    pub completed_checksum: Option<String>,
 }
 
 /// A part of a multipart upload.
@@ -720,6 +723,8 @@ pub struct UploadPart {
     pub size: u64,
     /// When it arrived, UNIX seconds.
     pub uploaded_at: i64,
+    /// Its checksum (base64) in the upload's checksum algorithm, if the upload has one.
+    pub checksum: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -731,6 +736,7 @@ struct UploadRow {
     created_at: i64,
     expires_at: i64,
     completed_etag: Option<String>,
+    completed_checksum: Option<String>,
 }
 
 impl From<UploadRow> for Upload {
@@ -743,6 +749,7 @@ impl From<UploadRow> for Upload {
             created_at: row.created_at,
             expires_at: row.expires_at,
             completed_etag: row.completed_etag,
+            completed_checksum: row.completed_checksum,
         }
     }
 }
@@ -754,6 +761,7 @@ struct PartRow {
     etag: String,
     size: i64,
     uploaded_at: i64,
+    checksum: Option<String>,
 }
 
 impl From<PartRow> for UploadPart {
@@ -764,6 +772,7 @@ impl From<PartRow> for UploadPart {
             etag: row.etag,
             size: u64::try_from(row.size).unwrap_or(0),
             uploaded_at: row.uploaded_at,
+            checksum: row.checksum,
         }
     }
 }
@@ -803,7 +812,7 @@ pub async fn create_upload(
 }
 
 const UPLOAD_COLUMNS: &str =
-    "upload_id, bucket_id, key, meta, created_at, expires_at, completed_etag";
+    "upload_id, bucket_id, key, meta, created_at, expires_at, completed_etag, completed_checksum";
 
 /// The upload `upload_id`, if it is in progress or was completed lately
 /// ([`Upload::completed_etag`]).
@@ -859,7 +868,7 @@ pub async fn record_part(
     .await?;
     sqlx::query(
         "INSERT OR REPLACE INTO s3_upload_parts (upload_id, part_number, file_name, etag, size, \
-         uploaded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         uploaded_at, checksum) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )
     .bind(upload_id)
     .bind(i64::from(part.part_number))
@@ -867,6 +876,7 @@ pub async fn record_part(
     .bind(&part.etag)
     .bind(i64::try_from(part.size).unwrap_or(i64::MAX))
     .bind(part.uploaded_at)
+    .bind(part.checksum.as_deref())
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -876,7 +886,7 @@ pub async fn record_part(
 /// The parts of upload `upload_id`, by part number.
 pub async fn parts(pool: &Pool, upload_id: &str) -> Result<Vec<UploadPart>> {
     let rows: Vec<PartRow> = sqlx::query_as(
-        "SELECT part_number, file_name, etag, size, uploaded_at FROM s3_upload_parts \
+        "SELECT part_number, file_name, etag, size, uploaded_at, checksum FROM s3_upload_parts \
          WHERE upload_id = ?1 ORDER BY part_number",
     )
     .bind(upload_id)
@@ -885,23 +895,25 @@ pub async fn parts(pool: &Pool, upload_id: &str) -> Result<Vec<UploadPart>> {
     Ok(rows.into_iter().map(UploadPart::from).collect())
 }
 
-/// Marks upload `upload_id` completed with the object's ETag: removes its parts and keeps the
-/// upload until `expires_at`, so that a repeated completion can be answered. Returns `false`
-/// if it was gone or completed already.
+/// Marks upload `upload_id` completed with the object's ETag and checksum: removes its parts
+/// and keeps the upload until `expires_at`, so that a repeated completion can be answered.
+/// Returns `false` if it was gone or completed already.
 pub async fn complete_upload(
     pool: &Pool,
     upload_id: &str,
     etag: &str,
+    checksum: Option<&str>,
     expires_at: i64,
 ) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
     let updated = sqlx::query(
-        "UPDATE s3_uploads SET completed_etag = ?2, expires_at = ?3 \
+        "UPDATE s3_uploads SET completed_etag = ?2, completed_checksum = ?4, expires_at = ?3 \
          WHERE upload_id = ?1 AND completed_etag IS NULL",
     )
     .bind(upload_id)
     .bind(etag)
     .bind(expires_at)
+    .bind(checksum)
     .execute(&mut *tx)
     .await?
     .rows_affected();

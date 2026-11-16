@@ -482,6 +482,7 @@ async fn multipart_uploads_keep_their_latest_parts_until_they_end() {
         etag: format!("etag-{file}"),
         size: 5,
         uploaded_at: 20,
+        checksum: (number == 1).then(|| "sum".to_owned()),
     };
     assert_eq!(
         s3::record_part(&f.pool, &id, &part(2, "2.a"), 200)
@@ -509,6 +510,13 @@ async fn multipart_uploads_keep_their_latest_parts_until_they_end() {
         .map(|part| part.file_name)
         .collect();
     assert_eq!(files, ["1.a", "2.b"]);
+    let checksums: Vec<Option<String>> = s3::parts(&f.pool, &id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|part| part.checksum)
+        .collect();
+    assert_eq!(checksums, [Some("sum".to_owned()), None]);
     assert_eq!(
         s3::upload(&f.pool, &id).await.unwrap().unwrap().expires_at,
         300
@@ -530,18 +538,19 @@ async fn multipart_uploads_keep_their_latest_parts_until_they_end() {
         .await
         .unwrap();
     assert!(
-        s3::complete_upload(&f.pool, &other, "abc-1", 250)
+        s3::complete_upload(&f.pool, &other, "abc-1", Some("sum-1"), 250)
             .await
             .unwrap()
     );
     assert!(
-        !s3::complete_upload(&f.pool, &other, "abc-1", 260)
+        !s3::complete_upload(&f.pool, &other, "abc-1", None, 260)
             .await
             .unwrap(),
         "completed once only"
     );
     let completed = s3::upload(&f.pool, &other).await.unwrap().unwrap();
     assert_eq!(completed.completed_etag.as_deref(), Some("abc-1"));
+    assert_eq!(completed.completed_checksum.as_deref(), Some("sum-1"));
     assert_eq!(completed.expires_at, 250);
     assert!(s3::parts(&f.pool, &other).await.unwrap().is_empty());
     assert_eq!(
