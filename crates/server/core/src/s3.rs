@@ -145,6 +145,8 @@ pub struct Bucket {
     pub anonymous_list: bool,
     /// The CORS rules as stored (a JSON array the S3 API writes and reads), if any.
     pub cors: Option<String>,
+    /// The bucket's tags as a JSON object (written and read by the S3 API); `None`: none.
+    pub tags: Option<String>,
     /// Creation time, UNIX seconds.
     pub created_at: i64,
 }
@@ -162,6 +164,7 @@ struct BucketRow {
     anonymous: String,
     anonymous_list: bool,
     cors: Option<String>,
+    tags: Option<String>,
     created_at: i64,
 }
 
@@ -181,6 +184,7 @@ impl TryFrom<BucketRow> for Bucket {
             anonymous: row.anonymous.parse()?,
             anonymous_list: row.anonymous_list,
             cors: row.cors,
+            tags: row.tags,
             created_at: row.created_at,
         })
     }
@@ -188,7 +192,7 @@ impl TryFrom<BucketRow> for Bucket {
 
 const BUCKET_QUERY: &str = "SELECT b.id, b.name, b.owner_id, u.username AS owner_name, \
      u.display_name AS owner_display_name, u.enabled AS owner_enabled, b.root_file_id, f.rel_path, \
-     b.anonymous, b.anonymous_list, b.cors, b.created_at \
+     b.anonymous, b.anonymous_list, b.cors, b.tags, b.created_at \
      FROM s3_buckets b JOIN files f ON f.id = b.root_file_id JOIN users u ON u.id = b.owner_id";
 
 /// The bucket called `name`, if there is one.
@@ -355,6 +359,21 @@ pub async fn set_cors(pool: &Pool, owner: i64, id: i64, cors: Option<&str>) -> R
         .bind(id)
         .bind(owner)
         .bind(cors)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(changed == 1)
+}
+
+/// Replaces the tags of `owner`'s bucket `id` with `tags` (a JSON object; `None` removes them).
+/// Returns `false` if there is no such bucket.
+pub async fn set_bucket_tags(pool: &Pool, owner: i64, id: i64, tags: Option<&str>) -> Result<bool> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let changed = sqlx::query("UPDATE s3_buckets SET tags = ?3 WHERE id = ?1 AND owner_id = ?2")
+        .bind(id)
+        .bind(owner)
+        .bind(tags)
         .execute(&mut *tx)
         .await?
         .rows_affected();

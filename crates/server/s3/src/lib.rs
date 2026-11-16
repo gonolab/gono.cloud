@@ -35,6 +35,7 @@ pub mod multipart;
 mod ops;
 mod policy;
 mod state;
+mod tags;
 mod upload;
 
 pub use state::{S3Settings, S3State};

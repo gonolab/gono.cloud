@@ -1232,6 +1232,44 @@ async fn md5s_belong_to_one_version() {
     assert_eq!(row("d/a").await.md5, None);
 }
 
+/// Tags are S3 metadata of one version: set for the version they name, kept by an ACL change,
+/// dropped by a write that is not an S3 write.
+#[tokio::test]
+async fn object_tags_belong_to_one_version() {
+    let f = fixture().await;
+    f.mkdir("b").await;
+    let tags: std::collections::BTreeMap<String, String> =
+        [("project".to_owned(), "blue".to_owned())].into();
+    let tagged = ObjectMeta {
+        tags: tags.clone(),
+        ..object("md5-1")
+    };
+    let id = f.put_object("b/a", 3, &tagged).await;
+    assert_eq!(f.object_meta("b/a").await.unwrap().tags, tags);
+
+    let etag = f.store.get(f.owner, &p("b/a")).await.unwrap().unwrap().etag;
+    let other: std::collections::BTreeMap<String, String> =
+        [("project".to_owned(), "red".to_owned())].into();
+    assert!(!f.store.set_object_tags(id, "old", &other).await.unwrap());
+    assert!(f.store.set_object_tags(id, &etag, &other).await.unwrap());
+    assert!(f.store.set_object_public(id, &etag, true).await.unwrap());
+    let stored = f.object_meta("b/a").await.unwrap();
+    assert_eq!(stored.tags, other);
+    assert_eq!(
+        stored.s3_etag.as_deref(),
+        Some("md5-1"),
+        "only the tags changed"
+    );
+
+    // A file without S3 metadata gets a row for its version.
+    f.write("b/a", 4).await;
+    assert_eq!(f.object_meta("b/a").await, None);
+    let etag = f.store.get(f.owner, &p("b/a")).await.unwrap().unwrap().etag;
+    assert!(f.store.set_object_tags(id, &etag, &tags).await.unwrap());
+    let stored = f.object_meta("b/a").await.unwrap();
+    assert_eq!((stored.tags, stored.s3_etag), (tags, None));
+}
+
 /// The parts of a multipart object are stored with its metadata, in order, and go with it.
 #[tokio::test]
 async fn object_parts_belong_to_one_version() {

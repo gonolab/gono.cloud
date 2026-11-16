@@ -170,6 +170,8 @@ CREATE TABLE s3_buckets (
     -- The bucket's CORS rules (PutBucketCors) as a JSON array, written and read by the S3 API;
     -- NULL: none, so browsers may not read responses of other origins.
     cors           TEXT    CHECK (cors IS NULL OR json_valid(cors)),
+    -- The bucket's tags (PutBucketTagging) as a JSON object; NULL: none.
+    tags           TEXT    CHECK (tags IS NULL OR json_valid(tags)),
     created_at     INTEGER NOT NULL
 ) STRICT;
 
@@ -270,6 +272,8 @@ CREATE TABLE object_meta (
     checksum_algorithm  TEXT,
     checksum_value      TEXT,
     checksum_type       TEXT    CHECK (checksum_type IN ('FULL_OBJECT', 'COMPOSITE')),
+    -- The object's tags (`x-amz-tagging`, PutObjectTagging) as a JSON object of strings.
+    tags                TEXT    NOT NULL DEFAULT '{}',
     CHECK ((checksum_algorithm IS NULL) = (checksum_value IS NULL)),
     CHECK (checksum_type IS NULL OR checksum_algorithm IS NOT NULL)
 ) STRICT;

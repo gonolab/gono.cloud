@@ -45,6 +45,8 @@ pub struct ObjectMeta {
     pub expires: Option<String>,
     /// `x-amz-meta-*`: names in lowercase without the prefix.
     pub user_meta: BTreeMap<String, String>,
+    /// The object's tags (`x-amz-tagging`).
+    pub tags: BTreeMap<String, String>,
     /// The `x-amz-checksum-*` the upload carried, or the checksum of a multipart upload.
     pub checksum: Option<Checksum>,
     /// The parts of an object written by a multipart upload, in order (empty otherwise).
@@ -96,6 +98,7 @@ struct MetaRow {
     checksum_algorithm: Option<String>,
     checksum_value: Option<String>,
     checksum_type: Option<String>,
+    tags: String,
 }
 
 impl From<MetaRow> for ObjectMeta {
@@ -112,6 +115,7 @@ impl From<MetaRow> for ObjectMeta {
             // Only the MetaStore writes this column, always from a map; an unreadable value
             // would mean a damaged database, and losing user metadata beats failing reads.
             user_meta: serde_json::from_str(&row.user_meta).unwrap_or_default(),
+            tags: serde_json::from_str(&row.tags).unwrap_or_default(),
             checksum: row
                 .checksum_algorithm
                 .zip(row.checksum_value)
@@ -133,6 +137,7 @@ pub(super) async fn store_object_meta(
 ) -> Result<()> {
     let user_meta =
         serde_json::to_string(&meta.user_meta).unwrap_or_else(|_| unreachable!("a string map"));
+    let tags = serde_json::to_string(&meta.tags).unwrap_or_else(|_| unreachable!("a string map"));
     // The parts of the replaced version go first (REPLACE does not cascade without recursive
     // triggers).
     sqlx::query("DELETE FROM object_parts WHERE file_id = ?1")
@@ -142,8 +147,8 @@ pub(super) async fn store_object_meta(
     sqlx::query(
         "INSERT OR REPLACE INTO object_meta (file_id, s3_etag, public_read, content_type, \
          content_encoding, content_disposition, content_language, cache_control, expires, \
-         user_meta, checksum_algorithm, checksum_value, checksum_type) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         user_meta, checksum_algorithm, checksum_value, checksum_type, tags) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )
     .bind(file_id)
     .bind(meta.s3_etag.as_deref())
@@ -164,6 +169,7 @@ pub(super) async fn store_object_meta(
             "FULL_OBJECT"
         }
     }))
+    .bind(tags)
     .execute(&mut **tx)
     .await?;
     for (number, part) in (1_i64..).zip(&meta.parts) {
@@ -299,7 +305,7 @@ impl MetaStore {
         let row: Option<MetaRow> = sqlx::query_as(
             "SELECT s3_etag, public_read, content_type, content_encoding, content_disposition, \
              content_language, cache_control, expires, user_meta, checksum_algorithm, \
-             checksum_value, checksum_type FROM object_meta WHERE file_id = ?1",
+             checksum_value, checksum_type, tags FROM object_meta WHERE file_id = ?1",
         )
         .bind(file_id)
         .fetch_optional(self.pool())
@@ -324,6 +330,33 @@ impl MetaStore {
                 checksum,
             })
             .collect())
+    }
+
+    /// Sets the tags of the version of file `file_id` whose WebDAV ETag is `etag` (empty: none).
+    /// Returns `false`, and changes nothing, when the file is gone, is a directory or has been
+    /// written since. Tags are not content: ETags stay the same and nothing is logged.
+    pub async fn set_object_tags(
+        &self,
+        file_id: i64,
+        etag: &str,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<bool> {
+        let tags = serde_json::to_string(tags).unwrap_or_else(|_| unreachable!("a string map"));
+        let mut tx = db::begin_immediate(self.pool()).await?;
+        // The WHERE clause also tells SQLite's parser that ON CONFLICT belongs to the INSERT.
+        let changed = sqlx::query(
+            "INSERT INTO object_meta (file_id, tags) \
+             SELECT id, ?3 FROM files WHERE id = ?1 AND etag = ?2 AND is_dir = 0 \
+             ON CONFLICT (file_id) DO UPDATE SET tags = excluded.tags",
+        )
+        .bind(file_id)
+        .bind(etag)
+        .bind(tags)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(changed == 1)
     }
 
     /// Sets or clears the `public-read` ACL of the version of file `file_id` whose WebDAV ETag

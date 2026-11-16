@@ -275,6 +275,7 @@ mod tests {
             anonymous,
             anonymous_list: false,
             cors: None,
+            tags: None,
             created_at: 0,
         }
     }

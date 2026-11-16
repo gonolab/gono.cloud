@@ -372,6 +372,15 @@ impl BucketPage {
     }
 }
 
+/// Refuses every version but `null`: versioning is never enabled.
+fn check_null_version(version: Option<&str>) -> S3Result<()> {
+    if version.is_some_and(|id| id != NULL_VERSION) {
+        Err(s3_error!(NoSuchVersion))
+    } else {
+        Ok(())
+    }
+}
+
 /// The condition of a write from `If-Match` and `If-None-Match`. `If-Match` (an ETag or `*`)
 /// needs an object (404 `NoSuchKey` otherwise); `If-None-Match` with an ETag lets every other
 /// version be replaced, and a missing object be created.
@@ -728,6 +737,49 @@ impl GonoS3 {
         })
     }
 
+    /// Sets the tags of the object `key` of the request's bucket (empty: removes them), for
+    /// its current version.
+    async fn set_tags(
+        &self,
+        auth: &Authorized,
+        key: &str,
+        tags: &BTreeMap<String, String>,
+    ) -> S3Result<()> {
+        let bucket = auth.bucket()?;
+        let client = match target(bucket, key)? {
+            Target::File(path) => path,
+            Target::Folder(_) => return Err(s3_error!(NoSuchKey)),
+        };
+        if !self.spelled_as(bucket, &client, key).await? {
+            return Err(s3_error!(NoSuchKey));
+        }
+        let identity = Self::bucket_identity(auth, bucket, true)?;
+        let entry = self
+            .state
+            .fs()
+            .stat(identity, &client)
+            .await
+            .map_err(|_| s3_error!(NoSuchKey))?;
+        let file_id = entry
+            .file_id
+            .filter(|_| !entry.is_dir())
+            .ok_or_else(|| s3_error!(NoSuchKey))?;
+        let set = self
+            .state
+            .fs()
+            .meta()
+            .set_object_tags(file_id, &entry.etag, tags)
+            .await
+            .map_err(error::database)?;
+        if !set {
+            return Err(s3_error!(
+                OperationAborted,
+                "The object changed while its tags were set; try again"
+            ));
+        }
+        Ok(())
+    }
+
     /// Writes the body of `PutObject` (or an empty folder marker).
     async fn put(&self, req: S3Request<dto::PutObjectInput>) -> S3Result<dto::PutObjectOutput> {
         let auth = authorized(&req)?;
@@ -831,6 +883,7 @@ impl GonoS3 {
             cache_control: input.cache_control,
             expires: input.expires,
             user_meta: user_meta(input.metadata),
+            tags: crate::tags::from_header(input.tagging.as_deref())?,
             checksum: checksum.clone(),
             parts: Vec::new(),
         };
@@ -1791,6 +1844,7 @@ impl S3 for GonoS3 {
             .and_then(|part| part.count)
             .and_then(|count| i32::try_from(count).ok());
         let meta = meta.unwrap_or_default();
+        let tags = meta.tags.clone();
         let mut response = S3Response::new(dto::GetObjectOutput {
             body: Some(body),
             content_length: Some(i64::try_from(length).unwrap_or(i64::MAX)),
@@ -1825,6 +1879,7 @@ impl S3 for GonoS3 {
             checksum_sha256: checksum.checksum_sha256,
             checksum_type: checksum.checksum_type,
             parts_count,
+            tag_count: crate::tags::count(&tags),
             ..Default::default()
         });
         nosniff(&mut response.headers, anonymous);
@@ -1877,6 +1932,7 @@ impl S3 for GonoS3 {
             .and_then(|part| part.count)
             .and_then(|count| i32::try_from(count).ok());
         let meta = meta.unwrap_or_default();
+        let tags = meta.tags.clone();
         let mut response = S3Response::new(dto::HeadObjectOutput {
             content_length: Some(i64::try_from(length).unwrap_or(i64::MAX)),
             accept_ranges: Some("bytes".to_owned()),
@@ -1896,6 +1952,7 @@ impl S3 for GonoS3 {
             checksum_sha256: checksum.checksum_sha256,
             checksum_type: checksum.checksum_type,
             parts_count,
+            tag_count: crate::tags::count(&tags),
             ..Default::default()
         });
         nosniff(&mut response.headers, anonymous);
@@ -2126,6 +2183,16 @@ impl S3 for GonoS3 {
         };
         let source_meta = source_meta.unwrap_or_default();
         let s3_etag = source_meta.s3_etag.clone();
+        // Tags are copied unless the request replaces them.
+        let tags = if input
+            .tagging_directive
+            .as_ref()
+            .is_some_and(|directive| directive.as_str() == dto::TaggingDirective::REPLACE)
+        {
+            crate::tags::from_header(input.tagging.as_deref())?
+        } else {
+            source_meta.tags.clone()
+        };
         let meta = if replace {
             ObjectMeta {
                 s3_etag,
@@ -2137,6 +2204,7 @@ impl S3 for GonoS3 {
                 cache_control: input.cache_control,
                 expires: input.expires,
                 user_meta: user_meta(input.metadata),
+                tags,
                 checksum: source_meta.checksum,
                 parts,
             }
@@ -2144,6 +2212,7 @@ impl S3 for GonoS3 {
             ObjectMeta {
                 s3_etag,
                 public_read: public,
+                tags,
                 parts,
                 ..source_meta
             }
@@ -2208,6 +2277,93 @@ impl S3 for GonoS3 {
             owner: Some(owner),
             ..Default::default()
         }))
+    }
+
+    async fn get_object_tagging(
+        &self,
+        req: S3Request<dto::GetObjectTaggingInput>,
+    ) -> S3Result<S3Response<dto::GetObjectTaggingOutput>> {
+        let auth = authorized(&req)?;
+        let input = req.input;
+        check_null_version(input.version_id.as_deref())?;
+        let (_, entry, meta, _) = self.open_for_read(&auth, &input.key).await?;
+        if entry.is_dir() {
+            return Err(s3_error!(NoSuchKey));
+        }
+        let tags = meta.map(|meta| meta.tags).unwrap_or_default();
+        Ok(S3Response::new(dto::GetObjectTaggingOutput {
+            tag_set: crate::tags::to_tag_set(&tags),
+            version_id: None,
+        }))
+    }
+
+    async fn put_object_tagging(
+        &self,
+        req: S3Request<dto::PutObjectTaggingInput>,
+    ) -> S3Result<S3Response<dto::PutObjectTaggingOutput>> {
+        let auth = authorized(&req)?;
+        let input = req.input;
+        check_null_version(input.version_id.as_deref())?;
+        let tags = crate::tags::from_tagging(input.tagging, false)?;
+        self.set_tags(&auth, &input.key, &tags).await?;
+        Ok(S3Response::new(dto::PutObjectTaggingOutput::default()))
+    }
+
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<dto::DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<dto::DeleteObjectTaggingOutput>> {
+        let auth = authorized(&req)?;
+        let input = req.input;
+        check_null_version(input.version_id.as_deref())?;
+        self.set_tags(&auth, &input.key, &BTreeMap::new()).await?;
+        Ok(S3Response::new(dto::DeleteObjectTaggingOutput::default()))
+    }
+
+    async fn get_bucket_tagging(
+        &self,
+        req: S3Request<dto::GetBucketTaggingInput>,
+    ) -> S3Result<S3Response<dto::GetBucketTaggingOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        let tags = crate::tags::from_stored(bucket.tags.as_deref());
+        if tags.is_empty() {
+            return Err(s3_error!(NoSuchTagSet));
+        }
+        Ok(S3Response::new(dto::GetBucketTaggingOutput {
+            tag_set: crate::tags::to_tag_set(&tags),
+        }))
+    }
+
+    async fn put_bucket_tagging(
+        &self,
+        req: S3Request<dto::PutBucketTaggingInput>,
+    ) -> S3Result<S3Response<dto::PutBucketTaggingOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        let tags = crate::tags::from_tagging(req.input.tagging, true)?;
+        let stored = serde_json::to_string(&tags).map_err(|_| s3_error!(InternalError))?;
+        s3::set_bucket_tags(
+            self.state.pool(),
+            bucket.owner_id,
+            bucket.id,
+            (!tags.is_empty()).then_some(stored.as_str()),
+        )
+        .await
+        .map_err(error::database)?;
+        Ok(S3Response::new(dto::PutBucketTaggingOutput::default()))
+    }
+
+    async fn delete_bucket_tagging(
+        &self,
+        req: S3Request<dto::DeleteBucketTaggingInput>,
+    ) -> S3Result<S3Response<dto::DeleteBucketTaggingOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        s3::set_bucket_tags(self.state.pool(), bucket.owner_id, bucket.id, None)
+            .await
+            .map_err(error::database)?;
+        Ok(S3Response::new(dto::DeleteBucketTaggingOutput::default()))
     }
 
     async fn put_object_acl(

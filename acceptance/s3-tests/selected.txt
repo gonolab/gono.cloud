@@ -5,7 +5,7 @@
 # Chosen from a run of every test of test_s3.py and test_headers.py
 # (S3_TESTS_SELECT=all scripts/s3-tests.sh): every test of the protocol surface of docs/s3.md.
 # Left out: tests of features outside it (versioning, lifecycle, object lock, encryption,
-# tagging, website, select, logging, IAM and STS, public access blocks, bucket
+# website, select, logging, IAM and STS, public access blocks, bucket
 # policies, explicit ACL grants), Signature Version 2 (form uploads included; SigV4
 # forms are covered by tests/s3.rs), tests marked fails_on_aws, and RGW extensions (usage
 # headers, unordered listings, tenants, torrents). Tests that fail are listed with their
@@ -178,6 +178,8 @@ s3tests/functional/test_s3.py::test_delete_marker_nonversioned
 s3tests/functional/test_s3.py::test_get_checksum_object_attributes
 s3tests/functional/test_s3.py::test_get_multipart_checksum_object_attributes
 s3tests/functional/test_s3.py::test_get_multipart_object_attributes
+s3tests/functional/test_s3.py::test_get_obj_head_tagging
+s3tests/functional/test_s3.py::test_get_obj_tagging
 s3tests/functional/test_s3.py::test_get_object_attributes
 s3tests/functional/test_s3.py::test_get_object_ifmatch_failed
 s3tests/functional/test_s3.py::test_get_object_ifmatch_good
@@ -279,6 +281,14 @@ s3tests/functional/test_s3.py::test_object_write_file
 s3tests/functional/test_s3.py::test_object_write_read_update_read_delete
 s3tests/functional/test_s3.py::test_object_write_to_nonexist_bucket
 s3tests/functional/test_s3.py::test_object_write_with_chunked_transfer_encoding
+s3tests/functional/test_s3.py::test_put_delete_tags
+s3tests/functional/test_s3.py::test_put_excess_key_tags
+s3tests/functional/test_s3.py::test_put_excess_tags
+s3tests/functional/test_s3.py::test_put_excess_val_tags
+s3tests/functional/test_s3.py::test_put_max_kvsize_tags
+s3tests/functional/test_s3.py::test_put_max_tags
+s3tests/functional/test_s3.py::test_put_modify_tags
+s3tests/functional/test_s3.py::test_put_obj_with_tags
 s3tests/functional/test_s3.py::test_put_object_if_match
 s3tests/functional/test_s3.py::test_put_object_ifmatch_failed
 s3tests/functional/test_s3.py::test_ranged_big_request_response_code
@@ -287,5 +297,7 @@ s3tests/functional/test_s3.py::test_ranged_request_invalid_range
 s3tests/functional/test_s3.py::test_ranged_request_response_code
 s3tests/functional/test_s3.py::test_ranged_request_return_trailing_bytes_response_code
 s3tests/functional/test_s3.py::test_ranged_request_skip_leading_bytes_response_code
+s3tests/functional/test_s3.py::test_set_bucket_tagging
 s3tests/functional/test_s3.py::test_set_cors
+s3tests/functional/test_s3.py::test_set_multipart_tagging
 s3tests/functional/test_s3.py::test_upload_part_copy_percent_encoded_key

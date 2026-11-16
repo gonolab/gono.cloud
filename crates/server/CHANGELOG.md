@@ -85,7 +85,8 @@ compatible within a major version: released clients keep working with newer serv
   (`x-amz-request-id`, and `RequestId` in error documents), which the request log records.
   Multipart uploads take a checksum algorithm and type (`COMPOSITE` or `FULL_OBJECT`, the
   latter combined from the parts' CRCs), as current AWS SDKs send by default; objects keep
-  their parts for `partNumber` reads and `GetObjectAttributes`.
+  their parts for `partNumber` reads and `GetObjectAttributes`. Objects and buckets take tags
+  (`PutObjectTagging`, `x-amz-tagging`, `PutBucketTagging` and the rest).
   `ListObjectVersions` lists each object as its only version, `null` (versioning is
   never enabled), which cleanup tools need. Keys need not be in Unicode NFC (names from older
   macOS are NFD): the tree stores the NFC name and S3 keeps the key's spelling

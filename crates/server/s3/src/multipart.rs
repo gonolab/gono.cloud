@@ -104,6 +104,7 @@ fn meta_to_json(meta: &ObjectMeta, checksum: Option<UploadChecksum>) -> String {
         "cache_control": meta.cache_control,
         "expires": meta.expires,
         "user_meta": user,
+        "tags": meta.tags,
         "checksum_algorithm": checksum.map(|checksum| checksum.algorithm),
         "checksum_type": checksum.map(UploadChecksum::type_name),
     })
@@ -142,6 +143,10 @@ fn meta_from_json(value: &str) -> ObjectMeta {
                     .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_owned())))
                     .collect()
             })
+            .unwrap_or_default(),
+        tags: value
+            .get("tags")
+            .and_then(|tags| serde_json::from_value(tags.clone()).ok())
             .unwrap_or_default(),
         checksum: None::<Checksum>,
         parts: Vec::new(),
@@ -249,6 +254,7 @@ pub(crate) async fn create(
             .into_iter()
             .map(|(name, value)| (name.to_ascii_lowercase(), value))
             .collect(),
+        tags: crate::tags::from_header(input.tagging.as_deref())?,
         ..ObjectMeta::default()
     };
     let now = db::unix_now();
@@ -1597,6 +1603,7 @@ mod tests {
             content_type: Some("video/mp4".into()),
             cache_control: Some("no-cache".into()),
             user_meta: [("mtime".to_owned(), "1".to_owned())].into(),
+            tags: [("project".to_owned(), "blue".to_owned())].into(),
             ..ObjectMeta::default()
         };
         assert_eq!(meta_from_json(&meta_to_json(&meta, None)), meta);

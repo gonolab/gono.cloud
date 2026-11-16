@@ -49,7 +49,7 @@ pub(crate) enum Class {
     List,
     /// `GetObject`, `HeadObject`: what anonymous requests may do.
     ObjectRead,
-    /// `GetObjectAcl`.
+    /// `GetObjectAcl`, `GetObjectTagging`: reading what a key may know about an object.
     ObjectAclRead,
     /// Every write of objects and multipart uploads.
     ObjectWrite,
@@ -67,23 +67,28 @@ pub(crate) fn classify(name: &str) -> Class {
             Class::BucketAdmin
         }
         "HeadBucket" => Class::HeadBucket,
-        "PutBucketCors" | "DeleteBucketCors" => Class::BucketConfig,
+        "PutBucketCors" | "DeleteBucketCors" | "PutBucketTagging" | "DeleteBucketTagging" => {
+            Class::BucketConfig
+        }
         "GetBucketLocation"
         | "GetBucketVersioning"
         | "GetBucketAcl"
         | "GetBucketCors"
         | "GetBucketPolicy"
         | "GetBucketPolicyStatus"
+        | "GetBucketTagging"
         | "ListMultipartUploads" => Class::BucketRead,
         "ListObjects" | "ListObjectsV2" | "ListObjectVersions" => Class::List,
         "GetObject" | "HeadObject" | "GetObjectAttributes" => Class::ObjectRead,
-        "GetObjectAcl" => Class::ObjectAclRead,
+        "GetObjectAcl" | "GetObjectTagging" => Class::ObjectAclRead,
         "PutObject"
         | "PostObject"
         | "CopyObject"
         | "DeleteObject"
         | "DeleteObjects"
         | "PutObjectAcl"
+        | "PutObjectTagging"
+        | "DeleteObjectTagging"
         | "CreateMultipartUpload"
         | "UploadPart"
         | "UploadPartCopy"
@@ -343,6 +348,7 @@ mod tests {
             anonymous,
             anonymous_list: list,
             cors: None,
+            tags: None,
             created_at: 0,
         }
     }
@@ -376,7 +382,10 @@ mod tests {
         assert_eq!(classify("PostObject"), Class::ObjectWrite);
         assert_eq!(classify("PutBucketPolicy"), Class::BucketAdmin);
         assert_eq!(classify("GetBucketPolicy"), Class::BucketRead);
-        assert_eq!(classify("PutBucketTagging"), Class::Other);
+        assert_eq!(classify("PutBucketTagging"), Class::BucketConfig);
+        assert_eq!(classify("GetObjectTagging"), Class::ObjectAclRead);
+        assert_eq!(classify("PutObjectTagging"), Class::ObjectWrite);
+        assert_eq!(classify("PutBucketLogging"), Class::Other);
     }
 
     #[test]
