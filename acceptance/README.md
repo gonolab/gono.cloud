@@ -288,3 +288,21 @@ p95, p99, max). It fails when a client fails or the server answers a write with 
 It is a measurement, not a CI job: numbers depend on the machine, and on macOS each upload's
 two `F_FULLFSYNC`s (the file and its folder) bound the throughput. Needs `rclone` and `restic`
 (`RUN_RESTIC=0` skips restic).
+
+## Applications: what they send to S3
+
+```sh
+acceptance/scripts/s3-apps.sh                     # every application
+acceptance/scripts/s3-apps.sh mastodon picgo      # some of them
+```
+
+Replays against a throwaway server what the target applications send to their object storage,
+with the S3 library and version each one uses and the parameters of its storage code
+([`s3-apps/`](s3-apps/)): Mastodon (aws-sdk-s3 1.242.0 as Paperclip uses it: `public-read`
+uploads, a multipart upload above 15 MB, single-request downloads, ACLs set private and back on
+suspension, batch deletes), Misskey and PeerTube (the AWS SDK for JavaScript 3.1161.0 with
+lib-storage: originals and variants with `Cache-Control` and `Content-Disposition`, HLS uploads,
+a prefix's ACLs changed, copies, ranged reads, a prefix removed), and the PicGo-Core command line
+with picgo-plugin-s3 1.5.2. Each scenario downloads what it uploaded anonymously and checks it.
+It is not a CI job: the libraries are installed by hand into `APPS_DIR`
+(`~/.cache/gono/apps`); `--help` shows the commands. `RUBY` and `NODE` name the interpreters.

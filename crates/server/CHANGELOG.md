@@ -97,8 +97,9 @@ compatible within a major version: released clients keep working with newer serv
   client the S3 endpoint, region and addressing (`gono_cloud.s3`). The acceptance suite drives
   it with the AWS SDK, and CI with the AWS CLI, rclone, mc and restic
   (`acceptance/scripts/s3-clients.sh`) and a selection of Ceph's s3-tests
-  (`acceptance/scripts/s3-tests.sh`); `acceptance/scripts/s3-load.sh` measures parallel
-  uploads, also of several accounts and mixed with WebDAV.
+  (`acceptance/scripts/s3-tests.sh`). `acceptance/scripts/s3-apps.sh` replays what Mastodon,
+  Misskey, PeerTube and PicGo send, with their libraries; `acceptance/scripts/s3-load.sh`
+  measures parallel uploads, also of several accounts and mixed with WebDAV.
 
 - **Checksums**: the server records the MD5 of every file it writes (WebDAV and the Nextcloud
   clients, chunked uploads, the web file UI, single S3 uploads; partial updates are read
