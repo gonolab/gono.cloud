@@ -243,11 +243,12 @@ impl TryFrom<ScopeRow> for Scope {
 }
 
 /// Lists the app passwords of a user, oldest first. The credentials of devices registered for
-/// remote access are not app passwords to the user and are left out ([`crate::devices`]).
+/// remote access are not app passwords to the user and are left out ([`crate::devices`]), and
+/// so are S3 access keys ([`crate::s3`]).
 pub async fn list(pool: &Pool, user_id: i64) -> Result<Vec<AppPassword>> {
     let rows: Vec<AppPasswordRow> = sqlx::query_as(
         "SELECT id, user_id, label, created_at, expires_at, last_used_at FROM app_passwords \
-         WHERE user_id = ?1 AND id NOT IN (SELECT app_password_id FROM devices \
+         WHERE user_id = ?1 AND kind = 'dav' AND id NOT IN (SELECT app_password_id FROM devices \
          WHERE app_password_id IS NOT NULL) ORDER BY id",
     )
     .bind(user_id)
@@ -284,11 +285,11 @@ pub async fn list(pool: &Pool, user_id: i64) -> Result<Vec<AppPassword>> {
 
 /// Revokes an app password of `user_id`. Returns `false` if there is no such app password. The
 /// credential of a registered device is not deleted here: revoking the device deletes it
-/// ([`crate::devices::revoke`]).
+/// ([`crate::devices::revoke`]); nor is an S3 access key ([`crate::s3::delete_key`]).
 pub async fn delete(pool: &Pool, user_id: i64, id: i64) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
     let result = sqlx::query(
-        "DELETE FROM app_passwords WHERE id = ?1 AND user_id = ?2 \
+        "DELETE FROM app_passwords WHERE id = ?1 AND user_id = ?2 AND kind = 'dav' \
          AND id NOT IN (SELECT app_password_id FROM devices WHERE app_password_id IS NOT NULL)",
     )
     .bind(id)
@@ -323,7 +324,7 @@ pub async fn authenticate(
 ) -> Result<Option<Device>> {
     let hash = hash_token(token.expose_secret());
     let row: Option<DeviceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "{DEVICE_QUERY} WHERE a.token_hash = ?1"
+        "{DEVICE_QUERY} WHERE a.kind = 'dav' AND a.token_hash = ?1"
     )))
     .bind(&hash[..])
     .fetch_optional(pool)
@@ -339,7 +340,7 @@ pub async fn authenticate(
 /// a direct download link.
 pub async fn device(pool: &Pool, id: i64, now: i64) -> Result<Option<Device>> {
     let row: Option<DeviceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "{DEVICE_QUERY} WHERE a.id = ?1"
+        "{DEVICE_QUERY} WHERE a.kind = 'dav' AND a.id = ?1"
     )))
     .bind(id)
     .fetch_optional(pool)

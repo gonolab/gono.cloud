@@ -157,6 +157,41 @@ pub enum Error {
     /// `init` was run against a database that already has accounts.
     #[error("the database already contains users; manage accounts with `gono-cloud user`")]
     AlreadyInitialized,
+
+    /// A bucket name breaks the naming rules.
+    #[error("invalid bucket name {name:?}: {reason}")]
+    InvalidBucketName {
+        /// The rejected name.
+        name: String,
+        /// Which rule it breaks.
+        reason: &'static str,
+    },
+
+    /// The bucket name is taken.
+    #[error("bucket {name} exists already{}", if *.yours { " and is yours" } else { "" })]
+    BucketExists {
+        /// The name.
+        name: String,
+        /// The bucket belongs to the account that asked for it.
+        yours: bool,
+    },
+
+    /// A folder cannot be bound as a bucket.
+    #[error("cannot bind {path}: {reason}")]
+    InvalidBucketFolder {
+        /// The folder.
+        path: String,
+        /// Why not.
+        reason: &'static str,
+    },
+
+    /// Not a bucket's anonymous access mode.
+    #[error("invalid anonymous access {0:?}: expected private, acl or public-read")]
+    InvalidAnonymous(String),
+
+    /// The grants of an S3 access key are inconsistent.
+    #[error("invalid S3 key grants: {0}")]
+    InvalidGrants(String),
 }
 
 /// Errors raised while loading or validating the configuration file.

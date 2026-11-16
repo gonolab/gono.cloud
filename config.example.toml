@@ -154,6 +154,44 @@ allowed_endpoints = []
 # max_client_bytes_per_sec = 2097152
 # max_client_burst_bytes = 262144
 
+[s3]
+# The S3-compatible API: S3 clients and applications upload files with an access key, and files
+# can be published for anonymous download. A bucket is a folder of its owner's tree, so files
+# uploaded through S3 also appear in WebDAV, the Nextcloud clients and the web file UI. Access
+# keys are created with `gono-cloud s3 key create`, on the account page or in the admin UI; their
+# secrets are encrypted with two_factor.key_file below. The reverse proxy needs a server block
+# for it (docs/reverse-proxy.md). Default: false.
+enabled = false
+
+# Public URL of the S3 API, the endpoint clients are configured with. It needs a host name of its
+# own, other than base_url's: buckets are addressed right below the root, and files published
+# for anonymous download must never share the site's host. Required when enabled.
+# public_url = "https://s3.example.com"
+
+# Address and port of the S3 API's plain-HTTP listener. The reverse proxy terminates HTTPS for
+# public_url and forwards everything to it, with the Host header unchanged (it is signed). Only
+# loopback addresses are accepted unless server.allow_non_loopback_bind is true.
+# Default: "127.0.0.1:16104".
+bind = "127.0.0.1:16104"
+
+# The region clients sign their requests for. Most clients default to us-east-1.
+# Default: "us-east-1".
+region = "us-east-1"
+
+# The folder, in each user's tree, that holds the buckets created through the S3 API
+# (CreateBucket). Existing folders can be bound as buckets from the account page or the CLI.
+# Default: "Buckets".
+bucket_folder = "Buckets"
+
+# Whether bucket owners may allow anonymous downloads: of single objects uploaded with the
+# public-read ACL, or of a whole bucket, and anonymous listings. While false, every bucket answers
+# as private. Default: false.
+allow_anonymous = false
+
+# Multipart uploads that are neither completed nor aborted within this many seconds are removed.
+# Default: 604800 (a week).
+multipart_ttl_secs = 604800
+
 [two_factor]
 # The key the TOTP secrets of two-step verification are encrypted with: 32 random bytes (or 64
 # hex digits), readable by the service. Keep it outside the data directory and back it up with

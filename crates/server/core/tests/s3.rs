@@ -1,0 +1,437 @@
+//! S3 buckets and access keys against a real database: bindings that follow their folders,
+//! names unique across accounts, grants, and keys that sign but never pass HTTP Basic.
+
+use gono_server_core::{
+    Error, Permission, RelPath, Username, app_passwords,
+    config::DbConfig,
+    db::{self, OpenMode, Pool},
+    meta::{DiskStat, MetaStore},
+    s3::{self, Anonymous, BucketName, Grant},
+    sealing::Key,
+    users::{self, NewUser},
+};
+use secrecy::{ExposeSecret as _, SecretString};
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    pool: Pool,
+    meta: MetaStore,
+    sealing: Key,
+}
+
+async fn fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let config = DbConfig {
+        path: dir.path().join("gono-cloud.db"),
+        max_connections: 4,
+        busy_timeout_secs: 5,
+    };
+    let pool = db::connect(&config, OpenMode::CreateIfMissing)
+        .await
+        .unwrap();
+    db::migrate(&pool).await.unwrap();
+    Fixture {
+        _dir: dir,
+        meta: MetaStore::new(pool.clone()),
+        pool,
+        sealing: Key::from_bytes(&[7; 32]),
+    }
+}
+
+impl Fixture {
+    async fn user(&self, name: &str) -> i64 {
+        let username = Username::new(name).unwrap();
+        let id = users::create(
+            &self.pool,
+            &NewUser {
+                username: &username,
+                display_name: name,
+                password_hash: "x",
+                is_admin: false,
+            },
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        self.meta
+            .adopt(
+                id,
+                &[(
+                    RelPath::root(),
+                    DiskStat {
+                        is_dir: true,
+                        mtime_ns: 1,
+                        size: 0,
+                    },
+                )],
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn folder(&self, owner: i64, path: &str) -> i64 {
+        self.meta
+            .record_mkdir(owner, &RelPath::parse(path).unwrap(), 1)
+            .await
+            .unwrap()
+            .id
+    }
+
+    async fn bucket(&self, owner: i64, name: &str, folder: i64) -> Result<s3::Bucket, Error> {
+        s3::create_bucket(&self.pool, owner, &BucketName::new(name).unwrap(), folder).await
+    }
+}
+
+#[tokio::test]
+async fn buckets_are_named_folders_that_follow_moves() {
+    let f = fixture().await;
+    let alice = f.user("alice").await;
+    let photos = f.folder(alice, "Photos").await;
+    let bucket = f.bucket(alice, "photos", photos).await.unwrap();
+    assert_eq!(bucket.folder.as_str(), "Photos");
+    assert_eq!(bucket.anonymous, Anonymous::Private);
+    assert!(!bucket.anonymous_list);
+
+    f.meta
+        .record_move(
+            alice,
+            &RelPath::parse("Photos").unwrap(),
+            &RelPath::parse("Archive").unwrap(),
+            DiskStat {
+                is_dir: true,
+                mtime_ns: 2,
+                size: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let moved = s3::bucket(&f.pool, "photos").await.unwrap().unwrap();
+    assert_eq!(moved.folder.as_str(), "Archive");
+    assert_eq!(moved.id, bucket.id);
+
+    f.meta
+        .record_delete(alice, &RelPath::parse("Archive").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(s3::bucket(&f.pool, "photos").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn bucket_names_are_unique_across_accounts() {
+    let f = fixture().await;
+    let alice = f.user("alice").await;
+    let bob = f.user("bob").await;
+    let a = f.folder(alice, "A").await;
+    let a2 = f.folder(alice, "A2").await;
+    let b = f.folder(bob, "B").await;
+    f.bucket(alice, "shared", a).await.unwrap();
+    assert!(matches!(
+        f.bucket(alice, "shared", a2).await,
+        Err(Error::BucketExists { yours: true, .. })
+    ));
+    assert!(matches!(
+        f.bucket(bob, "shared", b).await,
+        Err(Error::BucketExists { yours: false, .. })
+    ));
+    f.bucket(bob, "bobs", b).await.unwrap();
+    let names: Vec<String> = s3::buckets_of(&f.pool, alice)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|bucket| bucket.name)
+        .collect();
+    assert_eq!(names, ["shared"]);
+}
+
+#[tokio::test]
+async fn only_separate_folders_of_the_owner_can_be_buckets() {
+    let f = fixture().await;
+    let alice = f.user("alice").await;
+    let bob = f.user("bob").await;
+    let outer = f.folder(alice, "Outer").await;
+    let inner = f.folder(alice, "Outer/Inner").await;
+    let sibling = f.folder(alice, "Outer-2").await;
+    let file = f
+        .meta
+        .record_write(
+            alice,
+            &RelPath::parse("note.txt").unwrap(),
+            DiskStat {
+                is_dir: false,
+                mtime_ns: 1,
+                size: 1,
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+    let root = f
+        .meta
+        .get(alice, &RelPath::root())
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let bobs = f.folder(bob, "Mine").await;
+
+    f.bucket(alice, "inner", inner).await.unwrap();
+    for (name, folder) in [
+        ("outer", outer),
+        ("again", inner),
+        ("root", root),
+        ("file", file),
+        ("foreign", bobs),
+        ("missing", i64::MAX),
+    ] {
+        assert!(
+            matches!(
+                f.bucket(alice, name, folder).await,
+                Err(Error::InvalidBucketFolder { .. })
+            ),
+            "{name}"
+        );
+    }
+    // Prefixes are compared per segment.
+    f.bucket(alice, "sibling", sibling).await.unwrap();
+}
+
+#[tokio::test]
+async fn buckets_can_be_unbound_and_opened_to_anonymous_reads() {
+    let f = fixture().await;
+    let alice = f.user("alice").await;
+    let bob = f.user("bob").await;
+    let folder = f.folder(alice, "Public").await;
+    let bucket = f.bucket(alice, "public", folder).await.unwrap();
+    assert!(
+        !s3::set_anonymous(&f.pool, bob, bucket.id, Anonymous::PublicRead, true)
+            .await
+            .unwrap(),
+        "not bob's bucket"
+    );
+    assert!(
+        s3::set_anonymous(&f.pool, alice, bucket.id, Anonymous::Acl, true)
+            .await
+            .unwrap()
+    );
+    let stored = s3::bucket(&f.pool, "public").await.unwrap().unwrap();
+    assert_eq!(stored.anonymous, Anonymous::Acl);
+    assert!(stored.anonymous_list);
+
+    assert!(!s3::delete_bucket(&f.pool, bob, bucket.id).await.unwrap());
+    assert!(s3::delete_bucket(&f.pool, alice, bucket.id).await.unwrap());
+    assert_eq!(s3::bucket(&f.pool, "public").await.unwrap(), None);
+    assert!(
+        f.meta
+            .get(alice, &RelPath::parse("Public").unwrap())
+            .await
+            .unwrap()
+            .is_some(),
+        "the folder stays"
+    );
+}
+
+#[tokio::test]
+async fn keys_sign_with_their_sealed_secret() {
+    let f = fixture().await;
+    let alice = f.user("alice").await;
+    let (key, secret) = s3::create_key(
+        &f.pool,
+        &f.sealing,
+        alice,
+        "laptop",
+        vec![Grant::everything()],
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(s3::is_access_key_id(&key.access_key_id));
+    assert_eq!(secret.expose_secret().len(), 40);
+
+    let signing = s3::signing_key(&f.pool, &f.sealing, &key.access_key_id, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(signing.secret.expose_secret(), secret.expose_secret());
+    assert_eq!(signing.username.as_str(), "alice");
+    assert_eq!(signing.grants, [Grant::everything()]);
+
+    // The stored secret is not the secret.
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT secret_sealed FROM app_passwords WHERE id = ?1")
+            .bind(key.id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert!(
+        !stored
+            .windows(secret.expose_secret().len())
+            .any(|w| w == secret.expose_secret().as_bytes())
+    );
+    // Another key file opens nothing.
+    assert!(
+        s3::signing_key(&f.pool, &Key::from_bytes(&[8; 32]), &key.access_key_id, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        s3::signing_key(&f.pool, &f.sealing, "GONOAAAAAAAAAAAAAAAA", 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn keys_are_no_app_passwords() {
+    let f = fixture().await;
+    let alice = f.user("alice").await;
+    let (key, secret) = s3::create_key(
+        &f.pool,
+        &f.sealing,
+        alice,
+        "s3",
+        vec![Grant::everything()],
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        app_passwords::authenticate(&f.pool, "alice", &secret, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        app_passwords::authenticate(
+            &f.pool,
+            "alice",
+            &SecretString::from(key.access_key_id.clone()),
+            0
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        app_passwords::device(&f.pool, key.id, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        app_passwords::list(&f.pool, alice)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!app_passwords::delete(&f.pool, alice, key.id).await.unwrap());
+
+    // And app passwords are no keys.
+    let (dav, _) = app_passwords::create(&f.pool, alice, "phone", Vec::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(s3::list_keys(&f.pool, alice).await.unwrap().len(), 1);
+    assert!(!s3::delete_key(&f.pool, alice, dav).await.unwrap());
+    assert!(s3::delete_key(&f.pool, alice, key.id).await.unwrap());
+    assert!(s3::list_keys(&f.pool, alice).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn keys_stop_signing_when_they_expire_or_the_account_is_disabled() {
+    let f = fixture().await;
+    let alice = f.user("alice").await;
+    let (key, _) = s3::create_key(
+        &f.pool,
+        &f.sealing,
+        alice,
+        "temporary",
+        vec![Grant::everything()],
+        Some(100),
+    )
+    .await
+    .unwrap();
+    let signs = |now| {
+        let f = &f;
+        let id = key.access_key_id.clone();
+        async move {
+            s3::signing_key(&f.pool, &f.sealing, &id, now)
+                .await
+                .unwrap()
+                .is_some()
+        }
+    };
+    assert!(signs(99).await);
+    assert!(!signs(100).await);
+    sqlx::query("UPDATE app_passwords SET expires_at = NULL WHERE id = ?1")
+        .bind(key.id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    assert!(signs(100).await);
+    users::set_enabled(&f.pool, &Username::new("alice").unwrap(), false)
+        .await
+        .unwrap();
+    assert!(!signs(100).await);
+}
+
+#[tokio::test]
+async fn grants_name_buckets_of_the_owner() {
+    let f = fixture().await;
+    let alice = f.user("alice").await;
+    let bob = f.user("bob").await;
+    let one = f
+        .bucket(alice, "one", f.folder(alice, "One").await)
+        .await
+        .unwrap();
+    let two = f
+        .bucket(alice, "two", f.folder(alice, "Two").await)
+        .await
+        .unwrap();
+    let bobs = f
+        .bucket(bob, "bobs", f.folder(bob, "B").await)
+        .await
+        .unwrap();
+    let grant = |bucket: &s3::Bucket, permission| Grant {
+        bucket_id: Some(bucket.id),
+        permission,
+    };
+    let create = |grants: Vec<Grant>| {
+        let f = &f;
+        async move { s3::create_key(&f.pool, &f.sealing, alice, "k", grants, None).await }
+    };
+    for bad in [
+        Vec::new(),
+        vec![Grant::everything(), grant(&one, Permission::View)],
+        vec![grant(&one, Permission::View), grant(&one, Permission::Full)],
+        vec![grant(&bobs, Permission::View)],
+    ] {
+        assert!(
+            matches!(create(bad.clone()).await, Err(Error::InvalidGrants(_))),
+            "{bad:?}"
+        );
+    }
+    let (key, _) = create(vec![
+        grant(&two, Permission::Full),
+        grant(&one, Permission::View),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(
+        key.grants,
+        [grant(&one, Permission::View), grant(&two, Permission::Full)]
+    );
+    assert_eq!(
+        s3::list_keys(&f.pool, alice).await.unwrap()[0].grants,
+        key.grants
+    );
+
+    // Unbinding a bucket takes its grants along.
+    s3::delete_bucket(&f.pool, alice, one.id).await.unwrap();
+    let signing = s3::signing_key(&f.pool, &f.sealing, &key.access_key_id, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(signing.grants, [grant(&two, Permission::Full)]);
+}

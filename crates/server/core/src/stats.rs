@@ -53,11 +53,13 @@ pub async fn overview(pool: &Pool, now: i64) -> Result<Overview> {
     )
     .fetch_one(pool)
     .await?;
-    let (app_passwords, app_passwords_used_today): (i64, i64) =
-        sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(last_used_at >= ?1), 0) FROM app_passwords")
-            .bind(now - 24 * 3600)
-            .fetch_one(pool)
-            .await?;
+    let (app_passwords, app_passwords_used_today): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(last_used_at >= ?1), 0) FROM app_passwords \
+             WHERE kind = 'dav'",
+    )
+    .bind(now - 24 * 3600)
+    .fetch_one(pool)
+    .await?;
     let count = |sql: &'static str| async move {
         sqlx::query_scalar::<_, i64>(sql)
             .bind(now)
@@ -93,7 +95,7 @@ pub async fn overview(pool: &Pool, now: i64) -> Result<Overview> {
 pub async fn per_user(pool: &Pool) -> Result<HashMap<i64, UserCounts>> {
     let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
         "SELECT u.id, \
-         (SELECT COUNT(*) FROM app_passwords a WHERE a.user_id = u.id), \
+         (SELECT COUNT(*) FROM app_passwords a WHERE a.user_id = u.id AND a.kind = 'dav'), \
          COALESCE((SELECT f.size FROM files f WHERE f.owner_id = u.id AND f.rel_path = ''), 0) \
          FROM users u",
     )

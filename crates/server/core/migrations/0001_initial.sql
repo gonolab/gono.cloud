@@ -27,7 +27,10 @@
 -- - Booleans are INTEGER 0/1 with a CHECK constraint.
 -- - Secrets (app passwords, session cookies, Login Flow tokens, recovery codes) are stored only
 --   as SHA-256 digests (32-byte BLOBs). They are high-entropy random tokens, so a fast hash is
---   enough and lookups are a single indexed equality match.
+--   enough and lookups are a single indexed equality match. The exceptions are secrets the
+--   server must read back, TOTP secrets and S3 secret keys (an S3 signature is an HMAC keyed
+--   with the secret): they are sealed with the key file of `two_factor.key_file`
+--   (`gono_server_core::sealing`), so a copy of the database alone gives none of them away.
 -- - Tables are STRICT so SQLite enforces the declared column types.
 
 -- Server-wide settings that are generated once and must stay stable for the lifetime of the
@@ -61,19 +64,36 @@ CREATE TABLE users (
 ) STRICT;
 
 -- Per-device credentials, minted by Login Flow v2, device registration, the CLI or the web
--- admin UI.
+-- admin UI, and S3 access keys, minted by the CLI, the account page or the web admin UI.
+-- A credential of one kind never works as the other: S3 keys never pass HTTP Basic, and app
+-- passwords never sign S3 requests.
 CREATE TABLE app_passwords (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id      INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    -- SHA-256 of the token. The plaintext is shown once at creation and never stored.
-    token_hash   BLOB    NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    -- 'dav': an app password for HTTP Basic (WebDAV, OCS, notify_push), with scopes in
+    -- app_password_scopes. 's3': an S3 access key, with grants in s3_key_grants.
+    kind          TEXT    NOT NULL DEFAULT 'dav' CHECK (kind IN ('dav', 's3')),
+    -- SHA-256 of the token ('dav' only). The plaintext is shown once at creation and never
+    -- stored.
+    token_hash    BLOB    UNIQUE CHECK (token_hash IS NULL OR length(token_hash) = 32),
+    -- The access key id ('s3' only): `GONO` and 16 characters from [A-Z0-9].
+    access_key_id TEXT    UNIQUE COLLATE BINARY,
+    -- The secret key ('s3' only), sealed for `Purpose::S3Secret` and this row's id. Shown once
+    -- at creation like a token.
+    secret_sealed BLOB,
     -- Human-readable name, for example the device name reported by Login Flow v2.
     -- Not unique: the same device may sign in more than once.
-    label        TEXT    NOT NULL,
-    created_at   INTEGER NOT NULL,
+    label         TEXT    NOT NULL,
+    created_at    INTEGER NOT NULL,
     -- NULL means the password never expires.
-    expires_at   INTEGER,
-    last_used_at INTEGER
+    expires_at    INTEGER,
+    last_used_at  INTEGER,
+    CHECK (
+        (kind = 'dav' AND token_hash IS NOT NULL AND access_key_id IS NULL
+            AND secret_sealed IS NULL)
+        OR (kind = 's3' AND token_hash IS NULL AND access_key_id IS NOT NULL
+            AND secret_sealed IS NOT NULL)
+    )
 ) STRICT;
 
 CREATE INDEX app_passwords_user_id ON app_passwords (user_id);
@@ -113,6 +133,43 @@ CREATE TABLE files (
 
 -- Favorites lookup for the `filter-files` REPORT.
 CREATE INDEX files_favorites ON files (owner_id, rel_path) WHERE favorite = 1;
+
+-- S3 buckets: a bucket is a name bound to a folder of its owner's tree, and its objects are the
+-- files below that folder.
+CREATE TABLE s3_buckets (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- Unique across the server: an anonymous request names only the bucket. 3 to 63 characters
+    -- from [a-z0-9-], starting and ending with a letter or digit.
+    name           TEXT    NOT NULL UNIQUE COLLATE BINARY,
+    owner_id       INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    -- The folder, by file id: the bucket follows it through MOVE, and deleting it deletes the
+    -- bucket. A folder is bound to one bucket at most.
+    root_file_id   INTEGER NOT NULL UNIQUE REFERENCES files (id) ON DELETE CASCADE,
+    -- Anonymous reads: 'private' none; 'acl' objects with the public-read ACL
+    -- (object_meta.public_read); 'public-read' every object. Effective only while
+    -- `s3.allow_anonymous` is on.
+    anonymous      TEXT    NOT NULL DEFAULT 'private'
+                           CHECK (anonymous IN ('private', 'acl', 'public-read')),
+    -- Anonymous requests may list the bucket.
+    anonymous_list INTEGER NOT NULL DEFAULT 0 CHECK (anonymous_list IN (0, 1)),
+    created_at     INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX s3_buckets_owner_id ON s3_buckets (owner_id);
+
+-- What an S3 access key may reach. A key without grants reaches nothing.
+CREATE TABLE s3_key_grants (
+    app_password_id INTEGER NOT NULL REFERENCES app_passwords (id) ON DELETE CASCADE,
+    -- One bucket of the key's owner, or NULL for every bucket of the owner, present and future.
+    -- Only a key with a 'full' grant on every bucket may create and delete buckets and change
+    -- their anonymous access.
+    bucket_id       INTEGER REFERENCES s3_buckets (id) ON DELETE CASCADE,
+    permission      TEXT    NOT NULL CHECK (permission IN ('view', 'full'))
+) STRICT;
+
+-- One grant per key and bucket; NULL counts as the bucket "every bucket".
+CREATE UNIQUE INDEX s3_key_grants_key_bucket ON s3_key_grants (app_password_id, ifnull(bucket_id, 0));
+CREATE INDEX s3_key_grants_bucket_id ON s3_key_grants (bucket_id);
 
 -- WebDAV dead properties set through PROPPATCH. Keyed by file id, so MOVE keeps them and
 -- DELETE removes them.

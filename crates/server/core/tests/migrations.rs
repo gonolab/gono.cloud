@@ -85,6 +85,8 @@ async fn migrations_apply_to_an_empty_database() {
             "retired_usernames",
             "revocations_applied",
             "revoked_keys",
+            "s3_buckets",
+            "s3_key_grants",
             "settings",
             "two_factor",
             "upload_sessions",
@@ -203,6 +205,27 @@ async fn schema_enforces_constraints() {
     rejects(
         "INSERT INTO app_passwords (user_id, token_hash, label, created_at) \
          VALUES (?1, x'00', 'short', 0)",
+    )
+    .await;
+    // An app password has a token hash, an S3 key an access key id and a sealed secret, never
+    // the other's.
+    rejects(
+        "INSERT INTO app_passwords (user_id, kind, label, created_at) VALUES (?1, 'dav', 'x', 0)",
+    )
+    .await;
+    rejects(
+        "INSERT INTO app_passwords (user_id, kind, token_hash, access_key_id, secret_sealed, \
+         label, created_at) VALUES (?1, 's3', zeroblob(32), 'GONOX', x'00', 'x', 0)",
+    )
+    .await;
+    rejects(
+        "INSERT INTO app_passwords (user_id, kind, access_key_id, label, created_at) \
+         VALUES (?1, 's3', 'GONOX', 'x', 0)",
+    )
+    .await;
+    rejects(
+        "INSERT INTO app_passwords (user_id, kind, token_hash, label, created_at) \
+         VALUES (?1, 'ftp', zeroblob(32), 'x', 0)",
     )
     .await;
     // Foreign keys are enforced.

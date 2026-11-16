@@ -32,6 +32,14 @@ pub const DEFAULT_BIND: SocketAddr =
 pub const DEFAULT_RELAY_BIND: SocketAddr =
     SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 16103);
 
+/// Default address of the S3 API's plain-HTTP listener, next to [`DEFAULT_RELAY_BIND`].
+/// Loopback only: the reverse proxy terminates HTTPS for the S3 host name.
+pub const DEFAULT_S3_BIND: SocketAddr =
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 16104);
+
+/// Default of `s3.multipart_ttl_secs`: a week.
+pub const DEFAULT_MULTIPART_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// UDP port of QUIC address discovery that iroh devices use unless told otherwise.
 pub const DEFAULT_QAD_PORT: u16 = 7842;
 
@@ -63,6 +71,9 @@ pub struct Config {
     /// `[relay]`: the relay through which devices reach each other.
     #[serde(default)]
     pub relay: RelayConfig,
+    /// `[s3]`: the S3-compatible API.
+    #[serde(default)]
+    pub s3: S3Config,
     /// `[two_factor]`: two-step verification of web sign-ins.
     #[serde(default)]
     pub two_factor: TwoFactorConfig,
@@ -348,6 +359,65 @@ impl Default for RelayConfig {
     }
 }
 
+/// `[s3]` table: the S3-compatible API. Buckets are folders of their owners' trees, so files
+/// uploaded through S3 are WebDAV files as well.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct S3Config {
+    /// Serve the S3 API.
+    pub enabled: bool,
+
+    /// Public URL of the S3 API, for example `https://s3.example.com`.
+    ///
+    /// It needs a host name of its own: S3 clients address buckets right below the root, and
+    /// objects published for anonymous download must never run as part of the site's origin.
+    /// Required when the S3 API is enabled.
+    pub public_url: Option<Url>,
+
+    /// Socket address of the S3 API's plain-HTTP listener. Loopback only unless
+    /// `server.allow_non_loopback_bind`.
+    pub bind: SocketAddr,
+
+    /// The region clients sign their requests for. Most clients default to `us-east-1`.
+    pub region: String,
+
+    /// The folder, in each user's tree, that holds the buckets created through the S3 API: one
+    /// path segment.
+    pub bucket_folder: String,
+
+    /// Whether bucket owners may allow anonymous downloads and listings. While false, every
+    /// bucket answers as private, whatever its stored settings.
+    pub allow_anonymous: bool,
+
+    /// Multipart uploads that are neither completed nor aborted within this many seconds are
+    /// removed.
+    pub multipart_ttl_secs: u64,
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            public_url: None,
+            bind: DEFAULT_S3_BIND,
+            region: "us-east-1".to_owned(),
+            bucket_folder: "Buckets".to_owned(),
+            allow_anonymous: false,
+            multipart_ttl_secs: DEFAULT_MULTIPART_TTL_SECS,
+        }
+    }
+}
+
+/// Whether `region` is an AWS-style region name: lowercase letters, digits and `-`, starting
+/// with a letter, at most 63 characters.
+fn is_region(region: &str) -> bool {
+    (1..=63).contains(&region.len())
+        && region.starts_with(|c: char| c.is_ascii_lowercase())
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// Whether `id` is a device id as the relay expects it: 64 hex digits, the 32 bytes of an
 /// Ed25519 public key.
 pub fn is_endpoint_id(id: &str) -> bool {
@@ -599,6 +669,9 @@ impl Config {
         // [relay]
         self.validate_relay(&mut reject);
 
+        // [s3]
+        self.validate_s3(&mut reject);
+
         if issues.is_empty() {
             Ok(())
         } else {
@@ -702,6 +775,92 @@ impl Config {
                 "relay.max_client_burst_bytes",
                 "needs relay.max_client_bytes_per_sec".to_owned(),
             );
+        }
+    }
+
+    /// Checks the `[s3]` table. Values that are set are always checked; what the S3 API needs
+    /// to run is only required once it is enabled.
+    fn validate_s3(&self, reject: &mut impl FnMut(&'static str, String)) {
+        let s3 = &self.s3;
+        match &s3.public_url {
+            Some(url) => {
+                let host = url.host_str();
+                if let Err(message) = check_base_url(url) {
+                    reject("s3.public_url", message);
+                } else if host == self.server.base_url.host_str() {
+                    reject(
+                        "s3.public_url",
+                        "must have a host name other than server.base_url's, for example \
+                         https://s3.example.com: S3 clients address buckets right below the root, \
+                         and files published for anonymous download must never share the \
+                         site's host"
+                            .to_owned(),
+                    );
+                } else if self
+                    .relay
+                    .public_url
+                    .as_ref()
+                    .is_some_and(|relay| relay.host_str() == host)
+                {
+                    reject(
+                        "s3.public_url",
+                        "must have a host name other than relay.public_url's".to_owned(),
+                    );
+                }
+            }
+            None if s3.enabled => {
+                reject(
+                    "s3.public_url",
+                    "is required when the S3 API is enabled".to_owned(),
+                );
+            }
+            None => {}
+        }
+        if s3.enabled {
+            if !s3.bind.ip().is_loopback() && !self.server.allow_non_loopback_bind {
+                reject(
+                    "s3.bind",
+                    format!(
+                        "{} is not a loopback address; the S3 API serves plain HTTP behind the \
+                         reverse proxy. Bind to 127.0.0.1 or ::1, or set \
+                         server.allow_non_loopback_bind = true if the proxy cannot reach \
+                         loopback",
+                        s3.bind.ip()
+                    ),
+                );
+            }
+            if s3.bind == self.server.bind || (self.relay.enabled && s3.bind == self.relay.bind) {
+                reject(
+                    "s3.bind",
+                    "must differ from server.bind and relay.bind".to_owned(),
+                );
+            }
+        }
+        if !is_region(&s3.region) {
+            reject(
+                "s3.region",
+                format!(
+                    "{:?} is not a region name: lowercase letters, digits and '-', starting \
+                     with a letter",
+                    s3.region
+                ),
+            );
+        }
+        if crate::path::normalize_segment(s3.bucket_folder.as_bytes())
+            .ok()
+            .as_deref()
+            != Some(s3.bucket_folder.as_str())
+        {
+            reject(
+                "s3.bucket_folder",
+                format!(
+                    "{:?} is not a folder name: one path segment in Unicode NFC, without '/'",
+                    s3.bucket_folder
+                ),
+            );
+        }
+        if s3.multipart_ttl_secs == 0 {
+            reject("s3.multipart_ttl_secs", "must be greater than 0".to_owned());
         }
     }
 
@@ -1419,5 +1578,78 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../config.example.toml");
         let config = Config::load(&path).expect("config.example.toml should be valid");
         assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+    }
+
+    /// Parses `MINIMAL` with an `[s3]` table holding `body`.
+    fn with_s3(body: &str) -> Config {
+        parse(&format!("{MINIMAL}\n[s3]\n{body}\n"))
+    }
+
+    #[test]
+    fn s3_is_off_by_default() {
+        let s3 = parse(MINIMAL).s3;
+        assert!(!s3.enabled);
+        assert_eq!(s3.public_url, None);
+        assert_eq!(s3.bind, "127.0.0.1:16104".parse().unwrap());
+        assert_eq!(s3.region, "us-east-1");
+        assert_eq!(s3.bucket_folder, "Buckets");
+        assert!(!s3.allow_anonymous);
+        assert_eq!(s3.multipart_ttl_secs, 7 * 24 * 60 * 60);
+        assert!(issue_keys(&parse(MINIMAL)).is_empty());
+    }
+
+    #[test]
+    fn enabled_s3_needs_a_host_name_of_its_own() {
+        assert_eq!(issue_keys(&with_s3("enabled = true")), ["s3.public_url"]);
+        let valid = with_s3("enabled = true\npublic_url = \"https://s3.example.com\"");
+        assert!(issue_keys(&valid).is_empty());
+        for shared in [
+            "https://cloud.example.com",
+            // Another port is another origin, but cookies are shared by host name.
+            "https://cloud.example.com:9000",
+            "https://s3.example.com/s3",
+        ] {
+            assert_eq!(
+                issue_keys(&with_s3(&format!(
+                    "enabled = true\npublic_url = \"{shared}\""
+                ))),
+                ["s3.public_url"],
+                "{shared}"
+            );
+        }
+        let mut relay = with_s3("enabled = true\npublic_url = \"https://relay.example.com\"");
+        relay.relay.public_url = Some(Url::parse("https://relay.example.com").unwrap());
+        assert_eq!(issue_keys(&relay), ["s3.public_url"]);
+    }
+
+    #[test]
+    fn s3_values_are_checked() {
+        let enabled = "enabled = true\npublic_url = \"https://s3.example.com\"";
+        for (extra, key) in [
+            ("bind = \"0.0.0.0:16104\"", "s3.bind"),
+            ("bind = \"127.0.0.1:16102\"", "s3.bind"),
+            ("region = \"US East\"", "s3.region"),
+            ("region = \"\"", "s3.region"),
+            ("bucket_folder = \"a/b\"", "s3.bucket_folder"),
+            ("bucket_folder = \"..\"", "s3.bucket_folder"),
+            ("bucket_folder = \"\"", "s3.bucket_folder"),
+            ("bucket_folder = \"Cafe\u{0301}\"", "s3.bucket_folder"),
+            ("multipart_ttl_secs = 0", "s3.multipart_ttl_secs"),
+        ] {
+            assert_eq!(
+                issue_keys(&with_s3(&format!("{enabled}\n{extra}"))),
+                [key],
+                "{extra}"
+            );
+        }
+        let mut open = with_s3(&format!("{enabled}\nbind = \"0.0.0.0:16104\""));
+        open.server.allow_non_loopback_bind = true;
+        assert!(issue_keys(&open).is_empty());
+        assert!(
+            issue_keys(&with_s3(
+                "region = \"eu-central-1\"\nbucket_folder = \"S3\""
+            ))
+            .is_empty()
+        );
     }
 }

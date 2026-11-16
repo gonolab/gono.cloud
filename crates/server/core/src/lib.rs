@@ -19,6 +19,7 @@
 //! - [`login_flows`]: pending Login Flow v2 sign-ins.
 //! - [`web_sessions`]: browser sessions of the server's HTML pages.
 //! - [`direct_downloads`]: links that let media players stream a file without credentials.
+//! - [`s3`]: S3 buckets (names bound to folders) and S3 access keys.
 //! - [`rescan`]: walking a user's tree on disk for `gono-cloud rescan`.
 //! - [`secret`]: random tokens and their digests.
 //! - [`sealing`]: secrets stored encrypted because the server must read them back.
@@ -38,6 +39,7 @@ pub mod meta;
 pub mod password;
 pub mod path;
 pub mod rescan;
+pub mod s3;
 pub mod sealing;
 pub mod secret;
 pub mod settings;
