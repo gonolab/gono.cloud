@@ -26,7 +26,7 @@ use gono_server_core::{
     meta::{Checksum, ObjectMeta},
     s3::{self, Bucket, Upload, UploadPart},
 };
-use gono_server_dav::WriteCondition;
+use gono_server_dav::{ObjectError, WriteCondition};
 use rand::RngExt as _;
 use s3s::{
     S3Request, S3Response, S3Result,
@@ -37,7 +37,7 @@ use s3s::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-    access::Authorized,
+    access::{Authorized, Caller},
     error,
     keys::{self, Target},
     ops::GonoS3,
@@ -277,11 +277,42 @@ pub(crate) async fn upload_part(
     upload::apply_trailers(&mut claimed, trailers.as_ref())?;
     let checksum = upload::verify(&received, input.content_md5.as_deref(), &claimed)?;
     let etag = received.etag();
+    store_part(
+        state,
+        &input.upload_id,
+        input.part_number,
+        &received.temp,
+        received.size,
+        &etag,
+    )
+    .await?;
+    let checksum = upload::stored_checksum(checksum.as_ref());
+    Ok(S3Response::new(dto::UploadPartOutput {
+        e_tag: Some(ETag::Strong(etag)),
+        checksum_crc32: checksum.checksum_crc32,
+        checksum_crc32c: checksum.checksum_crc32c,
+        checksum_crc64nvme: checksum.checksum_crc64nvme,
+        checksum_sha1: checksum.checksum_sha1,
+        checksum_sha256: checksum.checksum_sha256,
+        ..Default::default()
+    }))
+}
 
-    let part_number = u32::try_from(input.part_number).unwrap_or(0);
+/// Moves the part file `temp` (`size` bytes, ETag `etag`) into the staging directory of
+/// `upload_id` under a name of its own and records it, replacing an earlier part of the same
+/// number.
+async fn store_part(
+    state: &S3State,
+    upload_id: &str,
+    part_number: i32,
+    temp: &upload::Temp,
+    size: u64,
+    etag: &str,
+) -> S3Result<()> {
+    let part_number = u32::try_from(part_number).unwrap_or(0);
     let file_name = format!("{part_number}.{:016x}", rand::rng().random::<u64>());
-    let dir = state.fs().layout().s3_upload_dir(&input.upload_id);
-    tokio::fs::rename(received.temp.path(), dir.join(&file_name))
+    let dir = state.fs().layout().s3_upload_dir(upload_id);
+    tokio::fs::rename(temp.path(), dir.join(&file_name))
         .await
         .map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
@@ -296,18 +327,13 @@ pub(crate) async fn upload_part(
     let part = UploadPart {
         part_number,
         file_name: file_name.clone(),
-        etag: etag.clone(),
-        size: received.size,
+        etag: etag.to_owned(),
+        size,
         uploaded_at: now,
     };
-    let recorded = s3::record_part(
-        state.pool(),
-        &input.upload_id,
-        &part,
-        now.saturating_add(ttl),
-    )
-    .await
-    .map_err(error::database)?;
+    let recorded = s3::record_part(state.pool(), upload_id, &part, now.saturating_add(ttl))
+        .await
+        .map_err(error::database)?;
     let Some(replaced) = recorded else {
         let _ = tokio::fs::remove_file(dir.join(&file_name)).await;
         return Err(s3_error!(NoSuchUpload));
@@ -315,14 +341,166 @@ pub(crate) async fn upload_part(
     if let Some(replaced) = replaced {
         let _ = tokio::fs::remove_file(dir.join(replaced)).await;
     }
-    let checksum = upload::stored_checksum(checksum.as_ref());
-    Ok(S3Response::new(dto::UploadPartOutput {
-        e_tag: Some(ETag::Strong(etag)),
-        checksum_crc32: checksum.checksum_crc32,
-        checksum_crc32c: checksum.checksum_crc32c,
-        checksum_crc64nvme: checksum.checksum_crc64nvme,
-        checksum_sha1: checksum.checksum_sha1,
-        checksum_sha256: checksum.checksum_sha256,
+    Ok(())
+}
+
+/// The bytes `x-amz-copy-source-range` names in an object of `size` bytes: the offset of the
+/// first and the number of bytes. Without a range, the whole object.
+fn copy_range(range: Option<&str>, size: u64) -> S3Result<(u64, u64)> {
+    let Some(range) = range else {
+        return Ok((0, size));
+    };
+    let malformed = || {
+        s3_error!(
+            InvalidArgument,
+            "The x-amz-copy-source-range value must be of the form bytes=first-last where first \
+             and last are the zero-based offsets of the first and last bytes to copy"
+        )
+    };
+    let (first, last) = range
+        .trim()
+        .strip_prefix("bytes=")
+        .and_then(|bytes| bytes.split_once('-'))
+        .ok_or_else(malformed)?;
+    let first: u64 = first.trim().parse().map_err(|_| malformed())?;
+    let last: u64 = last.trim().parse().map_err(|_| malformed())?;
+    if first > last || last >= size {
+        return Err(s3_error!(
+            InvalidRange,
+            "The range is not valid for a source object of {size} bytes"
+        ));
+    }
+    Ok((first, last - first + 1))
+}
+
+/// Copies `length` bytes of `source` from `start` on into the new file `temp`, synced. Returns
+/// their MD5.
+fn copy_part(
+    mut source: std::fs::File,
+    start: u64,
+    length: u64,
+    temp: &Path,
+) -> std::io::Result<[u8; 16]> {
+    use std::io::{Seek as _, SeekFrom};
+
+    source.seek(SeekFrom::Start(start))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut out = options.open(temp)?;
+    let mut md5 = Md5::new();
+    let mut buffer = vec![0; 1024 * 1024];
+    let mut remaining = length;
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = source.read(&mut buffer[..want])?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the source object became shorter while it was copied",
+            ));
+        }
+        md5.update(&buffer[..read]);
+        out.write_all(&buffer[..read])?;
+        remaining -= read as u64;
+    }
+    out.sync_all()?;
+    Ok(md5.finalize())
+}
+
+/// `UploadPartCopy`: a part from (a range of) an object the key may read, in this or another
+/// bucket of its account.
+pub(crate) async fn upload_part_copy(
+    s3: &GonoS3,
+    req: S3Request<dto::UploadPartCopyInput>,
+) -> S3Result<S3Response<dto::UploadPartCopyOutput>> {
+    let state = s3.state();
+    let auth = authorized(&req)?;
+    GonoS3::write_permission(&auth)?;
+    let key = match &auth.caller {
+        Caller::Key(key) => key.clone(),
+        Caller::Anonymous => return Err(s3_error!(AccessDenied)),
+    };
+    let destination = auth.bucket()?.clone();
+    let input = req.input;
+    if !(1..=MAX_PARTS).contains(&input.part_number) {
+        return Err(s3_error!(
+            InvalidArgument,
+            "Part numbers are between 1 and 10000"
+        ));
+    }
+    if input.sse_customer_algorithm.is_some() || input.copy_source_sse_customer_algorithm.is_some()
+    {
+        return Err(s3_error!(NotImplemented));
+    }
+    let dto::CopySource::Bucket {
+        bucket: source_bucket,
+        key: source_key,
+        version_id,
+    } = &input.copy_source
+    else {
+        return Err(s3_error!(
+            NotImplemented,
+            "Only bucket copy sources are supported"
+        ));
+    };
+    if version_id.as_deref().is_some_and(|id| id != "null") {
+        return Err(s3_error!(NoSuchVersion));
+    }
+    find_upload(state, &destination, &input.key, &input.upload_id).await?;
+    if state.is_completing(&input.upload_id) {
+        return Err(s3_error!(OperationAborted, "The upload is being completed"));
+    }
+    let (source, from) = s3
+        .copy_source(&key, &destination, source_bucket, source_key)
+        .await?;
+    let identity = auth.identity(&[(&source, false)])?;
+    let (entry, meta, file) =
+        state
+            .fs()
+            .open_object(identity, &from)
+            .await
+            .map_err(|err| match err {
+                ObjectError::IsFolder | ObjectError::NotFound => s3_error!(NoSuchKey),
+                other => error::object(other, false),
+            })?;
+    let source_etag = meta
+        .as_ref()
+        .map_or(entry.etag.as_str(), |meta| meta.etag_or(&entry.etag))
+        .to_owned();
+    crate::ops::check_copy_source_conditions(
+        &source_etag,
+        entry.modified,
+        input.copy_source_if_match.as_ref(),
+        input.copy_source_if_none_match.as_ref(),
+        input.copy_source_if_modified_since.as_ref(),
+        input.copy_source_if_unmodified_since.as_ref(),
+    )?;
+    let (start, length) = copy_range(input.copy_source_range.as_deref(), entry.size)?;
+
+    let temp = upload::Temp::new_in(&state.fs().layout().tmp_dir());
+    let path = temp.path().to_path_buf();
+    let md5 = tokio::task::spawn_blocking(move || copy_part(file, start, length, &path))
+        .await
+        .map_err(|_| s3_error!(InternalError))?
+        .map_err(error::io)?;
+    let etag = upload::hex(&md5);
+    store_part(
+        state,
+        &input.upload_id,
+        input.part_number,
+        &temp,
+        length,
+        &etag,
+    )
+    .await?;
+    Ok(S3Response::new(dto::UploadPartCopyOutput {
+        copy_part_result: Some(dto::CopyPartResult {
+            e_tag: Some(ETag::Strong(etag)),
+            last_modified: Some(Timestamp::from(SystemTime::now())),
+            ..Default::default()
+        }),
         ..Default::default()
     }))
 }
@@ -826,6 +1004,46 @@ mod tests {
         ]);
         assert_eq!(etag, format!("{}-2", upload::hex(&expected.finalize())));
         assert!(multipart_etag(&[part(1, "zz", 1)]).is_err());
+    }
+
+    #[test]
+    fn copy_ranges_name_inclusive_offsets() {
+        assert_eq!(copy_range(None, 10).unwrap(), (0, 10));
+        assert_eq!(copy_range(Some("bytes=0-9"), 10).unwrap(), (0, 10));
+        assert_eq!(copy_range(Some("bytes=3-3"), 10).unwrap(), (3, 1));
+        let code = |range: &str| copy_range(Some(range), 10).unwrap_err().code().clone();
+        assert_eq!(code("bytes=0-10"), s3s::S3ErrorCode::InvalidRange);
+        assert_eq!(code("bytes=5-4"), s3s::S3ErrorCode::InvalidRange);
+        for malformed in ["0-9", "bytes=-5", "bytes=5-", "bytes=a-b", "items=0-1"] {
+            assert_eq!(
+                code(malformed),
+                s3s::S3ErrorCode::InvalidArgument,
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn copied_parts_are_hashed_while_they_are_written() {
+        let dir = std::env::temp_dir().join(format!(
+            "gono-s3-copy-part-{:016x}",
+            rand::rng().random::<u64>()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let source = dir.join("source");
+        std::fs::write(&source, b"0123456789").unwrap();
+        let part = dir.join("part");
+        let md5 = copy_part(std::fs::File::open(&source).unwrap(), 2, 5, &part).unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), b"23456");
+        assert_eq!(md5, Md5::checksum(b"23456"));
+        let short = copy_part(
+            std::fs::File::open(&source).unwrap(),
+            8,
+            5,
+            &dir.join("short"),
+        );
+        assert_eq!(short.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

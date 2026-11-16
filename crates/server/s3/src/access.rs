@@ -82,6 +82,7 @@ pub(crate) fn classify(name: &str) -> Class {
         | "PutObjectAcl"
         | "CreateMultipartUpload"
         | "UploadPart"
+        | "UploadPartCopy"
         | "CompleteMultipartUpload"
         | "AbortMultipartUpload"
         | "ListParts" => Class::ObjectWrite,

@@ -249,6 +249,33 @@ fn check_read_conditions(
     }
 }
 
+/// Evaluates the `x-amz-copy-source-if-*` headers of a copy: like the conditional headers of a
+/// read, except that a failed condition is a `412` in every case.
+pub(crate) fn check_copy_source_conditions(
+    etag: &str,
+    modified: SystemTime,
+    if_match: Option<&ETagCondition>,
+    if_none_match: Option<&ETagCondition>,
+    if_modified_since: Option<&Timestamp>,
+    if_unmodified_since: Option<&Timestamp>,
+) -> S3Result<()> {
+    check_read_conditions(
+        etag,
+        modified,
+        if_match,
+        if_none_match,
+        if_modified_since,
+        if_unmodified_since,
+    )
+    .map_err(|err| {
+        if *err.code() == S3ErrorCode::NotModified {
+            s3_error!(PreconditionFailed)
+        } else {
+            err
+        }
+    })
+}
+
 /// The condition of a write from `If-Match` and `If-None-Match`.
 fn write_condition(
     if_match: Option<&ETagCondition>,
@@ -1440,24 +1467,9 @@ impl S3 for GonoS3 {
         if public {
             check_public_acl(&destination, self.allow_anonymous())?;
         }
-
-        // The key needs a grant on the source bucket of its own account too.
-        let source = if **source_bucket == *destination.name {
-            destination.clone()
-        } else {
-            let bucket = s3::bucket(self.state.pool(), source_bucket)
-                .await
-                .map_err(error::database)?
-                .ok_or_else(|| s3_error!(NoSuchBucket))?;
-            Arc::new(bucket)
-        };
-        if access::permission(&key, &source).is_none() {
-            return Err(s3_error!(AccessDenied));
-        }
-        let from = match keys::target(&source.name, source_key) {
-            Ok(Target::File(path)) => path,
-            _ => return Err(s3_error!(NoSuchKey)),
-        };
+        let (source, from) = self
+            .copy_source(&key, &destination, source_bucket, source_key)
+            .await?;
         let to = match target(&destination, &input.key)? {
             Target::File(path) => path,
             Target::Folder(_) => {
@@ -1477,23 +1489,14 @@ impl S3 for GonoS3 {
                 ObjectError::IsFolder | ObjectError::NotFound => s3_error!(NoSuchKey),
                 other => error::object(other, false),
             })?;
-        let source_etag = etag_of(&source_entry, source_meta.as_ref());
-        check_read_conditions(
-            &source_etag,
+        check_copy_source_conditions(
+            &etag_of(&source_entry, source_meta.as_ref()),
             source_entry.modified,
             input.copy_source_if_match.as_ref(),
             input.copy_source_if_none_match.as_ref(),
             input.copy_source_if_modified_since.as_ref(),
             input.copy_source_if_unmodified_since.as_ref(),
-        )
-        .map_err(|err| {
-            // A failed copy-source condition is a 412 in every case.
-            if *err.code() == S3ErrorCode::NotModified {
-                s3_error!(PreconditionFailed)
-            } else {
-                err
-            }
-        })?;
+        )?;
 
         let replace = input
             .metadata_directive
@@ -1650,6 +1653,13 @@ impl S3 for GonoS3 {
         crate::multipart::upload_part(&self.state, req).await
     }
 
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<dto::UploadPartCopyInput>,
+    ) -> S3Result<S3Response<dto::UploadPartCopyOutput>> {
+        crate::multipart::upload_part_copy(self, req).await
+    }
+
     async fn list_parts(
         &self,
         req: S3Request<dto::ListPartsInput>,
@@ -1717,6 +1727,35 @@ impl GonoS3 {
             .put_object(identity, client, temp, meta, condition)
             .await
             .map_err(|err| error::object(err, false))
+    }
+
+    /// The source of a copy into `destination`: `source_key` of the bucket `source_bucket`,
+    /// which `key` needs a grant on too (buckets of other accounts have none). Returns the
+    /// bucket and the client path of the file.
+    pub(crate) async fn copy_source(
+        &self,
+        key: &s3::SigningKey,
+        destination: &Arc<Bucket>,
+        source_bucket: &str,
+        source_key: &str,
+    ) -> S3Result<(Arc<Bucket>, RelPath)> {
+        let source = if source_bucket == destination.name {
+            destination.clone()
+        } else {
+            let bucket = s3::bucket(self.state.pool(), source_bucket)
+                .await
+                .map_err(error::database)?
+                .ok_or_else(|| s3_error!(NoSuchBucket))?;
+            Arc::new(bucket)
+        };
+        if access::permission(key, &source).is_none() {
+            return Err(s3_error!(AccessDenied));
+        }
+        let from = match keys::target(&source.name, source_key) {
+            Ok(Target::File(path)) => path,
+            _ => return Err(s3_error!(NoSuchKey)),
+        };
+        Ok((source, from))
     }
 
     /// The permission check of the multipart operations, which the access check already made.

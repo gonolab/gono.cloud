@@ -76,7 +76,8 @@ compatible within a major version: released clients keep working with newer serv
   certificate needed), and path style keeps working. Browser applications get per-bucket CORS
   rules (`PutBucketCors`, `GetBucketCors`, `DeleteBucketCors`; preflight requests are answered
   before s3s) and form uploads signed with a POST policy (`PostObject`, with the `acl` field
-  that s3s does not read itself). The acceptance suite drives it with the AWS SDK.
+  that s3s does not read itself). Large copies use `UploadPartCopy` (whole objects or byte
+  ranges). The acceptance suite drives it with the AWS SDK.
 
 ### Changed
 

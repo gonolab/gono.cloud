@@ -1073,3 +1073,144 @@ async fn browser_form_uploads_need_a_signed_policy() {
     assert!(answer.contains("MissingContentLength"), "{answer}");
     s3.clean(&s3.bucket, &prefix).await;
 }
+
+#[tokio::test]
+async fn parts_can_be_copied_from_objects() {
+    let s3 = require!(S3::new(), "S3 is not configured");
+    let prefix = unique_name("s3");
+    let big: Vec<u8> = (0..6 * 1024 * 1024).map(|i| (i % 253) as u8).collect();
+    let big_key = s3.key(&prefix, "source.bin");
+    s3.client
+        .put_object()
+        .bucket(&s3.bucket)
+        .key(&big_key)
+        .body(ByteStream::from(big.clone()))
+        .send()
+        .await
+        .unwrap();
+    let small_key = s3.key(&prefix, "tail.txt");
+    s3.put(&s3.bucket, &small_key, "tail").await;
+    let key = s3.key(&prefix, "assembled.bin");
+    let upload = s3
+        .client
+        .create_multipart_upload()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    let id = upload.upload_id().unwrap();
+    let source = |key: &str| format!("{}/{key}", s3.bucket);
+
+    // A range of one object, then the whole of another.
+    let first = s3
+        .client
+        .upload_part_copy()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .upload_id(id)
+        .part_number(1)
+        .copy_source(source(&big_key))
+        .copy_source_range(format!("bytes=1-{}", 5 * 1024 * 1024))
+        .send()
+        .await
+        .unwrap();
+    let second = s3
+        .client
+        .upload_part_copy()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .upload_id(id)
+        .part_number(2)
+        .copy_source(source(&small_key))
+        .send()
+        .await
+        .unwrap();
+    // A part's ETag is the MD5 of its bytes: the whole small object has the same one.
+    let small_etag = s3
+        .client
+        .head_object()
+        .bucket(&s3.bucket)
+        .key(&small_key)
+        .send()
+        .await
+        .unwrap()
+        .e_tag()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        second.copy_part_result().unwrap().e_tag(),
+        Some(small_etag.as_str())
+    );
+
+    // Conditions and ranges are checked.
+    let stale = s3
+        .client
+        .upload_part_copy()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .upload_id(id)
+        .part_number(3)
+        .copy_source(source(&small_key))
+        .copy_source_if_match("\"00000000000000000000000000000000\"")
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert_eq!(stale.meta().code(), Some("PreconditionFailed"));
+    let outside = s3
+        .client
+        .upload_part_copy()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .upload_id(id)
+        .part_number(3)
+        .copy_source(source(&small_key))
+        .copy_source_range("bytes=0-4")
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert_eq!(outside.meta().code(), Some("InvalidRange"));
+    let missing = s3
+        .client
+        .upload_part_copy()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .upload_id(id)
+        .part_number(3)
+        .copy_source(source(&s3.key(&prefix, "missing")))
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert_eq!(missing.meta().code(), Some("NoSuchKey"));
+
+    let parts = [first.copy_part_result(), second.copy_part_result()]
+        .into_iter()
+        .zip(1..)
+        .map(|(result, number)| {
+            CompletedPart::builder()
+                .part_number(number)
+                .e_tag(result.unwrap().e_tag().unwrap())
+                .build()
+        })
+        .collect();
+    s3.client
+        .complete_multipart_upload()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .upload_id(id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(parts))
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let mut expected = big[1..=5 * 1024 * 1024].to_vec();
+    expected.extend_from_slice(b"tail");
+    assert_eq!(s3.get(&s3.bucket, &key).await, expected);
+    s3.clean(&s3.bucket, &prefix).await;
+}
