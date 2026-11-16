@@ -324,6 +324,53 @@ pub(crate) fn check_copy_source_conditions(
     })
 }
 
+/// Which buckets one `ListBuckets` answer lists: those after the continuation token that start
+/// with the prefix, at most `max-buckets` (1 to 10000) of them. Without `max-buckets` every
+/// bucket fits, as S3's default page size is 10000.
+struct BucketPage {
+    after: Option<String>,
+    prefix: String,
+    max: usize,
+}
+
+impl BucketPage {
+    const MAX: usize = 10_000;
+
+    fn new(input: &dto::ListBucketsInput) -> S3Result<Self> {
+        let max = match input.max_buckets {
+            None => Self::MAX,
+            Some(max) => usize::try_from(max)
+                .ok()
+                .filter(|max| (1..=Self::MAX).contains(max))
+                .ok_or_else(|| {
+                    s3_error!(InvalidArgument, "max-buckets must be between 1 and 10000")
+                })?,
+        };
+        let after = match input.continuation_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(keys::marker_of_token(token).ok_or_else(|| {
+                s3_error!(InvalidArgument, "The continuation token is not valid")
+            })?),
+        };
+        Ok(Self {
+            after,
+            prefix: input.prefix.clone().unwrap_or_default(),
+            max,
+        })
+    }
+
+    /// The page of `sorted` (in name order) and whether more follow.
+    fn select<'a, T>(&self, sorted: &[&'a T], name: impl Fn(&T) -> &str) -> (Vec<&'a T>, bool) {
+        let mut candidates = sorted.iter().copied().filter(|item| {
+            let name = name(item);
+            name.starts_with(&self.prefix) && self.after.as_deref().is_none_or(|after| name > after)
+        });
+        let page: Vec<&T> = candidates.by_ref().take(self.max).collect();
+        let more = candidates.next().is_some();
+        (page, more)
+    }
+}
+
 /// The condition of a write from `If-Match` and `If-None-Match`. `If-Match` (an ETag or `*`)
 /// needs an object (404 `NoSuchKey` otherwise); `If-None-Match` with an ETag lets every other
 /// version be replaced, and a missing object be created.
@@ -815,26 +862,46 @@ impl S3 for GonoS3 {
     ) -> S3Result<S3Response<dto::ListBucketsOutput>> {
         let auth = authorized(&req)?;
         let key = signing_key(&auth)?;
+        let input = req.input;
+        let region = &self.state.settings().region;
+        let page = BucketPage::new(&input)?;
         let buckets = s3::buckets_of(self.state.pool(), key.user_id)
             .await
             .map_err(error::database)?;
-        let listed = buckets
+        // Every bucket is in this server's region.
+        let in_region = input
+            .bucket_region
+            .as_ref()
+            .is_none_or(|wanted| wanted == region);
+        let visible: Vec<&Bucket> = buckets
             .iter()
-            .filter(|bucket| access::permission(key, bucket).is_some())
+            .filter(|bucket| in_region && access::permission(key, bucket).is_some())
+            .collect();
+        let (listed, more) = page.select(&visible, |bucket| bucket.name.as_str());
+        let continuation_token = more
+            .then(|| {
+                listed
+                    .last()
+                    .map(|bucket| keys::continuation_token(&bucket.name))
+            })
+            .flatten();
+        let listed = listed
+            .iter()
             .map(|bucket| dto::Bucket {
                 creation_date: Some(timestamp_from_secs(bucket.created_at)),
                 name: Some(bucket.name.clone()),
-                bucket_region: Some(self.state.settings().region.clone()),
+                bucket_region: Some(region.clone()),
                 ..Default::default()
             })
             .collect();
         Ok(S3Response::new(dto::ListBucketsOutput {
             buckets: Some(listed),
+            continuation_token,
             owner: Some(dto::Owner {
                 display_name: Some(key.display_name.clone()),
                 id: Some(key.username.to_string()),
             }),
-            ..Default::default()
+            prefix: input.prefix,
         }))
     }
 
@@ -2222,6 +2289,34 @@ mod tests {
             WriteCondition::IfExists
         );
         assert!(write_condition(Some(&tag("e")), Some(&ETagCondition::Any)).is_err());
+    }
+
+    #[test]
+    fn bucket_pages_continue_after_the_token() {
+        let names = ["a", "b", "ba", "c"];
+        let sorted: Vec<&&str> = names.iter().collect();
+        let page = |max: Option<i32>, token: Option<&str>, prefix: Option<&str>| {
+            let input = dto::ListBucketsInput {
+                max_buckets: max,
+                continuation_token: token.map(keys::continuation_token),
+                prefix: prefix.map(str::to_owned),
+                ..Default::default()
+            };
+            let (page, more) = BucketPage::new(&input).unwrap().select(&sorted, |n| n);
+            (page.into_iter().copied().collect::<Vec<_>>(), more)
+        };
+        assert_eq!(page(None, None, None), (names.to_vec(), false));
+        assert_eq!(page(Some(2), None, None), (vec!["a", "b"], true));
+        assert_eq!(page(Some(2), Some("b"), None), (vec!["ba", "c"], false));
+        assert_eq!(page(Some(1), None, Some("b")), (vec!["b"], true));
+        assert_eq!(page(Some(1), Some("b"), Some("b")), (vec!["ba"], false));
+        for bad in [0, 10_001] {
+            let input = dto::ListBucketsInput {
+                max_buckets: Some(bad),
+                ..Default::default()
+            };
+            assert!(BucketPage::new(&input).is_err());
+        }
     }
 
     #[test]

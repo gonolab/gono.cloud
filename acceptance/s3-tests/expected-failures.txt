@@ -65,9 +65,6 @@ s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_prefix_ends_with_del
 # nothing.
 s3tests/functional/test_s3.py::test_delete_marker_nonversioned
 
-# Not supported yet: ListBuckets pagination (max-buckets, continuation-token).
-s3tests/functional/test_s3.py::test_list_buckets_paginated
-
 # Not supported yet: checksums of multipart uploads (ChecksumAlgorithm on CreateMultipartUpload,
 # part checksums at completion, composite checksums).
 s3tests/functional/test_s3.py::test_multipart_checksum_sha256
