@@ -25,7 +25,8 @@
 //!   path as its key spelled it; the file and the folders it creates record that spelling
 //!   (`files.s3_path`), and a write whose spelling differs from what is stored there already
 //!   (a key that differs only in Unicode normalization, in any segment) fails with
-//!   [`ObjectError::KeyConflict`]: one file tree cannot hold both.
+//!   [`ObjectError::KeyConflict`]: one file tree cannot hold both. A folder without files below
+//!   it holds no key, so it takes the new spelling instead.
 //! - Every write runs to completion even if the request is dropped, like every other write.
 //!
 //! WebDAV locks are the caller's concern ([`crate::locks::write_conflict`]), as for the chunked
@@ -396,7 +397,8 @@ impl ScopedFs {
             fs.create_folders(owner, &mount_root, &storage, true, spelled.as_deref())
                 .await?;
             if let Some(spelled) = &spelled {
-                fs.check_spelling(owner, &storage, spelled).await?;
+                fs.align_folder_spelling(owner, &mount_root, &storage, spelled)
+                    .await?;
             }
             Ok(fs.lookup(&ctx, &location).await?)
         })
@@ -454,6 +456,45 @@ impl ScopedFs {
             .as_ref()
             .map_or(mount_root.as_str(), |row| row.spelled());
         Ok(format!("{root}/{below}"))
+    }
+
+    /// Makes the folder `dir` (below the mount at `mount_root`) and its folders spelled as
+    /// `spelled`, the spelled path of `dir`: a folder spelled otherwise takes the new spelling if
+    /// no file is below it (it holds no key then), and the write fails with
+    /// [`ObjectError::KeyConflict`] otherwise.
+    async fn align_folder_spelling(
+        &self,
+        owner: i64,
+        mount_root: &RelPath,
+        dir: &RelPath,
+        spelled: &str,
+    ) -> Result<(), ObjectError> {
+        if self.check_spelling(owner, dir, spelled).await.is_ok() {
+            return Ok(());
+        }
+        // From the top down, the first folder spelled otherwise decides.
+        let mut folders: Vec<RelPath> = dir
+            .ancestors()
+            .into_iter()
+            .filter(|ancestor| ancestor.starts_with(mount_root) && ancestor != mount_root)
+            .collect();
+        folders.push(dir.clone());
+        for folder in folders {
+            let depth = folder.as_str().split('/').count();
+            let expected = spelled.split('/').take(depth).collect::<Vec<_>>().join("/");
+            if self.check_spelling(owner, &folder, &expected).await.is_ok() {
+                continue;
+            }
+            let respelled = self
+                .meta()
+                .respell_empty_folder(owner, &folder, &expected)
+                .await
+                .map_err(object_db_error)?;
+            if !respelled {
+                return Err(ObjectError::KeyConflict);
+            }
+        }
+        Ok(())
     }
 
     /// Fails with [`ObjectError::KeyConflict`] unless the entry at `storage`, if there is one,
@@ -639,7 +680,8 @@ impl ScopedFs {
             if let Some(spelled_parent) = spelled_parent
                 && !parent.is_root()
             {
-                self.check_spelling(owner, &parent, spelled_parent).await?;
+                self.align_folder_spelling(owner, &mount_root, &parent, spelled_parent)
+                    .await?;
             }
         }
         if let Some(spelled) = &spelled {

@@ -704,4 +704,18 @@ async fn spellings_are_recorded_and_other_spellings_refused() {
     h.fs.put_spelled_folder(full.clone(), &p(nfc), Some(nfd))
         .await
         .unwrap();
+
+    // Once no file is below it, the folder holds no key, and another spelling may use it.
+    for name in ["a.txt", "b.txt"] {
+        assert!(
+            h.fs.delete_object(full.clone(), &p(&format!("{nfc}/{name}")))
+                .await
+                .unwrap()
+        );
+    }
+    put(format!("{nfc}/c.txt"), format!("{nfc}/c.txt"))
+        .await
+        .unwrap();
+    assert_eq!(row(nfc.to_owned()).await.s3_path, None);
+    assert_eq!(row(format!("{nfc}/c.txt")).await.s3_path, None);
 }

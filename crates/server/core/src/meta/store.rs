@@ -733,6 +733,49 @@ impl MetaStore {
         Ok(row)
     }
 
+    /// Gives the folder `rel` and everything below it the S3 spelling `spelled` for `rel`, if no
+    /// file is below it (S3 sees nothing there, so another spelling of it may be used). Returns
+    /// `false`, and changes nothing, when files are below it or it is gone.
+    pub async fn respell_empty_folder(
+        &self,
+        owner: i64,
+        rel: &RelPath,
+        spelled: &str,
+    ) -> Result<bool> {
+        let mut tx = db::begin_immediate(&self.pool).await?;
+        let Some(folder) = select(&mut tx, owner, rel).await? else {
+            return Ok(false);
+        };
+        let (lower, upper) = descendant_bounds(rel.as_str()).unwrap_or_default();
+        let has_files: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM files WHERE owner_id = ?1 AND is_dir = 0 \
+             AND rel_path >= ?2 AND rel_path < ?3)",
+        )
+        .bind(owner)
+        .bind(&lower)
+        .bind(&upper)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !folder.is_dir || has_files {
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE files SET s3_path = ?4 || substr(COALESCE(s3_path, rel_path), length(?5) + 1) \
+             WHERE owner_id = ?1 AND (rel_path = ?6 OR (rel_path >= ?2 AND rel_path < ?3))",
+        )
+        .bind(owner)
+        .bind(&lower)
+        .bind(&upper)
+        .bind(spelled)
+        .bind(folder.spelled())
+        .bind(rel.as_str())
+        .execute(&mut *tx)
+        .await?;
+        drop_plain_spellings(&mut tx, owner, rel).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Records that `rel` and everything below it were deleted. Returns the removed row of
     /// `rel` itself, if it had one.
     pub async fn record_delete(&self, owner: i64, rel: &RelPath) -> Result<Option<FileRow>> {
