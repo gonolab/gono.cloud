@@ -5,7 +5,9 @@
 //! name), and reaches the tree only through [`gono_server_dav::ScopedFs`].
 //!
 //! - **Listings** come from the `files` table in S3 key order (`MetaStore::list_objects`), with
-//!   opaque continuation tokens and `encoding-type=url`.
+//!   opaque continuation tokens and `encoding-type=url`. Versioning is never enabled, so
+//!   `ListObjectVersions` lists each object as its only version, `null`, as S3 does for a
+//!   bucket that never had versioning.
 //! - **Writes** receive the body into `tmp/` and verify it ([`crate::upload`]), refuse files
 //!   locked by WebDAV clients (`OperationAborted`), and install with the object's metadata.
 //! - **Reads** honor `Range`, the conditional headers and, for signed requests only, the
@@ -59,6 +61,9 @@ const EMPTY_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
 
 /// Most keys in one listing and in one `DeleteObjects`.
 const MAX_KEYS: usize = 1000;
+
+/// The version id of every object: versioning is never enabled.
+pub(crate) const NULL_VERSION: &str = "null";
 
 /// Bytes read from a file at once for a download.
 const READ_CHUNK: usize = 256 * 1024;
@@ -353,6 +358,8 @@ struct Listed {
     truncated: bool,
     /// The last key or common prefix (where the next page starts after).
     last: Option<String>,
+    /// Whether that last entry is a common prefix.
+    last_is_prefix: bool,
 }
 
 impl GonoS3 {
@@ -487,6 +494,7 @@ impl GonoS3 {
                 .entries
                 .last()
                 .map(|entry| entry.marker().to_owned()),
+            last_is_prefix: matches!(listing.entries.last(), Some(ListEntry::CommonPrefix(_))),
         };
         for entry in listing.entries {
             match entry {
@@ -1256,6 +1264,93 @@ impl S3 for GonoS3 {
         Ok(response)
     }
 
+    async fn list_object_versions(
+        &self,
+        req: S3Request<dto::ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<dto::ListObjectVersionsOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        let input = req.input;
+        // Every object has the one version `null`, so a version id marker can only name that
+        // version of the key marker, after which the listing goes on with the next key.
+        let key_marker = input
+            .key_marker
+            .as_deref()
+            .filter(|marker| !marker.is_empty());
+        if input
+            .version_id_marker
+            .as_deref()
+            .is_some_and(|marker| !marker.is_empty())
+            && key_marker.is_none()
+        {
+            return Err(s3_error!(
+                InvalidArgument,
+                "A version-id marker cannot be specified without a key marker"
+            ));
+        }
+        let url = input
+            .encoding_type
+            .as_ref()
+            .is_some_and(|encoding| encoding.as_str() == dto::EncodingType::URL);
+        let prefix = input.prefix.clone().unwrap_or_default();
+        let listed = self
+            .list(
+                bucket,
+                ListRequest {
+                    prefix: &prefix,
+                    delimiter: input.delimiter.as_deref(),
+                    start_after: key_marker,
+                    max_keys: input.max_keys,
+                    url,
+                    owner: true,
+                },
+            )
+            .await?;
+        let encode = |value: Option<String>| {
+            value.map(|value| if url { keys::url_encode(&value) } else { value })
+        };
+        // A page that ends with an object goes on after its version; one that ends with a
+        // common prefix goes on after the prefix.
+        let ends_with_object = listed.truncated && !listed.last_is_prefix;
+        let versions = listed
+            .objects
+            .into_iter()
+            .map(|object| dto::ObjectVersion {
+                e_tag: object.e_tag,
+                is_latest: Some(true),
+                key: object.key,
+                last_modified: object.last_modified,
+                owner: object.owner,
+                size: object.size,
+                storage_class: Some(dto::ObjectVersionStorageClass::from_static(
+                    dto::ObjectVersionStorageClass::STANDARD,
+                )),
+                version_id: Some(NULL_VERSION.to_owned()),
+                ..Default::default()
+            })
+            .collect();
+        let mut response = S3Response::new(dto::ListObjectVersionsOutput {
+            name: Some(bucket.name.clone()),
+            prefix: encode(input.prefix),
+            key_marker: encode(input.key_marker),
+            version_id_marker: input.version_id_marker,
+            max_keys: Some(input.max_keys.unwrap_or(MAX_KEYS as i32)),
+            is_truncated: Some(listed.truncated),
+            next_key_marker: listed
+                .truncated
+                .then(|| encode(listed.last.clone()))
+                .flatten(),
+            next_version_id_marker: ends_with_object.then(|| NULL_VERSION.to_owned()),
+            versions: Some(versions),
+            common_prefixes: Some(listed.prefixes),
+            delimiter: encode(input.delimiter),
+            encoding_type: input.encoding_type,
+            ..Default::default()
+        });
+        nosniff(&mut response.headers, auth.caller.is_anonymous());
+        Ok(response)
+    }
+
     async fn put_object(
         &self,
         req: S3Request<dto::PutObjectInput>,
@@ -1304,7 +1399,11 @@ impl S3 for GonoS3 {
                 "Response overrides are only supported for signed requests"
             ));
         }
-        if input.version_id.as_deref().is_some_and(|id| id != "null") {
+        if input
+            .version_id
+            .as_deref()
+            .is_some_and(|id| id != NULL_VERSION)
+        {
             return Err(s3_error!(NoSuchVersion));
         }
         if input.part_number.is_some_and(|part| part != 1) {
@@ -1404,7 +1503,11 @@ impl S3 for GonoS3 {
         let auth = authorized(&req)?;
         let anonymous = auth.caller.is_anonymous();
         let input = req.input;
-        if input.version_id.as_deref().is_some_and(|id| id != "null") {
+        if input
+            .version_id
+            .as_deref()
+            .is_some_and(|id| id != NULL_VERSION)
+        {
             return Err(s3_error!(NoSuchVersion));
         }
         let (client, entry, meta, _) = self.open_for_read(&auth, &input.key).await?;
@@ -1458,7 +1561,11 @@ impl S3 for GonoS3 {
         let auth = authorized(&req)?;
         let bucket = auth.bucket()?;
         let input = req.input;
-        if input.version_id.as_deref().is_some_and(|id| id != "null") {
+        if input
+            .version_id
+            .as_deref()
+            .is_some_and(|id| id != NULL_VERSION)
+        {
             return Err(s3_error!(NotImplemented, "Versioning is not supported"));
         }
         self.delete_one(&auth, bucket, &input.key).await?;
@@ -1482,7 +1589,11 @@ impl S3 for GonoS3 {
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
         for object in input.delete.objects {
-            let result = if object.version_id.as_deref().is_some_and(|id| id != "null") {
+            let result = if object
+                .version_id
+                .as_deref()
+                .is_some_and(|id| id != NULL_VERSION)
+            {
                 Err(s3_error!(NotImplemented, "Versioning is not supported"))
             } else {
                 self.delete_one(&auth, bucket, &object.key).await
@@ -1527,7 +1638,7 @@ impl S3 for GonoS3 {
                 "Only bucket copy sources are supported"
             ));
         };
-        if version_id.as_deref().is_some_and(|id| id != "null") {
+        if version_id.as_deref().is_some_and(|id| id != NULL_VERSION) {
             return Err(s3_error!(NoSuchVersion));
         }
         if input.server_side_encryption.is_some() || input.sse_customer_algorithm.is_some() {

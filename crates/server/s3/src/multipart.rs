@@ -445,7 +445,10 @@ pub(crate) async fn upload_part_copy(
             "Only bucket copy sources are supported"
         ));
     };
-    if version_id.as_deref().is_some_and(|id| id != "null") {
+    if version_id
+        .as_deref()
+        .is_some_and(|id| id != crate::ops::NULL_VERSION)
+    {
         return Err(s3_error!(NoSuchVersion));
     }
     find_upload(state, &destination, &input.key, &input.upload_id).await?;

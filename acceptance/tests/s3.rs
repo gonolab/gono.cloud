@@ -293,6 +293,93 @@ async fn listings_page_through_keys_and_common_prefixes() {
         .await
         .unwrap();
     assert_eq!(v1.contents().len(), 1);
+
+    // Version listings: versioning is never enabled, so every object is its only version,
+    // `null`, as in an S3 bucket that never had versioning. Cleanup tools page through them.
+    let mut seen = Vec::new();
+    let mut markers: (Option<String>, Option<String>) = (None, None);
+    loop {
+        let page = s3
+            .client
+            .list_object_versions()
+            .bucket(&s3.bucket)
+            .prefix(format!("{prefix}/"))
+            .delimiter("/")
+            .max_keys(2)
+            .set_key_marker(markers.0.clone())
+            .set_version_id_marker(markers.1.clone())
+            .send()
+            .await
+            .unwrap();
+        assert!(page.delete_markers().is_empty());
+        for version in page.versions() {
+            assert_eq!(version.version_id(), Some("null"));
+            assert_eq!(version.is_latest(), Some(true));
+            assert!(version.owner().is_some());
+            seen.push(version.key().unwrap().to_owned());
+        }
+        for common in page.common_prefixes() {
+            seen.push(format!("{}*", common.prefix().unwrap()));
+        }
+        if page.is_truncated() != Some(true) {
+            break;
+        }
+        markers = (
+            page.next_key_marker().map(str::to_owned),
+            page.next_version_id_marker().map(str::to_owned),
+        );
+    }
+    seen.sort();
+    assert_eq!(seen, expected);
+    // A version id marker needs a key marker.
+    let err = s3
+        .client
+        .list_object_versions()
+        .bucket(&s3.bucket)
+        .version_id_marker("null")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.raw_response()
+            .map(|response| response.status().as_u16()),
+        Some(400)
+    );
+    // Deleting the `null` version deletes the object.
+    s3.client
+        .delete_object()
+        .bucket(&s3.bucket)
+        .key(s3.key(&prefix, "a0"))
+        .version_id("null")
+        .send()
+        .await
+        .unwrap();
+    let after = s3
+        .client
+        .list_object_versions()
+        .bucket(&s3.bucket)
+        .prefix(s3.key(&prefix, "a0"))
+        .send()
+        .await
+        .unwrap();
+    assert!(after.versions().is_empty());
+    // Anonymous version listings follow the listing switch, like other listings.
+    let anonymous = s3
+        .http
+        .get(format!("{}/{}?versions", s3.endpoint, s3.bucket))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), 403);
+    if let Some(public_bucket) = &s3.public_bucket {
+        let anonymous = s3
+            .http
+            .get(format!("{}/{public_bucket}?versions", s3.endpoint))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), 200);
+    }
     s3.clean(&s3.bucket, &prefix).await;
     for rest in ["a/1", "a/2"] {
         let _ = s3

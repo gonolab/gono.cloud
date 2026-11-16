@@ -45,7 +45,7 @@ pub(crate) enum Class {
     HeadBucket,
     /// Reading a bucket's settings or uploads.
     BucketRead,
-    /// `ListObjects`, `ListObjectsV2`.
+    /// `ListObjects`, `ListObjectsV2`, `ListObjectVersions`.
     List,
     /// `GetObject`, `HeadObject`: what anonymous requests may do.
     ObjectRead,
@@ -75,7 +75,7 @@ pub(crate) fn classify(name: &str) -> Class {
         | "GetBucketPolicy"
         | "GetBucketPolicyStatus"
         | "ListMultipartUploads" => Class::BucketRead,
-        "ListObjects" | "ListObjectsV2" => Class::List,
+        "ListObjects" | "ListObjectsV2" | "ListObjectVersions" => Class::List,
         "GetObject" | "HeadObject" => Class::ObjectRead,
         "GetObjectAcl" => Class::ObjectAclRead,
         "PutObject"
@@ -368,6 +368,7 @@ mod tests {
     fn operations_are_classified() {
         assert_eq!(classify("GetObject"), Class::ObjectRead);
         assert_eq!(classify("ListObjectsV2"), Class::List);
+        assert_eq!(classify("ListObjectVersions"), Class::List);
         assert_eq!(classify("CompleteMultipartUpload"), Class::ObjectWrite);
         assert_eq!(classify("PutBucketAcl"), Class::BucketAdmin);
         assert_eq!(classify("PutBucketCors"), Class::BucketConfig);
