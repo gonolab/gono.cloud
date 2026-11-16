@@ -30,6 +30,7 @@ const OWN_CRATES: &[&str] = &[
     "gono_server_dav",
     "gono_server_nextcloud",
     "gono_server_relay",
+    "gono_server_s3",
 ];
 
 /// Dependencies that log only errors, because their warnings describe normal operation.
@@ -39,6 +40,13 @@ const OWN_CRATES: &[&str] = &[
 /// about 950,000 such lines (120 MB) in ten seconds in a load test, which would fill the
 /// journal or `logging.file`. Gono Cloud's relay logs refused devices itself.
 const QUIET_CRATES: &[&str] = &["iroh_relay"];
+
+/// Dependencies that do not log at all unless `GONO_CLOUD_LOG` asks for them.
+///
+/// s3s logs every error response at the error level, including the answers to ordinary client
+/// mistakes and to anonymous requests for private objects, so anyone could fill the log. Gono
+/// Cloud logs one line per S3 request with its status, and its own failures behind it.
+const SILENT_CRATES: &[&str] = &["s3s"];
 
 /// Where log lines go.
 #[derive(Debug, Clone)]
@@ -107,6 +115,9 @@ fn default_directives(level: LogLevel) -> String {
     for krate in QUIET_CRATES {
         directives.push_str(&format!(",{krate}=error"));
     }
+    for krate in SILENT_CRATES {
+        directives.push_str(&format!(",{krate}=off"));
+    }
     directives
 }
 
@@ -127,13 +138,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_level_applies_to_own_crates_and_the_relay_library_stays_quiet() {
+    fn the_level_applies_to_own_crates_and_noisy_libraries_stay_quiet() {
         let directives = default_directives(LogLevel::Debug);
         assert_eq!(
             directives,
             "warn,gono_cloud=debug,gono_server_connect=debug,gono_server_core=debug,\
              gono_server_dav=debug,gono_server_nextcloud=debug,gono_server_relay=debug,\
-             iroh_relay=error"
+             gono_server_s3=debug,iroh_relay=error,s3s=off"
         );
         EnvFilter::try_new(directives).unwrap();
     }

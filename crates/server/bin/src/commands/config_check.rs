@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use gono_server_core::config::RelayConfig;
+use gono_server_core::config::{RelayConfig, S3Config};
 
 use super::load_config;
 
@@ -68,6 +68,10 @@ pub fn run(config_path: &Path) -> anyhow::Result<()> {
     if config.relay.enabled {
         settings.extend(relay_settings(&config.relay));
     }
+    settings.push(("s3.enabled", config.s3.enabled.to_string()));
+    if config.s3.enabled {
+        settings.extend(s3_settings(&config.s3));
+    }
     for (key, value) in settings {
         println!("  {key:<31} {value}");
     }
@@ -80,6 +84,23 @@ pub fn run(config_path: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The effective settings of an enabled S3 API.
+fn s3_settings(s3: &S3Config) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "s3.public_url",
+            s3.public_url
+                .as_ref()
+                .map_or_else(|| "(none)".to_owned(), ToString::to_string),
+        ),
+        ("s3.bind", s3.bind.to_string()),
+        ("s3.region", s3.region.clone()),
+        ("s3.bucket_folder", s3.bucket_folder.clone()),
+        ("s3.allow_anonymous", s3.allow_anonymous.to_string()),
+        ("s3.multipart_ttl_secs", s3.multipart_ttl_secs.to_string()),
+    ]
 }
 
 /// The effective settings of an enabled relay.

@@ -198,6 +198,17 @@ pub async fn bucket(pool: &Pool, name: &str) -> Result<Option<Bucket>> {
     row.map(Bucket::try_from).transpose()
 }
 
+/// The bucket with row id `id`, if there is one.
+pub async fn bucket_by_id(pool: &Pool, id: i64) -> Result<Option<Bucket>> {
+    let row: Option<BucketRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "{BUCKET_QUERY} WHERE b.id = ?1"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(Bucket::try_from).transpose()
+}
+
 /// The buckets of `owner`, by name.
 pub async fn buckets_of(pool: &Pool, owner: i64) -> Result<Vec<Bucket>> {
     let rows: Vec<BucketRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(

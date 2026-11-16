@@ -57,6 +57,10 @@ pub enum Command {
     #[command(subcommand)]
     Device(DeviceCommand),
 
+    /// Manage the S3 API: access keys and buckets.
+    #[command(subcommand)]
+    S3(S3Command),
+
     /// Re-read files that were changed directly in the data directory.
     ///
     /// The data directory belongs to the server. After changing files behind its back (SSH,
@@ -219,6 +223,160 @@ pub enum AppPasswordCommand {
         /// Id of the app password, as shown by `app-password list`.
         id: i64,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum S3Command {
+    /// Manage S3 access keys.
+    #[command(subcommand)]
+    Key(S3KeyCommand),
+
+    /// Manage S3 buckets: folders of a user's tree that S3 clients reach by name.
+    #[command(subcommand)]
+    Bucket(S3BucketCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum S3KeyCommand {
+    /// Create an access key and print its secret once.
+    Create {
+        /// Account the key belongs to.
+        username: Username,
+
+        /// Name shown in listings, for example the application that uses the key.
+        #[arg(long)]
+        label: String,
+
+        /// Grant access to one bucket, as `<NAME>` or `<NAME>:<view|full>` (default `full`).
+        /// Repeat for several buckets. Without any `--bucket` the key gets full access to every
+        /// bucket of the account, present and future, and may create and delete buckets.
+        #[arg(long = "bucket", value_name = "NAME[:PERM]")]
+        buckets: Vec<BucketGrantArg>,
+
+        /// Expire the key after this many days. By default it never expires.
+        #[arg(long, value_name = "DAYS")]
+        expires_in_days: Option<NonZeroU32>,
+    },
+
+    /// List the access keys of a user (never their secrets).
+    List {
+        /// Account whose keys are listed.
+        username: Username,
+    },
+
+    /// Revoke an access key.
+    Delete {
+        /// Account the key belongs to.
+        username: Username,
+
+        /// Id of the key, as shown by `s3 key list`.
+        id: i64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum S3BucketCommand {
+    /// List the buckets of a user.
+    List {
+        /// Account whose buckets are listed.
+        username: Username,
+    },
+
+    /// Create a bucket with a new folder `<s3.bucket_folder>/<NAME>`.
+    Create {
+        /// Account the bucket belongs to.
+        username: Username,
+
+        /// Bucket name: 3 to 63 characters from a-z, 0-9 and '-', unique on this server.
+        name: String,
+    },
+
+    /// Make an existing folder a bucket. Its files become objects at once.
+    Bind {
+        /// Account the folder belongs to.
+        username: Username,
+
+        /// Bucket name: 3 to 63 characters from a-z, 0-9 and '-', unique on this server.
+        name: String,
+
+        /// The folder, relative to the user's storage root, for example `/Photos`.
+        folder: String,
+    },
+
+    /// Set what anonymous requests may read in a bucket. Takes effect only while
+    /// `s3.allow_anonymous` is true.
+    Set {
+        /// Account the bucket belongs to.
+        username: Username,
+
+        /// Bucket name.
+        name: String,
+
+        /// `private` (nothing), `acl` (objects uploaded with the public-read ACL) or
+        /// `public-read` (every object).
+        #[arg(long, value_name = "MODE")]
+        anonymous: AnonymousArg,
+
+        /// Let anonymous requests list the bucket (`--list`) or not (`--no-list`, the
+        /// default). Listings show every key, private ones included.
+        #[arg(long, overrides_with = "no_list")]
+        list: bool,
+
+        /// Do not let anonymous requests list the bucket.
+        #[arg(long)]
+        no_list: bool,
+    },
+
+    /// Remove a bucket. Its folder and files stay where they are.
+    Unbind {
+        /// Account the bucket belongs to.
+        username: Username,
+
+        /// Bucket name.
+        name: String,
+    },
+}
+
+/// One `--bucket <NAME>[:<view|full>]` argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketGrantArg {
+    /// Bucket name.
+    pub name: String,
+    /// Access level.
+    pub permission: Permission,
+}
+
+impl FromStr for BucketGrantArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (name, permission) = match value.split_once(':') {
+            Some((name, permission)) => (name, permission.parse().map_err(|err| format!("{err}"))?),
+            None => (value, Permission::Full),
+        };
+        if name.is_empty() {
+            return Err("expected <NAME> or <NAME>:<view|full>".to_owned());
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            permission,
+        })
+    }
+}
+
+/// The anonymous access of a bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnonymousArg(pub gono_server_core::s3::Anonymous);
+
+impl FromStr for AnonymousArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse()
+            .map(Self)
+            .map_err(|err: gono_server_core::Error| err.to_string())
+    }
 }
 
 #[derive(Debug, Subcommand)]

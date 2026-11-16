@@ -2155,6 +2155,7 @@ mod tests {
         crate::janitor::Janitor {
             db: f.state.db.clone(),
             uploads: f.state.uploads.clone(),
+            s3: None,
         }
         .run_once()
         .await;

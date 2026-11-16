@@ -135,6 +135,7 @@ fn help_lists_every_subcommand() {
         "user",
         "app-password",
         "device",
+        "s3",
         "rescan",
     ] {
         assert!(help.contains(command), "missing {command}:\n{help}");
@@ -893,4 +894,118 @@ fn http_get(addr: SocketAddr, path: &str) -> Option<String> {
     let mut response = String::new();
     stream.read_to_string(&mut response).ok()?;
     Some(response)
+}
+
+#[test]
+fn s3_keys_and_buckets_can_be_managed() {
+    let instance = Instance::new();
+    assert!(instance.init().status.success());
+    let ok = |args: &[&str]| {
+        let output = run(&mut instance.command(args));
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            text(&output.stderr)
+        );
+        text(&output.stdout)
+    };
+    let fails = |args: &[&str]| {
+        let output = run(&mut instance.command(args));
+        assert!(!output.status.success(), "{args:?} should fail");
+        text(&output.stderr)
+    };
+
+    let created = ok(&["s3", "bucket", "create", "admin", "photos"]);
+    assert!(created.contains("/Buckets/photos"), "{created}");
+    assert!(!created.contains("//"), "{created}");
+    assert!(
+        instance
+            .dir
+            .path()
+            .join("data/files/1/Buckets/photos")
+            .is_dir()
+    );
+    assert!(fails(&["s3", "bucket", "create", "admin", "photos"]).contains("exists"));
+    assert!(
+        fails(&["s3", "bucket", "create", "admin", "Bad_Name"]).contains("invalid bucket name")
+    );
+
+    std::fs::create_dir(instance.dir.path().join("data/files/1/Docs")).unwrap();
+    ok(&["s3", "bucket", "bind", "admin", "docs", "/Docs"]);
+    assert!(fails(&["s3", "bucket", "bind", "admin", "missing", "/Nope"]).contains("no folder"));
+    let buckets = ok(&["s3", "bucket", "list", "admin"]);
+    assert!(
+        buckets.contains("photos") && buckets.contains("/Docs"),
+        "{buckets}"
+    );
+
+    let key = ok(&[
+        "s3",
+        "key",
+        "create",
+        "admin",
+        "--label",
+        "app",
+        "--bucket",
+        "photos:view",
+    ]);
+    let access_key_id = key
+        .lines()
+        .find_map(|line| line.strip_prefix("Access key id: "))
+        .unwrap_or_else(|| panic!("no access key id:\n{key}"));
+    let secret = key
+        .lines()
+        .find_map(|line| line.strip_prefix("Secret key:"))
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("no secret:\n{key}"));
+    assert_eq!(access_key_id.len(), 20);
+    assert_eq!(secret.len(), 40);
+    assert!(key.contains("photos:view"), "{key}");
+    assert!(key.contains("the S3 API is off"), "{key}");
+    assert!(
+        fails(&[
+            "s3", "key", "create", "admin", "--label", "x", "--bucket", "nope"
+        ])
+        .contains("no bucket nope")
+    );
+    let keys = ok(&["s3", "key", "list", "admin"]);
+    assert!(
+        keys.contains(access_key_id) && !keys.contains(secret),
+        "{keys}"
+    );
+    // S3 keys are not app passwords.
+    assert!(!ok(&["app-password", "list", "admin"]).contains("app"));
+
+    let set = ok(&[
+        "s3",
+        "bucket",
+        "set",
+        "admin",
+        "photos",
+        "--anonymous",
+        "public-read",
+        "--list",
+    ]);
+    assert!(set.contains("anonymous listing on"), "{set}");
+    assert!(set.contains("s3.allow_anonymous = false"), "{set}");
+    assert!(
+        fails(&[
+            "s3",
+            "bucket",
+            "set",
+            "admin",
+            "photos",
+            "--anonymous",
+            "public"
+        ])
+        .contains("expected private, acl or public-read")
+    );
+
+    ok(&["s3", "bucket", "unbind", "admin", "docs"]);
+    assert!(
+        instance.dir.path().join("data/files/1/Docs").is_dir(),
+        "the folder stays"
+    );
+    ok(&["s3", "key", "delete", "admin", "1"]);
+    assert!(fails(&["s3", "key", "delete", "admin", "1"]).contains("no S3 access key"));
 }

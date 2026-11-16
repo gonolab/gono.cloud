@@ -20,6 +20,7 @@ use gono_server_nextcloud::{
     notify_push::{self, Hub, PushSettings},
 };
 use gono_server_relay::{Admission, Relay};
+use gono_server_s3::{S3Settings, S3State};
 use tokio::{net::TcpListener, sync::Notify};
 
 use super::{load_config, refuse_root_on_foreign_install};
@@ -197,9 +198,49 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
     )
     .await?;
     let uploads = ChunkedUploads::new(dav.fs().clone(), LockStore::new(pool.clone()));
+    let sealing_key = two_factor_key(&config, &pool).await?;
+
+    // The S3 API on a listener of its own: a host name of its own, behind the reverse proxy.
+    let s3 = if config.s3.enabled {
+        let key = sealing_key.clone().context(
+            "the S3 API needs two_factor.key_file: the secrets of S3 access keys are encrypted \
+             with it",
+        )?;
+        let state = S3State::new(
+            pool.clone(),
+            dav.fs().clone(),
+            LockStore::new(pool.clone()),
+            key,
+            S3Settings {
+                region: config.s3.region.clone(),
+                bucket_folder: config.s3.bucket_folder.clone(),
+                allow_anonymous: config.s3.allow_anonymous,
+                multipart_ttl_secs: config.s3.multipart_ttl_secs,
+            },
+        );
+        let bind = config.s3.bind;
+        let listener = TcpListener::bind(bind)
+            .await
+            .with_context(|| format!("listen on s3.bind {bind}"))?;
+        tracing::info!(
+            address = %listener.local_addr().context("read the S3 listener address")?,
+            public_url = config.s3.public_url.as_ref().map(ToString::to_string),
+            anonymous = config.s3.allow_anonymous,
+            "S3 API listening"
+        );
+        let router = crate::s3::router(
+            state.clone(),
+            Arc::new(config.server.trusted_proxies.clone()),
+        );
+        let task = tokio::spawn(shutdown::serve(listener, router, || {}));
+        Some((state, task))
+    } else {
+        None
+    };
     let janitor = Janitor {
         db: pool.clone(),
         uploads: uploads.clone(),
+        s3: s3.as_ref().map(|(state, _)| state.clone()),
     }
     .spawn();
     let auth = Arc::new(Authenticator::new(
@@ -213,7 +254,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         Arc::new(RateLimiter::new()),
         &config.server.base_url,
     );
-    if let Some(key) = two_factor_key(&config, &pool).await? {
+    if let Some(key) = sealing_key {
         web = web.with_two_factor_key(key);
     }
     let web = Arc::new(web);
@@ -283,6 +324,14 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         }
     };
     let result = shutdown::serve(listener, app::router(state), on_signal).await;
+    // The S3 listener got the same signal and has the same grace period.
+    if let Some((_, task)) = s3 {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!(error = %err, "the S3 listener failed"),
+            Err(err) => tracing::warn!(error = %err, "the S3 listener stopped abnormally"),
+        }
+    }
     if let Some(hub) = &push {
         hub.shut_down();
     }

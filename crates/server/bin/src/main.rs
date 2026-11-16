@@ -19,6 +19,7 @@ mod password_input;
 mod qr;
 mod ratelimit;
 mod request_log;
+mod s3;
 mod shutdown;
 mod site;
 mod web;
@@ -58,6 +59,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::User(command) => commands::user::run(config, command).await,
         Command::AppPassword(command) => commands::app_password::run(config, command).await,
         Command::Device(command) => commands::device::run(config, command).await,
+        Command::S3(command) => commands::s3::run(config, command).await,
         Command::Rescan(args) => commands::rescan::run(config, args).await,
     }
 }

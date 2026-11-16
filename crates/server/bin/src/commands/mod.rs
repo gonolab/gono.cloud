@@ -7,6 +7,7 @@ pub mod init;
 pub(crate) mod output;
 pub mod relay;
 pub mod rescan;
+pub mod s3;
 pub mod serve;
 pub mod user;
 
