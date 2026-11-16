@@ -85,6 +85,7 @@ async fn fixture() -> Fixture {
             allow_anonymous: false,
             multipart_ttl_secs: 3600,
             virtual_host_domain: None,
+            website_domain: None,
         },
     );
     Fixture {

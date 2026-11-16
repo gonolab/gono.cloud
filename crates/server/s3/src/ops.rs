@@ -2320,6 +2320,47 @@ impl S3 for GonoS3 {
         Ok(S3Response::new(dto::DeleteObjectTaggingOutput::default()))
     }
 
+    async fn get_bucket_website(
+        &self,
+        req: S3Request<dto::GetBucketWebsiteInput>,
+    ) -> S3Result<S3Response<dto::GetBucketWebsiteOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        let website = crate::website::from_stored(bucket.website.as_deref())
+            .ok_or_else(|| s3_error!(NoSuchWebsiteConfiguration))?;
+        Ok(S3Response::new(crate::website::to_config(&website)))
+    }
+
+    async fn put_bucket_website(
+        &self,
+        req: S3Request<dto::PutBucketWebsiteInput>,
+    ) -> S3Result<S3Response<dto::PutBucketWebsiteOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        let website = crate::website::from_config(req.input.website_configuration)?;
+        s3::set_bucket_website(
+            self.state.pool(),
+            bucket.owner_id,
+            bucket.id,
+            Some(&crate::website::to_stored(&website)),
+        )
+        .await
+        .map_err(error::database)?;
+        Ok(S3Response::new(dto::PutBucketWebsiteOutput::default()))
+    }
+
+    async fn delete_bucket_website(
+        &self,
+        req: S3Request<dto::DeleteBucketWebsiteInput>,
+    ) -> S3Result<S3Response<dto::DeleteBucketWebsiteOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        s3::set_bucket_website(self.state.pool(), bucket.owner_id, bucket.id, None)
+            .await
+            .map_err(error::database)?;
+        Ok(S3Response::new(dto::DeleteBucketWebsiteOutput::default()))
+    }
+
     async fn get_bucket_lifecycle_configuration(
         &self,
         req: S3Request<dto::GetBucketLifecycleConfigurationInput>,

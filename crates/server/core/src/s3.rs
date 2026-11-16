@@ -149,6 +149,9 @@ pub struct Bucket {
     pub tags: Option<String>,
     /// The bucket's lifecycle rules as JSON (written and read by the S3 API); `None`: none.
     pub lifecycle: Option<String>,
+    /// The bucket's website configuration as JSON (written and read by the S3 API); `None`:
+    /// not a website.
+    pub website: Option<String>,
     /// Creation time, UNIX seconds.
     pub created_at: i64,
 }
@@ -168,6 +171,7 @@ struct BucketRow {
     cors: Option<String>,
     tags: Option<String>,
     lifecycle: Option<String>,
+    website: Option<String>,
     created_at: i64,
 }
 
@@ -189,6 +193,7 @@ impl TryFrom<BucketRow> for Bucket {
             cors: row.cors,
             tags: row.tags,
             lifecycle: row.lifecycle,
+            website: row.website,
             created_at: row.created_at,
         })
     }
@@ -196,7 +201,7 @@ impl TryFrom<BucketRow> for Bucket {
 
 const BUCKET_QUERY: &str = "SELECT b.id, b.name, b.owner_id, u.username AS owner_name, \
      u.display_name AS owner_display_name, u.enabled AS owner_enabled, b.root_file_id, f.rel_path, \
-     b.anonymous, b.anonymous_list, b.cors, b.tags, b.lifecycle, b.created_at \
+     b.anonymous, b.anonymous_list, b.cors, b.tags, b.lifecycle, b.website, b.created_at \
      FROM s3_buckets b JOIN files f ON f.id = b.root_file_id JOIN users u ON u.id = b.owner_id";
 
 /// The bucket called `name`, if there is one.
@@ -402,6 +407,26 @@ pub async fn set_bucket_lifecycle(
             .execute(&mut *tx)
             .await?
             .rows_affected();
+    tx.commit().await?;
+    Ok(changed == 1)
+}
+
+/// Replaces the website configuration of `owner`'s bucket `id` with `website` (JSON; `None`
+/// removes it). Returns `false` if there is no such bucket.
+pub async fn set_bucket_website(
+    pool: &Pool,
+    owner: i64,
+    id: i64,
+    website: Option<&str>,
+) -> Result<bool> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let changed = sqlx::query("UPDATE s3_buckets SET website = ?3 WHERE id = ?1 AND owner_id = ?2")
+        .bind(id)
+        .bind(owner)
+        .bind(website)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
     tx.commit().await?;
     Ok(changed == 1)
 }

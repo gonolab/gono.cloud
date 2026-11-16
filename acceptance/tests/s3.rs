@@ -9,6 +9,8 @@
 //! - `GONO_ACCEPT_S3_BUCKET`: a bucket of that user that honors object ACLs (`acl`), bound to
 //!   the folder `Buckets/<name>`;
 //! - `GONO_ACCEPT_S3_PUBLIC_BUCKET`: a bucket that is `public-read` with anonymous listing;
+//! - `GONO_ACCEPT_S3_WEBSITE_DOMAIN` (optional): the server's `s3.website_domain`, whose
+//!   host names the suite sends to the S3 endpoint without DNS;
 //! - `GONO_ACCEPT_S3_VIRTUAL_HOST_DOMAIN` (optional): the server's `s3.virtual_host_domain`;
 //!   requests to `<bucket>.<domain>` are sent to the endpoint's address, so no DNS is needed;
 //! - a server with `s3.allow_anonymous = true`.
@@ -1099,6 +1101,136 @@ async fn wrong_credentials_are_refused() {
             .iter()
             .any(|bucket| bucket.name() == Some(s3.bucket.as_str()))
     );
+}
+
+/// A bucket with a website configuration answers at `<bucket>.<website domain>` with its index
+/// and error documents, as far as anonymous requests may read it.
+#[tokio::test]
+async fn website_buckets_serve_index_and_error_documents() {
+    use aws_sdk_s3::types::{ErrorDocument, IndexDocument, WebsiteConfiguration};
+
+    let s3 = require!(S3::new(), "S3 is not configured");
+    let Some(domain) = env("GONO_ACCEPT_S3_WEBSITE_DOMAIN") else {
+        skip("GONO_ACCEPT_S3_WEBSITE_DOMAIN is not set; websites are not checked");
+        return;
+    };
+    let bucket = format!("site-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    s3.client
+        .create_bucket()
+        .bucket(&bucket)
+        .acl(BucketCannedAcl::PublicRead)
+        .send()
+        .await
+        .unwrap();
+    for (key, body) in [
+        ("index.html", "home"),
+        ("docs/index.html", "docs"),
+        ("404.html", "missing"),
+    ] {
+        s3.client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .content_type("text/html")
+            .body(ByteStream::from(body.as_bytes().to_vec()))
+            .send()
+            .await
+            .unwrap();
+    }
+    s3.client
+        .put_bucket_website()
+        .bucket(&bucket)
+        .website_configuration(
+            WebsiteConfiguration::builder()
+                .index_document(
+                    IndexDocument::builder()
+                        .suffix("index.html")
+                        .build()
+                        .unwrap(),
+                )
+                .error_document(ErrorDocument::builder().key("404.html").build().unwrap())
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let configured = s3
+        .client
+        .get_bucket_website()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        configured.index_document().map(IndexDocument::suffix),
+        Some("index.html")
+    );
+
+    let endpoint = url::Url::parse(&s3.endpoint).unwrap();
+    let address = endpoint.socket_addrs(|| None).unwrap()[0];
+    let port = endpoint.port_or_known_default().unwrap();
+    let host = format!("{bucket}.{domain}");
+    let http = reqwest::Client::builder()
+        .resolve(&host, address)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let site = |path: &str| http.get(format!("http://{host}:{port}{path}")).send();
+    let home = site("/").await.unwrap();
+    assert_eq!(home.status(), 200);
+    assert!(
+        home.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    assert_eq!(home.text().await.unwrap(), "home");
+    assert_eq!(site("/docs/").await.unwrap().text().await.unwrap(), "docs");
+    let folder = site("/docs").await.unwrap();
+    assert_eq!(folder.status(), 302);
+    assert_eq!(folder.headers()["location"], "/docs/");
+    // Anonymous requests may not list this bucket, so a missing page is 403, as in S3.
+    let missing = site("/nothing.html").await.unwrap();
+    assert_eq!(missing.status(), 403);
+    assert_eq!(missing.text().await.unwrap(), "missing");
+    let put = http
+        .put(format!("http://{host}:{port}/index.html"))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 405);
+    // A private bucket publishes nothing, its website included.
+    s3.client
+        .put_bucket_acl()
+        .bucket(&bucket)
+        .acl(BucketCannedAcl::Private)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(site("/").await.unwrap().status(), 403);
+
+    for key in ["index.html", "docs/index.html", "404.html"] {
+        s3.client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+    }
+    s3.client
+        .delete_bucket_website()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    s3.client
+        .delete_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

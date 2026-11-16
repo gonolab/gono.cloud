@@ -198,6 +198,12 @@ multipart_ttl_secs = 604800
 # wildcard certificate for *.<domain> at the reverse proxy (docs/reverse-proxy.md). Usually the
 # host of public_url. Path style keeps working either way. Default: unset (path style only).
 # virtual_host_domain = "s3.example.com"
+# The domain below which buckets with a website configuration (PutBucketWebsite) are served as
+# static websites: https://photos.web.example.com/ for "web.example.com", with index and error
+# documents, to anonymous GET and HEAD requests, as far as the bucket lets anonymous requests
+# read. A domain of its own, not the virtual_host_domain; needs a wildcard DNS record and
+# certificate for *.<domain> forwarded to `bind` like the S3 host. Default: unset (no websites).
+# website_domain = "web.example.com"
 
 [two_factor]
 # The key the TOTP secrets of two-step verification are encrypted with: 32 random bytes (or 64

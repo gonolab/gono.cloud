@@ -400,6 +400,12 @@ pub struct S3Config {
     /// wildcard DNS and a wildcard certificate for `*.<domain>`. Path style keeps working.
     /// `None` (the default): path style only.
     pub virtual_host_domain: Option<String>,
+
+    /// The domain below which buckets with a website configuration are served as static
+    /// websites, `<bucket>.<domain>`, to anonymous `GET` and `HEAD` requests. A domain of its
+    /// own (as S3's website endpoints): wildcard DNS and certificate for `*.<domain>`,
+    /// forwarded to `bind`. `None` (the default): no websites.
+    pub website_domain: Option<String>,
 }
 
 impl Default for S3Config {
@@ -413,6 +419,7 @@ impl Default for S3Config {
             allow_anonymous: false,
             multipart_ttl_secs: DEFAULT_MULTIPART_TTL_SECS,
             virtual_host_domain: None,
+            website_domain: None,
         }
     }
 }
@@ -897,6 +904,58 @@ impl Config {
         }
         if let Some(domain) = &s3.virtual_host_domain {
             self.validate_virtual_host_domain(domain, reject);
+        }
+        if let Some(domain) = &s3.website_domain {
+            self.validate_website_domain(domain, reject);
+        }
+    }
+
+    /// Checks `s3.website_domain`: a DNS name of its own, below which no other host of this
+    /// server lies and which is neither the virtual-hosted domain nor below or above it.
+    fn validate_website_domain(&self, domain: &str, reject: &mut impl FnMut(&'static str, String)) {
+        if !is_domain(domain) {
+            reject(
+                "s3.website_domain",
+                format!(
+                    "{domain:?} is not a domain name: lowercase letters, digits, '-' and '.', \
+                     without a scheme, a port or a trailing dot, for example \"web.example.com\""
+                ),
+            );
+            return;
+        }
+        let site = self.server.base_url.host_str();
+        let relay = self.relay.public_url.as_ref().and_then(Url::host_str);
+        let s3 = self.s3.public_url.as_ref().and_then(Url::host_str);
+        for (name, host) in [
+            ("server.base_url", site),
+            ("relay.public_url", relay),
+            ("s3.public_url", s3),
+        ] {
+            if let Some(host) = host
+                && (host.eq_ignore_ascii_case(domain)
+                    || is_below(&host.to_ascii_lowercase(), domain))
+            {
+                reject(
+                    "s3.website_domain",
+                    format!(
+                        "{name}'s host {host} is or lies below {domain}; websites need a domain \
+                         of their own, such as web.example.com"
+                    ),
+                );
+            }
+        }
+        if let Some(virtual_hosts) = &self.s3.virtual_host_domain
+            && (virtual_hosts == domain
+                || is_below(domain, virtual_hosts)
+                || is_below(virtual_hosts, domain))
+        {
+            reject(
+                "s3.website_domain",
+                format!(
+                    "{domain} and s3.virtual_host_domain {virtual_hosts} would name the same \
+                     hosts; use a domain apart from it"
+                ),
+            );
         }
     }
 
@@ -1680,6 +1739,32 @@ mod tests {
         assert_eq!(s3.multipart_ttl_secs, 7 * 24 * 60 * 60);
         assert_eq!(s3.virtual_host_domain, None);
         assert!(issue_keys(&parse(MINIMAL)).is_empty());
+    }
+
+    #[test]
+    fn website_domains_are_checked() {
+        let enabled = "enabled = true\npublic_url = \"https://s3.example.com\"\n\
+                       virtual_host_domain = \"s3.example.com\"";
+        let website = |value: &str| {
+            let mut keys = issue_keys(&with_s3(&format!(
+                "{enabled}\nwebsite_domain = \"{value}\""
+            )));
+            keys.dedup();
+            keys
+        };
+        assert!(website("web.example.org").is_empty());
+        for invalid in [
+            "https://web.example.org",
+            "web.example.org:443",
+            "Web.example.org",
+        ] {
+            assert_eq!(website(invalid), ["s3.website_domain"], "{invalid}");
+        }
+        // The S3 host, its virtual hosts and the site's host are not websites.
+        for clash in ["s3.example.com", "x.s3.example.com", "example.com"] {
+            assert_eq!(website(clash), ["s3.website_domain"], "{clash}");
+        }
+        assert_eq!(parse(MINIMAL).s3.website_domain, None);
     }
 
     #[test]

@@ -89,7 +89,9 @@ compatible within a major version: released clients keep working with newer serv
   (`PutObjectTagging`, `x-amz-tagging`, `PutBucketTagging` and the rest). Lifecycle rules
   (`PutBucketLifecycleConfiguration`) expire objects after days or on a date, by prefix, tags
   and size, and give up old multipart uploads; unlike S3 they expire only files written
-  through S3, counting from when they were written, never WebDAV files.
+  through S3, counting from when they were written, never WebDAV files. With
+  `s3.website_domain`, buckets with a website configuration (`PutBucketWebsite`) are static
+  sites at `<bucket>.<domain>`, with index and error documents and redirects.
   `ListObjectVersions` lists each object as its only version, `null` (versioning is
   never enabled), which cleanup tools need. Keys need not be in Unicode NFC (names from older
   macOS are NFD): the tree stores the NFC name and S3 keeps the key's spelling

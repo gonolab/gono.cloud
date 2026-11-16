@@ -277,6 +277,7 @@ mod tests {
             cors: None,
             tags: None,
             lifecycle: None,
+            website: None,
             created_at: 0,
         }
     }

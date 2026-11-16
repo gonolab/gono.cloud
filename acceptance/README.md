@@ -54,7 +54,9 @@ The script turns the S3 API on (with anonymous access allowed), creates the buck
 `acceptance` (`acl`) and `acceptance-public` (`public-read`, listable) for `gono` and a key with
 access to every bucket, and passes them to the S3 tests (`tests/s3.rs`) in
 `GONO_ACCEPT_S3_ENDPOINT`, `GONO_ACCEPT_S3_ACCESS_KEY`, `GONO_ACCEPT_S3_SECRET_KEY`,
-`GONO_ACCEPT_S3_BUCKET` and `GONO_ACCEPT_S3_PUBLIC_BUCKET`. Against another server, set them
+`GONO_ACCEPT_S3_BUCKET` and `GONO_ACCEPT_S3_PUBLIC_BUCKET`, and the S3 API's
+`virtual_host_domain` (`s3.localhost`) and `website_domain` (`web.localhost`) in
+`GONO_ACCEPT_S3_VIRTUAL_HOST_DOMAIN` and `GONO_ACCEPT_S3_WEBSITE_DOMAIN`. Against another server, set them
 yourself (the bucket must be bound to the folder `Buckets/<name>`); without them the S3 tests
 are skipped. They use the AWS SDK as it ships, so they also check its default integrity
 checksums and presigned URLs.

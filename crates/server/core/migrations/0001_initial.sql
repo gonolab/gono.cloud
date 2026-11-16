@@ -175,6 +175,9 @@ CREATE TABLE s3_buckets (
     -- The bucket's lifecycle rules (PutBucketLifecycleConfiguration) as JSON, written and read
     -- by the S3 API and applied by its background task; NULL: none.
     lifecycle      TEXT    CHECK (lifecycle IS NULL OR json_valid(lifecycle)),
+    -- The bucket's website configuration (PutBucketWebsite) as JSON, written and read by the
+    -- S3 API; NULL: not a website.
+    website        TEXT    CHECK (website IS NULL OR json_valid(website)),
     created_at     INTEGER NOT NULL
 ) STRICT;
 

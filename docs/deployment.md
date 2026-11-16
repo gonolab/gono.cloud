@@ -320,6 +320,7 @@ download ([s3.md](s3.md) describes it for users). It is off by default (`[s3]`,
 | **A server block in the reverse proxy** | HTTPS for the host name, forwarded to `s3.bind` (`127.0.0.1:16104`) with `Host` unchanged: [reverse-proxy.md](reverse-proxy.md#the-s3-api). |
 | **The key file** | The secrets of access keys are encrypted with `two_factor.key_file`, like TOTP secrets. `serve` refuses to start the S3 API without it. |
 | **Virtual-hosted style** (optional) | `<bucket>.s3.example.com` besides `s3.example.com/<bucket>`: `s3.virtual_host_domain`, a wildcard DNS record `*.s3.example.com` and a wildcard certificate ([reverse-proxy.md](reverse-proxy.md#virtual-hosted-style)). Path style works without it. |
+| **Websites** (optional) | Buckets with a website configuration as static sites at `<bucket>.web.example.com`: `s3.website_domain`, a domain of its own with a wildcard DNS record and certificate, forwarded to `s3.bind` like the S3 host ([reverse-proxy.md](reverse-proxy.md#websites)). |
 
 Turn it on in `/etc/gono-cloud/config.toml` and restart the service:
 
@@ -331,6 +332,8 @@ public_url = "https://s3.example.com"
 # allow_anonymous = true
 # Buckets as host names too (<bucket>.s3.example.com); needs wildcard DNS and a certificate.
 # virtual_host_domain = "s3.example.com"
+# Buckets as static websites (<bucket>.web.example.com); a wildcard of its own.
+# website_domain = "web.example.com"
 ```
 
 Then create a bucket and an access key, for example for the admin account (users can do the

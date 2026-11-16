@@ -480,6 +480,16 @@ s3.example.com, *.s3.example.com {
 
 Path style keeps working on `s3.example.com` itself.
 
+### Websites
+
+With `s3.website_domain = "web.example.com"`, buckets with a website configuration are served
+as static sites at `<bucket>.web.example.com`. That domain is the S3 API's listener too, as
+in S3 a website endpoint of its own: give it a wildcard DNS record (`*.web.example.com`) and a
+wildcard certificate, and forward it to `s3.bind` with `Host` passed through, like the
+virtual-hosted names above (nginx: `server_name *.web.example.com;` in a server block with
+the S3 block's settings; Caddy: `*.web.example.com { ... }` with the same `reverse_proxy`).
+Websites only answer anonymous `GET` and `HEAD` requests.
+
 ### Checking the S3 API
 
 ```sh

@@ -20,6 +20,9 @@
 //!   not route, and add their headers to s3s's responses.
 //! - **Request ids**: every response carries one in `x-amz-request-id`, and every error document
 //!   in `RequestId`, as from S3 (s3s writes neither); the request log records it.
+//! - **Websites** ([`website`]): with `s3.website_domain`, `<bucket>.<domain>` serves buckets
+//!   with a website configuration to anonymous `GET` and `HEAD` requests, through the S3 API's
+//!   own anonymous reads.
 //!
 //! [`service`] builds the [`Service`] the server binds to `s3.bind`.
 
@@ -38,6 +41,7 @@ mod policy;
 mod state;
 mod tags;
 mod upload;
+mod website;
 
 pub use state::{S3Settings, S3State};
 
@@ -49,6 +53,7 @@ use std::{
 use bytes::Bytes;
 use gono_server_core::s3 as buckets;
 use http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
+use http_body_util::Empty;
 use rand::RngExt as _;
 use s3s::{
     Body, HttpError, HttpResponse, S3Error,
@@ -189,12 +194,30 @@ impl Service {
         Ok(response)
     }
 
-    /// Answers `request`: form uploads are prepared for s3s first.
+    /// Answers `request`: website hosts apart, and form uploads are prepared for s3s first.
     async fn answer<B>(&self, request: Request<B>) -> Result<HttpResponse, HttpError>
     where
         B: http_body::Body<Data = Bytes> + Send + 'static,
         B::Error: std::error::Error + Send + Sync + 'static,
     {
+        if let Some(domain) = &self.state.settings().website_domain
+            && let Some(host) = request
+                .headers()
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+            && let Some(bucket) = website::bucket_of(host, domain)
+        {
+            let host = host.to_owned();
+            return Ok(self
+                .website(
+                    &bucket,
+                    request.method(),
+                    request.uri().path(),
+                    &host,
+                    request.headers(),
+                )
+                .await);
+        }
         if request.method() == Method::POST && is_form(request.headers()) {
             // s3s reads a form upload's file into memory to learn its size when the request
             // does not say it, and does so before the access check; browsers always say it.
@@ -253,6 +276,58 @@ impl Service {
     {
         let mut s3 = self.s3.clone();
         tower_service::Service::call(&mut s3, request).await
+    }
+
+    /// Answers a request to the website of `bucket` (see [`website`]): objects are read with
+    /// anonymous path-style requests of the S3 API, so the bucket's anonymous access decides
+    /// what the website shows.
+    async fn website(
+        &self,
+        bucket: &str,
+        method: &Method,
+        path: &str,
+        host: &str,
+        headers: &HeaderMap,
+    ) -> HttpResponse {
+        let site = match buckets::bucket(self.state.pool(), bucket).await {
+            Ok(Some(found)) if found.owner_enabled => {
+                website::from_stored(found.website.as_deref())
+            }
+            Ok(_) => None,
+            Err(err) => return error_response(error::database(err)),
+        };
+        let Some(site) = site else {
+            return website::not_a_website();
+        };
+        let passed: Vec<(header::HeaderName, HeaderValue)> = [
+            header::RANGE,
+            header::IF_MATCH,
+            header::IF_NONE_MATCH,
+            header::IF_MODIFIED_SINCE,
+            header::IF_UNMODIFIED_SINCE,
+        ]
+        .into_iter()
+        .filter_map(|name| headers.get(&name).map(|value| (name, value.clone())))
+        .collect();
+        let fetch = |key: String, method: Method| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(format!("/{bucket}/{}", website::encode_key(&key)))
+                // An address: s3s reads it as path style.
+                .header(header::HOST, "127.0.0.1");
+            for (name, value) in &passed {
+                request = request.header(name, value);
+            }
+            async move {
+                let Ok(request) = request.body(Empty::<Bytes>::new()) else {
+                    return error_response(s3_error!(InvalidURI));
+                };
+                self.forward(request)
+                    .await
+                    .unwrap_or_else(|_| error_response(s3_error!(InternalError)))
+            }
+        };
+        website::serve(&site, method, path, host, fetch).await
     }
 
     /// The bucket a request names, the way s3s finds it: in the host name (virtual-hosted
