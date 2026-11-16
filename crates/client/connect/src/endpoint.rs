@@ -19,6 +19,10 @@
 //!   a full one. Hosts in mainland China whose domain is not ICP-registered have port 80
 //!   intercepted, which reads as a captive portal everywhere; without the check, the relay's
 //!   host needs no port 80 for devices. Relay latency still comes from QAD and HTTPS (`/ping`).
+//! - on the remote endpoint, short path timers ([`REMOTE_PATH_IDLE_TIMEOUT`],
+//!   [`REMOTE_PATH_KEEP_ALIVE_INTERVAL`]): a selected direct path that goes silent is abandoned
+//!   after a few seconds instead of iroh's 15, and the connection moves to the relay path,
+//!   which stays open beside it (plan V8). The LAN endpoint keeps iroh's timers.
 //!
 //! Incoming connections: iroh 1.4.1 has no builder option for the endpoint's limit of pending
 //! connection attempts (noq's `max_incoming`, 65536 by default; `ServerConfigBuilder` only
@@ -30,9 +34,9 @@
 //!
 //! Products depend on this crate, never on iroh's configuration directly, so that an iroh
 //! upgrade that adds a default changes one file. What a product may tune is limited to what
-//! cannot add a contact: the QUIC transport parameters of [`TransportOptions`] (iroh's
-//! multipath and hole-punching settings stay as iroh sets them) and the addresses to bind
-//! ([`BindAddresses`]).
+//! cannot add a contact: the QUIC transport parameters of [`TransportOptions`] (with the path
+//! timers, but not iroh's other multipath and hole-punching settings) and the addresses to
+//! bind ([`BindAddresses`]).
 
 use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
@@ -92,10 +96,56 @@ impl BindAddresses {
     }
 }
 
+/// How long a path of the remote endpoint may receive nothing before it is abandoned (iroh: 15
+/// s). When a selected direct path goes silent (a network that starts dropping UDP, a NAT that
+/// forgets the mapping, Wi-Fi gone without a network event), nothing gets through until this
+/// timer abandons it: iroh moves the connection to the relay only then, although the relay
+/// path is open beside it the whole time (plan V8). Relay paths keep iroh's 30 s, and paths
+/// with a long round trip get at least three probe timeouts.
+///
+/// The price: a working path that receives nothing for this long (a radio gap) is abandoned
+/// too, and once a direct path was abandoned, iroh 1.4.1 punches a new one only when an
+/// address changes or at its upgrade check, every 60 s. Until then the connection stays on the
+/// relay, which still carries it. 3 s abandons the fewest working paths of the values measured
+/// (2–3 s); a silent break then reaches the relay about 3.1 s after the drop, longer than
+/// Input Show's 2 s key-release timeout, so held keys are released once at the switch.
+pub const REMOTE_PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How often the remote endpoint pings a path that carries nothing else (iroh: 5 s), so that
+/// an idle path outlives [`REMOTE_PATH_IDLE_TIMEOUT`]. It applies to the relay path as well.
+pub const REMOTE_PATH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// iroh's path idle timeout and keep-alive interval: what the LAN endpoint keeps, and the
+/// largest values iroh accepts.
+const IROH_PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+const IROH_PATH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The endpoint a configuration is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Profile {
+    /// [`bind`]: relay and direct paths, with the path timers of plan V8.
+    Remote,
+    /// [`bind_lan`]: direct paths only, with iroh's path timers.
+    Lan,
+}
+
+impl Profile {
+    /// The path idle timeout and keep-alive interval unless the product sets them.
+    fn path_timers(self) -> (Duration, Duration) {
+        match self {
+            Self::Remote => (REMOTE_PATH_IDLE_TIMEOUT, REMOTE_PATH_KEEP_ALIVE_INTERVAL),
+            Self::Lan => (IROH_PATH_IDLE_TIMEOUT, IROH_PATH_KEEP_ALIVE_INTERVAL),
+        }
+    }
+}
+
 /// QUIC transport parameters a product tunes for its protocol, for example Input Show's stream
-/// limits, its datagram buffers and the remote profile of plan 3.7. `None` keeps iroh's value.
-/// iroh's settings for multipath and hole punching (path keep-alive and idle timeout, paths,
-/// NAT-traversal addresses) are not offered: changing them breaks hole punching.
+/// limits, its datagram buffers and the remote profile of plan 3.7. `None` keeps the default:
+/// iroh's value, except for the path timers of the remote endpoint.
+///
+/// The path timers do not touch hole punching: noq opens a direct path only after a NAT
+/// traversal probe came back, so a short idle timeout cannot cut a punch short. iroh's other
+/// multipath and hole-punching settings (paths, NAT-traversal addresses) are not offered.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransportOptions {
     /// Incoming bidirectional streams open at once (iroh: 100).
@@ -110,16 +160,50 @@ pub struct TransportOptions {
     pub max_idle_timeout: Option<Duration>,
     /// The connection's keep-alive interval (iroh: 5 s).
     pub keep_alive_interval: Option<Duration>,
+    /// How long a path may receive nothing before it is abandoned and the connection moves to
+    /// another path: [`REMOTE_PATH_IDLE_TIMEOUT`] on the remote endpoint, iroh's 15 s on the
+    /// LAN endpoint. At most 15 s. Relay paths keep iroh's 30 s.
+    pub path_idle_timeout: Option<Duration>,
+    /// How often a path that carries nothing else is pinged:
+    /// [`REMOTE_PATH_KEEP_ALIVE_INTERVAL`] on the remote endpoint, iroh's 5 s on the LAN
+    /// endpoint. At most 5 s, and at most half the path idle timeout, so that one lost ping
+    /// does not end an idle path.
+    pub path_keep_alive_interval: Option<Duration>,
 }
 
 impl TransportOptions {
-    /// iroh's transport configuration with these values applied, or `None` when nothing is
-    /// set.
-    fn config(&self) -> Result<Option<QuicTransportConfig>, Error> {
-        if *self == Self::default() {
+    /// The path idle timeout and keep-alive interval for `profile`, checked against each
+    /// other and against what iroh accepts (iroh would clamp or ignore larger values with a
+    /// warning only).
+    fn path_timers(&self, profile: Profile) -> Result<(Duration, Duration), Error> {
+        let (idle, keep_alive) = profile.path_timers();
+        let idle = self.path_idle_timeout.unwrap_or(idle);
+        let keep_alive = self.path_keep_alive_interval.unwrap_or(keep_alive);
+        if idle > IROH_PATH_IDLE_TIMEOUT || keep_alive > IROH_PATH_KEEP_ALIVE_INTERVAL {
+            return Err(Error::Bind(format!(
+                "path timers {idle:?} / {keep_alive:?} exceed iroh's \
+                 {IROH_PATH_IDLE_TIMEOUT:?} / {IROH_PATH_KEEP_ALIVE_INTERVAL:?}"
+            )));
+        }
+        if keep_alive.is_zero() || keep_alive * 2 > idle {
+            return Err(Error::Bind(format!(
+                "path keep-alive {keep_alive:?} must be above zero and at most half the path \
+                 idle timeout {idle:?}"
+            )));
+        }
+        Ok((idle, keep_alive))
+    }
+
+    /// iroh's transport configuration for `profile` with these values applied, or `None` when
+    /// it would be iroh's own.
+    fn config(&self, profile: Profile) -> Result<Option<QuicTransportConfig>, Error> {
+        let (path_idle, path_keep_alive) = self.path_timers(profile)?;
+        if profile == Profile::Lan && *self == Self::default() {
             return Ok(None);
         }
-        let mut builder = QuicTransportConfig::builder();
+        let mut builder = QuicTransportConfig::builder()
+            .default_path_max_idle_timeout(path_idle)
+            .default_path_keep_alive_interval(path_keep_alive);
         if let Some(streams) = self.max_concurrent_bidi_streams {
             builder = builder.max_concurrent_bidi_streams(VarInt::from_u32(streams));
         }
@@ -175,7 +259,7 @@ pub async fn bind(
     options: EndpointOptions,
     lookup: impl AddressLookup + Clone,
 ) -> Result<Endpoint, Error> {
-    bind_with(&options, Some(lookup)).await
+    bind_with(&options, Some(lookup), Profile::Remote).await
 }
 
 /// Binds the LAN-only endpoint of plan 3.5: no relay and no address lookup, so it contacts
@@ -185,21 +269,23 @@ pub async fn bind_lan(options: EndpointOptions) -> Result<Endpoint, Error> {
     if options.relay_url.is_some() {
         return Err(Error::Bind("the LAN endpoint has no relay".to_owned()));
     }
-    bind_with::<crate::ControlLookup>(&options, None).await
+    bind_with::<crate::ControlLookup>(&options, None, Profile::Lan).await
 }
 
 async fn bind_with<L: AddressLookup + Clone>(
     options: &EndpointOptions,
     lookup: Option<L>,
+    profile: Profile,
 ) -> Result<Endpoint, Error> {
+    let transport = options.transport.config(profile)?;
     let Some(ipv6) = options.bind.ipv6 else {
-        return bind_families(options, lookup, None).await;
+        return bind_families(options, lookup, transport, None).await;
     };
-    match bind_families(options, lookup.clone(), Some(ipv6)).await {
+    match bind_families(options, lookup.clone(), transport.clone(), Some(ipv6)).await {
         Ok(endpoint) => Ok(endpoint),
         Err(err) => {
             tracing::warn!(error = %err, "cannot bind IPv6; using IPv4 only");
-            bind_families(options, lookup, None).await
+            bind_families(options, lookup, transport, None).await
         }
     }
 }
@@ -207,6 +293,7 @@ async fn bind_with<L: AddressLookup + Clone>(
 async fn bind_families(
     options: &EndpointOptions,
     lookup: Option<impl AddressLookup>,
+    transport: Option<QuicTransportConfig>,
     ipv6: Option<Ipv6Addr>,
 ) -> Result<Endpoint, Error> {
     let dns = match options.dns {
@@ -232,7 +319,7 @@ async fn bind_families(
     if let Some(lookup) = lookup {
         builder = builder.address_lookup(lookup);
     }
-    if let Some(transport) = options.transport.config()? {
+    if let Some(transport) = transport {
         builder = builder.transport_config(transport);
     }
     // Drops the default sockets of both families; one bind per family follows.
@@ -407,8 +494,9 @@ mod tests {
     }
 
     #[test]
-    fn transport_options_build_only_when_set() {
-        assert!(TransportOptions::default().config().unwrap().is_none());
+    fn transport_options_build_for_the_lan_only_when_set() {
+        let lan = TransportOptions::default().config(Profile::Lan).unwrap();
+        assert!(lan.is_none(), "the LAN endpoint keeps iroh's configuration");
         let options = TransportOptions {
             max_concurrent_bidi_streams: Some(8),
             max_concurrent_uni_streams: Some(4),
@@ -416,8 +504,87 @@ mod tests {
             datagram_send_buffer_size: Some(64 * 1024),
             max_idle_timeout: Some(Duration::from_secs(20)),
             keep_alive_interval: Some(Duration::from_secs(4)),
+            path_idle_timeout: Some(Duration::from_secs(10)),
+            path_keep_alive_interval: Some(Duration::from_secs(2)),
         };
-        assert!(options.config().unwrap().is_some());
+        for profile in [Profile::Lan, Profile::Remote] {
+            let config = format!("{:?}", options.config(profile).unwrap().unwrap());
+            assert!(
+                config.contains("default_path_max_idle_timeout: Some(10s)")
+                    && config.contains("default_path_keep_alive_interval: Some(2s)"),
+                "{config}"
+            );
+        }
+    }
+
+    /// The remote endpoint abandons a silent direct path after a few seconds (plan V8); the
+    /// LAN endpoint keeps iroh's 15 s and 5 s.
+    #[test]
+    fn the_remote_endpoint_has_short_path_timers() {
+        let remote = TransportOptions::default().config(Profile::Remote).unwrap();
+        let remote = format!(
+            "{:?}",
+            remote.expect("the remote profile sets the path timers")
+        );
+        let idle = format!("default_path_max_idle_timeout: Some({REMOTE_PATH_IDLE_TIMEOUT:?})");
+        let keep_alive =
+            format!("default_path_keep_alive_interval: Some({REMOTE_PATH_KEEP_ALIVE_INTERVAL:?})");
+        assert!(
+            remote.contains(&idle) && remote.contains(&keep_alive),
+            "{remote}"
+        );
+        // Values the product leaves alone stay iroh's.
+        // (noq prints the connection idle timeout in milliseconds.)
+        assert!(
+            remote.contains(" max_idle_timeout: Some(30000)"),
+            "{remote}"
+        );
+        assert!(
+            remote.contains(" keep_alive_interval: Some(5s)"),
+            "{remote}"
+        );
+
+        let lan = TransportOptions {
+            max_concurrent_uni_streams: Some(4),
+            ..TransportOptions::default()
+        };
+        let lan = format!("{:?}", lan.config(Profile::Lan).unwrap().unwrap());
+        assert!(
+            lan.contains("default_path_max_idle_timeout: Some(15s)")
+                && lan.contains("default_path_keep_alive_interval: Some(5s)"),
+            "{lan}"
+        );
+    }
+
+    #[test]
+    fn path_timers_iroh_would_clamp_or_that_end_idle_paths_are_refused() {
+        let secs = Duration::from_secs;
+        for (idle, keep_alive) in [
+            (Some(secs(16)), None),
+            (None, Some(secs(6))),
+            (Some(secs(2)), Some(secs(2))),
+            (Some(secs(3)), Some(Duration::from_millis(1600))),
+            (None, Some(Duration::ZERO)),
+            // The remote default keep-alive is more than half of this.
+            (Some(Duration::from_millis(1500)), None),
+        ] {
+            let options = TransportOptions {
+                path_idle_timeout: idle,
+                path_keep_alive_interval: keep_alive,
+                ..TransportOptions::default()
+            };
+            assert!(
+                matches!(options.config(Profile::Remote), Err(Error::Bind(_))),
+                "{idle:?} / {keep_alive:?}"
+            );
+        }
+        // On the LAN, iroh's 5 s keep-alive is more than half of a 9 s idle timeout.
+        let lan = TransportOptions {
+            path_idle_timeout: Some(secs(9)),
+            ..TransportOptions::default()
+        };
+        assert!(matches!(lan.config(Profile::Lan), Err(Error::Bind(_))));
+        assert!(lan.config(Profile::Remote).unwrap().is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]

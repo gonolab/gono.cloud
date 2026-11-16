@@ -21,8 +21,16 @@
 # Then: with no filter, `gono` must connect over the relay and then find the direct path; with
 # the relay down, it must connect directly (protocol 7.4).
 #
+# Last, a silent break: once the direct path carries the connection, all UDP to both ports is
+# dropped on arrival (udp-paths --silent-break), as a network that starts dropping UDP does.
+# With the remote endpoint's path timers, probes sent after the drop must come back over the
+# relay within OUTAGE_BOUND_MS; with iroh's own (15 s idle timeout, 5 s keep-alive), the
+# control, not before 10 s. Both must find the direct path again once UDP returns: iroh punches
+# again only at its upgrade check, every 60 s, when no address changes (as here).
+#
 # Linux only. As root (CI, under sudo) it uses `unshare --net` with a dummy interface;
-# otherwise pasta (rootless). Needs nft. A stuck case takes about 30 s (iroh's idle timeout).
+# otherwise pasta (rootless). Needs nft. A stuck case takes about 30 s (iroh's idle timeout),
+# a silent break up to 75 s.
 
 set -eu
 
@@ -49,6 +57,10 @@ else
 fi
 
 failures=0
+
+# The remote endpoint's path idle timeout (3 s) plus the retransmission over the relay, with
+# room for a slow runner.
+OUTAGE_BOUND_MS=${OUTAGE_BOUND_MS:-5000}
 
 # Runs udp-paths with arguments $3... in a new network namespace, with rule $2 in hook $1 (or
 # none for hook "none"), and prints its line. Returns its exit code.
@@ -108,6 +120,10 @@ for side in acceptor dialer; do
 done
 expect ok none "" "gono  no filter, relay then direct" gono with-direct --expect-direct
 expect ok none "" "gono  relay down, direct" gono with-direct --relay-down --expect-direct
+expect ok none "" "gono  silent break" gono with-direct --silent-break \
+	--outage-below "$OUTAGE_BOUND_MS"
+expect ok none "" "gono  silent break, iroh's timers" gono with-direct --silent-break \
+	--path-timers 15000/5000 --outage-above 10000
 
 if [ "$failures" -gt 0 ]; then
 	printf '\n%s case(s) failed.\n' "$failures"

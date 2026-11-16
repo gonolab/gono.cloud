@@ -49,6 +49,8 @@ http.workspace = true
 # A relay on loopback for examples/udp-paths.rs (scripts/test-udp-paths.sh).
 iroh-relay.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
+# RUST_LOG for examples/udp-paths.rs, on stderr.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

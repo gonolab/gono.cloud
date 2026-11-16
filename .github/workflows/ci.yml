@@ -281,8 +281,9 @@ jobs:
   # firewall refusing outbound UDP, an asymmetric filter) does not stop the connection. Runs
   # dials in network namespaces under nftables filters on either side, with iroh's own dial
   # as the control that must be stuck in exactly the one-way cases, and checks that a direct
-  # path follows the relay and that a relay outage falls back to direct addresses. See
-  # crates/client/connect/scripts/test-udp-paths.sh.
+  # path follows the relay, that a relay outage falls back to direct addresses, and that a
+  # direct path that goes silent hands the connection to the relay within seconds (iroh's own
+  # path timers, the control, take 15 s). See crates/client/connect/scripts/test-udp-paths.sh.
   udp-paths:
     name: Paths under UDP filters (Linux)
     runs-on: ubuntu-latest
