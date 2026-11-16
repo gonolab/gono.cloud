@@ -220,7 +220,7 @@ async fn if_match_compares_the_s3_etag() {
             WriteCondition::IfMatch("1".into())
         )
         .await,
-        Err(ObjectError::PreconditionFailed),
+        Err(ObjectError::NotFound),
         "nothing to match"
     );
     h.put_object(&full, "f", "one", object("md5-1"), WriteCondition::Always)
@@ -273,6 +273,46 @@ async fn if_match_compares_the_s3_etag() {
     .await
     .unwrap();
     assert_eq!(h.content("f"), "four");
+}
+
+#[tokio::test]
+async fn if_exists_and_if_none_match_compare_the_s3_etag() {
+    let h = Harness::new().await;
+    let full = h.full();
+    let put = |content: &'static str, etag: &'static str, condition: WriteCondition| {
+        let h = &h;
+        let full = full.clone();
+        async move {
+            h.put_object(&full, "f", content, object(etag), condition)
+                .await
+        }
+    };
+    assert_eq!(
+        put("x", "1", WriteCondition::IfExists).await,
+        Err(ObjectError::NotFound)
+    );
+    // Nothing there: no ETag matches, so the write happens.
+    put("one", "md5-1", WriteCondition::IfNoneMatch("md5-1".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        put("two", "md5-2", WriteCondition::IfNoneMatch("md5-1".into())).await,
+        Err(ObjectError::PreconditionFailed)
+    );
+    put("two", "md5-2", WriteCondition::IfNoneMatch("other".into()))
+        .await
+        .unwrap();
+    put("three", "md5-3", WriteCondition::IfExists)
+        .await
+        .unwrap();
+    assert_eq!(h.content("f"), "three");
+    // A folder is no object to replace.
+    h.fs.put_folder(full.clone(), &p("dir")).await.unwrap();
+    assert_eq!(
+        h.put_object(&full, "dir", "x", object("1"), WriteCondition::IfExists)
+            .await,
+        Err(ObjectError::PreconditionFailed)
+    );
 }
 
 #[tokio::test]

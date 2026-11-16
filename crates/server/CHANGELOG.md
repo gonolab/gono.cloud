@@ -79,7 +79,8 @@ compatible within a major version: released clients keep working with newer serv
   before s3s) and form uploads signed with a POST policy (`PostObject`, with the `acl` field
   that s3s does not read itself). Large copies use `UploadPartCopy` (whole objects or byte
   ranges); a repeated `CompleteMultipartUpload` (a retry after a lost answer) gets the first
-  answer again, as from S3. `ListObjectVersions` lists each object as its only version, `null` (versioning is
+  answer again, as from S3. Writes take the conditions `If-None-Match` (`*` or an ETag) and
+  `If-Match` (an ETag or `*`). `ListObjectVersions` lists each object as its only version, `null` (versioning is
   never enabled), which cleanup tools need. Keys need not be in Unicode NFC (names from older
   macOS are NFD): the tree stores the NFC name and S3 keeps the key's spelling
   (`files.s3_path`), in listings too. `mc anonymous set download` and `none` work: the anonymous-download bucket policy

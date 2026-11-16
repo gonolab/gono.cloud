@@ -16,9 +16,9 @@
 //!   ([`ObjectError::IsFolder`], [`ObjectError::ParentIsFile`]). Deleting removes only the file;
 //!   folders that become empty stay, because they may be the WebDAV user's own.
 //! - **Conditional writes** ([`WriteCondition`]): `CreateOnly` installs with `link(2)`, which
-//!   fails atomically when the name is taken, by any writer. `IfMatch` compares the S3 ETag and
-//!   installs under a lock per path, which makes it atomic against the other writes here; WebDAV
-//!   writes do not take that lock.
+//!   fails atomically when the name is taken, by any writer. `IfMatch`, `IfExists` and
+//!   `IfNoneMatch` compare the S3 ETag and install under a lock per path, which makes them
+//!   atomic against the other writes here; WebDAV writes do not take that lock.
 //! - **S3 metadata of one version**: [`ScopedFs::object`] returns the stored [`ObjectMeta`] only
 //!   while the file on disk is still the version it was written with.
 //! - **Spellings**: S3 keys need not be in NFC; the tree's names are. A write may name the client
@@ -143,7 +143,14 @@ pub enum WriteCondition {
     /// Only if nothing is at the path (`If-None-Match: *`).
     CreateOnly,
     /// Only if a file is at the path and its S3 ETag (without quotes) is this one (`If-Match`).
+    /// Fails with [`ObjectError::NotFound`] when nothing is there.
     IfMatch(String),
+    /// Only if a file is at the path (`If-Match: *`). Fails with [`ObjectError::NotFound`]
+    /// when nothing is there.
+    IfExists,
+    /// Unless a file is at the path whose S3 ETag (without quotes) is this one
+    /// (`If-None-Match` with an ETag).
+    IfNoneMatch(String),
 }
 
 /// The mutex of each path in use, by owner and storage path.
@@ -765,20 +772,41 @@ impl ScopedFs {
         if let Some(spelled) = &spelled {
             self.check_spelling(owner, &storage, spelled).await?;
         }
-        if let WriteCondition::IfMatch(expected) = &condition {
+        if matches!(
+            condition,
+            WriteCondition::IfMatch(_) | WriteCondition::IfExists | WriteCondition::IfNoneMatch(_)
+        ) {
             let current = match self.lookup(&ctx, &location).await {
-                Ok(entry) => entry,
-                Err(FsError::NotFound) => return Err(ObjectError::PreconditionFailed),
+                Ok(entry) => Some(entry),
+                Err(FsError::NotFound) => None,
                 Err(err) => return Err(err.into()),
             };
-            if current.is_dir() {
-                return Err(ObjectError::PreconditionFailed);
+            let etag = match &current {
+                // A folder has no ETag to match, and the write fails on it anyway.
+                Some(current) if current.is_dir() => None,
+                Some(current) => {
+                    let meta = self.version_meta(owner, current).await?;
+                    Some(meta.as_ref().map_or(current.etag.clone(), |meta| {
+                        meta.etag_or(&current.etag).to_owned()
+                    }))
+                }
+                None => None,
+            };
+            if current.is_none()
+                && matches!(
+                    condition,
+                    WriteCondition::IfMatch(_) | WriteCondition::IfExists
+                )
+            {
+                return Err(ObjectError::NotFound);
             }
-            let meta = self.version_meta(owner, &current).await?;
-            let etag = meta
-                .as_ref()
-                .map_or(current.etag.as_str(), |meta| meta.etag_or(&current.etag));
-            if etag != expected {
+            let holds = match &condition {
+                WriteCondition::IfMatch(expected) => etag.as_deref() == Some(expected.as_str()),
+                WriteCondition::IfExists => etag.is_some(),
+                WriteCondition::IfNoneMatch(unwanted) => etag.as_deref() != Some(unwanted.as_str()),
+                _ => true,
+            };
+            if !holds {
                 return Err(ObjectError::PreconditionFailed);
             }
             ctx.forget(&storage);

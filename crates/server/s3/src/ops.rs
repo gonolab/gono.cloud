@@ -324,24 +324,26 @@ pub(crate) fn check_copy_source_conditions(
     })
 }
 
-/// The condition of a write from `If-Match` and `If-None-Match`.
-fn write_condition(
+/// The condition of a write from `If-Match` and `If-None-Match`. `If-Match` (an ETag or `*`)
+/// needs an object (404 `NoSuchKey` otherwise); `If-None-Match` with an ETag lets every other
+/// version be replaced, and a missing object be created.
+pub(crate) fn write_condition(
     if_match: Option<&ETagCondition>,
     if_none_match: Option<&ETagCondition>,
 ) -> S3Result<WriteCondition> {
     match (if_match, if_none_match) {
         (None, None) => Ok(WriteCondition::Always),
         (None, Some(ETagCondition::Any)) => Ok(WriteCondition::CreateOnly),
+        (None, Some(ETagCondition::ETag(etag))) => {
+            Ok(WriteCondition::IfNoneMatch(etag.value().to_owned()))
+        }
         (Some(ETagCondition::ETag(etag)), None) => {
             Ok(WriteCondition::IfMatch(etag.value().to_owned()))
         }
-        (Some(ETagCondition::Any), None) => Err(s3_error!(
+        (Some(ETagCondition::Any), None) => Ok(WriteCondition::IfExists),
+        (Some(_), Some(_)) => Err(s3_error!(
             NotImplemented,
-            "If-Match: * is not supported for writes"
-        )),
-        _ => Err(s3_error!(
-            NotImplemented,
-            "Only If-None-Match: * or If-Match with an ETag is supported for writes"
+            "If-Match and If-None-Match together are not supported for writes"
         )),
     }
 }
@@ -2072,23 +2074,29 @@ impl GonoS3 {
         client: &RelPath,
         condition: &WriteCondition,
     ) -> S3Result<()> {
-        let expected = match condition {
-            WriteCondition::Always => return Ok(()),
-            WriteCondition::CreateOnly => None,
-            WriteCondition::IfMatch(etag) => Some(etag.as_str()),
-        };
+        if *condition == WriteCondition::Always {
+            return Ok(());
+        }
         let identity = Self::bucket_identity(auth, bucket, false)?;
         let current = match self.state.fs().object(identity, client).await {
             Ok((entry, meta)) => Some(etag_of(&entry, meta.as_ref())),
-            // A folder is in the way of both: the name is taken, and it has no ETag to match.
+            // A folder is in the way of all of them: the name is taken, and it has no ETag to
+            // match.
             Err(ObjectError::IsFolder) => Some(String::new()),
             Err(ObjectError::NotFound) => None,
             Err(err) => return Err(error::object(err, false)),
         };
-        let holds = match (expected, current) {
-            (None, current) => current.is_none(),
-            (Some(expected), Some(current)) => !current.is_empty() && current == expected,
-            (Some(_), None) => false,
+        let holds = match (condition, current.as_deref()) {
+            (WriteCondition::Always, _) => true,
+            (WriteCondition::CreateOnly, current) => current.is_none(),
+            (WriteCondition::IfMatch(_) | WriteCondition::IfExists, None) => {
+                return Err(s3_error!(NoSuchKey));
+            }
+            (WriteCondition::IfMatch(expected), Some(current)) => {
+                !current.is_empty() && current == expected
+            }
+            (WriteCondition::IfExists, Some(current)) => !current.is_empty(),
+            (WriteCondition::IfNoneMatch(unwanted), current) => current != Some(unwanted.as_str()),
         };
         if holds {
             Ok(())
@@ -2195,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn write_conditions_are_create_only_or_compare_and_swap() {
+    fn write_conditions_come_from_if_match_and_if_none_match() {
         assert_eq!(write_condition(None, None).unwrap(), WriteCondition::Always);
         assert_eq!(
             write_condition(None, Some(&ETagCondition::Any)).unwrap(),
@@ -2205,8 +2213,15 @@ mod tests {
             write_condition(Some(&tag("e")), None).unwrap(),
             WriteCondition::IfMatch("e".into())
         );
-        assert!(write_condition(None, Some(&tag("e"))).is_err());
-        assert!(write_condition(Some(&ETagCondition::Any), None).is_err());
+        assert_eq!(
+            write_condition(None, Some(&tag("e"))).unwrap(),
+            WriteCondition::IfNoneMatch("e".into())
+        );
+        assert_eq!(
+            write_condition(Some(&ETagCondition::Any), None).unwrap(),
+            WriteCondition::IfExists
+        );
+        assert!(write_condition(Some(&tag("e")), Some(&ETagCondition::Any)).is_err());
     }
 
     #[test]

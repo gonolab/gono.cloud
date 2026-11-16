@@ -84,11 +84,6 @@ s3tests/functional/test_s3.py::test_multipart_get_part
 s3tests/functional/test_s3.py::test_multipart_single_get_part
 s3tests/functional/test_s3.py::test_non_multipart_get_part
 
-# Not supported: If-Match: * and If-None-Match with an ETag on writes (only If-None-Match: * and
-# If-Match with an ETag).
-s3tests/functional/test_s3.py::test_multipart_put_object_if_match
-s3tests/functional/test_s3.py::test_put_object_if_match
-
 # A completion that names part 1 twice is refused (InvalidPartOrder or InvalidPart); RGW takes
 # the last.
 s3tests/functional/test_s3.py::test_multipart_resend_first_finishes_last

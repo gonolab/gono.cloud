@@ -36,7 +36,7 @@ use gono_server_core::{
     meta::{Checksum, ObjectMeta},
     s3::{self, Bucket, Upload, UploadPart},
 };
-use gono_server_dav::{ObjectError, WriteCondition};
+use gono_server_dav::ObjectError;
 use rand::RngExt as _;
 use s3s::{
     S3Request, S3Response, S3Result,
@@ -909,14 +909,8 @@ pub(crate) async fn complete(
         Ok(Target::File(client)) => client,
         _ => return Err(s3_error!(InvalidArgument)),
     };
-    let condition = match (input.if_match.as_ref(), input.if_none_match.as_ref()) {
-        (None, None) => WriteCondition::Always,
-        (None, Some(dto::ETagCondition::Any)) => WriteCondition::CreateOnly,
-        (Some(dto::ETagCondition::ETag(etag)), None) => {
-            WriteCondition::IfMatch(etag.value().to_owned())
-        }
-        _ => return Err(s3_error!(NotImplemented)),
-    };
+    let condition =
+        crate::ops::write_condition(input.if_match.as_ref(), input.if_none_match.as_ref())?;
     let Some(completing) = state.begin_completion(&upload.upload_id) else {
         return Err(s3_error!(
             OperationAborted,
