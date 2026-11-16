@@ -87,6 +87,8 @@ async fn migrations_apply_to_an_empty_database() {
             "revoked_keys",
             "s3_buckets",
             "s3_key_grants",
+            "s3_upload_parts",
+            "s3_uploads",
             "settings",
             "two_factor",
             "upload_sessions",

@@ -474,3 +474,87 @@ async fn parallel_writes_into_new_folders_keep_their_metadata() {
         );
     }
 }
+
+#[tokio::test]
+async fn objects_open_for_reading_with_their_metadata() {
+    use std::io::Read as _;
+
+    let h = Harness::new().await;
+    let full = h.full();
+    h.put_object(
+        &full,
+        "r/file",
+        "content",
+        object("md5"),
+        WriteCondition::Always,
+    )
+    .await
+    .unwrap();
+    let (entry, meta, mut file) = h.fs.open_object(full.clone(), &p("r/file")).await.unwrap();
+    let mut content = String::new();
+    file.read_to_string(&mut content).unwrap();
+    assert_eq!(content, "content");
+    assert_eq!(entry.size, 7);
+    assert_eq!(meta.unwrap().s3_etag.as_deref(), Some("md5"));
+    assert_eq!(
+        h.fs.open_object(full, &p("r")).await.unwrap_err(),
+        ObjectError::IsFolder
+    );
+}
+
+#[tokio::test]
+async fn only_folders_without_files_are_removed() {
+    let h = Harness::new().await;
+    let full = h.full();
+    h.fs.put_folder(full.clone(), &p("empty/a/b"))
+        .await
+        .unwrap();
+    h.put_object(
+        &full,
+        "kept/a/file",
+        "x",
+        object("1"),
+        WriteCondition::Always,
+    )
+    .await
+    .unwrap();
+    assert!(
+        h.fs.remove_empty_folder(full.clone(), &p("empty"))
+            .await
+            .unwrap()
+    );
+    assert!(!h.disk("empty").exists());
+    assert!(
+        h.fs.meta()
+            .get(h.owner, &p("empty/a"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !h.fs
+            .remove_empty_folder(full.clone(), &p("kept"))
+            .await
+            .unwrap()
+    );
+    assert!(h.disk("kept/a/file").exists());
+    assert!(
+        !h.fs
+            .remove_empty_folder(full.clone(), &p("missing"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !h.fs
+            .remove_empty_folder(full.clone(), &p("kept/a/file"))
+            .await
+            .unwrap()
+    );
+
+    let bucket = h.identity(vec![mount("bucket", "kept", true)]);
+    assert_eq!(
+        h.fs.remove_empty_folder(bucket, &p("bucket")).await,
+        Err(ObjectError::Forbidden),
+        "a mount root"
+    );
+}

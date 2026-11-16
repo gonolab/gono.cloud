@@ -129,6 +129,12 @@ pub struct Bucket {
     pub name: String,
     /// Owner.
     pub owner_id: i64,
+    /// Owner's name.
+    pub owner_name: Username,
+    /// Owner's display name.
+    pub owner_display_name: String,
+    /// Whether the owner's account is enabled; a disabled account's buckets answer nobody.
+    pub owner_enabled: bool,
     /// File id of the folder.
     pub root_file_id: i64,
     /// The folder's current path in the owner's tree.
@@ -146,6 +152,9 @@ struct BucketRow {
     id: i64,
     name: String,
     owner_id: i64,
+    owner_name: String,
+    owner_display_name: String,
+    owner_enabled: bool,
     root_file_id: i64,
     rel_path: String,
     anonymous: String,
@@ -161,6 +170,9 @@ impl TryFrom<BucketRow> for Bucket {
             id: row.id,
             name: row.name,
             owner_id: row.owner_id,
+            owner_name: Username::new(row.owner_name)?,
+            owner_display_name: row.owner_display_name,
+            owner_enabled: row.owner_enabled,
             root_file_id: row.root_file_id,
             folder: RelPath::from_db(row.rel_path),
             anonymous: row.anonymous.parse()?,
@@ -170,9 +182,10 @@ impl TryFrom<BucketRow> for Bucket {
     }
 }
 
-const BUCKET_QUERY: &str = "SELECT b.id, b.name, b.owner_id, b.root_file_id, f.rel_path, \
+const BUCKET_QUERY: &str = "SELECT b.id, b.name, b.owner_id, u.username AS owner_name, \
+     u.display_name AS owner_display_name, u.enabled AS owner_enabled, b.root_file_id, f.rel_path, \
      b.anonymous, b.anonymous_list, b.created_at \
-     FROM s3_buckets b JOIN files f ON f.id = b.root_file_id";
+     FROM s3_buckets b JOIN files f ON f.id = b.root_file_id JOIN users u ON u.id = b.owner_id";
 
 /// The bucket called `name`, if there is one.
 pub async fn bucket(pool: &Pool, name: &str) -> Result<Option<Bucket>> {
@@ -640,6 +653,228 @@ pub async fn signing_key(
         grants: grants.iter().map(Grant::try_from).collect::<Result<_>>()?,
         last_used_at: row.last_used_at,
     }))
+}
+
+/// A multipart upload in progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upload {
+    /// The id the client names it by.
+    pub upload_id: String,
+    /// The bucket it uploads into.
+    pub bucket_id: i64,
+    /// The key of the object to create.
+    pub key: String,
+    /// The S3 metadata of the object to create, as JSON (written and read by the S3 API).
+    pub meta: String,
+    /// Creation time, UNIX seconds.
+    pub created_at: i64,
+    /// When the purge removes it, UNIX seconds.
+    pub expires_at: i64,
+}
+
+/// A part of a multipart upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadPart {
+    /// 1 to 10000.
+    pub part_number: u32,
+    /// The part's file in the upload's directory.
+    pub file_name: String,
+    /// MD5 of the part, lowercase hex.
+    pub etag: String,
+    /// Length in bytes.
+    pub size: u64,
+    /// When it arrived, UNIX seconds.
+    pub uploaded_at: i64,
+}
+
+#[derive(FromRow)]
+struct UploadRow {
+    upload_id: String,
+    bucket_id: i64,
+    key: String,
+    meta: String,
+    created_at: i64,
+    expires_at: i64,
+}
+
+impl From<UploadRow> for Upload {
+    fn from(row: UploadRow) -> Self {
+        Self {
+            upload_id: row.upload_id,
+            bucket_id: row.bucket_id,
+            key: row.key,
+            meta: row.meta,
+            created_at: row.created_at,
+            expires_at: row.expires_at,
+        }
+    }
+}
+
+#[derive(FromRow)]
+struct PartRow {
+    part_number: i64,
+    file_name: String,
+    etag: String,
+    size: i64,
+    uploaded_at: i64,
+}
+
+impl From<PartRow> for UploadPart {
+    fn from(row: PartRow) -> Self {
+        Self {
+            part_number: u32::try_from(row.part_number).unwrap_or(0),
+            file_name: row.file_name,
+            etag: row.etag,
+            size: u64::try_from(row.size).unwrap_or(0),
+            uploaded_at: row.uploaded_at,
+        }
+    }
+}
+
+/// A new upload id: 32 random hex digits (128 bits), a safe directory name as it is.
+pub fn generate_upload_id() -> String {
+    let id: u128 = rand::rng().random();
+    format!("{id:032x}")
+}
+
+/// Starts a multipart upload of `key` into bucket `bucket_id` that expires at `expires_at`
+/// unless a part arrives, and returns its id.
+pub async fn create_upload(
+    pool: &Pool,
+    bucket_id: i64,
+    key: &str,
+    meta: &str,
+    now: i64,
+    expires_at: i64,
+) -> Result<String> {
+    let upload_id = generate_upload_id();
+    let mut tx = db::begin_immediate(pool).await?;
+    sqlx::query(
+        "INSERT INTO s3_uploads (upload_id, bucket_id, key, meta, created_at, expires_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )
+    .bind(&upload_id)
+    .bind(bucket_id)
+    .bind(key)
+    .bind(meta)
+    .bind(now)
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(upload_id)
+}
+
+const UPLOAD_COLUMNS: &str = "upload_id, bucket_id, key, meta, created_at, expires_at";
+
+/// The upload `upload_id`, if it is in progress.
+pub async fn upload(pool: &Pool, upload_id: &str) -> Result<Option<Upload>> {
+    let row: Option<UploadRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {UPLOAD_COLUMNS} FROM s3_uploads WHERE upload_id = ?1"
+    )))
+    .bind(upload_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(Upload::from))
+}
+
+/// The uploads in progress into bucket `bucket_id`, by key and then by id.
+pub async fn uploads_of_bucket(pool: &Pool, bucket_id: i64) -> Result<Vec<Upload>> {
+    let rows: Vec<UploadRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {UPLOAD_COLUMNS} FROM s3_uploads WHERE bucket_id = ?1 ORDER BY key, upload_id"
+    )))
+    .bind(bucket_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Upload::from).collect())
+}
+
+/// Records `part` of upload `upload_id`, replacing an earlier upload of the same part, and
+/// moves the upload's expiry to `expires_at`. Returns `None` if the upload is gone, else the
+/// file name of the replaced part, if any, for the caller to remove.
+pub async fn record_part(
+    pool: &Pool,
+    upload_id: &str,
+    part: &UploadPart,
+    expires_at: i64,
+) -> Result<Option<Option<String>>> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let updated = sqlx::query("UPDATE s3_uploads SET expires_at = ?2 WHERE upload_id = ?1")
+        .bind(upload_id)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if updated == 0 {
+        return Ok(None);
+    }
+    let replaced: Option<String> = sqlx::query_scalar(
+        "SELECT file_name FROM s3_upload_parts WHERE upload_id = ?1 AND part_number = ?2",
+    )
+    .bind(upload_id)
+    .bind(i64::from(part.part_number))
+    .fetch_optional(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR REPLACE INTO s3_upload_parts (upload_id, part_number, file_name, etag, size, \
+         uploaded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )
+    .bind(upload_id)
+    .bind(i64::from(part.part_number))
+    .bind(&part.file_name)
+    .bind(&part.etag)
+    .bind(i64::try_from(part.size).unwrap_or(i64::MAX))
+    .bind(part.uploaded_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(replaced))
+}
+
+/// The parts of upload `upload_id`, by part number.
+pub async fn parts(pool: &Pool, upload_id: &str) -> Result<Vec<UploadPart>> {
+    let rows: Vec<PartRow> = sqlx::query_as(
+        "SELECT part_number, file_name, etag, size, uploaded_at FROM s3_upload_parts \
+         WHERE upload_id = ?1 ORDER BY part_number",
+    )
+    .bind(upload_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(UploadPart::from).collect())
+}
+
+/// Ends upload `upload_id` (completed or aborted) with its parts. Returns `false` if it was
+/// gone already.
+pub async fn delete_upload(pool: &Pool, upload_id: &str) -> Result<bool> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let removed = sqlx::query("DELETE FROM s3_uploads WHERE upload_id = ?1")
+        .bind(upload_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(removed == 1)
+}
+
+/// Removes the uploads that expired at `now` and returns their ids, whose directories the
+/// caller removes.
+pub async fn purge_expired_uploads(pool: &Pool, now: i64) -> Result<Vec<String>> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let ids: Vec<String> =
+        sqlx::query_scalar("DELETE FROM s3_uploads WHERE expires_at <= ?1 RETURNING upload_id")
+            .bind(now)
+            .fetch_all(&mut *tx)
+            .await?;
+    tx.commit().await?;
+    Ok(ids)
+}
+
+/// The ids of every upload in progress.
+pub async fn upload_ids(pool: &Pool) -> Result<std::collections::HashSet<String>> {
+    let ids: Vec<String> = sqlx::query_scalar("SELECT upload_id FROM s3_uploads")
+        .fetch_all(pool)
+        .await?;
+    Ok(ids.into_iter().collect())
 }
 
 #[cfg(test)]

@@ -171,6 +171,37 @@ CREATE TABLE s3_key_grants (
 CREATE UNIQUE INDEX s3_key_grants_key_bucket ON s3_key_grants (app_password_id, ifnull(bucket_id, 0));
 CREATE INDEX s3_key_grants_bucket_id ON s3_key_grants (bucket_id);
 
+-- S3 multipart uploads in progress. Parts are staged in `s3-uploads/<upload id>/` of the data
+-- directory and assembled into the object at completion.
+CREATE TABLE s3_uploads (
+    -- 32 random hex digits, chosen by the server.
+    upload_id  TEXT    PRIMARY KEY COLLATE BINARY,
+    bucket_id  INTEGER NOT NULL REFERENCES s3_buckets (id) ON DELETE CASCADE,
+    -- The key of the object to create.
+    key        TEXT    NOT NULL COLLATE BINARY,
+    -- The S3 metadata of the object to create (content type, user metadata, ACL), as JSON.
+    meta       TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    -- Refreshed with every part; the purge removes uploads after it.
+    expires_at INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX s3_uploads_bucket_key ON s3_uploads (bucket_id, key);
+CREATE INDEX s3_uploads_expires_at ON s3_uploads (expires_at);
+
+CREATE TABLE s3_upload_parts (
+    upload_id   TEXT    NOT NULL REFERENCES s3_uploads (upload_id) ON DELETE CASCADE,
+    part_number INTEGER NOT NULL CHECK (part_number BETWEEN 1 AND 10000),
+    -- The part's file in the upload's directory. Every upload of a part gets a new name, so
+    -- a part uploaded twice at once never pairs one upload's file with the other's ETag.
+    file_name   TEXT    NOT NULL,
+    -- MD5 of the part, lowercase hex.
+    etag        TEXT    NOT NULL,
+    size        INTEGER NOT NULL CHECK (size >= 0),
+    uploaded_at INTEGER NOT NULL,
+    PRIMARY KEY (upload_id, part_number)
+) STRICT;
+
 -- WebDAV dead properties set through PROPPATCH. Keyed by file id, so MOVE keeps them and
 -- DELETE removes them.
 CREATE TABLE dead_props (

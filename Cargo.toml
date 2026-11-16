@@ -12,6 +12,7 @@ default-members = [
   "crates/server/dav",
   "crates/server/nextcloud",
   "crates/server/relay",
+  "crates/server/s3",
 ]
 # The acceptance suite is a standalone crate with its own `[workspace]`.
 exclude = ["acceptance"]
@@ -36,12 +37,18 @@ gono-server-core = { path = "crates/server/core" }
 gono-server-dav = { path = "crates/server/dav" }
 gono-server-nextcloud = { path = "crates/server/nextcloud" }
 gono-server-relay = { path = "crates/server/relay" }
+gono-server-s3 = { path = "crates/server/s3" }
 
 # Pinned exactly: the WebDAV layer is built against this version's trait surface
 # (`GuardedFileSystem`, `DavMetaData`, `DavLockSystem`). Upgrade deliberately.
 # `proppatch` (a default feature since 0.12.0) provides PROPPATCH and
 # `GuardedFileSystem::patch_props`; without it PROPPATCH answers 501.
 dav-server = { version = "=0.12.0", default-features = false, features = ["localfs", "proppatch"] }
+
+# Pinned exactly: the S3 protocol (SigV4 in headers and presigned URLs, aws-chunked bodies, XML,
+# errors) of the S3 API, the way dav-server provides WebDAV. 0.x releases break their API often;
+# upgrade deliberately and run the acceptance suite. The default features add nothing we use.
+s3s = { version = "=0.17.0", default-features = false }
 
 # Pinned exactly: the relay that devices reach each other through. Upgrades are deliberate: read
 # the iroh security advisories and noq's merges of quinn fixes first, and check again that
@@ -53,6 +60,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 
 anyhow = "1.0.100"
 argon2 = "0.6.0"
+async-trait = "0.1.92"
 askama = { version = "0.16.1", default-features = false, features = ["config", "derive", "std"] }
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.22.1"
@@ -66,6 +74,9 @@ http-body-util = "0.1.5"
 httpdate = "1.0.3"
 ipnet = "2.12.0"
 libc = "0.2.191"
+# Content types guessed from file name extensions: the table dav-server uses for WebDAV, so S3
+# reports the same types.
+mime_guess = { version = "2.0.5", default-features = false }
 # Global allocator of the musl builds only; see crates/server/bin/src/main.rs.
 mimalloc = { version = "0.1.52", default-features = false }
 pin-project-lite = "0.2.17"
@@ -88,6 +99,8 @@ sqlx = { version = "0.9.0", default-features = false, features = [
 ] }
 tempfile = "3.27.0"
 thiserror = "2.0.17"
+# Dates of the S3 API's conditional requests; the version s3s uses.
+time = { version = "0.3.55", default-features = false }
 tokio = "1.54.0"
 tokio-tungstenite = "0.29.0"
 tungstenite = { version = "0.29.0", default-features = false }

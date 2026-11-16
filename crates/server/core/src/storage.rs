@@ -5,15 +5,16 @@
 //!   files/<user id>/     the user's file tree, served as their WebDAV root
 //!   uploads/<user id>/   staging area of Nextcloud chunked uploads, one directory per
 //!                        session (see [`DataLayout::upload_session_dir`])
+//!   s3-uploads/<id>/     parts of an S3 multipart upload in progress, by upload id
 //!   tmp/                 partial files of PUT requests in progress; emptied at startup
 //!   deleted/             trees of deleted users, moved here by `user delete`
 //! ```
 //!
 //! - Per-user directories are named by the numeric user id, not the username, so that renaming
 //!   a user never has to move data.
-//! - `files/`, `uploads/` and `tmp/` must live on the same file system: uploads are finished
-//!   with an atomic `rename(2)` from `tmp/` or `uploads/` into `files/`, which fails across
-//!   file systems. [`DataLayout::open`] and [`DataLayout::create_user`] check this.
+//! - `files/`, `uploads/`, `s3-uploads/` and `tmp/` must live on the same file system: uploads
+//!   are finished with an atomic `rename(2)` from `tmp/` or `uploads/` into `files/`, and S3
+//!   parts are renamed from `tmp/` into `s3-uploads/`, which fails across file systems. [`DataLayout::open`] and [`DataLayout::create_user`] check this.
 //! - SQLite reuses the highest user id after that user is deleted. `user delete` therefore
 //!   moves the user's directories to `deleted/`, and [`DataLayout::create_user`] refuses to
 //!   adopt a non-empty leftover directory, so a new account never sees an old account's files.
@@ -58,6 +59,18 @@ impl DataLayout {
         self.root.join("uploads")
     }
 
+    /// Parent of the staging directories of S3 multipart uploads.
+    pub fn s3_uploads_root(&self) -> PathBuf {
+        self.root.join("s3-uploads")
+    }
+
+    /// The staging directory of S3 multipart upload `upload_id`, which the server generates (32
+    /// hex digits), so it is a safe name as it is.
+    pub fn s3_upload_dir(&self, upload_id: &str) -> PathBuf {
+        debug_assert!(upload_id.bytes().all(|b| b.is_ascii_hexdigit()));
+        self.s3_uploads_root().join(upload_id)
+    }
+
     /// Directory for partial files of PUT requests.
     pub fn tmp_dir(&self) -> PathBuf {
         self.root.join("tmp")
@@ -95,12 +108,18 @@ impl DataLayout {
             self.root.clone(),
             self.files_root(),
             self.uploads_root(),
+            self.s3_uploads_root(),
             self.tmp_dir(),
             self.deleted_root(),
         ] {
             create_private_dir_all(&dir)?;
         }
-        self.check_same_file_system(&[self.files_root(), self.uploads_root(), self.tmp_dir()])
+        self.check_same_file_system(&[
+            self.files_root(),
+            self.uploads_root(),
+            self.s3_uploads_root(),
+            self.tmp_dir(),
+        ])
     }
 
     /// Prepares an existing data directory for serving.

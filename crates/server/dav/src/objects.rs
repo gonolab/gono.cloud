@@ -338,6 +338,74 @@ impl ScopedFs {
         .await
     }
 
+    /// Opens the file at client path `client` for reading, with its S3 metadata as
+    /// [`Self::object`] returns it. The last path component is opened without following
+    /// symbolic links, like a WebDAV `GET`.
+    pub async fn open_object(
+        &self,
+        identity: Arc<Identity>,
+        client: &RelPath,
+    ) -> Result<(Arc<Entry>, Option<ObjectMeta>, std::fs::File), ObjectError> {
+        let (entry, meta) = self.object(identity.clone(), client).await?;
+        let storage = entry
+            .location
+            .storage()
+            .cloned()
+            .ok_or(ObjectError::NotFound)?;
+        let path = storage.to_fs_path(&self.user_root(identity.user_id));
+        let file = blocking(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
+            options.open(path).map_err(object_io_error)
+        })
+        .await?;
+        Ok((entry, meta, file))
+    }
+
+    /// Removes the folder at client path `client` with its subfolders if no file is left
+    /// below it (deleting an S3 bucket, or an S3 folder marker). Returns `false`, and removes
+    /// nothing, when there is no folder there or files are left. A mount root is refused.
+    pub async fn remove_empty_folder(
+        &self,
+        identity: Arc<Identity>,
+        client: &RelPath,
+    ) -> Result<bool, ObjectError> {
+        let target = self.object_target(identity, client, Method::DELETE).await?;
+        let fs = self.clone();
+        detached(async move {
+            let _path = fs.object_locks().path(target.owner, &target.storage).await;
+            // Folder creation of uploads takes this lock too, so none starts filling the
+            // folder while it is checked and removed.
+            let _account = fs.object_locks().account(target.owner).await;
+            let root = fs.user_root(target.owner);
+            let rel = target.storage.clone();
+            let removed = blocking(move || {
+                match lstat_beneath(&root, &rel).map_err(object_io_error)? {
+                    Some(meta) if meta.is_dir() => {}
+                    _ => return Ok(false),
+                }
+                let path = rel.to_fs_path(&root);
+                if holds_files(&path).map_err(object_io_error)? {
+                    return Ok(false);
+                }
+                std::fs::remove_dir_all(&path).map_err(object_io_error)?;
+                Ok(true)
+            })
+            .await?;
+            if removed {
+                fs.meta()
+                    .record_delete(target.owner, &target.storage)
+                    .await
+                    .map_err(object_db_error)?;
+                target.ctx.forget(&target.storage);
+            }
+            Ok(removed)
+        })
+        .await
+    }
+
     /// Deletes the file at client path `client`. Returns `false` when there is no file there
     /// (nothing, or a folder): deleting a missing object succeeds in S3. Parent folders stay.
     pub async fn delete_object(
@@ -546,4 +614,17 @@ impl ScopedFs {
         }
         Ok(())
     }
+}
+
+/// Whether anything but folders lies below the folder `dir` (symbolic links and special files
+/// count, so they are never removed by accident).
+fn holds_files(dir: &std::path::Path) -> io::Result<bool> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if !kind.is_dir() || holds_files(&entry.path())? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

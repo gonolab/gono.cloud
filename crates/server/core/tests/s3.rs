@@ -435,3 +435,102 @@ async fn grants_name_buckets_of_the_owner() {
         .unwrap();
     assert_eq!(signing.grants, [grant(&two, Permission::Full)]);
 }
+
+#[tokio::test]
+async fn multipart_uploads_keep_their_latest_parts_until_they_end() {
+    let f = fixture().await;
+    let alice = f.user("alice").await;
+    let bucket = f
+        .bucket(alice, "media", f.folder(alice, "Media").await)
+        .await
+        .unwrap();
+    let id = s3::create_upload(&f.pool, bucket.id, "video.mp4", "{}", 10, 100)
+        .await
+        .unwrap();
+    assert_eq!(id.len(), 32);
+    let upload = s3::upload(&f.pool, &id).await.unwrap().unwrap();
+    assert_eq!(upload.key, "video.mp4");
+    assert_eq!(upload.expires_at, 100);
+
+    let part = |number: u32, file: &str| s3::UploadPart {
+        part_number: number,
+        file_name: file.to_owned(),
+        etag: format!("etag-{file}"),
+        size: 5,
+        uploaded_at: 20,
+    };
+    assert_eq!(
+        s3::record_part(&f.pool, &id, &part(2, "2.a"), 200)
+            .await
+            .unwrap(),
+        Some(None)
+    );
+    assert_eq!(
+        s3::record_part(&f.pool, &id, &part(1, "1.a"), 200)
+            .await
+            .unwrap(),
+        Some(None)
+    );
+    assert_eq!(
+        s3::record_part(&f.pool, &id, &part(2, "2.b"), 300)
+            .await
+            .unwrap(),
+        Some(Some("2.a".to_owned())),
+        "the replaced file is reported for removal"
+    );
+    let files: Vec<String> = s3::parts(&f.pool, &id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|part| part.file_name)
+        .collect();
+    assert_eq!(files, ["1.a", "2.b"]);
+    assert_eq!(
+        s3::upload(&f.pool, &id).await.unwrap().unwrap().expires_at,
+        300
+    );
+    assert_eq!(
+        s3::uploads_of_bucket(&f.pool, bucket.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    assert!(s3::delete_upload(&f.pool, &id).await.unwrap());
+    assert!(!s3::delete_upload(&f.pool, &id).await.unwrap());
+    assert!(s3::parts(&f.pool, &id).await.unwrap().is_empty());
+    assert_eq!(
+        s3::record_part(&f.pool, &id, &part(3, "3.a"), 400)
+            .await
+            .unwrap(),
+        None,
+        "no parts for a finished upload"
+    );
+}
+
+#[tokio::test]
+async fn expired_uploads_are_purged_and_buckets_take_theirs_along() {
+    let f = fixture().await;
+    let alice = f.user("alice").await;
+    let bucket = f
+        .bucket(alice, "media", f.folder(alice, "Media").await)
+        .await
+        .unwrap();
+    let old = s3::create_upload(&f.pool, bucket.id, "a", "{}", 0, 50)
+        .await
+        .unwrap();
+    let fresh = s3::create_upload(&f.pool, bucket.id, "b", "{}", 0, 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        s3::purge_expired_uploads(&f.pool, 100).await.unwrap(),
+        [old]
+    );
+    assert_eq!(
+        s3::upload_ids(&f.pool).await.unwrap(),
+        std::collections::HashSet::from([fresh.clone()])
+    );
+    s3::delete_bucket(&f.pool, alice, bucket.id).await.unwrap();
+    assert!(s3::upload(&f.pool, &fresh).await.unwrap().is_none());
+}
