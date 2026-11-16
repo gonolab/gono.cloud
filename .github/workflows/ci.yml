@@ -125,6 +125,16 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
+      # systemd-resolved answers <bucket>.s3.localhost with the loopback addresses (checked on
+      # Ubuntu 24.04); should a runner image not, /etc/hosts gets the names the scenarios use.
+      - name: Resolve the virtual-hosted names
+        run: |
+          for host in $(acceptance/scripts/s3-clients.sh --hosts); do
+            if ! getent ahostsv4 "${host}" | grep -q '^127\.0\.0\.1 '; then
+              echo "127.0.0.1 ${host}" | sudo tee -a /etc/hosts
+            fi
+          done
+
       - name: S3 client scenarios
         run: acceptance/scripts/s3-clients.sh
 

@@ -33,6 +33,8 @@
 #
 # Usage:
 #   acceptance/scripts/s3-clients.sh [scenario...]   (default: all of them)
+#   acceptance/scripts/s3-clients.sh --hosts         print the host names that must resolve to
+#                                                    127.0.0.1 (virtual-hosted style), and exit
 #
 # Environment:
 #   AWS=<path> RCLONE=<path> MC=<path> RESTIC=<path>   client binaries (default: from PATH)
@@ -49,9 +51,12 @@ MC="${MC:-mc}"
 RESTIC="${RESTIC:-restic}"
 USER_NAME="gono"
 ALL_SCENARIOS=(aws-s3 aws-s3api app-public rclone mc restic nfd)
+# Virtual-hosted style goes through <bucket>.s3.localhost (see below); these buckets use it.
+VHOST_DOMAIN="s3.localhost"
+VHOST_BUCKETS=(app-media cli-s3 rclone-sync mc-bucket)
 
 usage() {
-  sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 SCENARIOS=()
@@ -59,6 +64,10 @@ for arg in "$@"; do
   case "${arg}" in
     -h | --help)
       usage
+      exit 0
+      ;;
+    --hosts)
+      printf '%s\n' "${VHOST_DOMAIN}" "${VHOST_BUCKETS[@]/%/.${VHOST_DOMAIN}}"
       exit 0
       ;;
     aws-s3 | aws-s3api | app-public | rclone | mc | restic | nfd)
@@ -180,7 +189,6 @@ DAV_URL="${BASE_URL}/remote.php/dav/files/${USER_NAME}"
 # which resolves to the loopback addresses without DNS set up (RFC 6761: glibc with
 # systemd-resolved, macOS, and the Go resolver alike).
 S3_URL="http://127.0.0.1:${S3_PORT}"
-VHOST_DOMAIN="s3.localhost"
 VHOST_URL="http://${VHOST_DOMAIN}:${S3_PORT}"
 
 # `info` so that the request log shows which requests the clients made.
@@ -235,11 +243,17 @@ for _ in $(seq 1 200); do
 done
 curl -fsS "${BASE_URL}/healthz" >/dev/null || fail "the server did not become ready"
 
-if ! python3 -c '
+unresolved="$(python3 -c '
 import socket, sys
-addresses = {info[4][0] for info in socket.getaddrinfo(sys.argv[1], 80, proto=socket.IPPROTO_TCP)}
-sys.exit(0 if "127.0.0.1" in addresses else 1)' "app-media.${VHOST_DOMAIN}" 2>/dev/null; then
-  fail "app-media.${VHOST_DOMAIN} does not resolve to 127.0.0.1; virtual-hosted style needs it"
+for host in sys.argv[1:]:
+    try:
+        infos = socket.getaddrinfo(host, 80, proto=socket.IPPROTO_TCP)
+    except OSError:
+        infos = []
+    if "127.0.0.1" not in {info[4][0] for info in infos}:
+        print(host)' "${VHOST_DOMAIN}" "${VHOST_BUCKETS[@]/%/.${VHOST_DOMAIN}}")"
+if [[ -n "${unresolved}" ]]; then
+  fail "virtual-hosted style needs these names to resolve to 127.0.0.1 (see --hosts): ${unresolved//$'\n'/ }"
 fi
 
 # --- Helpers ------------------------------------------------------------------------------------

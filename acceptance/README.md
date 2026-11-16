@@ -215,9 +215,12 @@ virtual-hosted style under `s3.localhost`) and drives it with real clients, one 
 Every scenario checks what the client wrote through WebDAV as well. The clients keep their
 configuration and caches in the work directory, never in `$HOME`. Virtual-hosted style needs
 `<bucket>.s3.localhost` to resolve to `127.0.0.1`, which macOS and Linux with systemd-resolved
-do without setup; the script stops early otherwise. CI runs it on Linux with the AWS CLI of the
-runner, rclone and restic from Ubuntu, and `mc` built from its last release tag (MinIO no
-longer publishes binaries of it). Locally: `brew install awscli rclone minio-mc restic`.
+do without setup; the script stops early otherwise, naming what does not resolve, and
+`--hosts` prints the names it needs (CI adds those that do not resolve to `/etc/hosts`). CI runs
+it on Linux with the AWS CLI of the runner, rclone and restic from Ubuntu, and `mc` built from
+its last release tag (MinIO no longer publishes binaries of it). Locally: `brew install awscli
+rclone minio-mc restic`. Ubuntu 24.04 ships rclone 1.60 and restic 0.16, older than Homebrew's;
+both pass.
 
 | Variable | Effect |
 |---|---|
