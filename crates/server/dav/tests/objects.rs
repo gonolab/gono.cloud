@@ -332,6 +332,7 @@ async fn copies_are_new_versions_with_their_own_metadata() {
             &p("dst/copy"),
             meta.clone(),
             WriteCondition::Always,
+            None,
         )
         .await
         .unwrap();
@@ -345,6 +346,20 @@ async fn copies_are_new_versions_with_their_own_metadata() {
     );
     assert_ne!(source.file_id, copy.file_id);
     assert!(copy.modified >= source.modified);
+    // A copy can carry a modification time of its own (rclone's mtime metadata).
+    let then = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 500_000_000);
+    let dated =
+        h.fs.copy_object(
+            full.clone(),
+            &p("src"),
+            &p("dst/dated"),
+            object("md5-src"),
+            WriteCondition::Always,
+            Some(then),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dated.modified, then);
 
     h.mkcol(&full, "folder").await.expect(201);
     assert_eq!(
@@ -353,7 +368,8 @@ async fn copies_are_new_versions_with_their_own_metadata() {
             &p("folder"),
             &p("x"),
             object("1"),
-            WriteCondition::Always
+            WriteCondition::Always,
+            None
         )
         .await
         .unwrap_err(),
@@ -365,7 +381,8 @@ async fn copies_are_new_versions_with_their_own_metadata() {
             &p("src"),
             &p("dst/copy"),
             object("1"),
-            WriteCondition::CreateOnly
+            WriteCondition::CreateOnly,
+            None
         )
         .await
         .unwrap_err(),

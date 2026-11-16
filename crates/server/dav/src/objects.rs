@@ -256,7 +256,7 @@ impl ScopedFs {
 
     /// Copies the file at client path `from` to client path `to` with the S3 metadata `object`,
     /// if `condition` holds, creating missing parent folders of `to`. The copy is a new version:
-    /// its modification time is now.
+    /// its modification time is `modified`, or now.
     pub async fn copy_object(
         &self,
         identity: Arc<Identity>,
@@ -264,6 +264,7 @@ impl ScopedFs {
         to: &RelPath,
         object: ObjectMeta,
         condition: WriteCondition,
+        modified: Option<SystemTime>,
     ) -> Result<Arc<Entry>, ObjectError> {
         let source = self.stat(identity.clone(), from).await?;
         if source.is_dir() {
@@ -289,7 +290,7 @@ impl ScopedFs {
                 let temp = tmp_dir.join(format!("{:032x}.part", rand::rng().random::<u128>()));
                 let copied = std::fs::copy(source.to_fs_path(&root), &temp).and_then(|_| {
                     let file = std::fs::OpenOptions::new().write(true).open(&temp)?;
-                    file.set_modified(SystemTime::now())?;
+                    file.set_modified(modified.unwrap_or_else(SystemTime::now))?;
                     file.sync_all()
                 });
                 if let Err(err) = copied {

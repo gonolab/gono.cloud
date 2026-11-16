@@ -1381,3 +1381,142 @@ async fn the_file_ui_links_to_published_objects() {
     assert_eq!(response.text().await.unwrap(), "linked");
     s3.clean(&s3.bucket, &prefix).await;
 }
+
+#[tokio::test]
+async fn mtime_metadata_sets_the_files_modification_time() {
+    let s3 = require!(S3::new(), "S3 is not configured");
+    let prefix = unique_name("s3");
+    // The time WebDAV reports for the file of `key`.
+    let s3 = &s3;
+    let modified = |key: String| async move {
+        s3.ctx
+            .dav()
+            .stat(&s3.webdav_path(&key))
+            .await
+            .text("DAV:", "getlastmodified")
+    };
+    // rclone sends the time in nanoseconds as a fraction of the seconds.
+    let key = s3.key(&prefix, "synced.txt");
+    s3.client
+        .put_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .metadata("mtime", "1700000000.123456789")
+        .body(ByteStream::from_static(b"synced"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        modified(key.clone()).await.as_deref(),
+        Some("Tue, 14 Nov 2023 22:13:20 GMT")
+    );
+    let head = s3
+        .client
+        .head_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head.last_modified().map(|time| time.secs()),
+        Some(1_700_000_000)
+    );
+    assert_eq!(
+        head.metadata()
+            .and_then(|meta| meta.get("mtime"))
+            .map(String::as_str),
+        Some("1700000000.123456789"),
+        "the metadata stays as sent"
+    );
+
+    // rclone changes the time of an object by copying it onto itself.
+    s3.client
+        .copy_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .copy_source(format!("{}/{key}", s3.bucket))
+        .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+        .metadata("mtime", "1600000000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        modified(key.clone()).await.as_deref(),
+        Some("Sun, 13 Sep 2020 12:26:40 GMT")
+    );
+    assert_eq!(s3.get(&s3.bucket, &key).await, b"synced");
+
+    // A multipart upload takes the time named when it was created.
+    let big = s3.key(&prefix, "big.bin");
+    let upload = s3
+        .client
+        .create_multipart_upload()
+        .bucket(&s3.bucket)
+        .key(&big)
+        .metadata("mtime", "1500000000")
+        .send()
+        .await
+        .unwrap();
+    let id = upload.upload_id().unwrap();
+    let part = s3
+        .client
+        .upload_part()
+        .bucket(&s3.bucket)
+        .key(&big)
+        .upload_id(id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"one part"))
+        .send()
+        .await
+        .unwrap();
+    s3.client
+        .complete_multipart_upload()
+        .bucket(&s3.bucket)
+        .key(&big)
+        .upload_id(id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part.e_tag().unwrap())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        modified(big).await.as_deref(),
+        Some("Fri, 14 Jul 2017 02:40:00 GMT")
+    );
+
+    // Without it, or with a value that is not a time, the upload is new.
+    let plain = s3.key(&prefix, "plain.txt");
+    s3.client
+        .put_object()
+        .bucket(&s3.bucket)
+        .key(&plain)
+        .metadata("mtime", "yesterday")
+        .body(ByteStream::from_static(b"plain"))
+        .send()
+        .await
+        .unwrap();
+    let head = s3
+        .client
+        .head_object()
+        .bucket(&s3.bucket)
+        .key(&plain)
+        .send()
+        .await
+        .unwrap();
+    let age = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - head.last_modified().unwrap().secs();
+    assert!(age.abs() < 600, "{age}");
+    s3.clean(&s3.bucket, &prefix).await;
+}

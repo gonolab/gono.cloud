@@ -672,6 +672,9 @@ impl GonoS3 {
             user_meta: user_meta(input.metadata),
             checksum: checksum.clone(),
         };
+        if let Some(time) = upload::mtime_of(&meta) {
+            upload::set_mtime(received.temp.path(), time).await?;
+        }
         self.state
             .fs()
             .put_object(
@@ -1614,7 +1617,14 @@ impl S3 for GonoS3 {
         let entry = self
             .state
             .fs()
-            .copy_object(identity, &from, &to, meta.clone(), condition)
+            .copy_object(
+                identity,
+                &from,
+                &to,
+                meta.clone(),
+                condition,
+                upload::mtime_of(&meta),
+            )
             .await
             .map_err(|err| error::object(err, false))?;
         Ok(S3Response::new(dto::CopyObjectOutput {

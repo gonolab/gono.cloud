@@ -124,6 +124,49 @@ pub(crate) fn apply_trailers(claimed: &mut Checksum, trailers: Option<&HeaderMap
     Ok(())
 }
 
+/// Latest modification time taken from metadata: the end of year 9999.
+const MAX_MTIME_SECS: u64 = 253_402_300_799;
+
+/// The modification time an object's user metadata names in `mtime` (`X-Amz-Meta-Mtime`, as
+/// rclone, s3fs and other tools send it): UNIX seconds, with a fraction of up to nine digits.
+/// Other values stay metadata only.
+pub(crate) fn mtime_of(meta: &meta::ObjectMeta) -> Option<std::time::SystemTime> {
+    let value = meta.user_meta.get("mtime")?.trim();
+    let (seconds, fraction) = value.split_once('.').unwrap_or((value, ""));
+    let digits = |text: &str| text.bytes().all(|b| b.is_ascii_digit());
+    if seconds.is_empty() || seconds.len() > 12 || !digits(seconds) {
+        return None;
+    }
+    if fraction.len() > 9 || !digits(fraction) {
+        return None;
+    }
+    let seconds: u64 = seconds.parse().ok()?;
+    if seconds == 0 || seconds > MAX_MTIME_SECS {
+        return None;
+    }
+    let nanos: u32 = if fraction.is_empty() {
+        0
+    } else {
+        format!("{fraction:0<9}").parse().ok()?
+    };
+    Some(std::time::UNIX_EPOCH + std::time::Duration::new(seconds, nanos))
+}
+
+/// Sets the modification time of the file at `path` (a received body in `tmp/`), so that
+/// WebDAV and the Nextcloud clients see the time the object's metadata names.
+pub(crate) async fn set_mtime(path: &Path, time: std::time::SystemTime) -> S3Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_modified(time)
+    })
+    .await
+    .map_err(|_| s3_error!(InternalError))?
+    .map_err(error::io)
+}
+
 /// A file in `tmp/`, removed when dropped unless it was moved away (installed) before.
 #[derive(Debug)]
 pub(crate) struct Temp(PathBuf);
@@ -362,6 +405,44 @@ mod tests {
         let mut claimed = Checksum::default();
         apply_trailers(&mut claimed, Some(&trailers)).unwrap();
         assert_eq!(claimed.checksum_crc64nvme.as_deref(), Some("AAAA"));
+    }
+
+    #[test]
+    fn mtime_metadata_names_unix_seconds() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let mtime = |value: &str| {
+            mtime_of(&meta::ObjectMeta {
+                user_meta: [("mtime".to_owned(), value.to_owned())].into(),
+                ..meta::ObjectMeta::default()
+            })
+        };
+        assert_eq!(
+            mtime("1700000000"),
+            Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+        );
+        // rclone: nanoseconds as a fraction.
+        assert_eq!(
+            mtime("1700000000.123456789"),
+            Some(UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789))
+        );
+        assert_eq!(
+            mtime(" 1700000000.5 "),
+            Some(UNIX_EPOCH + Duration::new(1_700_000_000, 500_000_000))
+        );
+        for ignored in [
+            "",
+            "0",
+            "-1",
+            "1e9",
+            "abc",
+            ".5",
+            "1700000000.1234567891",
+            "2023-11-14T22:13:20Z",
+            "999999999999",
+        ] {
+            assert_eq!(mtime(ignored), None, "{ignored:?}");
+        }
+        assert_eq!(mtime_of(&meta::ObjectMeta::default()), None);
     }
 
     #[test]

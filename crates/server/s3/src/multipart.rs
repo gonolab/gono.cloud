@@ -839,6 +839,9 @@ pub(crate) async fn complete(
             .await
             .map_err(|_| s3_error!(InternalError))?
             .map_err(error::io)?;
+        if let Some(time) = upload::mtime_of(&meta) {
+            upload::set_mtime(temp.path(), time).await?;
+        }
         s3.install(
             &auth,
             &bucket,
