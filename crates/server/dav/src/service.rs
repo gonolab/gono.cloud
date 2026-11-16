@@ -302,6 +302,29 @@ impl DavService {
         };
 
         let ctx = Ctx::new(identity.clone(), info);
+        // Nextcloud computes a file's checksum on request (`PATCH` with `X-Recalculate-Hash`,
+        // which rclone's Nextcloud backend sends after an upload); it reads, writes nothing.
+        if method.as_str() == "PATCH"
+            && let Some(kind) = parts
+                .headers
+                .get("x-recalculate-hash")
+                .and_then(|value| value.to_str().ok())
+            && let Some(path) = ctx.request().path.clone()
+        {
+            return match self.fs.recalculated_checksum(&ctx, &path, kind).await {
+                Ok(Some(checksum)) => {
+                    let mut response = simple(StatusCode::NO_CONTENT);
+                    if let Ok(value) = HeaderValue::from_str(&checksum) {
+                        response.headers_mut().insert("oc-checksum", value);
+                    }
+                    response
+                }
+                Ok(None) => simple(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+                Err(FsError::NotFound) => simple(StatusCode::NOT_FOUND),
+                Err(FsError::Forbidden) => simple(StatusCode::FORBIDDEN),
+                Err(_) => simple(StatusCode::INTERNAL_SERVER_ERROR),
+            };
+        }
         if let Some(response) = self.preflight(&ctx, &method).await {
             return response;
         }

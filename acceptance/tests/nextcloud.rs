@@ -179,7 +179,8 @@ const MD5_HELLO_WORLD: &str = "5eb63bbbe01eeed093cb22bb8f5acdc3";
 
 /// Every upload records the MD5 of its content, which downloads (`OC-Checksum`) and PROPFIND
 /// (`oc:checksums`) report, and an `OC-Checksum` a client sends with an upload must match it:
-/// a plain PUT and a chunked upload's final MOVE are refused with 400 otherwise.
+/// a plain PUT and a chunked upload's final MOVE are refused with 400 otherwise. `PATCH` with
+/// `X-Recalculate-Hash` answers a checksum of the file, as Nextcloud does.
 #[tokio::test]
 async fn uploads_record_and_check_md5_checksums() {
     let Some(ctx) = Ctx::new().await else { return };
@@ -226,6 +227,35 @@ async fn uploads_record_and_check_md5_checksums() {
     )
     .await
     .expect(&[204]);
+
+    // rclone's Nextcloud backend asks for a SHA-1 this way when `oc:checksums` has none.
+    for (kind, expected) in [
+        (
+            "sha1",
+            Some("SHA1:2aae6c35c94fcfb415dbe95f408b9ce91ee846ed"),
+        ),
+        ("MD5", Some(&*format!("MD5:{MD5_HELLO_WORLD}"))),
+        ("adler32", None),
+    ] {
+        let recalculated = dav
+            .send(
+                dav.request("PATCH", &dav.url(&rel))
+                    .header("X-Recalculate-Hash", kind),
+            )
+            .await;
+        match expected {
+            Some(expected) => {
+                recalculated.expect(&[204]);
+                assert_eq!(
+                    recalculated.header("oc-checksum").as_deref(),
+                    Some(expected)
+                );
+            }
+            None => {
+                recalculated.expect(&[415]);
+            }
+        }
+    }
 
     // A chunked upload: checked when it is assembled.
     let chunked = ctx.path("chunked-checksum.txt");

@@ -19,6 +19,7 @@ http-body-util.workspace = true
 pin-project-lite.workspace = true
 md-5.workspace = true
 rand.workspace = true
+sha1.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }
 tower-layer.workspace = true

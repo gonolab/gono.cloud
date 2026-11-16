@@ -1617,6 +1617,7 @@ dependencies = [
  "pin-project-lite",
  "rand 0.10.3",
  "rustix",
+ "sha1 0.11.0",
  "sha2 0.11.1",
  "sqlx",
  "tempfile",

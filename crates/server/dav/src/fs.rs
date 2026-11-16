@@ -764,6 +764,56 @@ impl ScopedFs {
         Ok((entry, replaced))
     }
 
+    /// The checksum of type `kind` (`md5` or `sha1`, in any case) of the file at `path`, as
+    /// Nextcloud writes it (`MD5:<hex>`, `SHA1:<hex>`): the recorded MD5, else computed from the
+    /// file. `None` for another type and for folders. rclone's Nextcloud backend asks for it
+    /// with `PATCH` and `X-Recalculate-Hash` when `oc:checksums` lacks the type it wants.
+    pub async fn recalculated_checksum(
+        &self,
+        ctx: &Ctx,
+        path: &DavPath,
+        kind: &str,
+    ) -> FsResult<Option<String>> {
+        let kind = kind.trim().to_ascii_uppercase();
+        if !matches!(kind.as_str(), "MD5" | "SHA1") {
+            return Ok(None);
+        }
+        let entry = self.entry(ctx, path).await?;
+        if entry.is_dir() {
+            return Ok(None);
+        }
+        if kind == "MD5"
+            && let Some(md5) = entry.md5_hex()
+        {
+            return Ok(Some(format!("MD5:{md5}")));
+        }
+        let storage = entry
+            .location
+            .storage()
+            .cloned()
+            .ok_or(FsError::Forbidden)?;
+        let path = storage.to_fs_path(&self.user_root(ctx.identity().user_id));
+        let sha1 = kind == "SHA1";
+        let hex = blocking(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
+            let file = options.open(path)?;
+            let digest = if sha1 {
+                hash_file::<sha1::Sha1>(file)?
+            } else {
+                hash_file::<md5::Md5>(file)?
+            };
+            Ok(digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>())
+        })
+        .await?;
+        Ok(Some(format!("{kind}:{hex}")))
+    }
+
     async fn open_for_read(&self, ctx: &Ctx, path: &DavPath) -> FsResult<Box<dyn DavFile>> {
         let entry = self.entry(ctx, path).await?;
         let storage = entry
@@ -1466,5 +1516,19 @@ impl GuardedFileSystem<Ctx> for ScopedFs {
             Ok((used, free.map(|free| used.saturating_add(free))))
         }
         .boxed()
+    }
+}
+
+/// The digest `D` of everything `file` holds from its current position on.
+fn hash_file<D: Digest + Default>(mut file: std::fs::File) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut hasher = D::default();
+    let mut buffer = vec![0; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hasher.finalize().to_vec());
+        }
+        hasher.update(&buffer[..read]);
     }
 }

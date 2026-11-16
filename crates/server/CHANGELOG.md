@@ -137,6 +137,9 @@ compatible within a major version: released clients keep working with newer serv
 
 ### Fixed
 
+- rclone's WebDAV backend with `vendor = nextcloud` failed every upload: after the upload it
+  asks the server for the file's SHA-1 (`PATCH` with `X-Recalculate-Hash`), which was refused
+  with 415. The server now answers it with the checksum (`sha1` or `md5`), as Nextcloud does.
 - The web file UI cut off the menu of the last files of a short folder at the bottom of the
   list, so their actions (rename, move, delete, and now "Copy public link") could not be
   reached there.
