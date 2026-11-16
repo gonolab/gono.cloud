@@ -36,7 +36,7 @@ pub(crate) enum Class {
     Service,
     /// `CreateBucket`.
     CreateBucket,
-    /// `DeleteBucket`, `PutBucketAcl`.
+    /// `DeleteBucket`, `PutBucketAcl`, `PutBucketPolicy`, `DeleteBucketPolicy`.
     BucketAdmin,
     /// Changing a bucket's settings that grant nothing (`PutBucketCors`, `DeleteBucketCors`):
     /// a `full` grant on the bucket.
@@ -63,13 +63,17 @@ pub(crate) fn classify(name: &str) -> Class {
     match name {
         "ListBuckets" => Class::Service,
         "CreateBucket" => Class::CreateBucket,
-        "DeleteBucket" | "PutBucketAcl" => Class::BucketAdmin,
+        "DeleteBucket" | "PutBucketAcl" | "PutBucketPolicy" | "DeleteBucketPolicy" => {
+            Class::BucketAdmin
+        }
         "HeadBucket" => Class::HeadBucket,
         "PutBucketCors" | "DeleteBucketCors" => Class::BucketConfig,
         "GetBucketLocation"
         | "GetBucketVersioning"
         | "GetBucketAcl"
         | "GetBucketCors"
+        | "GetBucketPolicy"
+        | "GetBucketPolicyStatus"
         | "ListMultipartUploads" => Class::BucketRead,
         "ListObjects" | "ListObjectsV2" => Class::List,
         "GetObject" | "HeadObject" => Class::ObjectRead,
@@ -369,7 +373,9 @@ mod tests {
         assert_eq!(classify("PutBucketCors"), Class::BucketConfig);
         assert_eq!(classify("GetBucketCors"), Class::BucketRead);
         assert_eq!(classify("PostObject"), Class::ObjectWrite);
-        assert_eq!(classify("PutBucketPolicy"), Class::Other);
+        assert_eq!(classify("PutBucketPolicy"), Class::BucketAdmin);
+        assert_eq!(classify("GetBucketPolicy"), Class::BucketRead);
+        assert_eq!(classify("PutBucketTagging"), Class::Other);
     }
 
     #[test]

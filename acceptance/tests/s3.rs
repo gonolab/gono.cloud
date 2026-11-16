@@ -1214,3 +1214,113 @@ async fn parts_can_be_copied_from_objects() {
     assert_eq!(s3.get(&s3.bucket, &key).await, expected);
     s3.clean(&s3.bucket, &prefix).await;
 }
+
+#[tokio::test]
+async fn the_download_policy_publishes_a_bucket() {
+    let s3 = require!(S3::new(), "S3 is not configured");
+    // A bucket of its own: the policy changes what the whole bucket publishes.
+    let bucket = format!(
+        "policy-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    s3.client
+        .create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    s3.put(&bucket, "a.txt", "published").await;
+    let anonymous = |url: String| s3.http.get(url).send();
+    let object = s3.url(&bucket, "a.txt");
+    let listing = format!("{}/{bucket}?list-type=2", s3.endpoint);
+    assert_eq!(anonymous(object.clone()).await.unwrap().status(), 403);
+    let none = s3
+        .client
+        .get_bucket_policy()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert_eq!(none.meta().code(), Some("NoSuchBucketPolicy"));
+
+    // What `mc anonymous set download` writes.
+    let download = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":["*"]}},"Action":["s3:GetBucketLocation","s3:ListBucket"],"Resource":["arn:aws:s3:::{bucket}"]}},{{"Effect":"Allow","Principal":{{"AWS":["*"]}},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+    );
+    s3.client
+        .put_bucket_policy()
+        .bucket(&bucket)
+        .policy(&download)
+        .send()
+        .await
+        .unwrap();
+    let response = anonymous(object.clone()).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "published");
+    let listed = anonymous(listing.clone()).await.unwrap();
+    assert_eq!(listed.status(), 200);
+    assert!(listed.text().await.unwrap().contains("<Key>a.txt</Key>"));
+    let policy = s3
+        .client
+        .get_bucket_policy()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    let policy = policy.policy().unwrap();
+    assert!(
+        policy.contains("s3:GetObject") && policy.contains("s3:ListBucket"),
+        "{policy}"
+    );
+    let status = s3
+        .client
+        .get_bucket_policy_status()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        status.policy_status().and_then(|status| status.is_public()),
+        Some(true)
+    );
+
+    // Anonymous writes (`mc anonymous set upload` or `public`) are not supported, and change
+    // nothing.
+    let upload = download.replace(r#""s3:GetObject""#, r#""s3:GetObject","s3:PutObject""#);
+    let refused = s3
+        .client
+        .put_bucket_policy()
+        .bucket(&bucket)
+        .policy(upload)
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert_eq!(refused.meta().code(), Some("NotImplemented"));
+    assert_eq!(anonymous(object.clone()).await.unwrap().status(), 200);
+
+    // `mc anonymous set none` deletes the policy: the bucket is private again.
+    s3.client
+        .delete_bucket_policy()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous(object).await.unwrap().status(), 403);
+    assert_eq!(anonymous(listing).await.unwrap().status(), 403);
+
+    s3.client
+        .delete_object()
+        .bucket(&bucket)
+        .key("a.txt")
+        .send()
+        .await
+        .unwrap();
+    s3.client
+        .delete_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+}

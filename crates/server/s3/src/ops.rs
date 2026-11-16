@@ -46,6 +46,7 @@ use crate::{
     cors, error,
     form::FormAcl,
     keys::{self, Target},
+    policy,
     state::S3State,
     upload,
 };
@@ -371,6 +372,30 @@ impl GonoS3 {
         if let Err(err) = audit::record(self.state.pool(), &record, db::unix_now()).await {
             tracing::warn!(kind, error = %err, "cannot write an audit record");
         }
+    }
+
+    /// Sets the anonymous access of `bucket` to `mode` and `list`, with an audit record, unless
+    /// it is so already.
+    async fn set_anonymous(
+        &self,
+        auth: &Authorized,
+        bucket: &Bucket,
+        mode: Anonymous,
+        list: bool,
+    ) -> S3Result<()> {
+        if (bucket.anonymous, bucket.anonymous_list) == (mode, list) {
+            return Ok(());
+        }
+        s3::set_anonymous(self.state.pool(), bucket.owner_id, bucket.id, mode, list)
+            .await
+            .map_err(error::database)?;
+        self.audit(
+            signing_key(auth)?,
+            "s3.bucket.anonymous",
+            json!({ "bucket": bucket.name, "anonymous": mode.as_str(), "list": list }),
+        )
+        .await;
+        Ok(())
     }
 
     /// The checks every write of a file shares: not locked by a WebDAV client.
@@ -1000,18 +1025,69 @@ impl S3 for GonoS3 {
             }
         };
         let list = mode != Anonymous::Private && bucket.anonymous_list;
-        if (bucket.anonymous, bucket.anonymous_list) != (mode, list) {
-            s3::set_anonymous(self.state.pool(), bucket.owner_id, bucket.id, mode, list)
-                .await
-                .map_err(error::database)?;
-            self.audit(
-                signing_key(&auth)?,
-                "s3.bucket.anonymous",
-                json!({ "bucket": bucket.name, "anonymous": mode.as_str(), "list": list }),
-            )
-            .await;
-        }
+        self.set_anonymous(&auth, bucket, mode, list).await?;
         Ok(S3Response::new(dto::PutBucketAclOutput::default()))
+    }
+
+    async fn put_bucket_policy(
+        &self,
+        req: S3Request<dto::PutBucketPolicyInput>,
+    ) -> S3Result<S3Response<dto::PutBucketPolicyOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        let download = policy::parse(&bucket.name, &req.input.policy)?;
+        if !self.allow_anonymous() {
+            return Err(s3_error!(
+                AccessDenied,
+                "Anonymous access is off on this server"
+            ));
+        }
+        self.set_anonymous(&auth, bucket, Anonymous::PublicRead, download.list)
+            .await?;
+        Ok(S3Response::new(dto::PutBucketPolicyOutput::default()))
+    }
+
+    async fn get_bucket_policy(
+        &self,
+        req: S3Request<dto::GetBucketPolicyInput>,
+    ) -> S3Result<S3Response<dto::GetBucketPolicyOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        let policy = policy::document(&bucket.name, auth.public(self.allow_anonymous()))
+            .ok_or_else(|| s3_error!(NoSuchBucketPolicy))?;
+        Ok(S3Response::new(dto::GetBucketPolicyOutput {
+            policy: Some(policy),
+        }))
+    }
+
+    async fn get_bucket_policy_status(
+        &self,
+        req: S3Request<dto::GetBucketPolicyStatusInput>,
+    ) -> S3Result<S3Response<dto::GetBucketPolicyStatusOutput>> {
+        let auth = authorized(&req)?;
+        auth.bucket()?;
+        let public = auth.public(self.allow_anonymous());
+        Ok(S3Response::new(dto::GetBucketPolicyStatusOutput {
+            policy_status: Some(dto::PolicyStatus {
+                is_public: Some(public.read == Anonymous::PublicRead || public.list),
+            }),
+        }))
+    }
+
+    async fn delete_bucket_policy(
+        &self,
+        req: S3Request<dto::DeleteBucketPolicyInput>,
+    ) -> S3Result<S3Response<dto::DeleteBucketPolicyOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        // What a policy can say goes: reads of every object and listings. Objects with a
+        // public-read ACL stay public in a bucket that honors ACLs.
+        let mode = match bucket.anonymous {
+            Anonymous::PublicRead => Anonymous::Private,
+            other => other,
+        };
+        self.set_anonymous(&auth, bucket, mode, false).await?;
+        Ok(S3Response::new(dto::DeleteBucketPolicyOutput::default()))
     }
 
     async fn put_bucket_cors(

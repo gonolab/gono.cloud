@@ -30,6 +30,7 @@ mod host;
 pub mod keys;
 pub mod multipart;
 mod ops;
+mod policy;
 mod state;
 mod upload;
 
