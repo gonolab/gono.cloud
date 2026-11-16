@@ -2,24 +2,32 @@
 //!
 //! - Connections run in WAL mode with foreign keys enforced and `synchronous = FULL`.
 //! - Writes go through [`begin_immediate`]: one `BEGIN IMMEDIATE` transaction per operation,
-//!   so the write lock is taken up front and concurrent writers wait on `busy_timeout` instead
-//!   of failing halfway through a transaction with `SQLITE_BUSY`.
+//!   so the write lock is taken up front and concurrent writers wait instead of failing halfway
+//!   through a transaction with `SQLITE_BUSY`. They wait at the database's **write gate**, an
+//!   in-process FIFO lock taken before a connection: SQLite has one writer anyway, and writers
+//!   queued at the gate neither hold pool connections (which readers need meanwhile) nor sleep
+//!   in SQLite's busy handler (which wakes them late, in steps of up to 100 ms, and gives up
+//!   after `busy_timeout`). The busy timeout still covers other processes (the CLI).
 //! - Migrations live in `crates/server/core/migrations/` and are embedded into the binary. Until
 //!   the first production deployment the schema is the single file `0001_initial.sql`, edited
 //!   in place; from then on migrations are append-only. See the header of that file, and
 //!   [`crate::meta`] for the path comparison rules every query must follow.
 
 use std::{
+    collections::HashMap,
     fs,
-    path::Path,
+    ops::{Deref, DerefMut},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use sqlx::{
-    Sqlite, Transaction,
+    Sqlite, SqliteConnection, Transaction,
     migrate::Migrator,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::{
     config::DbConfig,
@@ -29,8 +37,60 @@ use crate::{
 /// Connection pool type used throughout Gono Cloud.
 pub type Pool = sqlx::SqlitePool;
 
-/// A write transaction started by [`begin_immediate`].
-pub type Tx = Transaction<'static, Sqlite>;
+/// A write transaction started by [`begin_immediate`]. It holds the database's write gate until
+/// it is committed, rolled back or dropped, and is used like the connection it runs on
+/// (`&mut *tx` as an executor).
+pub struct Tx {
+    // Dropped first: a transaction that was neither committed nor rolled back is rolled back
+    // before the next writer passes the gate (SQLite's busy timeout covers the rest).
+    inner: Transaction<'static, Sqlite>,
+    _gate: OwnedMutexGuard<()>,
+}
+
+impl Tx {
+    /// Commits the transaction and opens the gate.
+    pub async fn commit(self) -> std::result::Result<(), sqlx::Error> {
+        self.inner.commit().await
+    }
+
+    /// Rolls the transaction back and opens the gate.
+    pub async fn rollback(self) -> std::result::Result<(), sqlx::Error> {
+        self.inner.rollback().await
+    }
+}
+
+impl Deref for Tx {
+    type Target = SqliteConnection;
+
+    fn deref(&self) -> &SqliteConnection {
+        &self.inner
+    }
+}
+
+impl DerefMut for Tx {
+    fn deref_mut(&mut self) -> &mut SqliteConnection {
+        &mut self.inner
+    }
+}
+
+impl std::fmt::Debug for Tx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tx").finish_non_exhaustive()
+    }
+}
+
+/// The write gate of the database `pool` opens, one per database file in this process.
+fn write_gate(pool: &Pool) -> Arc<AsyncMutex<()>> {
+    static GATES: OnceLock<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+    let file = pool.connect_options().get_filename().to_path_buf();
+    GATES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(file)
+        .or_default()
+        .clone()
+}
 
 /// The embedded schema migrations.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -85,12 +145,16 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
     Ok(())
 }
 
-/// Starts a write transaction with `BEGIN IMMEDIATE`.
+/// Starts a write transaction with `BEGIN IMMEDIATE`, after the database's write gate.
 ///
 /// Every operation that writes uses exactly one such transaction. Taking the write lock at
-/// `BEGIN` means a transaction never has to be retried after it has already read data.
+/// `BEGIN` means a transaction never has to be retried after it has already read data. A
+/// transaction must not start another one on the same database: the second would wait for the
+/// first forever.
 pub async fn begin_immediate(pool: &Pool) -> Result<Tx> {
-    Ok(pool.begin_with("BEGIN IMMEDIATE").await?)
+    let gate = write_gate(pool).lock_owned().await;
+    let inner = pool.begin_with("BEGIN IMMEDIATE").await?;
+    Ok(Tx { inner, _gate: gate })
 }
 
 /// Runs a trivial query to check that the database is reachable.

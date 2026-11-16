@@ -492,6 +492,54 @@ async fn parallel_writes_into_new_folders_keep_their_metadata() {
     }
 }
 
+/// Many parallel writes into a few new folders: every file and folder ends up in the metadata
+/// (rows, not just files on disk) with the file's S3 metadata. A writer must not skip the
+/// account's lock merely because its folders are on disk (another writer may not have recorded
+/// them yet); that race needs real fsync latency to show and was caught by
+/// acceptance/scripts/s3-load.sh (rclone check), so this test guards the outcome, not the race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_writes_record_every_file_and_folder() {
+    let h = Arc::new(Harness::new().await);
+    let full = h.full();
+    let writes = (0..64).map(|i| {
+        let h = h.clone();
+        let full = full.clone();
+        tokio::spawn(async move {
+            h.put_object(
+                &full,
+                &format!("burst/{}/{}/file-{i}", i % 4, i % 3),
+                "x",
+                object(&format!("md5-{i}")),
+                WriteCondition::Always,
+            )
+            .await
+            .unwrap();
+        })
+    });
+    for write in writes {
+        write.await.unwrap();
+    }
+    let meta = h.fs.meta();
+    for folder in (0..4).flat_map(|a| (0..3).map(move |b| format!("burst/{a}/{b}"))) {
+        let row = meta.get(h.owner, &p(&folder)).await.unwrap();
+        assert!(
+            row.is_some_and(|row| row.is_dir),
+            "{folder} is not recorded"
+        );
+    }
+    for i in 0..64 {
+        let file = format!("burst/{}/{}/file-{i}", i % 4, i % 3);
+        let row = meta.get(h.owner, &p(&file)).await.unwrap();
+        assert!(row.is_some_and(|row| !row.is_dir), "{file} is not recorded");
+        let (_, object) = h.fs.object(full.clone(), &p(&file)).await.unwrap();
+        assert_eq!(
+            object.and_then(|object| object.s3_etag),
+            Some(format!("md5-{i}")),
+            "{file} lost its S3 metadata"
+        );
+    }
+}
+
 #[tokio::test]
 async fn objects_open_for_reading_with_their_metadata() {
     use std::io::Read as _;

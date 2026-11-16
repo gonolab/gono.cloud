@@ -110,6 +110,12 @@ compatible within a major version: released clients keep working with newer serv
   script of 1.0 to 1.2 sets `path = "/gono-admin"`; change it to `"/apps/manage"` or remove the
   line to move the admin UI, and adjust reverse proxy rules that restrict the old path.
 
+- Database writes queue at an in-process write gate before they take a connection, instead of
+  waiting in SQLite's busy handler while holding one: under many parallel uploads, reads
+  (listings, PROPFIND, downloads) no longer wait for writers, and writes no longer come near
+  `db.busy_timeout_secs`. With 256 parallel S3 uploads, reads during the burst took 0.2 ms at
+  the median instead of 56 ms, and the longest write transaction 1 s instead of 3.3 s.
+
 ### Fixed
 
 - The web file UI cut off the menu of the last files of a short folder at the bottom of the

@@ -27,10 +27,10 @@
 //! upload.
 
 use std::{
-    hash::{DefaultHasher, Hash as _, Hasher as _},
+    collections::HashMap,
     io,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex as SyncMutex, Weak},
     time::SystemTime,
 };
 
@@ -52,8 +52,11 @@ use crate::{
     resolve::{self, Location},
 };
 
-/// Locks per path striped over this many mutexes; so are the locks per account.
+/// Locks per account are striped over this many mutexes.
 const STRIPES: usize = 64;
+
+/// The lock table of paths is swept of unused entries once it holds this many.
+const PATH_TABLE_SWEEP: usize = 1024;
 
 /// Why an object operation failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,29 +133,47 @@ pub enum WriteCondition {
     IfMatch(String),
 }
 
+/// The mutex of each path in use, by owner and storage path.
+type PathLocks = HashMap<(i64, String), Weak<Mutex<()>>>;
+
 /// The mutexes behind the locks per path and per account.
+///
+/// A path's lock is held from the checks of a write to its record in the database, which can
+/// take a while under load; so writers of different paths never share one: the table holds a
+/// mutex per path in use (writers of one path find the same one while any of them holds or
+/// awaits it). Folder creation is rare and short, so accounts share striped mutexes.
 #[derive(Debug)]
 pub(crate) struct ObjectLocks {
-    paths: Vec<Arc<Mutex<()>>>,
+    paths: SyncMutex<PathLocks>,
     accounts: Vec<Arc<Mutex<()>>>,
 }
 
 impl ObjectLocks {
     pub(crate) fn new() -> Self {
-        let stripes = || (0..STRIPES).map(|_| Arc::new(Mutex::new(()))).collect();
         Self {
-            paths: stripes(),
-            accounts: stripes(),
+            paths: SyncMutex::new(HashMap::new()),
+            accounts: (0..STRIPES).map(|_| Arc::new(Mutex::new(()))).collect(),
         }
     }
 
     /// The lock of `owner`'s path `rel`. Taken before the account's lock, never after it.
     async fn path(&self, owner: i64, rel: &RelPath) -> OwnedMutexGuard<()> {
-        let mut hasher = DefaultHasher::new();
-        owner.hash(&mut hasher);
-        rel.as_str().hash(&mut hasher);
-        let stripe = usize::try_from(hasher.finish() % STRIPES as u64).unwrap_or(0);
-        self.paths[stripe].clone().lock_owned().await
+        let mutex = {
+            let mut table = self
+                .paths
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if table.len() >= PATH_TABLE_SWEEP {
+                table.retain(|_, mutex| mutex.strong_count() > 0);
+            }
+            let entry = table.entry((owner, rel.as_str().to_owned())).or_default();
+            entry.upgrade().unwrap_or_else(|| {
+                let mutex = Arc::new(Mutex::new(()));
+                *entry = Arc::downgrade(&mutex);
+                mutex
+            })
+        };
+        mutex.lock_owned().await
     }
 
     /// The lock of `owner`'s folder creation.
@@ -578,6 +599,31 @@ impl ScopedFs {
         }
         if wanted.is_empty() {
             return Ok(());
+        }
+        // Mostly every folder is there already, and then nothing needs the account's lock: the
+        // deepest one recorded as a folder means all of them are recorded (a row's parent always
+        // has a row), and on disk as a folder (looked up without following links) means all of
+        // them exist. Both are needed: a writer holding the lock creates a folder on disk before
+        // it records it.
+        if let Some(deepest) = wanted.last().cloned() {
+            let recorded = self
+                .meta()
+                .get(owner, &deepest)
+                .await
+                .map_err(object_db_error)?
+                .is_some_and(|row| row.is_dir);
+            if recorded {
+                let root = self.user_root(owner);
+                let on_disk = blocking(move || {
+                    Ok(lstat_beneath(&root, &deepest)
+                        .map_err(object_io_error)?
+                        .is_some_and(|meta| meta.is_dir()))
+                })
+                .await?;
+                if on_disk {
+                    return Ok(());
+                }
+            }
         }
         let _account = self.object_locks().account(owner).await;
         for folder in wanted {
