@@ -46,7 +46,9 @@ listed under "In scope" is deferred until after v1.
   ACLs, and anonymous downloads of what a bucket publishes (also through the download bucket
   policy of `mc anonymous set download`), on a host name of its own, in path and virtual-hosted
   style; CORS rules and form uploads for browser applications; public links in the web file UI;
-  sync tools' `mtime` metadata as the files' modification time.
+  sync tools' `mtime` metadata as the files' modification time; keys in any Unicode
+  normalization, kept as written; version listings of the one `null` version, for cleanup
+  tools. Checked in CI with the AWS CLI, rclone, mc, restic and a selection of Ceph's s3-tests.
 - **CLI**: `init`, `serve`, `config check`, user and app password management (including
   promoting and demoting admins and changing display names), S3 access keys and buckets, and a
   manual `rescan` command.

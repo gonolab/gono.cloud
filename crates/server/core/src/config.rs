@@ -126,7 +126,9 @@ pub struct DbConfig {
     #[serde(default = "default_db_max_connections")]
     pub max_connections: u32,
 
-    /// How long a connection waits for a competing writer before giving up, in seconds.
+    /// How long a connection waits for a writer of another process (the CLI) before giving
+    /// up, in seconds. The server's own writers queue at the write gate instead
+    /// ([`crate::db::begin_immediate`]).
     #[serde(default = "default_db_busy_timeout_secs")]
     pub busy_timeout_secs: u64,
 }

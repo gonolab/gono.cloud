@@ -49,7 +49,8 @@ path = "gono-cloud.db"
 # Maximum number of pooled connections, 1 to 64. Default: 8.
 max_connections = 8
 
-# Seconds a connection waits for a competing writer before failing. Default: 5.
+# Seconds a connection waits for a writer of another process (the CLI) before failing.
+# Writers of the server queue in the server itself and do not count. Default: 5.
 busy_timeout_secs = 5
 
 [webdav]
