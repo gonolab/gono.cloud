@@ -278,9 +278,13 @@ FILES=20000 TRANSFERS="16 128" acceptance/scripts/s3-load.sh
 Measures what rclone and restic put on the single SQLite writer: a release build of the server
 (debug with `PROFILE=debug`), a tree of small files (`FILES`, default 5000 of `SIZE` 2048 bytes
 in `DIRS` 50 folders), uploaded with `rclone copy --transfers <n>` for each `n` in `TRANSFERS`
-(default `4 16 64`) and checked with `rclone check`, then backed up with restic. For each run
-it prints the uploads per second and, from the server's request log, the requests by status
-and the server-side latency of the object writes (p50, p95, p99, max). It fails when a client
-fails or the server answers a write with a 5xx status. It is a measurement, not a CI job:
-numbers depend on the machine, and on macOS each upload's two `F_FULLFSYNC`s (the file and its
-folder) bound the throughput. Needs `rclone` and `restic` (`RUN_RESTIC=0` skips restic).
+(default `4 16 64`) and checked with `rclone check`, then backed up with restic. With
+`ACCOUNTS=<n>`, n accounts upload the tree at once, each with a key and a bucket of its own;
+with `WEBDAV=1`, the tree is also uploaded through WebDAV into the first account at the same
+time (plain `PUT`s from n threads: rclone's WebDAV backend paces its requests and would not load
+the server). For each run it prints the uploads per second and, from the server's request log,
+the requests by status and the server-side latency of the S3 and WebDAV writes apart (p50,
+p95, p99, max). It fails when a client fails or the server answers a write with a 5xx status.
+It is a measurement, not a CI job: numbers depend on the machine, and on macOS each upload's
+two `F_FULLFSYNC`s (the file and its folder) bound the throughput. Needs `rclone` and `restic`
+(`RUN_RESTIC=0` skips restic).
