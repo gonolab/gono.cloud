@@ -70,7 +70,9 @@ use crate::{
     files::{self, Files},
     login_flow, nextcloud, notify_push,
     ratelimit::RateLimiter,
-    request_log, site,
+    request_log,
+    s3::S3Ui,
+    site,
     web::{self, Web},
 };
 
@@ -102,6 +104,8 @@ pub struct AppState {
     pub files: Option<Arc<Files>>,
     /// Remote connectivity, when the relay is enabled and `server.base_url` allows it.
     pub connect: Option<Arc<gono_server_connect::Connect>>,
+    /// What the account page and the admin UI show of the S3 API, when `s3.enabled`.
+    pub s3: Option<Arc<S3Ui>>,
 }
 
 /// Compresses the XML bodies of WebDAV responses (PROPFIND, REPORT, error documents) when the
@@ -532,6 +536,7 @@ mod tests {
             admin: None,
             files: None,
             connect: None,
+            s3: None,
         };
         Fixture {
             dir,

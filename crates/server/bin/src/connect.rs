@@ -476,6 +476,7 @@ mod tests {
             admin: None,
             files: None,
             connect: Some(connect),
+            s3: None,
         };
         let app = crate::app::router(state.clone());
         tokio::spawn(async move {

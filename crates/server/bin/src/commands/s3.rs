@@ -2,13 +2,16 @@
 //!
 //! The secret of a new access key is printed exactly once, to stdout, and never logged. Bucket
 //! folders are created and found through the same [`ScopedFs`] the server uses, so a running
-//! server and its clients see them like any other change.
+//! server and its clients see them like any other change. Changes are written to the audit log
+//! of the account as the account page writes them, with the actor `cli`.
 
 use std::{path::Path, sync::Arc};
 
 use anyhow::{Context, bail};
 use gono_server_core::{
-    Config, RelPath, db,
+    Config, RelPath,
+    audit::{Actor, Record},
+    db,
     meta::MetaStore,
     s3::{self, Anonymous, BucketName, Grant},
     settings,
@@ -22,7 +25,15 @@ use super::{
     open_database,
     output::{format_optional_time, format_time, print_table},
 };
-use crate::cli::{S3BucketCommand, S3Command, S3KeyCommand};
+use crate::{
+    cli::{S3BucketCommand, S3Command, S3KeyCommand},
+    s3::{audit, key_details},
+};
+
+/// An audit record of an S3 change made with the command line to account `user_id`.
+fn record(user_id: i64, kind: &'static str, details: serde_json::Value) -> Record {
+    Record::new(user_id, kind, Actor::Cli).details(details)
+}
 
 /// Runs one `s3` subcommand.
 pub async fn run(config_path: &Path, command: S3Command) -> anyhow::Result<()> {
@@ -63,6 +74,12 @@ async fn key(config: &Config, pool: &db::Pool, command: S3KeyCommand) -> anyhow:
                 expires_in_days.map(|days| db::unix_now() + i64::from(days.get()) * 86_400);
             let (key, secret) =
                 s3::create_key(pool, &sealing, user.id, &label, grants, expires_at).await?;
+            let buckets = s3::buckets_of(pool, user.id).await?;
+            audit(
+                pool,
+                record(user.id, "s3.key.created", key_details(&key, &buckets)),
+            )
+            .await;
 
             println!("Created S3 access key {} for {username}.", key.id);
             println!("  label    {}", key.label);
@@ -121,8 +138,19 @@ async fn key(config: &Config, pool: &db::Pool, command: S3KeyCommand) -> anyhow:
         }
         S3KeyCommand::Delete { username, id } => {
             let user = users::get(pool, &username).await?;
-            if !s3::delete_key(pool, user.id, id).await? {
+            let key = s3::list_keys(pool, user.id)
+                .await?
+                .into_iter()
+                .find(|key| key.id == id);
+            if key.is_none() || !s3::delete_key(pool, user.id, id).await? {
                 bail!("user {username} has no S3 access key with id {id}");
+            }
+            if let Some(key) = key {
+                let details = serde_json::json!({
+                    "access_key_id": key.access_key_id,
+                    "label": key.label,
+                });
+                audit(pool, record(user.id, "s3.key.revoked", details)).await;
             }
             println!("Revoked S3 access key {id} of {username}.");
             Ok(())
@@ -230,6 +258,8 @@ async fn bucket(config: &Config, pool: &db::Pool, command: S3BucketCommand) -> a
                 .with_context(|| format!("create the folder {folder}"))?;
             let folder_id = entry.file_id.context("the new folder has no file id")?;
             let bucket = s3::create_bucket(pool, user.id, &name, folder_id).await?;
+            let details = serde_json::json!({ "bucket": bucket.name, "new_folder": true });
+            audit(pool, record(user.id, "s3.bucket.created", details)).await;
             println!(
                 "Created bucket {} of {username} in the folder {}.",
                 bucket.name, bucket.folder
@@ -258,6 +288,8 @@ async fn bucket(config: &Config, pool: &db::Pool, command: S3BucketCommand) -> a
             }
             let folder_id = entry.file_id.context("the folder has no file id")?;
             let bucket = s3::create_bucket(pool, user.id, &name, folder_id).await?;
+            let details = serde_json::json!({ "bucket": bucket.name, "new_folder": false });
+            audit(pool, record(user.id, "s3.bucket.created", details)).await;
             println!(
                 "Bound {} as bucket {} of {username}.",
                 bucket.folder, bucket.name
@@ -278,6 +310,12 @@ async fn bucket(config: &Config, pool: &db::Pool, command: S3BucketCommand) -> a
                 .with_context(|| format!("user {username} has no bucket {name}"))?;
             let list = list && !no_list && anonymous.0 != Anonymous::Private;
             s3::set_anonymous(pool, user.id, bucket.id, anonymous.0, list).await?;
+            let details = serde_json::json!({
+                "bucket": bucket.name,
+                "anonymous": anonymous.0.as_str(),
+                "list": list,
+            });
+            audit(pool, record(user.id, "s3.bucket.anonymous", details)).await;
             println!(
                 "Bucket {name}: anonymous reads {}, anonymous listing {}.",
                 anonymous.0.as_str(),
@@ -298,6 +336,8 @@ async fn bucket(config: &Config, pool: &db::Pool, command: S3BucketCommand) -> a
                 .filter(|bucket| bucket.owner_id == user.id)
                 .with_context(|| format!("user {username} has no bucket {name}"))?;
             s3::delete_bucket(pool, user.id, bucket.id).await?;
+            let details = serde_json::json!({ "bucket": bucket.name });
+            audit(pool, record(user.id, "s3.bucket.removed", details)).await;
             println!(
                 "Removed bucket {name}; the folder {} and its files stay.",
                 bucket.folder

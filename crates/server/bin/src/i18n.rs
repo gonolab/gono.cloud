@@ -475,6 +475,72 @@ texts! {
     err_invalid_path: "Invalid path {}.", "路径 {} 无效。";
     err_scopes: "The mounts do not fit together: {}.", "挂载之间有冲突：{}。";
 
+    // Account: S3
+    s3_title: "S3 buckets", "S3 存储桶";
+    s3_note: "Buckets are folders of your files that S3 clients such as rclone, restic or the AWS CLI reach with an access key. What they upload are ordinary files here and in the apps.", "存储桶是你文件中的文件夹，rclone、restic、AWS CLI 等 S3 客户端用访问密钥访问它们。它们上传的内容在这里和各个 app 里都是普通文件。";
+    s3_endpoint: "Endpoint", "端点";
+    s3_endpoint_unset: "Not set (s3.public_url)", "未设置（s3.public_url）";
+    s3_region: "Region", "区域";
+    s3_addressing: "Addressing", "寻址方式";
+    s3_path_style: "Path style: {}/<bucket>/<key>", "路径风格：{}/<bucket>/<key>";
+    s3_anonymous_off: "Anonymous access is off on this server: every bucket answers signed requests only, whatever its setting.", "此服务器关闭了匿名访问：无论如何设置，所有存储桶都只响应带签名的请求。";
+    s3_no_buckets: "No buckets yet. Create one below, or let an access key with full access to all buckets create them.", "还没有存储桶。可以在下面创建，也可以用对全部存储桶有完全权限的访问密钥创建。";
+    s3_bucket: "Bucket", "存储桶";
+    s3_anonymous: "Anonymous access", "匿名访问";
+    s3_anon_private: "Private", "私有";
+    s3_anon_acl: "Objects with the public-read ACL", "设置了 public-read ACL 的对象";
+    s3_anon_public: "Every object", "所有对象";
+    s3_anon_list: "Allow anonymous listing: shows the name of every object, private ones too", "允许匿名列出：会显示每个对象的名称，包括私有对象";
+    s3_listing_on: "anonymous listing on", "允许匿名列出";
+    s3_make_private: "Make private", "设为私有";
+    s3_remove_bucket: "Remove", "移除";
+    s3_remove_note: "Removing a bucket only unbinds it: the folder and its files stay.", "移除存储桶只是解除绑定：文件夹和其中的文件都会保留。";
+    s3_new_bucket: "New bucket", "新建存储桶";
+    s3_new_bucket_note: "Creates the folder {} in your files.", "会在你的文件中创建文件夹 {}。";
+    s3_bucket_name: "Bucket name", "存储桶名称";
+    s3_bucket_name_hint: "3 to 63 characters: lowercase letters, digits and “-”. Unique on this server.", "3 到 63 个字符：小写字母、数字和“-”。在此服务器上唯一。";
+    s3_create_bucket: "Create bucket", "创建存储桶";
+    s3_bind_title: "Use an existing folder", "使用已有文件夹";
+    s3_bind_note: "Any folder of yours but the top level, neither inside nor above another bucket's folder. The bucket follows the folder when it is moved.", "可以是你的任意文件夹（顶层除外），但不能位于其他存储桶的文件夹之内或之上。文件夹被移动时，存储桶会跟着它。";
+    s3_bind: "Use as bucket", "设为存储桶";
+    s3_keys: "S3 access keys", "S3 访问密钥";
+    s3_keys_note: "One per S3 client. Revoking one stops that client at once.", "每个 S3 客户端一个。吊销后该客户端会立即失去访问权限。";
+    s3_no_keys: "No access keys yet.", "还没有访问密钥。";
+    s3_access_key_id: "Access key ID", "访问密钥 ID";
+    s3_secret_key: "Secret key", "秘密访问密钥";
+    s3_all_buckets: "all buckets", "全部存储桶";
+    s3_key_no_access: "No bucket: its buckets were removed", "没有存储桶：它的存储桶都已移除";
+    s3_new_key: "New S3 access key", "新建 S3 访问密钥";
+    s3_new_key_note: "For S3 clients such as rclone, restic or the AWS CLI. The secret key is shown once after it is created.", "用于 rclone、restic、AWS CLI 等 S3 客户端。秘密访问密钥创建后只显示一次。";
+    s3_access_everything: "All buckets, full access", "全部存储桶，完全权限";
+    s3_access_everything_note: "Reads and writes every bucket, present and future, and may create and remove buckets and change their anonymous access.", "可以读写现在和以后的所有存储桶，还可以创建、移除存储桶并修改它们的匿名访问。";
+    s3_access_chosen: "Chosen buckets", "指定存储桶";
+    s3_access_chosen_note: "View or full access to single buckets.", "对单个存储桶授予只读或完全权限。";
+    s3_grant_none: "No access", "无权限";
+    s3_create_key: "Create access key", "创建访问密钥";
+    s3_key_created: "S3 access key created", "S3 访问密钥已创建";
+    s3_key_created_lead: "Enter it in the S3 client now. The secret key will not be shown again.", "请现在把它填到 S3 客户端里。秘密访问密钥不会再次显示。";
+    s3_notice_bucket_created: "The bucket was created.", "存储桶已创建。";
+    s3_notice_bucket_bound: "The folder is a bucket now.", "这个文件夹现在是存储桶了。";
+    s3_notice_anonymous: "The anonymous access of the bucket was saved.", "存储桶的匿名访问设置已保存。";
+    s3_notice_bucket_removed: "The bucket was removed. Its folder and files stay.", "存储桶已移除，它的文件夹和文件都保留着。";
+    s3_notice_key_revoked: "The access key was revoked.", "访问密钥已吊销。";
+    s3_err_bucket_name: "Bucket names have 3 to 63 characters: lowercase letters, digits and “-”, starting and ending with a letter or digit.", "存储桶名称为 3 到 63 个字符：小写字母、数字和“-”，并以字母或数字开头和结尾。";
+    s3_err_bucket_yours: "You have a bucket named {} already.", "你已经有名为 {} 的存储桶。";
+    s3_err_bucket_taken: "The bucket name {} is taken on this server. Choose another.", "此服务器上已有名为 {} 的存储桶，请换一个名称。";
+    s3_err_folder_exists: "The folder {} exists already. Make it a bucket with “Use an existing folder”.", "文件夹 {} 已经存在。请用“使用已有文件夹”把它设为存储桶。";
+    s3_err_no_folder: "You have no folder {}.", "你没有文件夹 {}。";
+    s3_err_not_folder: "{} is a file, not a folder.", "{} 是文件，不是文件夹。";
+    s3_err_root: "The top level of your files cannot be a bucket.", "你的文件的顶层不能作为存储桶。";
+    s3_err_folder_bound: "The folder {} is a bucket already.", "文件夹 {} 已经是存储桶了。";
+    s3_err_nested: "The folder {} lies inside or above another bucket's folder.", "文件夹 {} 位于其他存储桶的文件夹之内或之上。";
+    s3_err_folder: "The folder {} cannot be a bucket: {}.", "文件夹 {} 不能作为存储桶：{}。";
+    s3_err_parent_is_file: "A file is in the way of the folder {}.", "有文件挡住了文件夹 {} 的位置。";
+    s3_err_no_grants: "Choose view or full access for at least one bucket.", "请至少给一个存储桶选择只读或完全权限。";
+    s3_err_grants: "The access does not fit: {}.", "权限设置无效：{}。";
+    s3_err_anonymous_off: "Anonymous access is off on this server: buckets can only be private.", "此服务器关闭了匿名访问：存储桶只能是私有的。";
+    s3_err_anonymous: "Choose private, objects with the public-read ACL, or every object.", "请选择私有、设置了 public-read ACL 的对象或所有对象。";
+
     // Time words of the admin UI
     just_now: "just now", "刚刚";
     minutes_ago: "{} min ago", "{} 分钟前";
@@ -687,6 +753,9 @@ texts! {
     a_no_such_user: "No such user", "没有这个用户";
     a_no_such_user_lead: "There is no account named {}.", "没有名为 {} 的账号。";
     a_all_users: "All users", "全部用户";
+    a_s3_buckets_note: "Removing a bucket only unbinds it: the folder and its files stay. Making it private stops anonymous reads at once.", "移除存储桶只是解除绑定：文件夹和其中的文件都会保留。设为私有会立即停止匿名读取。";
+    a_s3_keys_note: "Revoking a key stops its client at once. Only the user sees a key's secret, once.", "吊销后对应的客户端会立即失去访问权限。秘密访问密钥只向用户本人显示一次。";
+    a_s3_notice_private: "The bucket is private now.", "存储桶现在是私有的。";
 
     // Admin UI: delete and created
     a_delete_question: "Delete {}?", "删除 {}？";

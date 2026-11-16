@@ -15,6 +15,12 @@
 //! | `GET  <p>/users/<name>/delete`, `POST` the same | Confirm and delete the account. |
 //! | `POST <p>/users/<name>/app-passwords` | Create an app password, then show it once at `<p>/created`. |
 //! | `POST <p>/users/<name>/app-passwords/<id>/delete` | Revoke an app password. |
+//! | `POST <p>/users/<name>/s3/keys/<id>/delete` | Revoke an S3 access key (see [`s3`]). |
+//! | `POST <p>/users/<name>/s3/buckets/<id>/private` | Make an S3 bucket private. |
+//! | `POST <p>/users/<name>/s3/buckets/<id>/delete` | Remove an S3 bucket: the folder and its files stay. |
+//!
+//! The S3 requests answer 404 while the S3 API is off, and the user page shows S3 buckets and
+//! access keys only while it is on.
 //!
 //! # Security
 //!
@@ -36,6 +42,7 @@
 //!   with.
 
 mod pages;
+mod s3;
 
 pub(crate) use self::pages::format_bytes;
 
@@ -266,6 +273,18 @@ pub fn routes(prefix: &str) -> Router<AppState> {
         .route(
             &format!("{p}/users/{{name}}/two-factor/reset"),
             post(reset_two_factor),
+        )
+        .route(
+            &format!("{p}/users/{{name}}/s3/keys/{{id}}/delete"),
+            post(s3::revoke_key),
+        )
+        .route(
+            &format!("{p}/users/{{name}}/s3/buckets/{{id}}/private"),
+            post(s3::make_bucket_private),
+        )
+        .route(
+            &format!("{p}/users/{{name}}/s3/buckets/{{id}}/delete"),
+            post(s3::remove_bucket),
         )
 }
 
@@ -1299,6 +1318,13 @@ async fn user_page_response(
             expiry: pages::expiry(t, password.expires_at, now),
         })
         .collect();
+    let s3 = match &state.s3 {
+        Some(ui) => match s3::user_view(state, t, ui, user.id, now).await {
+            Ok(view) => Some(view),
+            Err(err) => return internal_error(&session.chrome, &err),
+        },
+        None => None,
+    };
     let remote = match &state.connect {
         Some(connect) => match connect.devices_with_presence(user.id).await {
             Ok(listed) => Some(
@@ -1337,6 +1363,7 @@ async fn user_page_response(
         app_passwords,
         form,
         remote,
+        s3,
     };
     web::render(status, &page)
 }
@@ -1597,6 +1624,9 @@ async fn user_page(
         Some("device-revoked") => Some(t.notice_device_revoked.to_owned()),
         Some("two-factor-reset") => Some(t.a_notice_tf_reset.to_owned()),
         Some("revoked") => Some(t.notice_revoked.to_owned()),
+        Some("s3-key-revoked") => Some(t.s3_notice_key_revoked.to_owned()),
+        Some("s3-bucket-private") => Some(t.a_s3_notice_private.to_owned()),
+        Some("s3-bucket-removed") => Some(t.s3_notice_bucket_removed.to_owned()),
         _ => None,
     };
     let options = UserPageOptions {
@@ -2002,6 +2032,20 @@ impl AppPasswordFields {
     }
 }
 
+/// The expiry of a new app password or S3 access key from a number of days (1 to 3650) after
+/// `now`; empty means it never expires.
+pub(crate) fn parse_expiry(t: &Text, days: &str, now: i64) -> Result<Option<i64>, String> {
+    if days.is_empty() {
+        return Ok(None);
+    }
+    let days: i64 = days
+        .parse()
+        .ok()
+        .filter(|days| (1..=3650).contains(days))
+        .ok_or_else(|| t.err_expiry.to_owned())?;
+    Ok(Some(now + days * 86_400))
+}
+
 /// Validates the form: label, expiry and scopes.
 pub(crate) fn parse_app_password(
     t: &Text,
@@ -2009,17 +2053,7 @@ pub(crate) fn parse_app_password(
     now: i64,
 ) -> Result<(String, Vec<Scope>, Option<i64>), String> {
     let label = app_passwords::check_label(&form.label).map_err(|err| core_message(t, &err))?;
-    let expires_at = if form.expires_in_days.is_empty() {
-        None
-    } else {
-        let days: i64 = form
-            .expires_in_days
-            .parse()
-            .ok()
-            .filter(|days| (1..=3650).contains(days))
-            .ok_or_else(|| t.err_expiry.to_owned())?;
-        Some(now + days * 86_400)
-    };
+    let expires_at = parse_expiry(t, &form.expires_in_days, now)?;
     let path = |value: &str| RelPath::parse(value).map_err(|_| fill(t.err_invalid_path, &[value]));
     let scopes = match form.access.as_str() {
         "view" => vec![Scope {

@@ -337,6 +337,7 @@ mod tests {
     fn key(user: i64, grants: Vec<Grant>) -> Caller {
         Caller::Key(Arc::new(SigningKey {
             id: 1,
+            access_key_id: "GONOAAAAAAAAAAAAAAAA".into(),
             user_id: user,
             username: Username::new("alice").unwrap(),
             display_name: "Alice".into(),

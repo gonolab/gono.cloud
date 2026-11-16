@@ -17,6 +17,16 @@
 //! | `GET /apps/account/two-factor/recovery-codes` | New recovery codes, shown once. |
 //! | `POST /apps/account/two-factor/renew` | New recovery codes (password and a code). |
 //! | `POST /apps/account/two-factor/disable` | Turn it off (password and a code). |
+//! | `POST /apps/account/s3/buckets` | Create an S3 bucket with a new folder `<s3.bucket_folder>/<name>`. |
+//! | `POST /apps/account/s3/buckets/bind` | Make an existing folder an S3 bucket. |
+//! | `POST /apps/account/s3/buckets/<id>/anonymous` | Change what anonymous requests may read and list in a bucket. |
+//! | `POST /apps/account/s3/buckets/<id>/delete` | Remove a bucket: only the binding goes, the folder and its files stay. |
+//! | `POST /apps/account/s3/keys` | Create an S3 access key, then show it once at `/apps/account/s3/created`. |
+//! | `GET /apps/account/s3/created` | The new access key with its secret key, once. |
+//! | `POST /apps/account/s3/keys/<id>/delete` | Revoke one of the user's S3 access keys. |
+//!
+//! The S3 part (see [`s3`]) is there only while the S3 API is enabled (`s3.enabled`); its
+//! requests answer 404 otherwise.
 //!
 //! Devices registered for remote access (`docs/connect-protocol.md`, sections 6 and 9) are
 //! listed only when remote connectivity is on. Their credentials are not app passwords and do
@@ -24,9 +34,11 @@
 //! revoke button opens a confirmation page.
 //!
 //! Every change is a POST with the session's CSRF token from this origin, answered with a
-//! redirect. A new app password is kept in memory for its session only and shown once; the
-//! URL carries no secret. Changing the password checks the current one through the
-//! failed-attempt limiter of the sign-in pages.
+//! redirect. A new app password or S3 access key is kept in memory for its session only and
+//! shown once; the URL carries no secret. Changing the password checks the current one through
+//! the failed-attempt limiter of the sign-in pages.
+
+pub(crate) mod s3;
 
 use std::{
     collections::HashMap,
@@ -66,41 +78,61 @@ use crate::{
 /// Where the account page lives.
 pub const ACCOUNT: &str = "/apps/account";
 
-/// How long a new app password waits to be shown.
+/// How long a new app password or S3 access key waits to be shown.
 const CREATED_TTL: Duration = Duration::from_secs(10 * 60);
 
-/// New app passwords waiting to be shown, at most.
+/// New secrets of one kind waiting to be shown, at most.
 const MAX_CREATED: usize = 1000;
 
 /// A new app password waiting to be shown once.
 #[derive(Debug)]
-pub struct Created {
-    /// The account of the session that created it: should a session of another account ever
-    /// get the same row id, it sees nothing.
-    user_id: i64,
+pub struct NewAppPassword {
     label: String,
     token: SecretString,
     scopes: Vec<Scope>,
     expires_at: Option<i64>,
-    until: Instant,
 }
 
-/// New app passwords by the id of the session that created them.
-#[derive(Debug, Default)]
-pub struct CreatedStore(Mutex<HashMap<i64, Created>>);
+/// A new secret waiting to be shown once.
+#[derive(Debug)]
+struct Waiting<T> {
+    /// The account of the session that created it: should a session of another account ever
+    /// get the same row id, it sees nothing.
+    user_id: i64,
+    until: Instant,
+    value: T,
+}
 
-impl CreatedStore {
-    fn put(&self, session_id: i64, created: Created) {
+/// New secrets of one kind (app passwords, S3 access keys) by the id of the session that
+/// created them; a session has one of each kind waiting at most.
+#[derive(Debug)]
+pub struct CreatedStore<T>(Mutex<HashMap<i64, Waiting<T>>>);
+
+impl<T> Default for CreatedStore<T> {
+    fn default() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
+}
+
+impl<T> CreatedStore<T> {
+    fn put(&self, session: &web_sessions::SessionUser, value: T) {
         let now = Instant::now();
         let mut waiting = self.0.lock().unwrap_or_else(|e| e.into_inner());
         waiting.retain(|_, entry| entry.until > now);
         if waiting.len() >= MAX_CREATED {
             waiting.clear();
         }
-        waiting.insert(session_id, created);
+        waiting.insert(
+            session.session_id,
+            Waiting {
+                user_id: session.user_id,
+                until: now + CREATED_TTL,
+                value,
+            },
+        );
     }
 
-    fn take(&self, session: &web_sessions::SessionUser) -> Option<Created> {
+    fn take(&self, session: &web_sessions::SessionUser) -> Option<T> {
         let mut waiting = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if !waiting
             .get(&session.session_id)
@@ -111,6 +143,7 @@ impl CreatedStore {
         waiting
             .remove(&session.session_id)
             .filter(|entry| entry.until > Instant::now())
+            .map(|entry| entry.value)
     }
 }
 
@@ -177,6 +210,8 @@ struct AccountPage {
     remote: Option<Vec<RemoteRow>>,
     devices: Vec<DeviceRow>,
     form: AppPasswordForm,
+    /// `None` when the S3 API is off.
+    s3: Option<s3::S3View>,
     notice: Option<String>,
     error: Option<String>,
 }
@@ -279,6 +314,20 @@ fn expiry(t: &Text, visitor: &Visitor, now: i64, expires_at: Option<i64>) -> Str
     }
 }
 
+/// What the account page shows besides the account itself.
+#[derive(Default)]
+struct PageOptions {
+    /// The new app password form, as entered.
+    form: AppPasswordForm,
+    /// The S3 forms, as entered.
+    s3: s3::S3Forms,
+    notice: Option<String>,
+    /// An error makes the page answer 422.
+    error: Option<String>,
+    /// Where to continue once two-step verification is on.
+    next: Option<String>,
+}
+
 async fn render_page(
     state: &AppState,
     visitor: &Visitor,
@@ -286,17 +335,23 @@ async fn render_page(
     notice: Option<String>,
     error: Option<String>,
 ) -> Response {
-    render_page_next(state, visitor, form, notice, error, None).await
+    let options = PageOptions {
+        form,
+        notice,
+        error,
+        ..PageOptions::default()
+    };
+    render(state, visitor, options).await
 }
 
-async fn render_page_next(
-    state: &AppState,
-    visitor: &Visitor,
-    form: AppPasswordForm,
-    notice: Option<String>,
-    error: Option<String>,
-    next: Option<String>,
-) -> Response {
+async fn render(state: &AppState, visitor: &Visitor, options: PageOptions) -> Response {
+    let PageOptions {
+        form,
+        s3: s3_forms,
+        notice,
+        error,
+        next,
+    } = options;
     let t = visitor.t();
     let passwords = match app_passwords::list(&state.db, visitor.user.user_id).await {
         Ok(passwords) => passwords,
@@ -328,6 +383,10 @@ async fn render_page_next(
         Ok(view) => view,
         Err(err) => return internal(visitor, "two-step verification", &err),
     };
+    let s3 = match s3::view(state, visitor, now, s3_forms).await {
+        Ok(view) => view,
+        Err(err) => return internal(visitor, "S3 buckets and keys", &err),
+    };
     let status = if error.is_some() {
         StatusCode::UNPROCESSABLE_ENTITY
     } else {
@@ -341,6 +400,7 @@ async fn render_page_next(
         remote,
         devices,
         form,
+        s3,
         notice,
         error,
     };
@@ -1004,6 +1064,7 @@ pub async fn show(
     };
     let t = visitor.t();
     let notice = match query.done.as_deref() {
+        Some(done) if done.starts_with("s3-") => s3::notice(t, done).map(str::to_owned),
         Some("display-name") => Some(t.notice_display_name.to_owned()),
         Some("password") => Some(t.notice_password_changed.to_owned()),
         Some("revoked") => Some(t.notice_revoked.to_owned()),
@@ -1014,16 +1075,12 @@ pub async fn show(
         Some("two-factor-off") => Some(t.notice_tf_off.to_owned()),
         _ => None,
     };
-    let next = next_path(query.next.as_deref());
-    render_page_next(
-        &state,
-        &visitor,
-        AppPasswordForm::default(),
+    let options = PageOptions {
         notice,
-        None,
-        next,
-    )
-    .await
+        next: next_path(query.next.as_deref()),
+        ..PageOptions::default()
+    };
+    render(&state, &visitor, options).await
 }
 
 /// `GET /apps/account`.
@@ -1184,14 +1241,12 @@ pub async fn create_app_password(
     };
     tracing::info!(user = %visitor.user.username, app_password = id, "user created an app password");
     files.created.put(
-        visitor.user.session_id,
-        Created {
-            user_id: visitor.user.user_id,
+        &visitor.user,
+        NewAppPassword {
             label,
             token,
             scopes,
             expires_at,
-            until: Instant::now() + CREATED_TTL,
         },
     );
     web::see_other(&format!("{ACCOUNT}/created"), &[])

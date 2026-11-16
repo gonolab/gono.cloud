@@ -26,6 +26,8 @@ use std::{
 use bytes::Bytes;
 use gono_server_core::{
     Permission, RelPath,
+    audit::{self, Actor, Record},
+    db,
     meta::{ListEntry, ObjectMeta, ObjectQuery},
     s3::{self, Anonymous, Bucket, BucketName},
 };
@@ -36,6 +38,7 @@ use s3s::{
     dto::{self, ETag, ETagCondition, Timestamp},
     s3_error,
 };
+use serde_json::json;
 use tokio::io::AsyncReadExt as _;
 
 use crate::{
@@ -324,6 +327,24 @@ struct Listed {
 }
 
 impl GonoS3 {
+    /// Writes an audit record of a change made with access key `key`. A failure is logged;
+    /// the change stands.
+    async fn audit(
+        &self,
+        key: &s3::SigningKey,
+        kind: &'static str,
+        mut details: serde_json::Value,
+    ) {
+        if let Some(details) = details.as_object_mut() {
+            details.insert("access_key_id".to_owned(), json!(key.access_key_id));
+        }
+        // The actor of S3 requests is the key's account, like a user in the browser.
+        let record = Record::new(key.user_id, kind, Actor::User).details(details);
+        if let Err(err) = audit::record(self.state.pool(), &record, db::unix_now()).await {
+            tracing::warn!(kind, error = %err, "cannot write an audit record");
+        }
+    }
+
     /// The checks every write of a file shares: not locked by a WebDAV client.
     async fn check_locks(&self, bucket: &Bucket, client: &RelPath) -> S3Result<()> {
         let storage = storage_of(bucket, client)?;
@@ -782,6 +803,12 @@ impl S3 for GonoS3 {
                 });
             }
         };
+        self.audit(
+            key,
+            "s3.bucket.created",
+            json!({ "bucket": bucket.name, "new_folder": true }),
+        )
+        .await;
         if public {
             s3::set_anonymous(
                 self.state.pool(),
@@ -792,6 +819,12 @@ impl S3 for GonoS3 {
             )
             .await
             .map_err(error::database)?;
+            self.audit(
+                key,
+                "s3.bucket.anonymous",
+                json!({ "bucket": bucket.name, "anonymous": "public-read", "list": false }),
+            )
+            .await;
         }
         Ok(S3Response::new(dto::CreateBucketOutput {
             location: Some(format!("/{name}")),
@@ -828,6 +861,8 @@ impl S3 for GonoS3 {
         s3::delete_bucket(self.state.pool(), bucket.owner_id, bucket.id)
             .await
             .map_err(error::database)?;
+        self.audit(key, "s3.bucket.removed", json!({ "bucket": bucket.name }))
+            .await;
         // The folder goes too, if nothing has arrived in it since.
         if let Err(err) = self
             .state
@@ -924,9 +959,17 @@ impl S3 for GonoS3 {
             }
         };
         let list = mode != Anonymous::Private && bucket.anonymous_list;
-        s3::set_anonymous(self.state.pool(), bucket.owner_id, bucket.id, mode, list)
-            .await
-            .map_err(error::database)?;
+        if (bucket.anonymous, bucket.anonymous_list) != (mode, list) {
+            s3::set_anonymous(self.state.pool(), bucket.owner_id, bucket.id, mode, list)
+                .await
+                .map_err(error::database)?;
+            self.audit(
+                signing_key(&auth)?,
+                "s3.bucket.anonymous",
+                json!({ "bucket": bucket.name, "anonymous": mode.as_str(), "list": list }),
+            )
+            .await;
+        }
         Ok(S3Response::new(dto::PutBucketAclOutput::default()))
     }
 

@@ -101,6 +101,7 @@ async fn fixture_with(files: bool) -> Fixture {
         admin: None,
         files: files.then(|| Arc::new(Files::new())),
         connect: None,
+        s3: None,
     };
     Fixture {
         _dir: dir,
@@ -1910,4 +1911,674 @@ async fn secrets_shown_once_stay_with_the_account_of_their_session() {
         "/apps/account/",
         "nothing to show to bob"
     );
+}
+
+/// The S3 API as the pages see it: on, with anonymous access allowed or not.
+fn s3_on(allow_anonymous: bool) -> Option<Arc<crate::s3::S3Ui>> {
+    Some(Arc::new(crate::s3::S3Ui {
+        public_url: Some(Url::parse("https://s3.example.com").unwrap()),
+        region: "eu-test-1".to_owned(),
+        bucket_folder: "Buckets".to_owned(),
+        allow_anonymous,
+    }))
+}
+
+/// The kinds of alice's audit records, oldest first.
+async fn audit_kinds(f: &Fixture) -> Vec<(String, String)> {
+    let mut kinds: Vec<(String, String)> =
+        gono_server_core::audit::list(&f.state.db, Some(1), None, 1000)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.kind, entry.actor))
+            .collect();
+    kinds.reverse();
+    kinds
+}
+
+#[tokio::test]
+async fn the_s3_part_of_the_account_page_is_there_only_while_the_s3_api_is_on() {
+    let f = fixture().await;
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+    let page = browser.get("/apps/account/").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        !page.text().contains("/apps/account/s3/"),
+        "{}",
+        page.text()
+    );
+    assert!(!page.text().contains("S3"));
+    for (uri, fields) in [
+        ("/apps/account/s3/buckets", vec![("name", "photos")]),
+        (
+            "/apps/account/s3/buckets/bind",
+            vec![("name", "photos"), ("folder", "/Photos")],
+        ),
+        ("/apps/account/s3/buckets/1/anonymous", vec![]),
+        ("/apps/account/s3/buckets/1/delete", vec![]),
+        ("/apps/account/s3/keys", vec![("label", "rclone")]),
+        ("/apps/account/s3/keys/1/delete", vec![]),
+    ] {
+        let mut fields = fields;
+        fields.push(("csrf", &csrf));
+        assert_eq!(
+            browser.post(uri, &fields).await.status,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    assert_eq!(
+        browser.get("/apps/account/s3/created").await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert!(
+        gono_server_core::s3::buckets_of(&f.state.db, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn buckets_are_created_bound_changed_and_removed_on_the_account_page() {
+    use gono_server_core::s3::{self, Anonymous};
+    let mut f = fixture().await;
+    f.state.s3 = s3_on(true);
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+    let page = browser.get("/apps/account/").await;
+    let text = page.text();
+    assert!(text.contains("S3 buckets"), "{text}");
+    assert!(text.contains("https://s3.example.com"));
+    assert!(text.contains("eu-test-1"));
+    assert!(text.contains("Path style: https://s3.example.com/&#60;bucket&#62;/&#60;key&#62;"));
+    assert!(text.contains("Creates the folder /Buckets/&#60;name&#62; in your files."));
+    assert!(text.contains("the folder and its files stay"));
+
+    // A new bucket gets a new folder.
+    let created = browser
+        .post(
+            "/apps/account/s3/buckets",
+            &[("csrf", &csrf), ("name", "photos")],
+        )
+        .await;
+    assert_eq!(created.location(), "/apps/account/?done=s3-bucket-created");
+    let photos = s3::bucket(&f.state.db, "photos").await.unwrap().unwrap();
+    assert_eq!(photos.owner_id, 1);
+    assert_eq!(photos.folder.as_str(), "Buckets/photos");
+    assert_eq!(photos.anonymous, Anonymous::Private);
+    assert_eq!(
+        browser
+            .dav(&f.device, "PROPFIND", "Buckets/photos", "")
+            .await
+            .status,
+        StatusCode::MULTI_STATUS
+    );
+    let page = browser.get("/apps/account/?done=s3-bucket-created").await;
+    assert!(page.text().contains("The bucket was created."));
+    assert!(page.text().contains("href=\"/apps/files/Buckets/photos/\""));
+    let ids = web::element_ids(&page.text());
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(ids.len(), unique.len(), "duplicate ids in {ids:?}");
+
+    // Names follow the S3 rules and are unique; an existing folder is not taken over.
+    for (name, error) in [
+        ("photos", "You have a bucket named photos already."),
+        ("Photos", "Bucket names have 3 to 63 characters"),
+        ("ab", "Bucket names have 3 to 63 characters"),
+    ] {
+        let refused = browser
+            .post(
+                "/apps/account/s3/buckets",
+                &[("csrf", &csrf), ("name", name)],
+            )
+            .await;
+        assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY, "{name}");
+        assert!(refused.text().contains(error), "{name}: {}", refused.text());
+        assert!(
+            refused.text().contains(&format!("value=\"{name}\"")),
+            "kept"
+        );
+    }
+    assert_eq!(
+        browser
+            .dav(&f.device, "MKCOL", "Buckets/backup", "")
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+    let exists = browser
+        .post(
+            "/apps/account/s3/buckets",
+            &[("csrf", &csrf), ("name", "backup")],
+        )
+        .await;
+    assert_eq!(exists.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        exists
+            .text()
+            .contains("The folder /Buckets/backup exists already."),
+        "{}",
+        exists.text()
+    );
+
+    // An existing folder becomes a bucket.
+    assert_eq!(
+        browser.dav(&f.device, "MKCOL", "Media", "").await.status,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        browser.dav(&f.device, "PUT", "notes.txt", "x").await.status,
+        StatusCode::CREATED
+    );
+    for (name, folder, error) in [
+        ("media", "/Nope", "You have no folder /Nope."),
+        ("media", "/notes.txt", "/notes.txt is a file, not a folder."),
+        (
+            "media",
+            "/",
+            "The top level of your files cannot be a bucket.",
+        ),
+        ("media", "/Buckets", "lies inside or above another bucket"),
+        (
+            "other",
+            "/Buckets/photos",
+            "The folder /Buckets/photos is a bucket already.",
+        ),
+    ] {
+        let refused = browser
+            .post(
+                "/apps/account/s3/buckets/bind",
+                &[("csrf", &csrf), ("name", name), ("folder", folder)],
+            )
+            .await;
+        assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY, "{folder}");
+        assert!(
+            refused.text().contains(error),
+            "{folder}: {}",
+            refused.text()
+        );
+    }
+    let bound = browser
+        .post(
+            "/apps/account/s3/buckets/bind",
+            &[("csrf", &csrf), ("name", "media"), ("folder", "/Media/")],
+        )
+        .await;
+    assert_eq!(bound.location(), "/apps/account/?done=s3-bucket-bound");
+    let media = s3::bucket(&f.state.db, "media").await.unwrap().unwrap();
+    assert_eq!(media.folder.as_str(), "Media");
+
+    // Anonymous access; listing goes with some anonymous access only.
+    let anonymous = format!("/apps/account/s3/buckets/{}/anonymous", photos.id);
+    let public = browser
+        .post(
+            &anonymous,
+            &[
+                ("csrf", &csrf),
+                ("anonymous", "public-read"),
+                ("list", "on"),
+            ],
+        )
+        .await;
+    assert_eq!(public.location(), "/apps/account/?done=s3-bucket-anonymous");
+    let changed = s3::bucket(&f.state.db, "photos").await.unwrap().unwrap();
+    assert_eq!(
+        (changed.anonymous, changed.anonymous_list),
+        (Anonymous::PublicRead, true)
+    );
+    let page = browser.get("/apps/account/").await;
+    assert!(
+        page.text()
+            .contains("<option value=\"public-read\" selected>"),
+        "{}",
+        page.text()
+    );
+    let private = browser
+        .post(
+            &anonymous,
+            &[("csrf", &csrf), ("anonymous", "private"), ("list", "on")],
+        )
+        .await;
+    assert_eq!(private.status, StatusCode::SEE_OTHER);
+    let changed = s3::bucket(&f.state.db, "photos").await.unwrap().unwrap();
+    assert_eq!(
+        (changed.anonymous, changed.anonymous_list),
+        (Anonymous::Private, false)
+    );
+    let acl = browser
+        .post(&anonymous, &[("csrf", &csrf), ("anonymous", "acl")])
+        .await;
+    assert_eq!(acl.status, StatusCode::SEE_OTHER);
+    let bogus = browser
+        .post(&anonymous, &[("csrf", &csrf), ("anonymous", "everyone")])
+        .await;
+    assert_eq!(bogus.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        s3::bucket(&f.state.db, "photos")
+            .await
+            .unwrap()
+            .unwrap()
+            .anonymous,
+        Anonymous::Acl
+    );
+
+    // Removing unbinds: the folder and its files stay.
+    assert_eq!(
+        browser
+            .dav(&f.device, "PUT", "Buckets/photos/cat.jpg", "meow")
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+    let removed = browser
+        .post(
+            &format!("/apps/account/s3/buckets/{}/delete", photos.id),
+            &[("csrf", &csrf)],
+        )
+        .await;
+    assert_eq!(removed.location(), "/apps/account/?done=s3-bucket-removed");
+    assert!(s3::bucket(&f.state.db, "photos").await.unwrap().is_none());
+    let file = browser
+        .dav(&f.device, "GET", "Buckets/photos/cat.jpg", "")
+        .await;
+    assert_eq!(file.status, StatusCode::OK);
+    assert_eq!(file.text(), "meow");
+    let again = browser
+        .post(
+            &format!("/apps/account/s3/buckets/{}/delete", photos.id),
+            &[("csrf", &csrf)],
+        )
+        .await;
+    assert_eq!(again.location(), "/apps/account/", "nothing left to remove");
+
+    assert_eq!(
+        audit_kinds(&f).await,
+        [
+            ("s3.bucket.created", "user"),
+            ("s3.bucket.created", "user"),
+            ("s3.bucket.anonymous", "user"),
+            ("s3.bucket.anonymous", "user"),
+            ("s3.bucket.anonymous", "user"),
+            ("s3.bucket.removed", "user"),
+        ]
+        .map(|(kind, actor)| (kind.to_owned(), actor.to_owned()))
+    );
+}
+
+#[tokio::test]
+async fn anonymous_access_needs_the_server_to_allow_it() {
+    use gono_server_core::s3::{self, Anonymous};
+    let mut f = fixture().await;
+    f.state.s3 = s3_on(false);
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+    browser
+        .post(
+            "/apps/account/s3/buckets",
+            &[("csrf", &csrf), ("name", "photos")],
+        )
+        .await;
+    let photos = s3::bucket(&f.state.db, "photos").await.unwrap().unwrap();
+    let page = browser.get("/apps/account/").await;
+    let text = page.text();
+    assert!(
+        text.contains("Anonymous access is off on this server"),
+        "{text}"
+    );
+    assert!(text.contains(&format!(
+        "<select id=\"s3-anon-{}\" name=\"anonymous\" aria-label=\"Anonymous access photos\" disabled>",
+        photos.id
+    )));
+    assert!(!text.contains("Make private"), "private already");
+
+    let anonymous = format!("/apps/account/s3/buckets/{}/anonymous", photos.id);
+    for fields in [
+        vec![("anonymous", "public-read")],
+        vec![("anonymous", "acl"), ("list", "on")],
+    ] {
+        let mut fields = fields;
+        fields.push(("csrf", &csrf));
+        let refused = browser.post(&anonymous, &fields).await;
+        assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            refused
+                .text()
+                .contains("Anonymous access is off on this server: buckets can only be private.")
+        );
+    }
+    let stored = s3::bucket(&f.state.db, "photos").await.unwrap().unwrap();
+    assert_eq!(
+        (stored.anonymous, stored.anonymous_list),
+        (Anonymous::Private, false)
+    );
+
+    // A setting stored earlier is shown, and can still be made private.
+    s3::set_anonymous(&f.state.db, 1, photos.id, Anonymous::PublicRead, true)
+        .await
+        .unwrap();
+    let page = browser.get("/apps/account/").await;
+    assert!(
+        page.text()
+            .contains("<option value=\"public-read\" selected>")
+    );
+    assert!(page.text().contains("Make private"));
+    let private = browser
+        .post(&anonymous, &[("csrf", &csrf), ("anonymous", "private")])
+        .await;
+    assert_eq!(
+        private.location(),
+        "/apps/account/?done=s3-bucket-anonymous"
+    );
+    let stored = s3::bucket(&f.state.db, "photos").await.unwrap().unwrap();
+    assert_eq!(
+        (stored.anonymous, stored.anonymous_list),
+        (Anonymous::Private, false)
+    );
+}
+
+/// The text of the first `<dd class="mono">` after `label` on a page.
+fn fact(text: &str, label: &str) -> String {
+    let start = text
+        .find(label)
+        .unwrap_or_else(|| panic!("{label} in {text}"));
+    let rest = &text[start..];
+    let start = rest.find("<dd class=\"mono\">").unwrap() + 17;
+    rest[start..start + rest[start..].find('<').unwrap()].to_owned()
+}
+
+#[tokio::test]
+async fn s3_access_keys_are_created_shown_once_and_revoked() {
+    use gono_server_core::{
+        Permission,
+        s3::{self, Grant},
+    };
+    let mut f = fixture().await;
+    f.state.s3 = s3_on(true);
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+    browser
+        .post(
+            "/apps/account/s3/buckets",
+            &[("csrf", &csrf), ("name", "photos")],
+        )
+        .await;
+    let photos = s3::bucket(&f.state.db, "photos").await.unwrap().unwrap();
+    let grant_field = format!("bucket_{}", photos.id);
+
+    let nothing = browser
+        .post(
+            "/apps/account/s3/keys",
+            &[
+                ("csrf", &csrf),
+                ("label", "rclone"),
+                ("access", "buckets"),
+                (&grant_field, ""),
+            ],
+        )
+        .await;
+    assert_eq!(nothing.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        nothing
+            .text()
+            .contains("Choose view or full access for at least one bucket.")
+    );
+    assert!(nothing.text().contains("value=\"rclone\""), "kept");
+    assert!(nothing.text().contains(
+        "id=\"s3-access-buckets\" type=\"radio\" name=\"access\" value=\"buckets\" checked"
+    ));
+    let bad_expiry = browser
+        .post(
+            "/apps/account/s3/keys",
+            &[
+                ("csrf", &csrf),
+                ("label", "rclone"),
+                ("expires_in_days", "0"),
+            ],
+        )
+        .await;
+    assert_eq!(bad_expiry.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(s3::list_keys(&f.state.db, 1).await.unwrap().is_empty());
+
+    let created = browser
+        .post(
+            "/apps/account/s3/keys",
+            &[
+                ("csrf", &csrf),
+                ("label", "rclone"),
+                ("expires_in_days", "30"),
+                ("access", "buckets"),
+                (&grant_field, "view"),
+            ],
+        )
+        .await;
+    assert_eq!(created.location(), "/apps/account/s3/created");
+    let shown = browser.get("/apps/account/s3/created").await;
+    assert_eq!(shown.status, StatusCode::OK);
+    assert_eq!(shown.header("cache-control"), "no-store");
+    let text = shown.text();
+    let access_key_id = fact(&text, "Access key ID");
+    assert!(s3::is_access_key_id(&access_key_id), "{access_key_id}");
+    let start = text.find("<div class=\"secret\">").expect("secret") + 20;
+    let secret = text[start..start + text[start..].find('<').unwrap()].to_owned();
+    assert_eq!(secret.len(), 40, "{secret}");
+    assert_eq!(fact(&text, "Endpoint"), "https://s3.example.com");
+    assert_eq!(fact(&text, "Region"), "eu-test-1");
+    assert!(text.contains("photos <span class=\"perm\">view</span>"));
+
+    // The secret signs requests of this key, and is never shown again.
+    let sealing = gono_server_core::two_factor::Key::from_bytes(&[9; 32]);
+    let signing = s3::signing_key(&f.state.db, &sealing, &access_key_id, db::unix_now())
+        .await
+        .unwrap()
+        .expect("the key signs");
+    assert_eq!(signing.secret.expose_secret(), secret);
+    let again = browser.get("/apps/account/s3/created").await;
+    assert_eq!(again.location(), "/apps/account/", "shown once");
+    let page = browser.get("/apps/account/").await;
+    assert!(page.text().contains(&access_key_id));
+    assert!(page.text().contains("rclone"));
+    assert!(!page.text().contains(&secret));
+    let keys = s3::list_keys(&f.state.db, 1).await.unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(
+        keys[0].grants,
+        [Grant {
+            bucket_id: Some(photos.id),
+            permission: Permission::View,
+        }]
+    );
+    assert!(keys[0].expires_at.is_some());
+    // S3 keys are not app passwords.
+    assert!(
+        app_passwords::list(&f.state.db, 1)
+            .await
+            .unwrap()
+            .iter()
+            .all(|password| password.label != "rclone")
+    );
+
+    let everything = browser
+        .post(
+            "/apps/account/s3/keys",
+            &[("csrf", &csrf), ("label", "backup"), ("access", "all")],
+        )
+        .await;
+    assert_eq!(everything.location(), "/apps/account/s3/created");
+    let keys = s3::list_keys(&f.state.db, 1).await.unwrap();
+    assert_eq!(keys[1].grants, [Grant::everything()]);
+    assert_eq!(keys[1].expires_at, None);
+
+    let revoked = browser
+        .post(
+            &format!("/apps/account/s3/keys/{}/delete", keys[0].id),
+            &[("csrf", &csrf)],
+        )
+        .await;
+    assert_eq!(revoked.location(), "/apps/account/?done=s3-key-revoked");
+    assert!(
+        s3::signing_key(&f.state.db, &sealing, &access_key_id, db::unix_now())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let keys = s3::list_keys(&f.state.db, 1).await.unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].label, "backup");
+    assert!(
+        browser
+            .get("/apps/account/?done=s3-key-revoked")
+            .await
+            .text()
+            .contains("The access key was revoked.")
+    );
+    let kinds: Vec<String> = audit_kinds(&f)
+        .await
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .filter(|kind| kind.starts_with("s3.key."))
+        .collect();
+    assert_eq!(
+        kinds,
+        ["s3.key.created", "s3.key.created", "s3.key.revoked"]
+    );
+}
+
+#[tokio::test]
+async fn s3_forms_need_the_session_csrf_token_and_the_users_own_buckets() {
+    use gono_server_core::s3::{self, Anonymous, BucketName};
+    let mut f = fixture().await;
+    f.state.s3 = s3_on(true);
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+    let missing = browser
+        .post("/apps/account/s3/buckets", &[("name", "photos")])
+        .await;
+    assert_eq!(missing.status, StatusCode::FORBIDDEN);
+    let wrong = browser
+        .post(
+            "/apps/account/s3/keys",
+            &[("csrf", "nope"), ("label", "rclone")],
+        )
+        .await;
+    assert_eq!(wrong.status, StatusCode::FORBIDDEN);
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs([("csrf", csrf.as_str()), ("name", "photos")])
+        .finish();
+    let foreign = browser
+        .send(
+            "POST",
+            "/apps/account/s3/buckets",
+            &[
+                ("Content-Type", "application/x-www-form-urlencoded"),
+                ("Origin", "https://evil.example"),
+            ],
+            Body::from(body),
+        )
+        .await;
+    assert_eq!(foreign.status, StatusCode::FORBIDDEN);
+    assert!(s3::buckets_of(&f.state.db, 1).await.unwrap().is_empty());
+    assert!(s3::list_keys(&f.state.db, 1).await.unwrap().is_empty());
+
+    // Another account's bucket and key are out of reach.
+    let layout = DataLayout::new(f._dir.path().join("data"));
+    let hash = password::hash(&SecretString::from("bob password".to_owned())).unwrap();
+    let bob = users::create(
+        &f.state.db,
+        &NewUser {
+            username: &Username::new("bob").unwrap(),
+            display_name: "Bob",
+            password_hash: &hash,
+            is_admin: false,
+        },
+        |id| layout.create_user(id),
+    )
+    .await
+    .unwrap();
+    let bob_identity = gono_server_dav::Identity::for_web_session(
+        bob,
+        Username::new("bob").unwrap(),
+        "Bob".to_owned(),
+    );
+    let folder = f
+        .state
+        .dav
+        .fs()
+        .put_folder(
+            bob_identity,
+            &gono_server_core::RelPath::parse("Shared").unwrap(),
+        )
+        .await
+        .unwrap();
+    let shared = s3::create_bucket(
+        &f.state.db,
+        bob,
+        &BucketName::new("shared").unwrap(),
+        folder.file_id.unwrap(),
+    )
+    .await
+    .unwrap();
+    let sealing = gono_server_core::two_factor::Key::from_bytes(&[9; 32]);
+    let (bob_key, _) = s3::create_key(
+        &f.state.db,
+        &sealing,
+        bob,
+        "bob's",
+        vec![s3::Grant::everything()],
+        None,
+    )
+    .await
+    .unwrap();
+    let anonymous = browser
+        .post(
+            &format!("/apps/account/s3/buckets/{}/anonymous", shared.id),
+            &[("csrf", &csrf), ("anonymous", "public-read")],
+        )
+        .await;
+    assert_eq!(anonymous.status, StatusCode::NOT_FOUND);
+    browser
+        .post(
+            &format!("/apps/account/s3/buckets/{}/delete", shared.id),
+            &[("csrf", &csrf)],
+        )
+        .await;
+    browser
+        .post(
+            &format!("/apps/account/s3/keys/{}/delete", bob_key.id),
+            &[("csrf", &csrf)],
+        )
+        .await;
+    let taken = browser
+        .post(
+            "/apps/account/s3/buckets",
+            &[("csrf", &csrf), ("name", "shared")],
+        )
+        .await;
+    assert!(
+        taken
+            .text()
+            .contains("The bucket name shared is taken on this server."),
+        "{}",
+        taken.text()
+    );
+    let kept = s3::bucket(&f.state.db, "shared").await.unwrap().unwrap();
+    assert_eq!(kept.anonymous, Anonymous::Private);
+    assert_eq!(s3::list_keys(&f.state.db, bob).await.unwrap().len(), 1);
+    // A grant for another account's bucket is ignored: it is not among alice's buckets.
+    let foreign_grant = browser
+        .post(
+            "/apps/account/s3/keys",
+            &[
+                ("csrf", &csrf),
+                ("label", "sneaky"),
+                ("access", "buckets"),
+                (&format!("bucket_{}", shared.id), "full"),
+            ],
+        )
+        .await;
+    assert_eq!(foreign_grant.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(s3::list_keys(&f.state.db, 1).await.unwrap().is_empty());
 }

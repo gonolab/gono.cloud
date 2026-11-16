@@ -98,7 +98,9 @@ pub struct Files {
     /// Running `.zip` downloads per user.
     zips: Mutex<HashMap<i64, usize>>,
     /// New app passwords of the account page, waiting to be shown once.
-    created: account::CreatedStore,
+    created: account::CreatedStore<account::NewAppPassword>,
+    /// New S3 access keys of the account page, waiting to be shown once.
+    s3_created: account::CreatedStore<account::s3::NewKey>,
 }
 
 /// A running `.zip` download; frees its place when dropped.
@@ -204,6 +206,28 @@ pub fn routes() -> Router<AppState> {
         .route(
             &format!("{ACCOUNT}/two-factor/disable"),
             post(account::two_factor_disable),
+        )
+        .route(
+            &format!("{ACCOUNT}/s3/buckets"),
+            post(account::s3::create_bucket),
+        )
+        .route(
+            &format!("{ACCOUNT}/s3/buckets/bind"),
+            post(account::s3::bind_bucket),
+        )
+        .route(
+            &format!("{ACCOUNT}/s3/buckets/{{id}}/anonymous"),
+            post(account::s3::set_anonymous),
+        )
+        .route(
+            &format!("{ACCOUNT}/s3/buckets/{{id}}/delete"),
+            post(account::s3::remove_bucket),
+        )
+        .route(&format!("{ACCOUNT}/s3/keys"), post(account::s3::create_key))
+        .route(&format!("{ACCOUNT}/s3/created"), get(account::s3::created))
+        .route(
+            &format!("{ACCOUNT}/s3/keys/{{id}}/delete"),
+            post(account::s3::revoke_key),
         )
 }
 

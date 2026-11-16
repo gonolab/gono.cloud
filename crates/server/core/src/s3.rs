@@ -388,6 +388,8 @@ pub struct S3Key {
 pub struct SigningKey {
     /// The `app_passwords` row id.
     pub id: i64,
+    /// The access key id.
+    pub access_key_id: String,
     /// Owner's id.
     pub user_id: i64,
     /// Owner's name.
@@ -657,6 +659,7 @@ pub async fn signing_key(
     .await?;
     Ok(Some(SigningKey {
         id: row.id,
+        access_key_id: access_key_id.to_owned(),
         user_id: row.user_id,
         username: Username::new(row.username)?,
         display_name: row.display_name,

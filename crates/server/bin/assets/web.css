@@ -629,6 +629,16 @@ legend { margin-bottom: 8px; padding: 0; font-size: 14px; font-weight: 500; }
 .mount-head { margin-bottom: 4px; color: var(--text-muted); font-size: 12px; font-weight: 600; }
 .inline-form { display: flex; gap: 8px; }
 .inline-form input { flex: 1; min-inline-size: 0; }
+/* S3 buckets and access keys on the account page. */
+.panel-body.sep { border-block-start: 1px solid var(--line); }
+.panel-body h3 { margin: 0 0 4px; font-size: 0.9375rem; font-weight: 600; }
+.anon-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.anon-form select { inline-size: auto; min-inline-size: 12rem; }
+.anon-form .check { margin: 0; }
+td.end .actions { justify-content: flex-end; }
+.scope:has(#s3-access-buckets:checked) .mounts { display: block; }
+.mounts .grant-row { display: grid; grid-template-columns: 1fr 140px; gap: 8px; align-items: center; }
+.mounts .grant-row:not(.mount-head) { margin-bottom: 8px; }
 
 /* ---------------------------------------------------------------------------------------------
    Notices, badges, chips, tables, facts

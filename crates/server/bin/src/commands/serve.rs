@@ -32,6 +32,7 @@ use crate::{
     janitor::Janitor,
     logging::{self, Destination},
     ratelimit::RateLimiter,
+    s3::S3Ui,
     shutdown,
     web::Web,
 };
@@ -306,6 +307,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         admin,
         files,
         connect: connect.clone(),
+        s3: S3Ui::from_config(&config.s3).map(Arc::new),
     };
     let connect_task = connect.clone().map(|connect| tokio::spawn(connect.run()));
     let on_signal = {

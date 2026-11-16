@@ -331,6 +331,8 @@ pub struct UserPage {
     /// The account's devices registered for remote access; `None` when remote connectivity is
     /// off.
     pub remote: Option<Vec<RemoteDeviceRow>>,
+    /// The account's S3 buckets and access keys; `None` when the S3 API is off.
+    pub s3: Option<super::s3::UserS3>,
 }
 
 /// One device registered for remote access.
