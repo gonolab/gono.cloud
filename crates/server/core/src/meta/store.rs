@@ -705,7 +705,9 @@ impl MetaStore {
     }
 
     /// Records that a directory was created at `rel` for an S3 key that spells it `spelled`
-    /// (`None`: as its parent's spelling and its name say).
+    /// (`None`: as its parent's spelling and its name say). Below a parent spelled otherwise
+    /// than `spelled` says, the directory is spelled as its parent instead, so that a row's
+    /// spelling always continues its parent's (the key's writer then finds the conflict).
     pub async fn record_spelled_mkdir(
         &self,
         owner: i64,
@@ -724,7 +726,11 @@ impl MetaStore {
         };
         let mut row = insert(&mut tx, owner, rel, stat, Etag::Written).await?;
         if let Some(spelled) = spelled {
-            row.s3_path = set_spelling(&mut tx, row.id, rel, spelled).await?;
+            // `insert` spelled it as its parent; only the name may differ.
+            let parent = |path: &str| path.rsplit_once('/').map(|(parent, _)| parent.to_owned());
+            if parent(row.spelled()) == parent(spelled) {
+                row.s3_path = set_spelling(&mut tx, row.id, rel, spelled).await?;
+            }
         }
         propagate(&mut tx, owner, rel, -stale_size).await?;
         let event = log_change(&mut tx, owner, row.id, rel, None, ChangeOperation::Create).await?;

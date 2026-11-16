@@ -26,7 +26,10 @@
 //!   (`files.s3_path`), and a write whose spelling differs from what is stored there already
 //!   (a key that differs only in Unicode normalization, in any segment) fails with
 //!   [`ObjectError::KeyConflict`]: one file tree cannot hold both. A folder without files below
-//!   it holds no key, so it takes the new spelling instead.
+//!   it holds no key, so it takes the new spelling instead. A write of a spelled key holds its
+//!   account's spellings shared from its checks to its record, and a write that respells a
+//!   folder holds them exclusively while it does, so no file is ever recorded with a spelling
+//!   its folder no longer has.
 //! - Every write runs to completion even if the request is dropped, like every other write.
 //!
 //! WebDAV locks are the caller's concern ([`crate::locks::write_conflict`]), as for the chunked
@@ -48,7 +51,7 @@ use gono_server_core::{
 };
 use http::Method;
 use rand::RngExt as _;
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, RwLock};
 
 use crate::{
     ctx::{Ctx, RequestInfo},
@@ -151,11 +154,15 @@ type PathLocks = HashMap<(i64, String), Weak<Mutex<()>>>;
 /// A path's lock is held from the checks of a write to its record in the database, which can
 /// take a while under load; so writers of different paths never share one: the table holds a
 /// mutex per path in use (writers of one path find the same one while any of them holds or
-/// awaits it). Folder creation is rare and short, so accounts share striped mutexes.
+/// awaits it). Folder creation is rare and short, so accounts share striped mutexes, and so do
+/// the spellings, which are held shared except while a folder is respelled.
+///
+/// Order: a path's lock, then the account's spellings, then the account's folder creation.
 #[derive(Debug)]
 pub(crate) struct ObjectLocks {
     paths: SyncMutex<PathLocks>,
     accounts: Vec<Arc<Mutex<()>>>,
+    spellings: Vec<Arc<RwLock<()>>>,
 }
 
 impl ObjectLocks {
@@ -163,7 +170,18 @@ impl ObjectLocks {
         Self {
             paths: SyncMutex::new(HashMap::new()),
             accounts: (0..STRIPES).map(|_| Arc::new(Mutex::new(()))).collect(),
+            spellings: (0..STRIPES).map(|_| Arc::new(RwLock::new(()))).collect(),
         }
+    }
+
+    fn stripe(owner: i64) -> usize {
+        usize::try_from(owner.rem_euclid(STRIPES as i64)).unwrap_or(0)
+    }
+
+    /// The lock of `owner`'s spellings: a write of a spelled key holds it shared from its
+    /// spelling checks to its record; respelling a folder holds it exclusively.
+    fn spellings(&self, owner: i64) -> Arc<RwLock<()>> {
+        self.spellings[Self::stripe(owner)].clone()
     }
 
     /// The lock of `owner`'s path `rel`. Taken before the account's lock, never after it.
@@ -188,8 +206,10 @@ impl ObjectLocks {
 
     /// The lock of `owner`'s folder creation.
     async fn account(&self, owner: i64) -> OwnedMutexGuard<()> {
-        let stripe = usize::try_from(owner.rem_euclid(STRIPES as i64)).unwrap_or(0);
-        self.accounts[stripe].clone().lock_owned().await
+        self.accounts[Self::stripe(owner)]
+            .clone()
+            .lock_owned()
+            .await
     }
 }
 
@@ -394,12 +414,17 @@ impl ScopedFs {
         let fs = self.clone();
         let ctx = Ctx::new(identity.clone(), RequestInfo::new(Method::PUT));
         detached(async move {
-            fs.create_folders(owner, &mount_root, &storage, true, spelled.as_deref())
-                .await?;
-            if let Some(spelled) = &spelled {
-                fs.align_folder_spelling(owner, &mount_root, &storage, spelled)
-                    .await?;
-            }
+            let _spellings = match &spelled {
+                Some(spelled) => Some(
+                    fs.spelled_folders(owner, &mount_root, &storage, true, spelled)
+                        .await?,
+                ),
+                None => {
+                    fs.create_folders(owner, &mount_root, &storage, true, None)
+                        .await?;
+                    None
+                }
+            };
             Ok(fs.lookup(&ctx, &location).await?)
         })
         .await
@@ -458,10 +483,65 @@ impl ScopedFs {
         Ok(format!("{root}/{below}"))
     }
 
+    /// Creates the folder `dir` (only its ancestors when `include_dir` is false) and its
+    /// missing ancestors below `mount_root`, spelled as `spelled_dir`, the spelled path of `dir`,
+    /// and makes the existing ones spelled that way: a folder spelled otherwise takes the new
+    /// spelling if no file is below it (it holds no key then), and the write fails with
+    /// [`ObjectError::KeyConflict`] otherwise.
+    ///
+    /// Returns the account's spellings held shared: the caller keeps them until its write is
+    /// recorded, so that no folder on its path is respelled meanwhile.
+    async fn spelled_folders(
+        &self,
+        owner: i64,
+        mount_root: &RelPath,
+        dir: &RelPath,
+        include_dir: bool,
+        spelled_dir: &str,
+    ) -> Result<OwnedRwLockReadGuard<()>, ObjectError> {
+        let lock = self.object_locks().spellings(owner);
+        let shared = lock.clone().read_owned().await;
+        self.create_folders(owner, mount_root, dir, include_dir, Some(spelled_dir))
+            .await?;
+        // The folder named last decides: with its spelling right, its ancestors' are too (a
+        // row is spelled as its parent, plus its own name).
+        let checked = if include_dir {
+            Some(dir.clone())
+        } else {
+            dir.parent()
+        };
+        let Some(checked) = checked.filter(|folder| folder != mount_root && !folder.is_root())
+        else {
+            return Ok(shared);
+        };
+        let spelled_checked = if include_dir {
+            spelled_dir
+        } else {
+            spelled_dir
+                .rsplit_once('/')
+                .map_or("", |(parent, _)| parent)
+        };
+        if self
+            .check_spelling(owner, &checked, spelled_checked)
+            .await
+            .is_ok()
+        {
+            return Ok(shared);
+        }
+        // Respelling: wait until no other write of the account is between its spelling checks
+        // and its record, then check again from the top.
+        drop(shared);
+        let exclusive = lock.write_owned().await;
+        self.align_folder_spelling(owner, mount_root, &checked, spelled_checked)
+            .await?;
+        Ok(exclusive.downgrade())
+    }
+
     /// Makes the folder `dir` (below the mount at `mount_root`) and its folders spelled as
     /// `spelled`, the spelled path of `dir`: a folder spelled otherwise takes the new spelling if
     /// no file is below it (it holds no key then), and the write fails with
-    /// [`ObjectError::KeyConflict`] otherwise.
+    /// [`ObjectError::KeyConflict`] otherwise. Called with the account's spellings held
+    /// exclusively.
     async fn align_folder_spelling(
         &self,
         owner: i64,
@@ -668,22 +748,20 @@ impl ScopedFs {
             ..
         } = target;
         let _path = self.object_locks().path(owner, &storage).await;
-        let spelled_parent = spelled
-            .as_deref()
-            .and_then(|spelled| spelled.rsplit_once('/'))
-            .map(|(parent, _)| parent);
-        if let Some(parent) = storage.parent() {
-            self.create_folders(owner, &mount_root, &parent, true, spelled_parent)
-                .await?;
-            // Under the path's lock, after the folders: a key that differs only in Unicode
-            // normalization from what is stored on its path cannot be stored too.
-            if let Some(spelled_parent) = spelled_parent
-                && !parent.is_root()
-            {
-                self.align_folder_spelling(owner, &mount_root, &parent, spelled_parent)
+        // Under the path's lock: a key that differs only in Unicode normalization from what is
+        // stored on its path cannot be stored too. The spellings stay held until the record.
+        let _spellings = match (&spelled, storage.parent()) {
+            (Some(spelled), Some(_)) => Some(
+                self.spelled_folders(owner, &mount_root, &storage, false, spelled)
+                    .await?,
+            ),
+            (None, Some(parent)) => {
+                self.create_folders(owner, &mount_root, &parent, true, None)
                     .await?;
+                None
             }
-        }
+            (_, None) => None,
+        };
         if let Some(spelled) = &spelled {
             self.check_spelling(owner, &storage, spelled).await?;
         }

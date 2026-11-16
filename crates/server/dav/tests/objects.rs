@@ -474,21 +474,24 @@ async fn scopes_apply_as_for_webdav() {
 async fn parallel_writes_into_new_folders_keep_their_metadata() {
     let h = Arc::new(Harness::new().await);
     let full = h.full();
-    let writes = (0..16).map(|i| {
-        let h = h.clone();
-        let full = full.clone();
-        tokio::spawn(async move {
-            h.put_object(
-                &full,
-                &format!("new/deep/{}/file-{i}", i % 2),
-                "x",
-                object(&format!("md5-{i}")),
-                WriteCondition::Always,
-            )
-            .await
-            .unwrap();
+    // Collected, so that every task is spawned before the first is awaited.
+    let writes: Vec<_> = (0..16)
+        .map(|i| {
+            let h = h.clone();
+            let full = full.clone();
+            tokio::spawn(async move {
+                h.put_object(
+                    &full,
+                    &format!("new/deep/{}/file-{i}", i % 2),
+                    "x",
+                    object(&format!("md5-{i}")),
+                    WriteCondition::Always,
+                )
+                .await
+                .unwrap();
+            })
         })
-    });
+        .collect();
     for write in writes {
         write.await.unwrap();
     }
@@ -512,21 +515,24 @@ async fn parallel_writes_into_new_folders_keep_their_metadata() {
 async fn parallel_writes_record_every_file_and_folder() {
     let h = Arc::new(Harness::new().await);
     let full = h.full();
-    let writes = (0..64).map(|i| {
-        let h = h.clone();
-        let full = full.clone();
-        tokio::spawn(async move {
-            h.put_object(
-                &full,
-                &format!("burst/{}/{}/file-{i}", i % 4, i % 3),
-                "x",
-                object(&format!("md5-{i}")),
-                WriteCondition::Always,
-            )
-            .await
-            .unwrap();
+    // Collected, so that every task is spawned before the first is awaited.
+    let writes: Vec<_> = (0..64)
+        .map(|i| {
+            let h = h.clone();
+            let full = full.clone();
+            tokio::spawn(async move {
+                h.put_object(
+                    &full,
+                    &format!("burst/{}/{}/file-{i}", i % 4, i % 3),
+                    "x",
+                    object(&format!("md5-{i}")),
+                    WriteCondition::Always,
+                )
+                .await
+                .unwrap();
+            })
         })
-    });
+        .collect();
     for write in writes {
         write.await.unwrap();
     }
@@ -694,6 +700,16 @@ async fn spellings_are_recorded_and_other_spellings_refused() {
     put(format!("{nfc}/b.txt"), format!("{nfd}/b.txt"))
         .await
         .unwrap();
+    // Also when the key's folders below the spelled one are new.
+    assert_eq!(
+        put(format!("{nfc}/new/c.txt"), format!("{nfc}/new/c.txt")).await,
+        Err(ObjectError::KeyConflict)
+    );
+    assert_eq!(
+        row(format!("{nfc}/new")).await.spelled(),
+        format!("{nfd}/new"),
+        "a new folder is spelled as its parent"
+    );
     // Folder markers: the folder's spelling must match too.
     assert_eq!(
         h.fs.put_spelled_folder(full.clone(), &p(nfc), Some(nfc))
@@ -718,4 +734,89 @@ async fn spellings_are_recorded_and_other_spellings_refused() {
         .unwrap();
     assert_eq!(row(nfc.to_owned()).await.s3_path, None);
     assert_eq!(row(format!("{nfc}/c.txt")).await.s3_path, None);
+}
+
+/// Writers of two spellings race into a folder without files: one of them may give the folder
+/// its spelling, and every write of the other spelling then fails, so no file is recorded below
+/// a folder spelled otherwise. The writers of one spelling start first and the others follow
+/// after a delay that differs from round to round, so that in some rounds the folder is respelled
+/// while the first ones are between their checks and their records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn respelling_an_empty_folder_excludes_writers_of_the_old_spelling() {
+    let h = Arc::new(Harness::new().await);
+    let full = h.full();
+    let nfc = "Caf\u{e9}";
+    let nfd = "Cafe\u{301}";
+    for round in 0..48 {
+        let folder = format!("r{round}/{nfc}");
+        let spelled_folder = |spelling: &str| format!("r{round}/{spelling}");
+        // A folder spelled in NFD without files: it holds no key.
+        h.fs.put_spelled_folder(full.clone(), &p(&folder), Some(&spelled_folder(nfd)))
+            .await
+            .unwrap();
+        let delay = std::time::Duration::from_micros(500 * (round % 12));
+        let later = if round % 2 == 0 { nfc } else { nfd };
+        // Collected, so that every task is spawned before the first is awaited.
+        let writes: Vec<_> = (0..16)
+            .map(|i| {
+                let h = h.clone();
+                let full = full.clone();
+                let spelling = if i % 2 == 0 { nfc } else { nfd };
+                let client = format!("{folder}/f{i}");
+                let spelled = format!("{}/f{i}", spelled_folder(spelling));
+                tokio::spawn(async move {
+                    if spelling == later {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let temp = h.upload("x");
+                    let result =
+                        h.fs.put_object(
+                            full,
+                            &p(&client),
+                            Some(&spelled),
+                            temp.clone(),
+                            object("1"),
+                            WriteCondition::Always,
+                        )
+                        .await;
+                    match result {
+                        Ok(_) => Some(spelling),
+                        Err(err) => {
+                            assert_eq!(err, ObjectError::KeyConflict, "{spelled}");
+                            std::fs::remove_file(temp).unwrap();
+                            None
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut written = Vec::new();
+        for write in writes {
+            written.push(write.await.unwrap());
+        }
+        let meta = h.fs.meta();
+        let folder_row = meta.get(h.owner, &p(&folder)).await.unwrap().unwrap();
+        let winner = folder_row.spelled().rsplit('/').next().unwrap().to_owned();
+        for (i, spelling) in written.iter().enumerate() {
+            let row = meta
+                .get(h.owner, &p(&format!("{folder}/f{i}")))
+                .await
+                .unwrap();
+            match spelling {
+                Some(spelling) => {
+                    assert_eq!(
+                        *spelling, winner,
+                        "round {round}: f{i} written as the loser"
+                    );
+                    let row = row.expect("a written file is recorded");
+                    assert_eq!(
+                        row.spelled(),
+                        format!("{}/f{i}", folder_row.spelled()),
+                        "round {round}: f{i} is spelled unlike its folder"
+                    );
+                }
+                None => assert!(row.is_none(), "round {round}: refused f{i} is recorded"),
+            }
+        }
+    }
 }
