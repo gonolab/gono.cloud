@@ -1,0 +1,112 @@
+# Tests of selected.txt that are expected to fail, grouped by reason. Format: one node id per
+# line; `#` starts a comment. scripts/s3-tests.sh fails when a selected test fails that is not
+# listed here, or when a listed test passes, so remove entries as the behavior changes.
+
+
+# Test defect (fails_on_rgw): the header is changed before botocore signs, so the request is
+# signed after all. Unsigned writes are refused (acceptance tests/s3.rs).
+s3tests/functional/test_headers.py::test_bucket_create_bad_authorization_empty
+s3tests/functional/test_headers.py::test_bucket_create_bad_authorization_none
+s3tests/functional/test_headers.py::test_object_create_bad_authorization_empty
+s3tests/functional/test_headers.py::test_object_create_bad_authorization_none
+
+# Design (plan 6): a public-read bucket publishes every object (the mode of mc anonymous set
+# download), listing is a switch of its own, and a public-read object needs a bucket that
+# publishes objects (AccessControlListNotSupported otherwise); S3's bucket ACL grants listing
+# only.
+s3tests/functional/test_headers.py::test_object_acl_create_contentlength_none
+s3tests/functional/test_s3.py::test_access_bucket_private_object_publicread
+s3tests/functional/test_s3.py::test_access_bucket_private_objectv2_publicread
+s3tests/functional/test_s3.py::test_access_bucket_publicread_object_private
+s3tests/functional/test_s3.py::test_access_bucket_publicread_object_publicread
+s3tests/functional/test_s3.py::test_bucket_acl_canned
+s3tests/functional/test_s3.py::test_bucket_list_objects_anonymous
+s3tests/functional/test_s3.py::test_bucket_listv2_objects_anonymous
+s3tests/functional/test_s3.py::test_cors_origin_response
+s3tests/functional/test_s3.py::test_cors_origin_wildcard
+s3tests/functional/test_s3.py::test_object_acl_canned
+s3tests/functional/test_s3.py::test_object_acl_canned_during_create
+s3tests/functional/test_s3.py::test_object_copy_canned_acl
+s3tests/functional/test_s3.py::test_object_raw_authenticated_bucket_acl
+s3tests/functional/test_s3.py::test_object_raw_get_bucket_acl
+s3tests/functional/test_s3.py::test_object_raw_get_object_acl
+
+# fails_on_rgw: s3s needs X-Amz-Date in a signed request and signs it, as S3 does.
+s3tests/functional/test_headers.py::test_object_create_amz_date_and_no_date
+s3tests/functional/test_headers.py::test_object_create_date_and_amz_date
+
+# A PutObject needs Content-Length (411 MissingContentLength), as in S3.
+s3tests/functional/test_headers.py::test_object_create_bad_contentlength_none
+s3tests/functional/test_s3.py::test_object_write_with_chunked_transfer_encoding
+
+# S3 answers a repeated CreateBucket of one's own bucket in us-east-1 with 200 (and resets its
+# ACL); Gono Cloud answers BucketAlreadyOwnedByYou, as S3 does in every other region.
+s3tests/functional/test_s3.py::test_bucket_create_exists
+s3tests/functional/test_s3.py::test_bucket_recreate_new_acl
+s3tests/functional/test_s3.py::test_bucket_recreate_not_overriding
+s3tests/functional/test_s3.py::test_bucket_recreate_overwrite_acl
+
+# Design (plan 7): bucket names are 3 to 63 characters of a-z, 0-9 and '-', without dots, so
+# that virtual-hosted style works with one wildcard certificate.
+s3tests/functional/test_s3.py::test_bucket_create_naming_good_contains_period
+
+# s3-tests sends its api_name as LocationConstraint; buckets are only created in s3.region.
+s3tests/functional/test_s3.py::test_bucket_get_location
+
+# Design (plan 5.2): a key below another key (a/b while a is an object), or a key ending in '/'
+# with a body, cannot be held by one file tree; the write is refused (409 KeyConflict or 400).
+s3tests/functional/test_s3.py::test_bucket_list_delimiter_basic
+s3tests/functional/test_s3.py::test_bucket_list_delimiter_not_skip_special
+s3tests/functional/test_s3.py::test_bucket_list_delimiter_prefix_ends_with_delimiter
+s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_basic
+s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_prefix_ends_with_delimiter
+
+# RGW sends x-amz-delete-marker: false on deletes in unversioned buckets; S3 and Gono Cloud send
+# nothing.
+s3tests/functional/test_s3.py::test_delete_marker_nonversioned
+
+# Not supported yet: ListBuckets pagination (max-buckets, continuation-token).
+s3tests/functional/test_s3.py::test_list_buckets_paginated
+
+# Not supported yet: checksums of multipart uploads (ChecksumAlgorithm on CreateMultipartUpload,
+# part checksums at completion, composite checksums).
+s3tests/functional/test_s3.py::test_multipart_checksum_sha256
+s3tests/functional/test_s3.py::test_multipart_reupload_checksum_and_etag
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc32
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc32c
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc64nvme
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_sha1
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_sha256
+
+# Design: objects keep no part boundaries, so GetObject with partNumber serves the whole object
+# as part 1 (no x-amz-mp-parts-count), and other part numbers answer 416 InvalidPartNumber.
+s3tests/functional/test_s3.py::test_multipart_get_part
+s3tests/functional/test_s3.py::test_multipart_single_get_part
+s3tests/functional/test_s3.py::test_non_multipart_get_part
+
+# Not supported: If-Match: * and If-None-Match with an ETag on writes (only If-None-Match: * and
+# If-Match with an ETag).
+s3tests/functional/test_s3.py::test_multipart_put_object_if_match
+s3tests/functional/test_s3.py::test_put_object_if_match
+
+# A completion that names part 1 twice is refused (InvalidPartOrder or InvalidPart); RGW takes
+# the last.
+s3tests/functional/test_s3.py::test_multipart_resend_first_finishes_last
+
+# Design (plan 6): anonymous requests get 403 for every refusal, missing buckets and objects
+# included, so they cannot probe what exists.
+s3tests/functional/test_s3.py::test_object_delete_key_bucket_gone
+s3tests/functional/test_s3.py::test_object_raw_get_bucket_gone
+s3tests/functional/test_s3.py::test_object_raw_get_object_gone
+
+# s3s answers an expired or out-of-range presigned URL with 400, S3 with 403.
+s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_max_range
+s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_positive_range
+s3tests/functional/test_s3.py::test_object_raw_put_authenticated_expired
+
+# fails_on_rgw: RGW-specific expectations of key and metadata encodings.
+s3tests/functional/test_s3.py::test_object_read_unreadable
+s3tests/functional/test_s3.py::test_object_set_get_unicode_metadata
+
+# s3s writes no RequestId into error documents.
+s3tests/functional/test_s3.py::test_object_requestid_matches_header_on_error

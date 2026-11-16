@@ -86,7 +86,8 @@ compatible within a major version: released clients keep working with newer serv
   the Nextcloud clients see the original time. The `gono_cloud` capability tells the Gono
   client the S3 endpoint, region and addressing (`gono_cloud.s3`). The acceptance suite drives
   it with the AWS SDK, and CI with the AWS CLI, rclone, mc and restic
-  (`acceptance/scripts/s3-clients.sh`).
+  (`acceptance/scripts/s3-clients.sh`) and a selection of Ceph's s3-tests
+  (`acceptance/scripts/s3-tests.sh`).
 
 ### Changed
 

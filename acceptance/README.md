@@ -224,3 +224,43 @@ longer publishes binaries of it). Locally: `brew install awscli rclone minio-mc 
 | `AWS`, `RCLONE`, `MC`, `RESTIC` | Client binaries to use instead of the ones on `PATH`. |
 | `NEW_TARGET_DIR=<dir>` | Cargo target directory for the server build. |
 | `KEEP_WORK_DIR=1` | Keep the configuration, data, client files and logs (`client.log`, `server.log`). |
+
+## Ceph's s3-tests
+
+```sh
+acceptance/scripts/s3-tests.sh                      # the selection
+S3_TESTS_SELECT=all KEEP_WORK_DIR=1 acceptance/scripts/s3-tests.sh   # every test, report only
+```
+
+Runs a selection of [Ceph's S3 compatibility tests](https://github.com/ceph/s3-tests) against
+the server built from this checkout: a throwaway installation with the S3 API on, the three
+users the tests need (main, alt and tenant) with an access key each, and an s3-tests
+configuration for them. [`s3-tests/selected.txt`](s3-tests/selected.txt) lists the tests that
+run and why the others do not (features outside the protocol surface, Signature Version 2,
+tests that fail on AWS too, RGW extensions);
+[`s3-tests/expected-failures.txt`](s3-tests/expected-failures.txt) lists the selected tests
+that fail, grouped by reason (design decisions, S3 features not supported yet, s3s, test
+defects). The script fails when a selected test fails that is not listed, when a listed test
+passes, or when a selected test is skipped. With `S3_TESTS_SELECT=all` it runs every test of
+`test_s3.py` and `test_headers.py` and only reports, which is how the selection was made.
+
+s3-tests is not part of this repository. It is pinned to the last commit before it moved into
+the ceph repository; set it up once:
+
+```sh
+git clone https://github.com/ceph/s3-tests.git ~/.cache/gono/s3-tests
+git -C ~/.cache/gono/s3-tests checkout 5b3987116eca0b4b8fa57d6b10f3db57bab196b6
+uv venv --python 3.12 ~/.cache/gono/s3-tests/.venv
+uv pip install --python ~/.cache/gono/s3-tests/.venv/bin/python -r acceptance/s3-tests/requirements.txt
+```
+
+CI runs the selection on Linux after the S3 client scenarios.
+
+| Variable | Effect |
+|---|---|
+| `S3_TESTS=<dir>` | The s3-tests checkout (default `~/.cache/gono/s3-tests`); the script checks its commit. |
+| `S3_TESTS_PYTHON=<path>` | Its Python (default `<S3_TESTS>/.venv/bin/python`). |
+| `S3_TESTS_SELECT=all` | Run every test and report, instead of the selection. |
+| `-- <args>` | Extra arguments for pytest, e.g. `-- -k multipart`. |
+| `NEW_TARGET_DIR=<dir>` | Cargo target directory for the server build. |
+| `KEEP_WORK_DIR=1` | Keep the configuration, data, `results.xml` (JUnit) and logs. |

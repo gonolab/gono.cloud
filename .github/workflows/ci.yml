@@ -91,9 +91,10 @@ jobs:
   # runner), rclone and restic as Ubuntu ships them, and mc built from its last release tag
   # (MinIO no longer publishes mc binaries). Virtual-hosted style uses <bucket>.s3.localhost,
   # which systemd-resolved answers with the loopback addresses. See
-  # acceptance/scripts/s3-clients.sh.
+  # acceptance/scripts/s3-clients.sh. Then the selection of Ceph's s3-tests, whose failures
+  # must match acceptance/s3-tests/expected-failures.txt (acceptance/scripts/s3-tests.sh).
   s3-clients:
-    name: S3 clients (Linux)
+    name: S3 clients and s3-tests (Linux)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -126,6 +127,30 @@ jobs:
 
       - name: S3 client scenarios
         run: acceptance/scripts/s3-clients.sh
+
+      # The last commit of ceph/s3-tests before the tests moved into the ceph repository.
+      - name: Check out s3-tests
+        uses: actions/checkout@v6
+        with:
+          repository: ceph/s3-tests
+          ref: 5b3987116eca0b4b8fa57d6b10f3db57bab196b6
+          path: s3-tests
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install the requirements of s3-tests
+        run: |
+          python -m venv s3-tests/.venv
+          s3-tests/.venv/bin/pip install --quiet -r acceptance/s3-tests/requirements.txt
+
+      - name: s3-tests (selection)
+        env:
+          S3_TESTS: ${{ github.workspace }}/s3-tests
+        run: acceptance/scripts/s3-tests.sh
 
   # Packs a debug build the way the release workflow packs release builds (on Linux a static
   # musl build with cargo-zigbuild, as released) and runs the install script end to end on the
