@@ -31,6 +31,7 @@ mod error;
 mod form;
 mod host;
 pub mod keys;
+pub mod lifecycle;
 pub mod multipart;
 mod ops;
 mod policy;

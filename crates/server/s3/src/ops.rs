@@ -2320,6 +2320,75 @@ impl S3 for GonoS3 {
         Ok(S3Response::new(dto::DeleteObjectTaggingOutput::default()))
     }
 
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<dto::GetBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<dto::GetBucketLifecycleConfigurationOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        let rules = crate::lifecycle::from_stored(bucket.lifecycle.as_deref());
+        if rules.is_empty() {
+            return Err(s3_error!(NoSuchLifecycleConfiguration));
+        }
+        Ok(S3Response::new(
+            dto::GetBucketLifecycleConfigurationOutput {
+                rules: Some(crate::lifecycle::to_config(&rules)),
+                ..Default::default()
+            },
+        ))
+    }
+
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<dto::PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<dto::PutBucketLifecycleConfigurationOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        let config = req
+            .input
+            .lifecycle_configuration
+            .ok_or_else(|| s3_error!(MalformedXML, "The lifecycle configuration is missing"))?;
+        let rules = crate::lifecycle::from_config(config)?;
+        s3::set_bucket_lifecycle(
+            self.state.pool(),
+            bucket.owner_id,
+            bucket.id,
+            Some(&crate::lifecycle::to_stored(&rules)),
+        )
+        .await
+        .map_err(error::database)?;
+        // Rules delete files: their changes are recorded.
+        self.audit(
+            signing_key(&auth)?,
+            "s3.bucket.lifecycle",
+            json!({ "bucket": bucket.name, "rules": rules.len() }),
+        )
+        .await;
+        Ok(S3Response::new(
+            dto::PutBucketLifecycleConfigurationOutput::default(),
+        ))
+    }
+
+    async fn delete_bucket_lifecycle(
+        &self,
+        req: S3Request<dto::DeleteBucketLifecycleInput>,
+    ) -> S3Result<S3Response<dto::DeleteBucketLifecycleOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        s3::set_bucket_lifecycle(self.state.pool(), bucket.owner_id, bucket.id, None)
+            .await
+            .map_err(error::database)?;
+        if bucket.lifecycle.is_some() {
+            self.audit(
+                signing_key(&auth)?,
+                "s3.bucket.lifecycle",
+                json!({ "bucket": bucket.name, "rules": 0 }),
+            )
+            .await;
+        }
+        Ok(S3Response::new(dto::DeleteBucketLifecycleOutput::default()))
+    }
+
     async fn get_bucket_tagging(
         &self,
         req: S3Request<dto::GetBucketTaggingInput>,

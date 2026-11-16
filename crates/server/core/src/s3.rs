@@ -147,6 +147,8 @@ pub struct Bucket {
     pub cors: Option<String>,
     /// The bucket's tags as a JSON object (written and read by the S3 API); `None`: none.
     pub tags: Option<String>,
+    /// The bucket's lifecycle rules as JSON (written and read by the S3 API); `None`: none.
+    pub lifecycle: Option<String>,
     /// Creation time, UNIX seconds.
     pub created_at: i64,
 }
@@ -165,6 +167,7 @@ struct BucketRow {
     anonymous_list: bool,
     cors: Option<String>,
     tags: Option<String>,
+    lifecycle: Option<String>,
     created_at: i64,
 }
 
@@ -185,6 +188,7 @@ impl TryFrom<BucketRow> for Bucket {
             anonymous_list: row.anonymous_list,
             cors: row.cors,
             tags: row.tags,
+            lifecycle: row.lifecycle,
             created_at: row.created_at,
         })
     }
@@ -192,7 +196,7 @@ impl TryFrom<BucketRow> for Bucket {
 
 const BUCKET_QUERY: &str = "SELECT b.id, b.name, b.owner_id, u.username AS owner_name, \
      u.display_name AS owner_display_name, u.enabled AS owner_enabled, b.root_file_id, f.rel_path, \
-     b.anonymous, b.anonymous_list, b.cors, b.tags, b.created_at \
+     b.anonymous, b.anonymous_list, b.cors, b.tags, b.lifecycle, b.created_at \
      FROM s3_buckets b JOIN files f ON f.id = b.root_file_id JOIN users u ON u.id = b.owner_id";
 
 /// The bucket called `name`, if there is one.
@@ -379,6 +383,37 @@ pub async fn set_bucket_tags(pool: &Pool, owner: i64, id: i64, tags: Option<&str
         .rows_affected();
     tx.commit().await?;
     Ok(changed == 1)
+}
+
+/// Replaces the lifecycle rules of `owner`'s bucket `id` with `lifecycle` (JSON; `None`
+/// removes them). Returns `false` if there is no such bucket.
+pub async fn set_bucket_lifecycle(
+    pool: &Pool,
+    owner: i64,
+    id: i64,
+    lifecycle: Option<&str>,
+) -> Result<bool> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let changed =
+        sqlx::query("UPDATE s3_buckets SET lifecycle = ?3 WHERE id = ?1 AND owner_id = ?2")
+            .bind(id)
+            .bind(owner)
+            .bind(lifecycle)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    tx.commit().await?;
+    Ok(changed == 1)
+}
+
+/// The buckets with lifecycle rules, of enabled accounts.
+pub async fn buckets_with_lifecycle(pool: &Pool) -> Result<Vec<Bucket>> {
+    let rows: Vec<BucketRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "{BUCKET_QUERY} WHERE b.lifecycle IS NOT NULL AND u.enabled = 1 ORDER BY b.id"
+    )))
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(Bucket::try_from).collect()
 }
 
 /// What an access key may reach: one bucket, or (`bucket_id` `None`) every bucket of its owner.

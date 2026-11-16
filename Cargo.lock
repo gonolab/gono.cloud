@@ -1694,6 +1694,8 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sqlx",
+ "tempfile",
  "time",
  "tokio",
  "tower-service",

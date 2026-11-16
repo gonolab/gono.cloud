@@ -800,6 +800,19 @@ pub(crate) async fn abort(
     Ok(S3Response::new(dto::AbortMultipartUploadOutput::default()))
 }
 
+/// Gives up the upload `upload_id` with its parts (a lifecycle rule), unless it is being
+/// completed right now. Returns whether it did.
+pub(crate) async fn give_up(state: &S3State, upload_id: &str) -> gono_server_core::Result<bool> {
+    let Some(_completing) = state.begin_completion(upload_id) else {
+        return Ok(false);
+    };
+    let removed = s3::delete_upload(state.pool(), upload_id).await?;
+    if removed {
+        remove_staging(state, upload_id).await;
+    }
+    Ok(removed)
+}
+
 /// Removes the staging directory of `upload_id`.
 async fn remove_staging(state: &S3State, upload_id: &str) {
     let dir = state.fs().layout().s3_upload_dir(upload_id);

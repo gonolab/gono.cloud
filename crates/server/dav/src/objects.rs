@@ -683,6 +683,60 @@ impl ScopedFs {
         .await
     }
 
+    /// Deletes the file at client path `client` if it is still the version with WebDAV ETag
+    /// `etag`, and on disk as recorded. Returns `false`, deleting nothing, otherwise: for
+    /// deletions the server decides on its own (lifecycle rules), a write that came since
+    /// wins. WebDAV locks are the caller's concern, as for every object write.
+    pub async fn delete_object_version(
+        &self,
+        identity: Arc<Identity>,
+        client: &RelPath,
+        etag: &str,
+    ) -> Result<bool, ObjectError> {
+        let target = self.object_target(identity, client, Method::DELETE).await?;
+        let fs = self.clone();
+        let etag = etag.to_owned();
+        detached(async move {
+            let _path = fs.object_locks().path(target.owner, &target.storage).await;
+            let row = fs
+                .meta()
+                .get(target.owner, &target.storage)
+                .await
+                .map_err(object_db_error)?;
+            let Some(row) = row.filter(|row| !row.is_dir && row.etag == etag) else {
+                return Ok(false);
+            };
+            let root = fs.user_root(target.owner);
+            let rel = target.storage.clone();
+            let removed = blocking(move || {
+                match lstat_beneath(&root, &rel).map_err(object_io_error)? {
+                    Some(meta) if meta.is_file() => {
+                        let stat = disk_stat(&meta);
+                        if stat.mtime_ns != row.mtime_ns || stat.size != row.size {
+                            return Ok(false);
+                        }
+                    }
+                    _ => return Ok(false),
+                }
+                match std::fs::remove_file(rel.to_fs_path(&root)) {
+                    Ok(()) => Ok(true),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+                    Err(err) => Err(object_io_error(err)),
+                }
+            })
+            .await?;
+            if removed {
+                fs.meta()
+                    .record_delete(target.owner, &target.storage)
+                    .await
+                    .map_err(object_db_error)?;
+                target.ctx.forget(&target.storage);
+            }
+            Ok(removed)
+        })
+        .await
+    }
+
     /// Deletes the file at client path `client`. Returns `false` when there is no file there
     /// (nothing, or a folder): deleting a missing object succeeds in S3. Parent folders stay.
     pub async fn delete_object(

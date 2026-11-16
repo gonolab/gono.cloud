@@ -172,6 +172,9 @@ CREATE TABLE s3_buckets (
     cors           TEXT    CHECK (cors IS NULL OR json_valid(cors)),
     -- The bucket's tags (PutBucketTagging) as a JSON object; NULL: none.
     tags           TEXT    CHECK (tags IS NULL OR json_valid(tags)),
+    -- The bucket's lifecycle rules (PutBucketLifecycleConfiguration) as JSON, written and read
+    -- by the S3 API and applied by its background task; NULL: none.
+    lifecycle      TEXT    CHECK (lifecycle IS NULL OR json_valid(lifecycle)),
     created_at     INTEGER NOT NULL
 ) STRICT;
 
@@ -274,6 +277,10 @@ CREATE TABLE object_meta (
     checksum_type       TEXT    CHECK (checksum_type IN ('FULL_OBJECT', 'COMPOSITE')),
     -- The object's tags (`x-amz-tagging`, PutObjectTagging) as a JSON object of strings.
     tags                TEXT    NOT NULL DEFAULT '{}',
+    -- When this version was written through the S3 API, UNIX seconds: the age lifecycle rules
+    -- count from (never the modification time, which clients set). NULL for a version that
+    -- only got an ACL or tags.
+    written_at          INTEGER,
     CHECK ((checksum_algorithm IS NULL) = (checksum_value IS NULL)),
     CHECK (checksum_type IS NULL OR checksum_algorithm IS NOT NULL)
 ) STRICT;

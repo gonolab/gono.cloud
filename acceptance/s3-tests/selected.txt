@@ -4,8 +4,9 @@
 #
 # Chosen from a run of every test of test_s3.py and test_headers.py
 # (S3_TESTS_SELECT=all scripts/s3-tests.sh): every test of the protocol surface of docs/s3.md.
-# Left out: tests of features outside it (versioning, lifecycle, object lock, encryption,
-# website, select, logging, IAM and STS, public access blocks, bucket
+# Left out: tests of features outside it (versioning, object lock, encryption, website,
+# lifecycle tests that need versioning, RGW's accelerated lifecycle clock or the
+# x-amz-expiration header, select, logging, IAM and STS, public access blocks, bucket
 # policies, explicit ACL grants), Signature Version 2 (form uploads included; SigV4
 # forms are covered by tests/s3.rs), tests marked fails_on_aws, and RGW extensions (usage
 # headers, unordered listings, tenants, torrents). Tests that fail are listed with their
@@ -191,6 +192,21 @@ s3tests/functional/test_s3.py::test_get_object_ifunmodifiedsince_failed
 s3tests/functional/test_s3.py::test_get_object_ifunmodifiedsince_good
 s3tests/functional/test_s3.py::test_get_paginated_multipart_object_attributes
 s3tests/functional/test_s3.py::test_get_single_multipart_object_attributes
+s3tests/functional/test_s3.py::test_lifecycle_delete
+s3tests/functional/test_s3.py::test_lifecycle_expiration_days0
+s3tests/functional/test_s3.py::test_lifecycle_expiration_header_and_tags_head
+s3tests/functional/test_s3.py::test_lifecycle_get
+s3tests/functional/test_s3.py::test_lifecycle_get_no_id
+s3tests/functional/test_s3.py::test_lifecycle_id_too_long
+s3tests/functional/test_s3.py::test_lifecycle_invalid_status
+s3tests/functional/test_s3.py::test_lifecycle_same_id
+s3tests/functional/test_s3.py::test_lifecycle_set
+s3tests/functional/test_s3.py::test_lifecycle_set_date
+s3tests/functional/test_s3.py::test_lifecycle_set_deletemarker
+s3tests/functional/test_s3.py::test_lifecycle_set_empty_filter
+s3tests/functional/test_s3.py::test_lifecycle_set_filter
+s3tests/functional/test_s3.py::test_lifecycle_set_invalid_date
+s3tests/functional/test_s3.py::test_lifecycle_set_multipart
 s3tests/functional/test_s3.py::test_list_buckets_paginated
 s3tests/functional/test_s3.py::test_list_multipart_upload
 s3tests/functional/test_s3.py::test_multi_object_delete

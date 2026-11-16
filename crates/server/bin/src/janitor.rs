@@ -9,7 +9,9 @@
 //! - expired browser sessions ([`web_sessions::purge_expired`]);
 //! - expired direct download links ([`direct_downloads::purge_expired`]);
 //! - expired S3 multipart uploads with their parts, and part directories that belong to no
-//!   upload ([`gono_server_s3::multipart::purge`]), when the S3 API is on.
+//!   upload ([`gono_server_s3::multipart::purge`]), when the S3 API is on;
+//! - the lifecycle rules of S3 buckets ([`gono_server_s3::lifecycle::apply`]), when the S3 API
+//!   is on.
 //!
 //! Every pass is independent: a failure is logged and the next pass tries again.
 
@@ -63,6 +65,9 @@ impl Janitor {
                 Ok(0) => {}
                 Ok(removed) => tracing::info!(removed, "removed expired S3 multipart uploads"),
                 Err(err) => tracing::warn!(error = %err, "cannot clean up S3 multipart uploads"),
+            }
+            if let Err(err) = gono_server_s3::lifecycle::apply(s3, db::unix_now()).await {
+                tracing::warn!(error = %err, "cannot apply S3 lifecycle rules");
             }
         }
     }

@@ -67,9 +67,12 @@ pub(crate) fn classify(name: &str) -> Class {
             Class::BucketAdmin
         }
         "HeadBucket" => Class::HeadBucket,
-        "PutBucketCors" | "DeleteBucketCors" | "PutBucketTagging" | "DeleteBucketTagging" => {
-            Class::BucketConfig
-        }
+        "PutBucketCors"
+        | "DeleteBucketCors"
+        | "PutBucketTagging"
+        | "DeleteBucketTagging"
+        | "PutBucketLifecycleConfiguration"
+        | "DeleteBucketLifecycle" => Class::BucketConfig,
         "GetBucketLocation"
         | "GetBucketVersioning"
         | "GetBucketAcl"
@@ -77,6 +80,7 @@ pub(crate) fn classify(name: &str) -> Class {
         | "GetBucketPolicy"
         | "GetBucketPolicyStatus"
         | "GetBucketTagging"
+        | "GetBucketLifecycleConfiguration"
         | "ListMultipartUploads" => Class::BucketRead,
         "ListObjects" | "ListObjectsV2" | "ListObjectVersions" => Class::List,
         "GetObject" | "HeadObject" | "GetObjectAttributes" => Class::ObjectRead,
@@ -349,6 +353,7 @@ mod tests {
             anonymous_list: list,
             cors: None,
             tags: None,
+            lifecycle: None,
             created_at: 0,
         }
     }

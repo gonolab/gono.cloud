@@ -147,8 +147,8 @@ pub(super) async fn store_object_meta(
     sqlx::query(
         "INSERT OR REPLACE INTO object_meta (file_id, s3_etag, public_read, content_type, \
          content_encoding, content_disposition, content_language, cache_control, expires, \
-         user_meta, checksum_algorithm, checksum_value, checksum_type, tags) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         user_meta, checksum_algorithm, checksum_value, checksum_type, tags, written_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
     )
     .bind(file_id)
     .bind(meta.s3_etag.as_deref())
@@ -170,6 +170,7 @@ pub(super) async fn store_object_meta(
         }
     }))
     .bind(tags)
+    .bind(db::unix_now())
     .execute(&mut **tx)
     .await?;
     for (number, part) in (1_i64..).zip(&meta.parts) {
@@ -195,6 +196,25 @@ pub(super) async fn clear_object_meta(tx: &mut db::Tx, file_id: i64) -> Result<(
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+/// A file that lifecycle rules may expire: written through the S3 API, still that version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiryCandidate {
+    /// The file's row.
+    pub file: FileRow,
+    /// Its tags.
+    pub tags: BTreeMap<String, String>,
+    /// When the version was written through the S3 API, UNIX seconds.
+    pub written_at: i64,
+}
+
+#[derive(FromRow)]
+struct CandidateRow {
+    #[sqlx(flatten)]
+    file: Row,
+    tags: String,
+    written_at: i64,
 }
 
 /// What [`MetaStore::list_objects`] lists.
@@ -311,6 +331,44 @@ impl MetaStore {
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(ObjectMeta::from))
+    }
+
+    /// Up to `limit` files of `owner` below the folder `folder` whose current version was
+    /// written through the S3 API at or before `written_before` (any time if `None`), after
+    /// file id `after`, by id: what the lifecycle rules of a bucket on that folder judge.
+    pub async fn expiry_candidates(
+        &self,
+        owner: i64,
+        folder: &RelPath,
+        written_before: Option<i64>,
+        after: i64,
+        limit: u32,
+    ) -> Result<Vec<ExpiryCandidate>> {
+        let (lower, upper) = super::descendant_bounds(folder.as_str()).unwrap_or_default();
+        let rows: Vec<CandidateRow> = sqlx::query_as(
+            "SELECT f.id, f.rel_path, f.is_dir, f.etag, f.mtime_ns, f.size, f.favorite, \
+             f.creation_time, f.s3_path, f.md5, o.tags, o.written_at \
+             FROM files f JOIN object_meta o ON o.file_id = f.id \
+             WHERE f.owner_id = ?1 AND f.is_dir = 0 AND f.rel_path >= ?2 AND f.rel_path < ?3 \
+             AND o.s3_etag IS NOT NULL AND o.written_at IS NOT NULL \
+             AND (?4 IS NULL OR o.written_at <= ?4) AND f.id > ?5 ORDER BY f.id LIMIT ?6",
+        )
+        .bind(owner)
+        .bind(lower)
+        .bind(upper)
+        .bind(written_before)
+        .bind(after)
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ExpiryCandidate {
+                file: FileRow::from(row.file),
+                tags: serde_json::from_str(&row.tags).unwrap_or_default(),
+                written_at: row.written_at,
+            })
+            .collect())
     }
 
     /// The parts of file `file_id`'s current version, in order, if a multipart upload wrote

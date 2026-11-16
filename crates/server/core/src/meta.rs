@@ -35,8 +35,8 @@ mod store;
 
 pub use changes::{ChangeEvent, ChangeOperation, ChangeSink};
 pub use objects::{
-    Checksum, ListEntry, ListedObject, ObjectListing, ObjectMeta, ObjectPart, ObjectQuery,
-    prefix_successor,
+    Checksum, ExpiryCandidate, ListEntry, ListedObject, ObjectListing, ObjectMeta, ObjectPart,
+    ObjectQuery, prefix_successor,
 };
 pub use store::{
     DeadProp, DiskStat, FileRow, MetaStore, PropChange, Reconciled, derived_file_etag,
