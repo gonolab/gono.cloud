@@ -1921,6 +1921,7 @@ fn s3_on(allow_anonymous: bool) -> Option<Arc<crate::s3::S3Ui>> {
         bucket_folder: "Buckets".to_owned(),
         allow_anonymous,
         virtual_host_domain: None,
+        website_domain: None,
     }))
 }
 
@@ -2003,6 +2004,109 @@ async fn the_account_page_shows_virtual_hosted_style_when_enabled() {
         ),
         "{text}"
     );
+}
+
+#[tokio::test]
+async fn the_account_page_shows_tags_lifecycle_rules_and_websites_set_through_s3() {
+    use gono_server_core::s3;
+    let mut f = fixture().await;
+    let ui = |website_domain: Option<&str>| {
+        let mut ui = Arc::unwrap_or_clone(s3_on(true).unwrap());
+        ui.website_domain = website_domain.map(str::to_owned);
+        Some(Arc::new(ui))
+    };
+    f.state.s3 = ui(Some("web.example.com"));
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+    browser
+        .post(
+            "/apps/account/s3/buckets",
+            &[("csrf", &csrf), ("name", "photos")],
+        )
+        .await;
+    let photos = s3::bucket(&f.state.db, "photos").await.unwrap().unwrap();
+    let text = browser.get("/apps/account/").await.text();
+    for absent in ["Tags:", "Lifecycle:", "Deletes", "Website"] {
+        assert!(!text.contains(absent), "{absent} in {text}");
+    }
+
+    // Each setting is stored as the S3 API stores it; the page only sums it up.
+    s3::set_bucket_tags(
+        &f.state.db,
+        1,
+        photos.id,
+        Some(r#"{"team":"web","env":"prod"}"#),
+    )
+    .await
+    .unwrap();
+    let rules = [
+        r#"{"id":"cache","enabled":true,"prefix":"cache/","expiration_days":30}"#,
+        // 2025-11-16, for objects with a tag.
+        r#"{"id":"dated","enabled":true,"tags":{"kind":"tmp"},"expiration_date":1763251200}"#,
+        r#"{"id":"off","enabled":false,"prefix":"old/","expiration_days":1}"#,
+        r#"{"id":"uploads","enabled":true,"abort_days":7}"#,
+        r#"{"id":"logs","enabled":true,"prefix":"logs/","expiration_days":1}"#,
+        r#"{"id":"tmp","enabled":true,"prefix":"tmp/","size_less_than":100,"expiration_days":2}"#,
+    ];
+    let lifecycle = format!("[{}]", rules.join(","));
+    s3::set_bucket_lifecycle(&f.state.db, 1, photos.id, Some(&lifecycle))
+        .await
+        .unwrap();
+    s3::set_bucket_website(
+        &f.state.db,
+        1,
+        photos.id,
+        Some(r#"{"index_suffix":"index.html"}"#),
+    )
+    .await
+    .unwrap();
+    let text = browser.get("/apps/account/").await.text();
+    assert!(text.contains("Tags: 2 (set through the S3 API)"), "{text}");
+    assert!(text.contains("Lifecycle: 6 rules (set through the S3 API)"));
+    assert!(
+        text.contains(
+            "Deletes objects written through S3, for good: cache/* after 30 days · every object \
+             (filtered by tags or size) on 2025-11-16 · logs/* after 1 day · 1 more"
+        ),
+        "{text}"
+    );
+    assert!(text.contains(
+        "Website (set through the S3 API): <a href=\"https://photos.web.example.com/\">"
+    ));
+
+    // Rules that delete nothing say so; a website needs s3.website_domain to be served.
+    s3::set_bucket_lifecycle(&f.state.db, 1, photos.id, Some(&format!("[{}]", rules[3])))
+        .await
+        .unwrap();
+    f.state.s3 = ui(None);
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+    let text = browser.get("/apps/account/").await.text();
+    assert!(
+        text.contains("Lifecycle: 1 rule (set through the S3 API)"),
+        "{text}"
+    );
+    assert!(text.contains("Deletes no objects"));
+    assert!(text.contains(
+        "Website: set through the S3 API, but not served (s3.website_domain is not set)"
+    ));
+    assert!(!text.contains("web.example.com"));
+
+    // Chinese pages say the same.
+    let text = browser
+        .send(
+            "GET",
+            "/apps/account/",
+            &[("Accept-Language", "zh-CN,zh;q=0.9")],
+            Body::empty(),
+        )
+        .await
+        .text();
+    assert!(
+        text.contains("生命周期：1 条规则（通过 S3 API 设置）"),
+        "{text}"
+    );
+    assert!(text.contains("标签：2 个（通过 S3 API 设置）"));
 }
 
 #[tokio::test]

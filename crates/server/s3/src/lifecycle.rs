@@ -306,6 +306,68 @@ pub(crate) fn from_stored(stored: Option<&str>) -> Vec<Rule> {
         .unwrap_or_default()
 }
 
+/// When the objects of a rule expire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expires {
+    /// This many days after they were written, at the next midnight UTC.
+    AfterDays(i32),
+    /// On this date: a midnight UTC, in UNIX seconds.
+    On(i64),
+}
+
+/// What one enabled rule deletes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expiry {
+    /// The key prefix the rule applies to; empty: every key.
+    pub prefix: String,
+    /// The rule also filters by tags or object size.
+    pub filtered: bool,
+    /// When the objects expire.
+    pub expires: Expires,
+}
+
+/// A bucket's lifecycle rules in short, as the account page and the admin UI show them
+/// (read-only: only the S3 API sets rules).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Summary {
+    /// The rules, enabled or not.
+    pub rules: usize,
+    /// What the enabled rules delete, in their order. Disabled rules, and rules that only give
+    /// up multipart uploads, delete no objects and are left out.
+    pub expiries: Vec<Expiry>,
+}
+
+/// The summary of a bucket's stored rules ([`Bucket::lifecycle`]), or `None` if it has none
+/// (or they cannot be read, so that [`apply`] applies none either).
+pub fn summary(stored: Option<&str>) -> Option<Summary> {
+    let rules = from_stored(stored);
+    if rules.is_empty() {
+        return None;
+    }
+    let expiries = rules
+        .iter()
+        .filter(|rule| rule.enabled)
+        .filter_map(|rule| {
+            let expires = match (rule.expiration_days, rule.expiration_date) {
+                (Some(days), _) => Expires::AfterDays(days),
+                (None, Some(date)) => Expires::On(date),
+                (None, None) => return None,
+            };
+            Some(Expiry {
+                prefix: rule.prefix.clone(),
+                filtered: !rule.tags.is_empty()
+                    || rule.size_greater_than.is_some()
+                    || rule.size_less_than.is_some(),
+                expires,
+            })
+        })
+        .collect();
+    Some(Summary {
+        rules: rules.len(),
+        expiries,
+    })
+}
+
 impl Rule {
     /// Whether the rule applies to the object `key` of `size` bytes with `tags`.
     fn matches(&self, key: &str, size: u64, tags: &BTreeMap<String, String>) -> bool {
@@ -594,6 +656,55 @@ mod tests {
         assert_eq!(rules[0].written_before(1_763_251_199), None);
         assert_eq!(rules[0].written_before(1_763_251_200), Some(None));
         assert_eq!(rules[0].expires_at(0), Some(1_763_251_200));
+    }
+
+    #[test]
+    fn summaries_list_what_enabled_rules_delete() {
+        assert_eq!(summary(None), None);
+        assert_eq!(summary(Some("not json")), None);
+        // Days, a date, a filter, a disabled rule and one that only gives up uploads.
+        let days = rule();
+        let mut dated = rule();
+        dated.id = Some("dated".into());
+        dated.filter = Some(dto::LifecycleRuleFilter {
+            tag: Some(tag("kind", "cache")),
+            ..Default::default()
+        });
+        dated.expiration = Some(dto::LifecycleExpiration {
+            date: Some(dto::Timestamp::from(
+                time::OffsetDateTime::from_unix_timestamp(1_763_251_200).unwrap(),
+            )),
+            ..Default::default()
+        });
+        let mut disabled = rule();
+        disabled.id = Some("disabled".into());
+        disabled.status = dto::ExpirationStatus::from_static(dto::ExpirationStatus::DISABLED);
+        let mut uploads = rule();
+        uploads.id = Some("uploads".into());
+        uploads.filter = Some(dto::LifecycleRuleFilter::default());
+        uploads.expiration = None;
+        uploads.abort_incomplete_multipart_upload = Some(dto::AbortIncompleteMultipartUpload {
+            days_after_initiation: Some(7),
+        });
+        let rules = config(vec![days, dated, disabled, uploads]).unwrap();
+        assert_eq!(
+            summary(Some(&to_stored(&rules))),
+            Some(Summary {
+                rules: 4,
+                expiries: vec![
+                    Expiry {
+                        prefix: "logs/".to_owned(),
+                        filtered: false,
+                        expires: Expires::AfterDays(1),
+                    },
+                    Expiry {
+                        prefix: String::new(),
+                        filtered: true,
+                        expires: Expires::On(1_763_251_200),
+                    },
+                ],
+            })
+        );
     }
 
     #[test]

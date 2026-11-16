@@ -42,6 +42,8 @@ pub struct S3Ui {
     pub allow_anonymous: bool,
     /// `s3.virtual_host_domain`: buckets are also `<bucket>.<domain>`.
     pub virtual_host_domain: Option<String>,
+    /// `s3.website_domain`: buckets with a website configuration are `<bucket>.<domain>`.
+    pub website_domain: Option<String>,
 }
 
 impl S3Ui {
@@ -53,6 +55,7 @@ impl S3Ui {
             bucket_folder: config.bucket_folder.clone(),
             allow_anonymous: config.allow_anonymous,
             virtual_host_domain: config.virtual_host_domain.clone(),
+            website_domain: config.website_domain.clone(),
         })
     }
 
@@ -66,7 +69,19 @@ impl S3Ui {
     /// The origin of `bucket` in virtual-hosted style, `<scheme>://<bucket>.<domain>[:<port>]`
     /// with the scheme and port of the endpoint; `None` without `s3.virtual_host_domain`.
     pub fn virtual_host_origin(&self, bucket: &str) -> Option<String> {
-        let domain = self.virtual_host_domain.as_deref()?;
+        Some(self.origin(bucket, self.virtual_host_domain.as_deref()?))
+    }
+
+    /// The website of `bucket`, `<scheme>://<bucket>.<domain>[:<port>]/` with the scheme and
+    /// port of the endpoint (websites are served by the same listener); `None` without
+    /// `s3.website_domain`.
+    pub fn website_url(&self, bucket: &str) -> Option<String> {
+        let domain = self.website_domain.as_deref()?;
+        Some(format!("{}/", self.origin(bucket, domain)))
+    }
+
+    /// `<scheme>://<bucket>.<domain>[:<port>]` with the scheme and port of the endpoint.
+    fn origin(&self, bucket: &str, domain: &str) -> String {
         let scheme = self.public_url.as_ref().map_or("https", Url::scheme);
         let port = self
             .public_url
@@ -74,7 +89,7 @@ impl S3Ui {
             .and_then(Url::port)
             .map(|port| format!(":{port}"))
             .unwrap_or_default();
-        Some(format!("{scheme}://{bucket}.{domain}{port}"))
+        format!("{scheme}://{bucket}.{domain}{port}")
     }
 }
 
@@ -259,6 +274,7 @@ mod tests {
             bucket_folder: "Buckets".to_owned(),
             allow_anonymous: false,
             virtual_host_domain: domain.map(str::to_owned),
+            website_domain: None,
         }
     }
 
@@ -370,6 +386,17 @@ mod tests {
         assert_eq!(
             ui("https://s3.example.com", None).virtual_host_origin("photos"),
             None
+        );
+    }
+
+    #[test]
+    fn website_urls_keep_the_endpoints_scheme_and_port() {
+        let mut local = ui("http://s3.localhost:9000", None);
+        assert_eq!(local.website_url("site"), None);
+        local.website_domain = Some("web.localhost".to_owned());
+        assert_eq!(
+            local.website_url("site").as_deref(),
+            Some("http://site.web.localhost:9000/")
         );
     }
 }

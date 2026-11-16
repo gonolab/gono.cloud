@@ -1448,6 +1448,7 @@ mod tests {
             bucket_folder: "Buckets".to_owned(),
             allow_anonymous: true,
             virtual_host_domain: Some("s3.example.com".to_owned()),
+            website_domain: None,
         }));
         let mut request = Request::builder()
             .uri("/ocs/v2.php/cloud/capabilities?format=json")

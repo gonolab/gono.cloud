@@ -70,7 +70,7 @@ pub(super) async fn user_view(
         allow_anonymous: ui.allow_anonymous,
         buckets: buckets
             .iter()
-            .map(|bucket| BucketRow::new(t, bucket, &pages::date(bucket.created_at)))
+            .map(|bucket| BucketRow::new(t, ui, bucket, &pages::date(bucket.created_at)))
             .collect(),
         keys,
     })

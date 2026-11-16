@@ -1402,6 +1402,21 @@ async fn admins_see_revoke_and_remove_the_s3_keys_and_buckets_of_an_account() {
     s3::set_anonymous(&f.state.db, f.alice, photos.id, Anonymous::PublicRead, true)
         .await
         .unwrap();
+    // Settings only the S3 API makes, stored as it stores them.
+    s3::set_bucket_tags(&f.state.db, f.alice, photos.id, Some(r#"{"team":"web"}"#))
+        .await
+        .unwrap();
+    s3::set_bucket_lifecycle(
+        &f.state.db,
+        f.alice,
+        photos.id,
+        Some(r#"[{"id":"cache","enabled":true,"prefix":"cache/","expiration_days":30}]"#),
+    )
+    .await
+    .unwrap();
+    s3::set_bucket_website(&f.state.db, f.alice, photos.id, Some("{}"))
+        .await
+        .unwrap();
     let sealing = gono_server_core::two_factor::Key::from_bytes(&[9; 32]);
     let (key, secret) = s3::create_key(
         &f.state.db,
@@ -1438,6 +1453,7 @@ async fn admins_see_revoke_and_remove_the_s3_keys_and_buckets_of_an_account() {
         bucket_folder: "Buckets".to_owned(),
         allow_anonymous: true,
         virtual_host_domain: None,
+        website_domain: Some("web.example.com".to_owned()),
     }));
     let mut browser = Browser::new(&f.state);
     let csrf = browser.root().await;
@@ -1446,6 +1462,18 @@ async fn admins_see_revoke_and_remove_the_s3_keys_and_buckets_of_an_account() {
     assert!(page.body.contains("photos"));
     assert!(page.body.contains("/Buckets/photos"));
     assert!(page.body.contains("Every object · anonymous listing on"));
+    assert!(page.body.contains("Tags: 1 (set through the S3 API)"));
+    assert!(
+        page.body
+            .contains("Lifecycle: 1 rule (set through the S3 API)")
+    );
+    assert!(
+        page.body
+            .contains("Deletes objects written through S3, for good: cache/* after 30 days")
+    );
+    assert!(page.body.contains(
+        "Website (set through the S3 API): <a href=\"https://photos.web.example.com/\">"
+    ));
     assert!(page.body.contains(&key.access_key_id));
     assert!(page.body.contains("rclone"));
     assert!(!page.body.contains(secret.expose_secret()));

@@ -8,6 +8,9 @@
 //!   bucket only unbinds it; the folder and its files stay. Anonymous access other than private
 //!   can be set only while `s3.allow_anonymous` is on (making a bucket private always works),
 //!   and anonymous listing needs some anonymous access.
+//! - **Settings of the S3 API.** A bucket's CORS rules, tags, lifecycle rules and website
+//!   configuration are set only through the S3 API; each row sums them up, read-only
+//!   ([`BucketRow`], which the admin UI's list shares).
 //! - **Access keys.** A new key is kept in memory for its session and shown once at
 //!   `/apps/account/s3/created`, with the endpoint and region to configure; the URL carries no
 //!   secret. Its secret key is sealed with the server's key file (`two_factor.key_file`).
@@ -35,6 +38,7 @@ use gono_server_core::{
     s3::{self, Anonymous, Bucket, BucketName, Grant},
 };
 use gono_server_dav::ObjectError;
+use gono_server_s3::lifecycle;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::json;
@@ -44,6 +48,7 @@ use crate::{
     admin::{core_message, parse_expiry},
     app::AppState,
     client_ip::client_ip,
+    commands::output::format_time,
     files::{
         Visitor, internal,
         view::{display_path, url, when},
@@ -106,12 +111,72 @@ pub struct BucketRow {
     pub list: bool,
     /// "CORS: 2 rules", if the bucket has CORS rules (set through the S3 API).
     pub cors: Option<String>,
+    /// "Tags: 3", if the bucket has tags (set through the S3 API).
+    pub tags: Option<String>,
+    /// "Lifecycle: 2 rules", if the bucket has lifecycle rules (set through the S3 API).
+    pub lifecycle: Option<String>,
+    /// What those rules delete, for example "Deletes objects written through S3, for good:
+    /// logs/* after 30 days", or that they delete nothing.
+    pub expiry: Option<String>,
+    /// "Website:" with [`Self::website_url`], or that it is not served, if the bucket has a
+    /// website configuration (set through the S3 API).
+    pub website: Option<String>,
+    /// `https://<bucket>.<s3.website_domain>/`, if the bucket is a website and the domain is
+    /// set.
+    pub website_url: Option<String>,
+}
+
+/// The expiries a row names; the rest are counted.
+const EXPIRIES_SHOWN: usize = 3;
+
+/// What a bucket's lifecycle rules delete, in words.
+fn expiry_text(t: &Text, summary: &lifecycle::Summary) -> String {
+    if summary.expiries.is_empty() {
+        return t.s3_expiry_none.to_owned();
+    }
+    let mut items: Vec<String> = summary
+        .expiries
+        .iter()
+        .take(EXPIRIES_SHOWN)
+        .map(|expiry| {
+            let mut scope = if expiry.prefix.is_empty() {
+                t.s3_expiry_every.to_owned()
+            } else {
+                format!("{}*", expiry.prefix)
+            };
+            if expiry.filtered {
+                scope = fill(t.s3_expiry_filtered, &[&scope]);
+            }
+            match expiry.expires {
+                lifecycle::Expires::AfterDays(1) => fill(t.s3_expiry_day, &[&scope]),
+                lifecycle::Expires::AfterDays(days) => {
+                    fill(t.s3_expiry_days, &[&scope, &days.to_string()])
+                }
+                // Dates are midnights UTC: the day says it all.
+                lifecycle::Expires::On(date) => {
+                    let day: String = format_time(date).chars().take(10).collect();
+                    fill(t.s3_expiry_date, &[&scope, &day])
+                }
+            }
+        })
+        .collect();
+    let more = summary.expiries.len().saturating_sub(EXPIRIES_SHOWN);
+    if more > 0 {
+        items.push(fill(t.s3_expiry_more, &[&more.to_string()]));
+    }
+    fill(t.s3_expiry, &[&items.join(" · ")])
 }
 
 impl BucketRow {
-    /// The row of `bucket`, created at the time `created` formats.
-    pub fn new(t: &Text, bucket: &Bucket, created: &str) -> Self {
+    /// The row of `bucket`, created at the time `created` formats, with the website address
+    /// that `ui` gives it.
+    pub fn new(t: &Text, ui: &S3Ui, bucket: &Bucket, created: &str) -> Self {
         let mut anonymous_text = anonymous_label(t, bucket.anonymous).to_owned();
+        let summary = lifecycle::summary(bucket.lifecycle.as_deref());
+        let website_url = bucket
+            .website
+            .as_ref()
+            .and_then(|_| ui.website_url(&bucket.name));
         if bucket.anonymous_list {
             anonymous_text.push_str(" · ");
             anonymous_text.push_str(t.s3_listing_on);
@@ -135,6 +200,29 @@ impl BucketRow {
                     fill(t.s3_cors_rules, &[&rules.to_string()])
                 }
             }),
+            tags: bucket.tags.as_deref().map(|stored| {
+                // Only the S3 API writes the tags: a JSON object of them.
+                let tags =
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(stored)
+                        .map_or(0, |tags| tags.len());
+                fill(t.s3_tags, &[&tags.to_string()])
+            }),
+            lifecycle: summary.as_ref().map(|summary| {
+                if summary.rules == 1 {
+                    t.s3_lifecycle_rule.to_owned()
+                } else {
+                    fill(t.s3_lifecycle_rules, &[&summary.rules.to_string()])
+                }
+            }),
+            expiry: summary.as_ref().map(|summary| expiry_text(t, summary)),
+            website: bucket.website.is_some().then(|| {
+                if website_url.is_some() {
+                    t.s3_website.to_owned()
+                } else {
+                    t.s3_website_unserved.to_owned()
+                }
+            }),
+            website_url,
         }
     }
 
@@ -293,7 +381,7 @@ pub(super) async fn view(
         .collect();
     let rows = buckets
         .iter()
-        .map(|bucket| BucketRow::new(t, bucket, &when(lang, now, bucket.created_at).0))
+        .map(|bucket| BucketRow::new(t, ui, bucket, &when(lang, now, bucket.created_at).0))
         .collect();
     let (endpoint, addressing) = endpoint(t, ui);
     Ok(Some(S3View {
