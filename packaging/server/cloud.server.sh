@@ -735,16 +735,35 @@ EOF
 	if [ "$RELAY_CONFIGURED" = 1 ]; then
 		cat <<EOF
 
-The relay runs at https://$RELAY_HOST, but no device may use it yet. Next steps (see "The
-relay" in docs/deployment.md):
+The relay runs at https://$RELAY_HOST. Next steps (see "The relay" in docs/deployment.md):
   1. Give $RELAY_HOST a server block of its own in the reverse proxy, with HTTPS, and with
      plain HTTP for /generate_204 (docs/reverse-proxy.md).
-  2. Allow your devices: add their ids to relay.allowed_endpoints in $CONFIG_FILE.
-  3. For QUIC address discovery, copy the certificate of $RELAY_HOST into
+  2. For QUIC address discovery, copy the certificate of $RELAY_HOST into
      $CONFIG_DIR/relay-tls/ after every renewal, then set relay.qad_bind,
      relay.tls_cert and relay.tls_key, and open UDP 7842 in the firewall.
-  4. Restart the service.
+  3. Restart the service.
 EOF
+		# The server admits the devices registered for remote access, which needs an https
+		# base URL; relay.allowed_endpoints is only for devices that are not registered.
+		case $BASE_URL in
+		https://*)
+			cat <<EOF
+
+Devices use the relay once they are registered for remote access, from accounts with two-step
+verification on ("Remote access" in docs/deployment.md); nothing needs to be listed for them.
+relay.allowed_endpoints in the configuration is only for devices that are not registered, such
+as test setups.
+EOF
+			;;
+		*)
+			cat <<EOF
+
+Remote access needs an https base URL, so devices cannot register with
+$BASE_URL. Until it is https, the relay admits only the device ids listed in
+relay.allowed_endpoints in the configuration.
+EOF
+			;;
+		esac
 	fi
 	if [ "$START" = 0 ]; then
 		printf '\nThe service was not started (--no-start).\n'
