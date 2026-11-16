@@ -1299,6 +1299,7 @@ fn script_text(t: &Text) -> String {
         "themeSystem": t.theme_system,
         "themeLight": t.theme_light,
         "themeDark": t.theme_dark,
+        "linkCopied": t.js_link_copied,
     });
     embed_json(&value)
 }

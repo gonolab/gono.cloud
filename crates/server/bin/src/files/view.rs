@@ -274,6 +274,8 @@ pub struct Row {
     pub download_href: String,
     /// The folder that holds it, for search results and favorites.
     pub location: Option<Crumb>,
+    /// The URL anyone can download the file from through the S3 API, if a bucket publishes it.
+    pub public_link: Option<String>,
 }
 
 /// A sort tab.

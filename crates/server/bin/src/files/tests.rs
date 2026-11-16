@@ -2619,3 +2619,103 @@ async fn s3_forms_need_the_session_csrf_token_and_the_users_own_buckets() {
     assert_eq!(foreign_grant.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(s3::list_keys(&f.state.db, 1).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn published_files_offer_their_public_link() {
+    use gono_server_core::s3::{self, Anonymous, BucketName};
+    let mut f = fixture().await;
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+    for dir in ["Buckets", "Buckets/media", "Buckets/media/2026", "Site"] {
+        browser.dav(&f.device, "MKCOL", dir, "").await;
+    }
+    for file in [
+        "Buckets/media/2026/a b.jpg",
+        "Buckets/media/private.jpg",
+        "Site/index.html",
+    ] {
+        browser
+            .dav(&f.device, "PUT", &file.replace(' ', "%20"), "content")
+            .await;
+    }
+    let meta = f.state.dav.fs().meta().clone();
+    let folder = |rel: &str| {
+        let meta = meta.clone();
+        let rel = gono_server_core::RelPath::parse(rel).unwrap();
+        async move { meta.get(1, &rel).await.unwrap().unwrap() }
+    };
+    let media = s3::create_bucket(
+        &f.state.db,
+        1,
+        &BucketName::new("media").unwrap(),
+        folder("Buckets/media").await.id,
+    )
+    .await
+    .unwrap();
+    s3::set_anonymous(&f.state.db, 1, media.id, Anonymous::Acl, false)
+        .await
+        .unwrap();
+    let site = s3::create_bucket(
+        &f.state.db,
+        1,
+        &BucketName::new("site").unwrap(),
+        folder("Site").await.id,
+    )
+    .await
+    .unwrap();
+    s3::set_anonymous(&f.state.db, 1, site.id, Anonymous::PublicRead, false)
+        .await
+        .unwrap();
+    // The public-read ACL of one object of the `acl` bucket.
+    let photo = folder("Buckets/media/2026/a b.jpg").await;
+    assert!(
+        meta.set_object_public(photo.id, &photo.etag, true)
+            .await
+            .unwrap()
+    );
+
+    let links = |text: String| text.match_indices("data-copy-link").count();
+    // While the S3 API or anonymous access is off, nothing is public.
+    let page = browser.get("/apps/files/Site/").await.text();
+    assert_eq!(links(page), 0);
+    f.state.s3 = s3_on(false);
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+    assert_eq!(links(browser.get("/apps/files/Site/").await.text()), 0);
+
+    f.state.s3 = s3_on(true);
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+    let site_page = browser.get("/apps/files/Site/").await.text();
+    assert!(
+        site_page.contains("href=\"https://s3.example.com/site/index.html\""),
+        "{site_page}"
+    );
+    assert!(site_page.contains("Copy public link"));
+    let photos = browser.get("/apps/files/Buckets/media/2026/").await.text();
+    assert!(
+        photos.contains("href=\"https://s3.example.com/media/2026/a%20b.jpg\""),
+        "{photos}"
+    );
+    let media_page = browser.get("/apps/files/Buckets/media/").await.text();
+    assert_eq!(links(media_page), 0, "a private object and a folder");
+    // The file page shows the link too.
+    let file = browser.get("/apps/files/Site/index.html").await.text();
+    assert!(file.contains("Public link"), "{file}");
+    assert_eq!(links(file), 1);
+    // Search results and favorites as well.
+    let found = browser.get("/apps/files/?q=index").await.text();
+    assert_eq!(links(found), 1);
+
+    // An overwrite makes the object private again, and its link goes.
+    browser
+        .dav(
+            &f.device,
+            "PUT",
+            "Buckets/media/2026/a%20b.jpg",
+            "new content",
+        )
+        .await;
+    let photos = browser.get("/apps/files/Buckets/media/2026/").await.text();
+    assert_eq!(links(photos), 0);
+}

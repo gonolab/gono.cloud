@@ -15,10 +15,11 @@ use axum::{
     response::{IntoResponse as _, Response},
 };
 use gono_server_core::{
+    RelPath,
     audit::{self, Record},
     config::S3Config,
     db,
-    s3::{Bucket, S3Key},
+    s3::{Anonymous, Bucket, S3Key},
 };
 use gono_server_s3::S3State;
 use ipnet::IpNet;
@@ -74,6 +75,82 @@ impl S3Ui {
             .map(|port| format!(":{port}"))
             .unwrap_or_default();
         Some(format!("{scheme}://{bucket}.{domain}{port}"))
+    }
+}
+
+/// What the file UI needs for its "copy public link" action: the endpoint and the account's
+/// buckets that publish something right now.
+#[derive(Debug, Clone)]
+pub struct PublicLinks {
+    ui: Arc<S3Ui>,
+    /// The buckets whose mode is `acl` or `public-read`.
+    buckets: Vec<Bucket>,
+}
+
+impl PublicLinks {
+    /// The public links of `owner`'s files: `None` while the S3 API or anonymous access is off,
+    /// the endpoint is unknown, or no bucket of `owner` publishes anything.
+    pub async fn load(ui: Option<&Arc<S3Ui>>, pool: &db::Pool, owner: i64) -> Option<Self> {
+        let ui = ui?;
+        if !ui.allow_anonymous || ui.public_url.is_none() {
+            return None;
+        }
+        let buckets = match gono_server_core::s3::buckets_of(pool, owner).await {
+            Ok(buckets) => buckets,
+            Err(err) => {
+                tracing::warn!(error = %err, "cannot read the buckets for public links");
+                return None;
+            }
+        };
+        let buckets: Vec<Bucket> = buckets
+            .into_iter()
+            .filter(|bucket| bucket.owner_enabled && bucket.anonymous != Anonymous::Private)
+            .collect();
+        (!buckets.is_empty()).then(|| Self {
+            ui: ui.clone(),
+            buckets,
+        })
+    }
+
+    /// The buckets whose folder holds `rel`, innermost first.
+    fn holding(&self, rel: &RelPath) -> Vec<&Bucket> {
+        let mut holding: Vec<&Bucket> = self
+            .buckets
+            .iter()
+            .filter(|bucket| rel.starts_with(&bucket.folder) && *rel != bucket.folder)
+            .collect();
+        holding.sort_by_key(|bucket| std::cmp::Reverse(bucket.folder.as_str().len()));
+        holding
+    }
+
+    /// Whether the file at `rel` is published only if it has the `public-read` ACL, so that
+    /// [`Self::url`] needs to know.
+    pub fn needs_acl(&self, rel: &RelPath) -> bool {
+        let holding = self.holding(rel);
+        !holding.is_empty()
+            && holding
+                .iter()
+                .all(|bucket| bucket.anonymous == Anonymous::Acl)
+    }
+
+    /// The URL anyone can download the file at `rel` from, if one of the buckets holding it
+    /// publishes it: every file of a `public-read` bucket, and in an `acl` bucket the files
+    /// whose current version has the `public-read` ACL (`public_acl`). Virtual-hosted style when
+    /// it is enabled, which gives each bucket an origin of its own.
+    pub fn url(&self, rel: &RelPath, public_acl: bool) -> Option<String> {
+        let bucket = self.holding(rel).into_iter().find(|bucket| {
+            bucket.anonymous == Anonymous::PublicRead
+                || (bucket.anonymous == Anonymous::Acl && public_acl)
+        })?;
+        let key = rel.strip_prefix(&bucket.folder)?;
+        if key.as_str().len() > gono_server_s3::keys::MAX_KEY_BYTES {
+            return None;
+        }
+        let key = gono_server_s3::keys::url_encode(key.as_str());
+        Some(match self.ui.virtual_host_origin(&bucket.name) {
+            Some(origin) => format!("{origin}/{key}"),
+            None => format!("{}/{}/{key}", self.ui.endpoint()?, bucket.name),
+        })
     }
 }
 
@@ -170,6 +247,76 @@ mod tests {
             allow_anonymous: false,
             virtual_host_domain: domain.map(str::to_owned),
         }
+    }
+
+    fn bucket(id: i64, name: &str, folder: &str, anonymous: Anonymous) -> Bucket {
+        Bucket {
+            id,
+            name: name.to_owned(),
+            owner_id: 1,
+            owner_name: gono_server_core::Username::new("alice").unwrap(),
+            owner_display_name: "Alice".to_owned(),
+            owner_enabled: true,
+            root_file_id: 100 + id,
+            folder: RelPath::parse(folder).unwrap(),
+            anonymous,
+            anonymous_list: false,
+            cors: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn public_links_name_the_bucket_that_publishes_a_file() {
+        let links = PublicLinks {
+            ui: Arc::new(ui("https://s3.example.com", None)),
+            buckets: vec![
+                bucket(1, "media", "Buckets/media", Anonymous::Acl),
+                bucket(2, "site", "Sites/site", Anonymous::PublicRead),
+                bucket(3, "inner", "Sites/site/inner", Anonymous::Acl),
+            ],
+        };
+        let path = |rel: &str| RelPath::parse(rel).unwrap();
+        // An `acl` bucket publishes only files with the public-read ACL.
+        assert!(links.needs_acl(&path("Buckets/media/a b.jpg")));
+        assert_eq!(links.url(&path("Buckets/media/a b.jpg"), false), None);
+        assert_eq!(
+            links
+                .url(&path("Buckets/media/2026/a b+c.jpg"), true)
+                .as_deref(),
+            Some("https://s3.example.com/media/2026/a%20b%2Bc.jpg")
+        );
+        // A public-read bucket publishes everything, also below a nested acl bucket.
+        assert!(!links.needs_acl(&path("Sites/site/index.html")));
+        assert_eq!(
+            links.url(&path("Sites/site/index.html"), false).as_deref(),
+            Some("https://s3.example.com/site/index.html")
+        );
+        assert!(!links.needs_acl(&path("Sites/site/inner/x.txt")));
+        assert_eq!(
+            links.url(&path("Sites/site/inner/x.txt"), false).as_deref(),
+            Some("https://s3.example.com/site/inner/x.txt")
+        );
+        assert_eq!(
+            links.url(&path("Sites/site/inner/x.txt"), true).as_deref(),
+            Some("https://s3.example.com/inner/x.txt"),
+            "the innermost bucket that publishes it"
+        );
+        // Outside every bucket, or the bucket's folder itself: nothing.
+        assert!(!links.needs_acl(&path("Documents/a.txt")));
+        assert_eq!(links.url(&path("Documents/a.txt"), true), None);
+        assert_eq!(links.url(&path("Buckets/media"), true), None);
+
+        let virtual_links = PublicLinks {
+            ui: Arc::new(ui("https://s3.example.com", Some("s3.example.com"))),
+            ..links
+        };
+        assert_eq!(
+            virtual_links
+                .url(&path("Sites/site/index.html"), false)
+                .as_deref(),
+            Some("https://site.s3.example.com/index.html")
+        );
     }
 
     #[test]

@@ -24,6 +24,9 @@
     </div>
     <div class="files-actions">
       <a class="btn primary" href="{{ row.download_href }}"><svg class="icon"><use href="#i-down"/></svg><span>{{ chrome.t.download }}</span></a>
+      {%- if let Some(link) = row.public_link %}
+      <a class="btn" href="{{ link }}" target="_blank" rel="noopener noreferrer" data-copy-link><svg class="icon"><use href="#i-link"/></svg><span data-copy-label>{{ chrome.t.copy_public_link }}</span></a>
+      {%- endif %}
       <form method="post" action="{{ row.parent_href }}">
         <input type="hidden" name="csrf" value="{{ chrome.csrf }}"><input type="hidden" name="action" value="favorite"><input type="hidden" name="item" value="{{ row.name }}"><input type="hidden" name="back" value="{{ row.href }}">
         {%- if row.favorite %}
@@ -68,6 +71,9 @@
       <dt>{{ chrome.t.size }}</dt><dd>{{ row.size }}</dd>
       <dt>{{ chrome.t.modified }}</dt><dd><time datetime="{{ row.modified_iso }}">{{ row.modified }}</time></dd>
       <dt>{{ chrome.t.folder }}</dt><dd><a href="{{ row.parent_href }}">{% if let Some(last) = crumbs.last() %}{{ last.name }}{% endif %}</a></dd>
+      {%- if let Some(link) = row.public_link %}
+      <dt>{{ chrome.t.public_link }}</dt><dd class="mono small"><a href="{{ link }}" target="_blank" rel="noopener noreferrer">{{ link }}</a></dd>
+      {%- endif %}
     </dl>
   </div></div>
 </aside>

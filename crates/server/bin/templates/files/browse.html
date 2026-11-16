@@ -84,6 +84,9 @@
               <input type="hidden" name="value" value="1"><button class="menu__item" type="submit"><svg class="icon"><use href="#i-star"/></svg>{{ chrome.t.add_favorite }}</button>
               {%- endif %}
             </form>
+            {%- if let Some(link) = row.public_link %}
+            <a class="menu__item" href="{{ link }}" target="_blank" rel="noopener noreferrer" data-copy-link><svg class="icon"><use href="#i-link"/></svg><span data-copy-label>{{ chrome.t.copy_public_link }}</span></a>
+            {%- endif %}
             <a class="menu__item" href="{{ row.parent_href }}?action=rename&amp;item={{ row.item }}"><svg class="icon"><use href="#i-edit"/></svg>{{ chrome.t.rename }}</a>
             <a class="menu__item" href="{{ row.parent_href }}?action=move&amp;item={{ row.item }}"><svg class="icon"><use href="#i-move"/></svg>{{ chrome.t.move_to }}</a>
             <a class="menu__item menu__item--danger" href="{{ row.parent_href }}?action=delete&amp;item={{ row.item }}"><svg class="icon"><use href="#i-trash"/></svg>{{ chrome.t.delete }}</a>

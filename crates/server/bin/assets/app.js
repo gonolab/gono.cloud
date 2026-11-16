@@ -2,6 +2,7 @@
 //
 // - Theme switch without a reload; dates in the browser's time zone.
 // - Menus (<details>) close when another one opens, on Escape and on clicks outside.
+// - Public links (S3) are copied to the clipboard instead of opened.
 // - Folder pages: selection count, drag and drop of files and folders, folder upload, and an
 //   upload queue with progress. Small files are sent with one PUT; large ones in chunks
 //   (chunked upload v2 of the server), each retried after network errors, so that an
@@ -131,6 +132,34 @@
         menu.open = false;
         menu.querySelector("summary")?.focus();
       }
+    });
+  }
+
+  // ------------------------------------------------------------------------------------------
+  // Public links
+  // ------------------------------------------------------------------------------------------
+
+  /** Links marked data-copy-link go to the clipboard; without one, they open as links do. */
+  function setupCopyLinks() {
+    if (!navigator.clipboard || !window.isSecureContext) return;
+    document.addEventListener("click", async (event) => {
+      const link = event.target instanceof Element && event.target.closest("a[data-copy-link]");
+      if (!link) return;
+      event.preventDefault();
+      try {
+        await navigator.clipboard.writeText(link.href);
+      } catch {
+        window.open(link.href, "_blank", "noopener,noreferrer");
+        return;
+      }
+      const label = link.querySelector("[data-copy-label]");
+      if (!label || !T.linkCopied) return;
+      const before = label.textContent;
+      label.textContent = T.linkCopied;
+      setTimeout(() => {
+        label.textContent = before;
+        link.closest("details.menu")?.removeAttribute("open");
+      }, 1500);
     });
   }
 
@@ -511,6 +540,7 @@
     setupTheme();
     setupTimes();
     setupMenus();
+    setupCopyLinks();
     setupSelection();
     setupUploads();
   }

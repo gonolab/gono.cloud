@@ -276,6 +276,30 @@ impl MetaStore {
         Ok(changed > 0)
     }
 
+    /// Of `owner`'s files `file_ids`, those whose recorded version has the `public-read` ACL,
+    /// each with the WebDAV ETag of that version (the ACL holds only while the file on disk is
+    /// still that version).
+    pub async fn public_objects(
+        &self,
+        owner: i64,
+        file_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, String>> {
+        if file_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let ids = serde_json::to_string(file_ids).unwrap_or_else(|_| unreachable!("numbers"));
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT f.id, f.etag FROM object_meta o JOIN files f ON f.id = o.file_id \
+             WHERE o.public_read = 1 AND f.owner_id = ?1 AND f.is_dir = 0 \
+             AND o.file_id IN (SELECT value FROM json_each(?2))",
+        )
+        .bind(owner)
+        .bind(ids)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// Lists `owner`'s files below `query.root` in S3 key order, with S3's prefix, delimiter
     /// and start-after semantics (see the module documentation).
     pub async fn list_objects(&self, owner: i64, query: ObjectQuery<'_>) -> Result<ObjectListing> {

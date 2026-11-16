@@ -348,6 +348,7 @@ texts! {
 
     // Uploads (script)
     js_uploads: "Uploads", "上传";
+    js_link_copied: "Link copied", "链接已复制";
     js_waiting: "Waiting", "等待中";
     js_uploading: "{} of {}", "{} / {}";
     js_finishing: "Finishing…", "正在完成…";
@@ -484,6 +485,8 @@ texts! {
     s3_addressing: "Addressing", "寻址方式";
     s3_path_style: "Path style: {}/<bucket>/<key>", "路径风格：{}/<bucket>/<key>";
     s3_virtual_style: "Virtual-hosted style: {}/<key>", "虚拟主机风格：{}/<key>";
+    copy_public_link: "Copy public link", "复制公开链接";
+    public_link: "Public link", "公开链接";
     s3_cors_rule: "CORS: 1 rule (set through the S3 API)", "CORS：1 条规则（通过 S3 API 设置）";
     s3_cors_rules: "CORS: {} rules (set through the S3 API)", "CORS：{} 条规则（通过 S3 API 设置）";
     s3_anonymous_off: "Anonymous access is off on this server: every bucket answers signed requests only, whatever its setting.", "此服务器关闭了匿名访问：无论如何设置，所有存储桶都只响应带签名的请求。";

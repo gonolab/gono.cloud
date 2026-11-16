@@ -1205,8 +1205,45 @@ async fn object_acls_apply_to_the_version_they_were_set_for() {
     let meta = f.object_meta("b/s3.png").await.unwrap();
     assert!(meta.public_read);
     assert_eq!(meta.s3_etag.as_deref(), Some("md5"));
+    // The file UI asks for the public files of a listing at once.
+    let dav = f
+        .store
+        .get(f.owner, &p("b/dav.txt"))
+        .await
+        .unwrap()
+        .unwrap();
+    let public = f
+        .store
+        .public_objects(f.owner, &[dav.id, id, i64::MAX])
+        .await
+        .unwrap();
+    assert_eq!(public.len(), 2);
+    assert_eq!(public[&id], etag);
+    assert_eq!(public[&dav.id], dav.etag);
+    assert!(
+        f.store
+            .public_objects(f.owner + 1, &[dav.id, id])
+            .await
+            .unwrap()
+            .is_empty(),
+        "another account's files"
+    );
+    assert!(
+        f.store
+            .public_objects(f.owner, &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(f.store.set_object_public(id, &etag, false).await.unwrap());
     assert!(!f.object_meta("b/s3.png").await.unwrap().public_read);
+    assert!(
+        !f.store
+            .public_objects(f.owner, &[id])
+            .await
+            .unwrap()
+            .contains_key(&id)
+    );
 
     // A stale version, a directory and a missing file are refused.
     f.write("b/s3.png", 2).await;

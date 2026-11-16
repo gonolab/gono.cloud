@@ -70,6 +70,7 @@ use self::{
 use crate::{
     app::{AppState, percent_decode},
     i18n::{Lang, Text, fill},
+    s3::PublicLinks,
     web::{self, Chrome, Message, Nav},
 };
 
@@ -692,6 +693,56 @@ fn row(visitor: &Visitor, now: i64, parent: &RelPath, name: &str, meta: Meta) ->
         modified_iso,
         favorite: meta.favorite,
         location: None,
+        public_link: None,
+    }
+}
+
+/// The file behind a listing row, for its public link: path, file id and WebDAV ETag. `None`
+/// for folders, which S3 does not publish.
+type LinkTarget = Option<(RelPath, i64, String)>;
+
+fn link_target(rel: RelPath, entry: &Entry) -> LinkTarget {
+    if entry.is_dir() {
+        return None;
+    }
+    Some((rel, entry.file_id?, entry.etag.clone()))
+}
+
+/// Sets the public link of each row (`targets` holds the row's file) that anyone may download
+/// through the S3 API: every file of a `public-read` bucket, and in an `acl` bucket the files
+/// whose current version has the `public-read` ACL.
+async fn add_public_links(
+    state: &AppState,
+    visitor: &Visitor,
+    rows: &mut [Row],
+    targets: &[LinkTarget],
+) {
+    if targets.iter().all(Option::is_none) {
+        return;
+    }
+    let owner = visitor.user.user_id;
+    let Some(links) = PublicLinks::load(state.s3.as_ref(), &state.db, owner).await else {
+        return;
+    };
+    let ids: Vec<i64> = targets
+        .iter()
+        .flatten()
+        .filter(|(rel, _, _)| links.needs_acl(rel))
+        .map(|(_, id, _)| *id)
+        .collect();
+    let public = match state.dav.fs().meta().public_objects(owner, &ids).await {
+        Ok(public) => public,
+        Err(err) => {
+            tracing::warn!(error = %err, "cannot read the ACLs for public links");
+            HashMap::new()
+        }
+    };
+    for (row, target) in rows.iter_mut().zip(targets) {
+        if let Some((rel, id, etag)) = target {
+            // The ACL belongs to the version it was set for.
+            let acl = public.get(id).is_some_and(|recorded| recorded == etag);
+            row.public_link = links.url(rel, acl);
+        }
     }
 }
 
@@ -744,12 +795,14 @@ async fn folder_page(
     let pages = total.div_ceil(PAGE_SIZE).max(1);
     let page = params.page.min(pages);
     let now = gono_server_core::db::unix_now();
-    let rows: Vec<Row> = children
-        .iter()
-        .skip((page - 1) * PAGE_SIZE)
-        .take(PAGE_SIZE)
+    let shown = || children.iter().skip((page - 1) * PAGE_SIZE).take(PAGE_SIZE);
+    let mut rows: Vec<Row> = shown()
         .map(|(name, entry)| row(visitor, now, rel, name, Meta::of(entry)))
         .collect();
+    let targets: Vec<LinkTarget> = shown()
+        .map(|(name, entry)| link_target(rel.join(name), entry))
+        .collect();
+    add_public_links(state, visitor, &mut rows, &targets).await;
     let dir_href = url(rel, true);
     let tab = |label, key: &str, this: Sort| {
         let current = sort == this;
@@ -828,6 +881,7 @@ async fn search_page(state: &AppState, visitor: &Visitor, rel: &RelPath, q: &str
         fill(t.search_in, &[&display_path(rel)])
     };
     let mut rows = Vec::new();
+    let mut targets: Vec<LinkTarget> = Vec::new();
     let mut limited = false;
     if q.chars().count() >= 2 {
         let found = match state
@@ -854,8 +908,11 @@ async fn search_page(state: &AppState, visitor: &Visitor, rel: &RelPath, q: &str
                 href: url(&parent, true),
             });
             rows.push(row);
+            targets
+                .push((!file.is_dir).then(|| (file.rel_path.clone(), file.id, file.etag.clone())));
         }
     }
+    add_public_links(state, visitor, &mut rows, &targets).await;
     if limited {
         let note = fill(t.search_limited, &[&SEARCH_LIMIT.to_string()]);
         sub = if sub.is_empty() {
@@ -907,6 +964,7 @@ async fn favorites_page(state: &AppState, visitor: &Visitor) -> Response {
     };
     let now = gono_server_core::db::unix_now();
     let mut rows = Vec::new();
+    let mut targets: Vec<LinkTarget> = Vec::new();
     for file in favorites {
         // Look each one up again, so that the list shows what is really there.
         let Ok(entry) = state
@@ -927,7 +985,9 @@ async fn favorites_page(state: &AppState, visitor: &Visitor) -> Response {
             href: url(&parent, true),
         });
         rows.push(row);
+        targets.push(link_target(file.rel_path.clone(), &entry));
     }
+    add_public_links(state, visitor, &mut rows, &targets).await;
     let count = rows.len();
     let page = BrowsePage {
         chrome: visitor.chrome(Nav::Favorites),
@@ -997,7 +1057,15 @@ async fn file_page(
     let name = rel.file_name().unwrap_or_default().to_owned();
     let parent = rel.parent().unwrap_or_else(RelPath::root);
     let now = gono_server_core::db::unix_now();
-    let row = row(visitor, now, &parent, &name, Meta::of(entry));
+    let mut rows = [row(visitor, now, &parent, &name, Meta::of(entry))];
+    add_public_links(
+        state,
+        visitor,
+        &mut rows,
+        &[link_target(rel.clone(), entry)],
+    )
+    .await;
+    let [row] = rows;
     let preview = Preview::of(&name);
     let (text, truncated) = if preview == Preview::Text {
         match text_preview(state, visitor, rel).await {

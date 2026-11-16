@@ -1324,3 +1324,60 @@ async fn the_download_policy_publishes_a_bucket() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn the_file_ui_links_to_published_objects() {
+    use gono_acceptance::web::{AfterLogin, Browser};
+
+    let s3 = require!(S3::new(), "S3 is not configured");
+    let web = require!(s3.ctx.web(), "GONO_ACCEPT_WEB_PASSWORD not set");
+    let prefix = unique_name("s3");
+    let key = s3.key(&prefix, "shared photo.txt");
+    s3.client
+        .put_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .acl(ObjectCannedAcl::PublicRead)
+        .body(ByteStream::from_static(b"linked"))
+        .send()
+        .await
+        .unwrap();
+    s3.put(&s3.bucket, &s3.key(&prefix, "private.txt"), "private")
+        .await;
+
+    let browser = Browser::new("gono-acceptance browser");
+    let folder = s3
+        .ctx
+        .url(&format!("/apps/files/Buckets/{}/{prefix}/", s3.bucket));
+    let folder = url::Url::parse(&folder).unwrap();
+    browser
+        .login(&folder, &web, AfterLogin::Stop)
+        .await
+        .unwrap_or_else(|err| panic!("signing in to the file UI failed: {err}"));
+    let page = browser.get(&folder, None).await;
+    assert_eq!(page.status, 200, "{}", page.describe());
+    let links: Vec<&str> = page
+        .body
+        .split("data-copy-link")
+        .filter_map(|before| {
+            let start = before.rfind("href=\"")? + 6;
+            before[start..].split('"').next()
+        })
+        .filter(|href| href.contains("://"))
+        .collect();
+    assert_eq!(links.len(), 1, "only the public object: {links:?}");
+    let link = url::Url::parse(links[0]).unwrap();
+    assert!(link.path().ends_with("/shared%20photo.txt"), "{link}");
+
+    // The link works for anyone: it is sent to the S3 listener, whatever its host name.
+    let endpoint = url::Url::parse(&s3.endpoint).unwrap();
+    let address = endpoint.socket_addrs(|| None).unwrap()[0];
+    let anonymous = reqwest::Client::builder()
+        .resolve(link.host_str().unwrap(), address)
+        .build()
+        .unwrap();
+    let response = anonymous.get(link.as_str()).send().await.unwrap();
+    assert_eq!(response.status(), 200, "{link}");
+    assert_eq!(response.text().await.unwrap(), "linked");
+    s3.clean(&s3.bucket, &prefix).await;
+}
