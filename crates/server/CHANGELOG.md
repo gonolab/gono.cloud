@@ -69,7 +69,8 @@ compatible within a major version: released clients keep working with newer serv
   `s3.bucket_folder`, `Buckets/` by default), or bound to existing folders. Objects keep their
   MD5 ETag, content type, user metadata and checksum until they are overwritten other than
   through S3; listings come from the metadata database in S3 key order; multipart uploads are
-  staged in `s3-uploads/` of the data directory. With `s3.allow_anonymous`, bucket owners can
+  staged in `s3-uploads/` of the data directory; completing one renames the first part into
+  place and appends the others, on Linux with `copy_file_range` (shared data on XFS and btrfs). With `s3.allow_anonymous`, bucket owners can
   publish objects uploaded with the `public-read` ACL or a whole bucket, and allow anonymous
   listings; anonymous requests only read. With `s3.virtual_host_domain`, buckets are also
   addressed by host name (`<bucket>.s3.example.com`, virtual-hosted style; wildcard DNS and

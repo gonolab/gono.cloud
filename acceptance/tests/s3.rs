@@ -915,6 +915,57 @@ async fn keys_keep_their_unicode_spelling() {
         );
     }
 
+    // A multipart upload of the other spelling fails at its completion, after the parts were
+    // assembled, and stays complete-able: its first part was put back.
+    let upload = s3
+        .client
+        .create_multipart_upload()
+        .bucket(&s3.bucket)
+        .key(&nfc)
+        .send()
+        .await
+        .unwrap();
+    let upload_id = upload.upload_id().unwrap();
+    let mut parts = Vec::new();
+    for (number, body) in [(1, vec![b'a'; 5 * 1024 * 1024]), (2, b"tail".to_vec())] {
+        let uploaded = s3
+            .client
+            .upload_part()
+            .bucket(&s3.bucket)
+            .key(&nfc)
+            .upload_id(upload_id)
+            .part_number(number)
+            .body(ByteStream::from(body))
+            .send()
+            .await
+            .unwrap();
+        parts.push(
+            CompletedPart::builder()
+                .part_number(number)
+                .e_tag(uploaded.e_tag().unwrap())
+                .build(),
+        );
+    }
+    let complete = || {
+        s3.client
+            .complete_multipart_upload()
+            .bucket(&s3.bucket)
+            .key(&nfc)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts.clone()))
+                    .build(),
+            )
+            .send()
+    };
+    let refused = complete().await.unwrap_err();
+    assert_eq!(
+        refused.as_service_error().and_then(|e| e.meta().code()),
+        Some("KeyConflict")
+    );
+    assert_eq!(s3.get(&s3.bucket, &nfd).await, b"decomposed");
+
     // WebDAV and the Nextcloud clients see the NFC name.
     let dav = s3.ctx.dav();
     let got = dav.get(&s3.webdav_path(&nfc)).await;
@@ -938,6 +989,19 @@ async fn keys_keep_their_unicode_spelling() {
         .await
         .unwrap();
     dav.get(&s3.webdav_path(&nfc)).await.expect(&[404]);
+
+    // With the place free, the same completion succeeds and the object is whole.
+    complete().await.unwrap();
+    let mut expected = vec![b'a'; 5 * 1024 * 1024];
+    expected.extend_from_slice(b"tail");
+    assert_eq!(s3.get(&s3.bucket, &nfc).await, expected);
+    s3.client
+        .delete_object()
+        .bucket(&s3.bucket)
+        .key(&nfc)
+        .send()
+        .await
+        .unwrap();
     let _ = dav.delete(&s3.webdav_path(&prefix)).await;
 }
 

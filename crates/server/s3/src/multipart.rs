@@ -7,7 +7,11 @@
 //!   the other's ETag; the replaced file is removed.
 //! - **Completion** checks the part list against what arrived (ascending part numbers, matching
 //!   ETags, every part but the last at least 5 MiB, as in S3), then answers `200` right away and
-//!   assembles the parts in `tmp/` while s3s keeps the connection alive with whitespace. The
+//!   assembles the parts in `tmp/` while s3s keeps the connection alive with whitespace: the
+//!   first part's file becomes the start of the object (renamed, not copied) and the others are
+//!   appended, on Linux in the kernel (`copy_file_range`, which shares the data on file systems
+//!   with reflinks such as XFS and btrfs). If the object is not installed after all, the first
+//!   part is cut back and put back, so the upload can still be completed. The
 //!   object is installed like a `PutObject` (WebDAV locks, conditions), its ETag is the MD5 of
 //!   the part MD5s followed by `-<parts>`, and the upload ends. While one completion runs, the
 //!   upload takes no parts and no second completion. `If-Match` and `If-None-Match` are checked
@@ -808,33 +812,78 @@ fn repeated_completion(
     })
 }
 
-/// Concatenates the parts in `dir` into a new synced file in `tmp_dir`.
+/// Assembles the parts in `dir` into a synced file at `temp` (in `tmp/`): the first part's file
+/// is renamed there and the others are appended. On failure the first part is put back
+/// ([`put_back_first_part`]).
 fn assemble(dir: &Path, parts: &[UploadPart], temp: &Path) -> std::io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut out = options.open(temp)?;
-    let mut buffer = vec![0; 1024 * 1024];
-    for part in parts {
-        let mut file = std::fs::File::open(dir.join(&part.file_name))?;
-        let mut copied: u64 = 0;
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
+    let wrong_size = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "a part's file does not have the part's size",
+        )
+    };
+    let Some((first, rest)) = parts.split_first() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no parts",
+        ));
+    };
+    std::fs::rename(dir.join(&first.file_name), temp)?;
+    let appended = (|| {
+        let mut out = std::fs::OpenOptions::new().write(true).open(temp)?;
+        if out.metadata()?.len() != first.size {
+            return Err(wrong_size());
+        }
+        // Not O_APPEND: copy_file_range refuses such a target. The offset is at the end.
+        std::io::Seek::seek(&mut out, std::io::SeekFrom::End(0))?;
+        let mut buffer = Vec::new();
+        for part in rest {
+            let mut file = std::fs::File::open(dir.join(&part.file_name))?;
+            if append(&mut file, &mut out, &mut buffer)? != part.size {
+                return Err(wrong_size());
             }
-            out.write_all(&buffer[..read])?;
-            copied += read as u64;
         }
-        if copied != part.size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "a part's file does not have the part's size",
-            ));
-        }
+        out.sync_all()
+    })();
+    if appended.is_err()
+        && let Err(err) = put_back_first_part(dir, first, temp)
+    {
+        tracing::warn!(error = %err, "cannot put the first part of an upload back");
     }
-    out.sync_all()
+    appended
+}
+
+/// Appends `from` to `to` at its offset and returns the bytes copied. On Linux the standard
+/// library copies in the kernel (`copy_file_range`, falling back to `sendfile`); elsewhere it
+/// would use a buffer of 8 KiB, so a buffer of 1 MiB is used instead.
+fn append(
+    from: &mut std::fs::File,
+    to: &mut std::fs::File,
+    buffer: &mut Vec<u8>,
+) -> std::io::Result<u64> {
+    if cfg!(target_os = "linux") {
+        return std::io::copy(from, to);
+    }
+    buffer.resize(1024 * 1024, 0);
+    let mut copied: u64 = 0;
+    loop {
+        let read = from.read(buffer)?;
+        if read == 0 {
+            return Ok(copied);
+        }
+        to.write_all(&buffer[..read])?;
+        copied += read as u64;
+    }
+}
+
+/// Undoes [`assemble`] for an object that was not installed: cuts the file at `temp` back to
+/// the first part and renames it to that part's file again.
+fn put_back_first_part(dir: &Path, first: &UploadPart, temp: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(temp)?
+        .set_len(first.size)?;
+    std::fs::rename(temp, dir.join(&first.file_name))
 }
 
 /// `CompleteMultipartUpload`.
@@ -910,22 +959,56 @@ pub(crate) async fn complete(
         let dir = state.fs().layout().s3_upload_dir(&upload.upload_id);
         let temp = upload::Temp::new_in(&state.fs().layout().tmp_dir());
         let path = temp.path().to_path_buf();
-        tokio::task::spawn_blocking(move || assemble(&dir, &parts, &path))
+        let started = std::time::Instant::now();
+        let part_count = parts.len();
+        let first = parts.first().cloned();
+        let assemble_dir = dir.clone();
+        tokio::task::spawn_blocking(move || assemble(&assemble_dir, &parts, &path))
             .await
             .map_err(|_| s3_error!(InternalError))?
             .map_err(error::io)?;
-        if let Some(time) = upload::mtime_of(&meta) {
-            upload::set_mtime(temp.path(), time).await?;
+        let assembled = started.elapsed();
+        let installed = async {
+            if let Some(time) = upload::mtime_of(&meta) {
+                upload::set_mtime(temp.path(), time).await?;
+            }
+            s3.install(
+                &auth,
+                &bucket,
+                &key,
+                temp.path().to_path_buf(),
+                meta,
+                condition,
+            )
+            .await
         }
-        s3.install(
-            &auth,
-            &bucket,
-            &key,
-            temp.path().to_path_buf(),
-            meta,
-            condition,
-        )
-        .await?;
+        .await;
+        if let Err(err) = installed {
+            // Not installed (a condition, a conflict, a lock): the upload stays complete-able.
+            if let Some(first) = first {
+                let path = temp.path().to_path_buf();
+                let put_back =
+                    tokio::task::spawn_blocking(move || put_back_first_part(&dir, &first, &path))
+                        .await;
+                if !matches!(put_back, Ok(Ok(()))) {
+                    tracing::warn!(
+                        upload_id = %upload.upload_id,
+                        "cannot put the first part of an upload back"
+                    );
+                }
+            }
+            return Err(err);
+        }
+        // The request log sees only the start of the answer; this says what the time went to.
+        tracing::info!(
+            upload_id = %upload.upload_id,
+            parts = part_count,
+            bytes = total,
+            assembled_ms = u64::try_from(assembled.as_millis()).unwrap_or(u64::MAX),
+            installed_ms =
+                u64::try_from((started.elapsed() - assembled).as_millis()).unwrap_or(u64::MAX),
+            "s3 multipart upload completed"
+        );
         let keep = i64::try_from(COMPLETED_KEEP.as_secs()).unwrap_or(i64::MAX);
         s3::complete_upload(
             state.pool(),
@@ -1127,6 +1210,41 @@ mod tests {
             &dir.join("short"),
         );
         assert_eq!(short.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parts_are_assembled_in_place_and_the_first_one_put_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "gono-s3-assemble-{:016x}",
+            rand::rng().random::<u64>()
+        ));
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        for (number, content) in [(1, "first-"), (2, "second-"), (3, "third")] {
+            std::fs::write(staging.join(format!("{number}.x")), content).unwrap();
+        }
+        let parts = [part(1, "a", 6), part(2, "b", 7), part(3, "c", 5)];
+        let temp = dir.join("object");
+        assemble(&staging, &parts, &temp).unwrap();
+        assert_eq!(std::fs::read(&temp).unwrap(), b"first-second-third");
+        // The first part became the object; the others are still staged.
+        assert!(!staging.join("1.x").exists());
+        assert!(staging.join("2.x").exists());
+
+        // An object that is not installed gives the first part back as it was.
+        put_back_first_part(&staging, &parts[0], &temp).unwrap();
+        assert!(!temp.exists());
+        assert_eq!(std::fs::read(staging.join("1.x")).unwrap(), b"first-");
+
+        // A part of the wrong size fails the assembly, and the first part is back too.
+        let wrong = [part(1, "a", 6), part(2, "b", 99)];
+        assert_eq!(
+            assemble(&staging, &wrong, &temp).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(!temp.exists());
+        assert_eq!(std::fs::read(staging.join("1.x")).unwrap(), b"first-");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

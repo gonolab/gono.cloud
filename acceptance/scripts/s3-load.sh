@@ -11,7 +11,9 @@
 #   2. checks it with `rclone check`,
 #
 # and finally backs the tree up with restic (`-o s3.connections=<largest n>`) and checks the
-# repository. For each run it prints the wall time, the uploads per second, and, from the
+# repository. With BIG_MB set, it also uploads one file of that many MiB in parts of
+# BIG_PART_MB (default 16) and reports how long the server took to complete it
+# (CompleteMultipartUpload assembles the parts). For each run it prints the wall time, the uploads per second, and, from the
 # server's request log, the number of requests by status and the server-side latency of the
 # object writes (p50, p95, p99, max). It exits non-zero when a client fails or the server
 # answered an upload with a 5xx status.
@@ -25,6 +27,8 @@
 #   SIZE=<bytes>           size of each file (default 2048)
 #   TRANSFERS="<n> ..."    rclone concurrencies to run (default "4 16 64")
 #   RUN_RESTIC=0           skip the restic backup
+#   BIG_MB=<n>             also upload one file of n MiB in parts (default: none)
+#   BIG_PART_MB=<n>        the part size of that upload in MiB (default 16)
 #   PROFILE=debug          build and measure the debug profile instead of release
 #   RCLONE=<path> RESTIC=<path>   client binaries (default: from PATH)
 #   NEW_TARGET_DIR=<dir>   cargo target dir for the server build (default: the repository's)
@@ -39,6 +43,8 @@ DIRS="${DIRS:-50}"
 SIZE="${SIZE:-2048}"
 TRANSFERS="${TRANSFERS:-4 16 64}"
 RUN_RESTIC="${RUN_RESTIC:-1}"
+BIG_MB="${BIG_MB:-0}"
+BIG_PART_MB="${BIG_PART_MB:-16}"
 PROFILE="${PROFILE:-release}"
 RCLONE="${RCLONE:-rclone}"
 RESTIC="${RESTIC:-restic}"
@@ -47,7 +53,7 @@ USER_NAME="gono"
 case "${1:-}" in
   "") ;;
   -h | --help)
-    sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   *)
@@ -246,6 +252,33 @@ print(f'    {int(sys.argv[3])} files in {s:.1f} s: {int(sys.argv[3]) / s:.0f} up
   retries="$(grep -c "low level retry\|Attempt [0-9]/[0-9] failed" "${CLIENT_LOG}" || true)"
   echo "    rclone check ok; retries logged so far: ${retries}"
 done
+
+if ((BIG_MB > 0)); then
+  echo "==> one file of ${BIG_MB} MiB in ${BIG_PART_MB} MiB parts"
+  mkdir -p "${WORK_DIR}/big"
+  head -c "$((BIG_MB * 1024 * 1024))" /dev/urandom >"${WORK_DIR}/big/big.bin"
+  "${RCLONE}" --config "${WORK_DIR}/rclone.conf" mkdir gono:load-big >>"${CLIENT_LOG}" 2>&1 ||
+    fail "rclone mkdir"
+  mark="$(lines)"
+  start="$(now)"
+  "${RCLONE}" --config "${WORK_DIR}/rclone.conf" copyto --s3-chunk-size "${BIG_PART_MB}M" \
+    --s3-upload-cutoff "${BIG_PART_MB}M" --s3-upload-concurrency 4 "${WORK_DIR}/big/big.bin" gono:load-big/big.bin \
+    >>"${CLIENT_LOG}" 2>&1 || fail "rclone copyto of the big file"
+  end="$(now)"
+  python3 -c "import sys; s = float(sys.argv[2]) - float(sys.argv[1]); \
+print(f'    {sys.argv[3]} MiB in {s:.1f} s: {int(sys.argv[3]) / s:.0f} MiB/s')" \
+    "${start}" "${end}" "${BIG_MB}"
+  tail -n "+$((mark + 1))" "${LOG_FILE}" | python3 -c '
+import re, sys
+for line in sys.stdin:
+    if "s3 multipart upload completed" in line:
+        print("    completion: " + re.search(r"parts=(\d+)", line).group(1) + " parts assembled in "
+              + re.search(r"assembled_ms=(\d+)", line).group(1) + " ms, installed in "
+              + re.search(r"installed_ms=(\d+)", line).group(1) + " ms")'
+  "${RCLONE}" --config "${WORK_DIR}/rclone.conf" check --download "${WORK_DIR}/big" gono:load-big \
+    >>"${CLIENT_LOG}" 2>&1 || fail "rclone check of the big file"
+  echo "    rclone check --download ok"
+fi
 
 if [[ "${RUN_RESTIC}" == "1" ]]; then
   connections="${TRANSFERS##* }"
