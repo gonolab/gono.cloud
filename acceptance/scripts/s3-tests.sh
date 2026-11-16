@@ -45,7 +45,7 @@ EXPECTED_FAILURES_FILE="${ACCEPT_DIR}/s3-tests/expected-failures.txt"
 PYTEST_ARGS=()
 
 usage() {
-  sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while (($#)); do
