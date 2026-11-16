@@ -1926,6 +1926,41 @@ impl GonoS3 {
             .map_err(|err| error::object(err, false))
     }
 
+    /// Checks `condition` against the object at `client` as it is now, before a write that
+    /// cannot report a failure with its status any more (a multipart completion). The write
+    /// checks it again atomically.
+    pub(crate) async fn check_write_condition(
+        &self,
+        auth: &Authorized,
+        bucket: &Bucket,
+        client: &RelPath,
+        condition: &WriteCondition,
+    ) -> S3Result<()> {
+        let expected = match condition {
+            WriteCondition::Always => return Ok(()),
+            WriteCondition::CreateOnly => None,
+            WriteCondition::IfMatch(etag) => Some(etag.as_str()),
+        };
+        let identity = Self::bucket_identity(auth, bucket, false)?;
+        let current = match self.state.fs().object(identity, client).await {
+            Ok((entry, meta)) => Some(etag_of(&entry, meta.as_ref())),
+            // A folder is in the way of both: the name is taken, and it has no ETag to match.
+            Err(ObjectError::IsFolder) => Some(String::new()),
+            Err(ObjectError::NotFound) => None,
+            Err(err) => return Err(error::object(err, false)),
+        };
+        let holds = match (expected, current) {
+            (None, current) => current.is_none(),
+            (Some(expected), Some(current)) => !current.is_empty() && current == expected,
+            (Some(_), None) => false,
+        };
+        if holds {
+            Ok(())
+        } else {
+            Err(s3_error!(PreconditionFailed))
+        }
+    }
+
     /// The source of a copy into `destination`: `source_key` of the bucket `source_bucket`,
     /// which `key` needs a grant on too (buckets of other accounts have none). Returns the
     /// bucket and the client path of the file.

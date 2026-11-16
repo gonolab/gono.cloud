@@ -521,6 +521,47 @@ async fn multipart_uploads_keep_their_latest_parts_until_they_end() {
         1
     );
 
+    // A completed upload loses its parts and leaves the listing, but is kept with the ETag
+    // for repeated completions; it takes no parts any more.
+    let other = s3::create_upload(&f.pool, bucket.id, "clip.mp4", "{}", 10, 100)
+        .await
+        .unwrap();
+    s3::record_part(&f.pool, &other, &part(1, "1.c"), 200)
+        .await
+        .unwrap();
+    assert!(
+        s3::complete_upload(&f.pool, &other, "abc-1", 250)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !s3::complete_upload(&f.pool, &other, "abc-1", 260)
+            .await
+            .unwrap(),
+        "completed once only"
+    );
+    let completed = s3::upload(&f.pool, &other).await.unwrap().unwrap();
+    assert_eq!(completed.completed_etag.as_deref(), Some("abc-1"));
+    assert_eq!(completed.expires_at, 250);
+    assert!(s3::parts(&f.pool, &other).await.unwrap().is_empty());
+    assert_eq!(
+        s3::record_part(&f.pool, &other, &part(2, "2.c"), 700)
+            .await
+            .unwrap(),
+        None
+    );
+    let listed: Vec<String> = s3::uploads_of_bucket(&f.pool, bucket.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|upload| upload.upload_id)
+        .collect();
+    assert_eq!(listed, std::slice::from_ref(&id));
+    assert_eq!(
+        s3::purge_expired_uploads(&f.pool, 260).await.unwrap(),
+        [other]
+    );
+
     assert!(s3::delete_upload(&f.pool, &id).await.unwrap());
     assert!(!s3::delete_upload(&f.pool, &id).await.unwrap());
     assert!(s3::parts(&f.pool, &id).await.unwrap().is_empty());

@@ -447,7 +447,7 @@ async fn multipart_uploads_assemble_their_parts() {
         .upload_id(id)
         .multipart_upload(
             CompletedMultipartUpload::builder()
-                .set_parts(Some(parts))
+                .set_parts(Some(parts.clone()))
                 .build(),
         )
         .send()
@@ -458,6 +458,111 @@ async fn multipart_uploads_assemble_their_parts() {
         "{:?}",
         done.e_tag()
     );
+    // A client that lost the answer and completes again gets the same one, as from S3; the
+    // upload takes no parts any more.
+    let again = s3
+        .client
+        .complete_multipart_upload()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .upload_id(id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(parts.clone()))
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.e_tag(), done.e_tag());
+    let late_part = s3
+        .client
+        .upload_part()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .upload_id(id)
+        .part_number(3)
+        .body(ByteStream::from_static(b"late"))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        late_part.raw_response().map(|r| r.status().as_u16()),
+        Some(404)
+    );
+    let other_parts = s3
+        .client
+        .complete_multipart_upload()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .upload_id(id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(parts[..1].to_vec()))
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        other_parts.raw_response().map(|r| r.status().as_u16()),
+        Some(400)
+    );
+
+    // A completion that may only create the object fails with a real 412 when the key exists,
+    // before the answer starts.
+    let conditional = s3
+        .client
+        .create_multipart_upload()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    let conditional_id = conditional.upload_id().unwrap();
+    let small = s3
+        .client
+        .upload_part()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .upload_id(conditional_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"small"))
+        .send()
+        .await
+        .unwrap();
+    let refused = s3
+        .client
+        .complete_multipart_upload()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .upload_id(conditional_id)
+        .if_none_match("*")
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(small.e_tag().unwrap())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.raw_response().map(|r| r.status().as_u16()),
+        Some(412)
+    );
+    s3.client
+        .abort_multipart_upload()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .upload_id(conditional_id)
+        .send()
+        .await
+        .unwrap();
     let mut expected = part1;
     expected.extend_from_slice(&part2);
     assert_eq!(s3.get(&s3.bucket, &key).await, expected);

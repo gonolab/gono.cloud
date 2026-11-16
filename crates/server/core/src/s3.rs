@@ -703,6 +703,8 @@ pub struct Upload {
     pub created_at: i64,
     /// When the purge removes it, UNIX seconds.
     pub expires_at: i64,
+    /// The ETag of the object it created, once it is completed.
+    pub completed_etag: Option<String>,
 }
 
 /// A part of a multipart upload.
@@ -728,6 +730,7 @@ struct UploadRow {
     meta: String,
     created_at: i64,
     expires_at: i64,
+    completed_etag: Option<String>,
 }
 
 impl From<UploadRow> for Upload {
@@ -739,6 +742,7 @@ impl From<UploadRow> for Upload {
             meta: row.meta,
             created_at: row.created_at,
             expires_at: row.expires_at,
+            completed_etag: row.completed_etag,
         }
     }
 }
@@ -798,9 +802,11 @@ pub async fn create_upload(
     Ok(upload_id)
 }
 
-const UPLOAD_COLUMNS: &str = "upload_id, bucket_id, key, meta, created_at, expires_at";
+const UPLOAD_COLUMNS: &str =
+    "upload_id, bucket_id, key, meta, created_at, expires_at, completed_etag";
 
-/// The upload `upload_id`, if it is in progress.
+/// The upload `upload_id`, if it is in progress or was completed lately
+/// ([`Upload::completed_etag`]).
 pub async fn upload(pool: &Pool, upload_id: &str) -> Result<Option<Upload>> {
     let row: Option<UploadRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {UPLOAD_COLUMNS} FROM s3_uploads WHERE upload_id = ?1"
@@ -814,7 +820,8 @@ pub async fn upload(pool: &Pool, upload_id: &str) -> Result<Option<Upload>> {
 /// The uploads in progress into bucket `bucket_id`, by key and then by id.
 pub async fn uploads_of_bucket(pool: &Pool, bucket_id: i64) -> Result<Vec<Upload>> {
     let rows: Vec<UploadRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {UPLOAD_COLUMNS} FROM s3_uploads WHERE bucket_id = ?1 ORDER BY key, upload_id"
+        "SELECT {UPLOAD_COLUMNS} FROM s3_uploads WHERE bucket_id = ?1 AND completed_etag IS NULL \
+         ORDER BY key, upload_id"
     )))
     .bind(bucket_id)
     .fetch_all(pool)
@@ -832,12 +839,14 @@ pub async fn record_part(
     expires_at: i64,
 ) -> Result<Option<Option<String>>> {
     let mut tx = db::begin_immediate(pool).await?;
-    let updated = sqlx::query("UPDATE s3_uploads SET expires_at = ?2 WHERE upload_id = ?1")
-        .bind(upload_id)
-        .bind(expires_at)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    let updated = sqlx::query(
+        "UPDATE s3_uploads SET expires_at = ?2 WHERE upload_id = ?1 AND completed_etag IS NULL",
+    )
+    .bind(upload_id)
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     if updated == 0 {
         return Ok(None);
     }
@@ -876,8 +885,36 @@ pub async fn parts(pool: &Pool, upload_id: &str) -> Result<Vec<UploadPart>> {
     Ok(rows.into_iter().map(UploadPart::from).collect())
 }
 
-/// Ends upload `upload_id` (completed or aborted) with its parts. Returns `false` if it was
-/// gone already.
+/// Marks upload `upload_id` completed with the object's ETag: removes its parts and keeps the
+/// upload until `expires_at`, so that a repeated completion can be answered. Returns `false`
+/// if it was gone or completed already.
+pub async fn complete_upload(
+    pool: &Pool,
+    upload_id: &str,
+    etag: &str,
+    expires_at: i64,
+) -> Result<bool> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let updated = sqlx::query(
+        "UPDATE s3_uploads SET completed_etag = ?2, expires_at = ?3 \
+         WHERE upload_id = ?1 AND completed_etag IS NULL",
+    )
+    .bind(upload_id)
+    .bind(etag)
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    sqlx::query("DELETE FROM s3_upload_parts WHERE upload_id = ?1")
+        .bind(upload_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(updated == 1)
+}
+
+/// Ends upload `upload_id` with its parts (aborted, or in progress and expired). Returns
+/// `false` if it was gone already.
 pub async fn delete_upload(pool: &Pool, upload_id: &str) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
     let removed = sqlx::query("DELETE FROM s3_uploads WHERE upload_id = ?1")
@@ -902,7 +939,7 @@ pub async fn purge_expired_uploads(pool: &Pool, now: i64) -> Result<Vec<String>>
     Ok(ids)
 }
 
-/// The ids of every upload in progress.
+/// The ids of every upload, in progress or completed lately.
 pub async fn upload_ids(pool: &Pool) -> Result<std::collections::HashSet<String>> {
     let ids: Vec<String> = sqlx::query_scalar("SELECT upload_id FROM s3_uploads")
         .fetch_all(pool)

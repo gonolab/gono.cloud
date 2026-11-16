@@ -10,7 +10,13 @@
 //!   assembles the parts in `tmp/` while s3s keeps the connection alive with whitespace. The
 //!   object is installed like a `PutObject` (WebDAV locks, conditions), its ETag is the MD5 of
 //!   the part MD5s followed by `-<parts>`, and the upload ends. While one completion runs, the
-//!   upload takes no parts and no second completion.
+//!   upload takes no parts and no second completion. `If-Match` and `If-None-Match` are checked
+//!   before the answer starts, so a failed condition is a real `412` (the install checks them
+//!   again).
+//! - **Repeated completions**: a completed upload is kept, without parts, for
+//!   [`COMPLETED_KEEP`], and a completion of it with the same parts answers as the first did,
+//!   as in S3, so that a client retrying after a lost answer does not fail. Every other
+//!   operation takes it for gone (`NoSuchUpload`).
 //! - **Expiry**: an upload expires `s3.multipart_ttl_secs` after its last part (or its
 //!   creation); [`purge`], run by a background task, removes it, and staging directories that
 //!   belong to no upload.
@@ -53,6 +59,9 @@ const MAX_PARTS: i32 = 10_000;
 
 /// Most parts or uploads in one listing.
 const MAX_LISTED: usize = 1000;
+
+/// How long a completed upload is kept for repeated completions.
+const COMPLETED_KEEP: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Staging directories without an upload are left alone this long, so that a part that is
 /// being renamed in is never taken for an orphan.
@@ -117,7 +126,8 @@ fn meta_from_json(value: &str) -> ObjectMeta {
     }
 }
 
-/// The upload `upload_id` of `key` in `bucket`, or `NoSuchUpload`.
+/// The upload `upload_id` of `key` in `bucket`, in progress or completed lately, or
+/// `NoSuchUpload`.
 async fn find_upload(
     state: &S3State,
     bucket: &Bucket,
@@ -129,6 +139,20 @@ async fn find_upload(
         .map_err(error::database)?
         .filter(|upload| upload.bucket_id == bucket.id && upload.key == key)
         .ok_or_else(|| s3_error!(NoSuchUpload))?;
+    Ok(upload)
+}
+
+/// The upload `upload_id` of `key` in `bucket` if it is in progress, or `NoSuchUpload`.
+async fn find_open_upload(
+    state: &S3State,
+    bucket: &Bucket,
+    key: &str,
+    upload_id: &str,
+) -> S3Result<Upload> {
+    let upload = find_upload(state, bucket, key, upload_id).await?;
+    if upload.completed_etag.is_some() {
+        return Err(s3_error!(NoSuchUpload));
+    }
     Ok(upload)
 }
 
@@ -243,7 +267,7 @@ pub(crate) async fn upload_part(
     if input.sse_customer_algorithm.is_some() {
         return Err(s3_error!(NotImplemented));
     }
-    find_upload(state, bucket, &input.key, &input.upload_id).await?;
+    find_open_upload(state, bucket, &input.key, &input.upload_id).await?;
     if state.is_completing(&input.upload_id) {
         return Err(s3_error!(OperationAborted, "The upload is being completed"));
     }
@@ -451,7 +475,7 @@ pub(crate) async fn upload_part_copy(
     {
         return Err(s3_error!(NoSuchVersion));
     }
-    find_upload(state, &destination, &input.key, &input.upload_id).await?;
+    find_open_upload(state, &destination, &input.key, &input.upload_id).await?;
     if state.is_completing(&input.upload_id) {
         return Err(s3_error!(OperationAborted, "The upload is being completed"));
     }
@@ -516,7 +540,7 @@ pub(crate) async fn list_parts(
     let auth = authorized(&req)?;
     let bucket = auth.bucket()?;
     let input = req.input;
-    find_upload(state, bucket, &input.key, &input.upload_id).await?;
+    find_open_upload(state, bucket, &input.key, &input.upload_id).await?;
     let marker = input
         .part_number_marker
         .and_then(|marker| u32::try_from(marker).ok())
@@ -659,7 +683,7 @@ pub(crate) async fn abort(
     GonoS3::write_permission(&auth)?;
     let bucket = auth.bucket()?;
     let input = req.input;
-    find_upload(state, bucket, &input.key, &input.upload_id).await?;
+    find_open_upload(state, bucket, &input.key, &input.upload_id).await?;
     let Some(_completing) = state.begin_completion(&input.upload_id) else {
         return Err(s3_error!(OperationAborted, "The upload is being completed"));
     };
@@ -733,19 +757,59 @@ fn chosen_parts(
 
 /// The ETag of a multipart object: the MD5 of the parts' MD5s, a dash and the number of parts.
 fn multipart_etag(parts: &[UploadPart]) -> S3Result<String> {
+    etag_of_parts(parts.iter().map(|part| part.etag.as_str()))
+        .ok_or_else(|| s3_error!(InternalError, "a stored part ETag is not an MD5"))
+}
+
+/// The multipart ETag of parts with these MD5s (lowercase hex), or `None` if one is not an MD5.
+fn etag_of_parts<'a>(etags: impl ExactSizeIterator<Item = &'a str>) -> Option<String> {
+    let count = etags.len();
     let mut md5 = Md5::new();
-    for part in parts {
+    for etag in etags {
+        if etag.len() != 32 {
+            return None;
+        }
         let mut digest = [0u8; 16];
         for (index, byte) in digest.iter_mut().enumerate() {
-            *byte = part
-                .etag
+            *byte = etag
                 .get(index * 2..index * 2 + 2)
-                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
-                .ok_or_else(|| s3_error!(InternalError, "a stored part ETag is not an MD5"))?;
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())?;
         }
         md5.update(&digest);
     }
-    Ok(format!("{}-{}", upload::hex(&md5.finalize()), parts.len()))
+    Some(format!("{}-{count}", upload::hex(&md5.finalize())))
+}
+
+/// The answer to a repeated completion of an upload that created an object with ETag
+/// `completed`: the same as the first one if the same parts are named, `InvalidPart` otherwise.
+fn repeated_completion(
+    completed: &str,
+    requested: &[dto::CompletedPart],
+    bucket: &str,
+    key: &str,
+) -> S3Result<dto::CompleteMultipartUploadOutput> {
+    let etags: Vec<String> = requested
+        .iter()
+        .map(|part| {
+            part.e_tag
+                .as_ref()
+                .map(|etag| etag.value().to_ascii_lowercase())
+                .unwrap_or_default()
+        })
+        .collect();
+    if etag_of_parts(etags.iter().map(String::as_str)).as_deref() != Some(completed) {
+        return Err(s3_error!(
+            InvalidPart,
+            "The upload was completed with other parts"
+        ));
+    }
+    Ok(dto::CompleteMultipartUploadOutput {
+        bucket: Some(bucket.to_owned()),
+        key: Some(key.to_owned()),
+        e_tag: Some(ETag::Strong(completed.to_owned())),
+        location: Some(format!("/{bucket}/{key}")),
+        ..Default::default()
+    })
 }
 
 /// Concatenates the parts in `dir` into a new synced file in `tmp_dir`.
@@ -788,6 +852,14 @@ pub(crate) async fn complete(
     let bucket = auth.bucket()?.clone();
     let input = req.input;
     let upload = find_upload(&state, &bucket, &input.key, &input.upload_id).await?;
+    if let Some(completed) = &upload.completed_etag {
+        let requested = input
+            .multipart_upload
+            .and_then(|upload| upload.parts)
+            .unwrap_or_default();
+        return repeated_completion(completed, &requested, &bucket.name, &input.key)
+            .map(S3Response::new);
+    }
     let client = match keys::target(&bucket.name, &input.key) {
         Ok(Target::File(client)) => client,
         _ => return Err(s3_error!(InvalidArgument)),
@@ -827,6 +899,10 @@ pub(crate) async fn complete(
     let etag = multipart_etag(&parts)?;
     let mut meta = meta_from_json(&upload.meta);
     meta.s3_etag = Some(etag.clone());
+    // Once the answer has started, a failure can only be an error document in a 200; check
+    // the condition now, so that a failed one is a 412 (the install checks it again).
+    s3.check_write_condition(&auth, &bucket, &client, &condition)
+        .await?;
 
     // From here on the answer is 200 with whitespace until the object is in place; failures
     // arrive as an error document in the body.
@@ -854,9 +930,15 @@ pub(crate) async fn complete(
             condition,
         )
         .await?;
-        s3::delete_upload(state.pool(), &upload.upload_id)
-            .await
-            .map_err(error::database)?;
+        let keep = i64::try_from(COMPLETED_KEEP.as_secs()).unwrap_or(i64::MAX);
+        s3::complete_upload(
+            state.pool(),
+            &upload.upload_id,
+            &etag,
+            db::unix_now().saturating_add(keep),
+        )
+        .await
+        .map_err(error::database)?;
         remove_staging(&state, &upload.upload_id).await;
         Ok(dto::CompleteMultipartUploadOutput {
             bucket: Some(bucket_name.clone()),

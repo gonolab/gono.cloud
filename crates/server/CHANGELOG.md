@@ -77,7 +77,8 @@ compatible within a major version: released clients keep working with newer serv
   rules (`PutBucketCors`, `GetBucketCors`, `DeleteBucketCors`; preflight requests are answered
   before s3s) and form uploads signed with a POST policy (`PostObject`, with the `acl` field
   that s3s does not read itself). Large copies use `UploadPartCopy` (whole objects or byte
-  ranges). `ListObjectVersions` lists each object as its only version, `null` (versioning is
+  ranges); a repeated `CompleteMultipartUpload` (a retry after a lost answer) gets the first
+  answer again, as from S3. `ListObjectVersions` lists each object as its only version, `null` (versioning is
   never enabled), which cleanup tools need. `mc anonymous set download` and `none` work: the anonymous-download bucket policy
   maps onto the bucket's anonymous access, and other policies answer `NotImplemented`. The web
   file UI offers "Copy public link" for files anyone can download through S3. The `mtime`

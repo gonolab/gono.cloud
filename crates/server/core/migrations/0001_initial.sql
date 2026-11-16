@@ -186,7 +186,11 @@ CREATE TABLE s3_uploads (
     meta       TEXT    NOT NULL,
     created_at INTEGER NOT NULL,
     -- Refreshed with every part; the purge removes uploads after it.
-    expires_at INTEGER NOT NULL
+    expires_at INTEGER NOT NULL,
+    -- The ETag of the object, once the upload is completed. A completed upload has no parts
+    -- left; it is kept for a while so that a client repeating the completion (a retry after a
+    -- lost answer) gets the same answer, as from S3.
+    completed_etag TEXT
 ) STRICT;
 
 CREATE INDEX s3_uploads_bucket_key ON s3_uploads (bucket_id, key);
