@@ -1,15 +1,17 @@
 //! S3 views of the `files` table: object metadata (`object_meta`) and listings in S3 key order.
 //!
 //! A bucket is a folder of its owner's tree; its objects are the files below that folder, and
-//! an object's key is the file's `rel_path` relative to the folder. The S3 API itself lives in
-//! another crate; this module holds what depends on the metadata model.
+//! an object's key is the file's path relative to the folder **as S3 spelled it**
+//! ([`FileRow::spelled`]: `s3_path`, or `rel_path` when S3 wrote nothing else; S3 keys need not
+//! be in NFC, the tree's names are). The S3 API itself lives in another crate; this module holds
+//! what depends on the metadata model.
 //!
 //! # Listing order
 //!
-//! S3 lists keys in the byte order of their UTF-8 encoding. `rel_path` uses `BINARY` collation,
-//! which is that order, and stripping the folder's prefix keeps it. [`MetaStore::list_objects`]
-//! therefore reads file rows in `rel_path` order and never derives common prefixes from
-//! directory rows: the folder `a` sorts before the file `a-b`, while S3 orders the common prefix
+//! S3 lists keys in the byte order of their UTF-8 encoding. The spelled paths use `BINARY`
+//! collation, which is that order, and stripping the folder's spelled prefix keeps it
+//! (`files_s3_listing` indexes them). [`MetaStore::list_objects`] therefore reads file rows in
+//! that order and never derives common prefixes from directory rows: the folder `a` sorts before the file `a-b`, while S3 orders the common prefix
 //! `a/` after the key `a-b` (`-` is 0x2D, `/` is 0x2F). Common prefixes come from the first file
 //! below them, and the scan then jumps past all their keys with one indexed seek
 //! ([`prefix_successor`]). Directories without files never show up, as in S3.
@@ -300,13 +302,39 @@ impl MetaStore {
         Ok(rows.into_iter().collect())
     }
 
+    /// Of `owner`'s entries `file_ids`, those that S3 spells otherwise than their path, with
+    /// that spelling ([`FileRow::s3_path`]).
+    pub async fn spellings(
+        &self,
+        owner: i64,
+        file_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, String>> {
+        if file_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let ids = serde_json::to_string(file_ids).unwrap_or_else(|_| unreachable!("numbers"));
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, s3_path FROM files WHERE owner_id = ?1 AND s3_path IS NOT NULL \
+             AND id IN (SELECT value FROM json_each(?2))",
+        )
+        .bind(owner)
+        .bind(ids)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// Lists `owner`'s files below `query.root` in S3 key order, with S3's prefix, delimiter
     /// and start-after semantics (see the module documentation).
     pub async fn list_objects(&self, owner: i64, query: ObjectQuery<'_>) -> Result<ObjectListing> {
         let base = if query.root.is_root() {
             String::new()
         } else {
-            format!("{}/", query.root.as_str())
+            let root = self.get(owner, query.root).await?;
+            let spelled = root
+                .as_ref()
+                .map_or(query.root.as_str(), |row| row.spelled());
+            format!("{spelled}/")
         };
         let delimiter = query.delimiter.filter(|d| !d.is_empty());
         let full_prefix = format!("{base}{}", query.prefix);
@@ -343,7 +371,8 @@ impl MetaStore {
             let exhausted = rows.len() < limit;
             for row in rows {
                 let file = FileRow::from(row.file);
-                let Some(key) = file.rel_path.as_str().strip_prefix(&base) else {
+                let spelled = file.spelled().to_owned();
+                let Some(key) = spelled.strip_prefix(&base) else {
                     // The range guarantees the prefix; stay safe if it ever did not.
                     continue;
                 };
@@ -365,7 +394,7 @@ impl MetaStore {
                         None => break 'scan,
                     }
                 }
-                from = Start::After(file.rel_path.as_str().to_owned());
+                from = Start::After(spelled.clone());
                 entries.push(ListEntry::Object(ListedObject {
                     key: key.to_owned(),
                     file,
@@ -381,7 +410,8 @@ impl MetaStore {
         Ok(ObjectListing { entries, truncated })
     }
 
-    /// Up to `limit` file rows of `owner` from `from` to before `upper`, in `rel_path` order.
+    /// Up to `limit` file rows of `owner` from `from` to before `upper`, in the order of their
+    /// spelled paths (the expression and the condition of the index `files_s3_listing`).
     async fn scan_files(
         &self,
         owner: i64,
@@ -393,19 +423,20 @@ impl MetaStore {
             Start::Including(start) => (">=", start),
             Start::After(start) => (">", start),
         };
-        // Separate statements with and without an upper bound: `?3 IS NULL OR rel_path < ?3`
-        // would keep SQLite from ending the index range scan there.
+        // Separate statements with and without an upper bound: `?3 IS NULL OR ... < ?3` would
+        // keep SQLite from ending the index range scan there.
         let upper_clause = if upper.is_some() {
-            "AND f.rel_path < ?3"
+            "AND COALESCE(f.s3_path, f.rel_path) < ?3"
         } else {
             ""
         };
         let sql = format!(
             "SELECT f.id, f.rel_path, f.is_dir, f.etag, f.mtime_ns, f.size, f.favorite, \
-             f.creation_time, o.s3_etag FROM files f \
+             f.creation_time, f.s3_path, o.s3_etag FROM files f \
              LEFT JOIN object_meta o ON o.file_id = f.id \
-             WHERE f.owner_id = ?1 AND f.rel_path {op} ?2 {upper_clause} AND f.is_dir = 0 \
-             ORDER BY f.rel_path LIMIT ?4"
+             WHERE f.owner_id = ?1 AND COALESCE(f.s3_path, f.rel_path) {op} ?2 {upper_clause} \
+             AND f.is_dir = 0 \
+             ORDER BY COALESCE(f.s3_path, f.rel_path) LIMIT ?4"
         );
         let rows = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(owner)

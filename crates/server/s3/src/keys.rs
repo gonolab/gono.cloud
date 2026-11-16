@@ -1,13 +1,14 @@
 //! Object keys as paths of the tree, and their encodings in listings.
 //!
-//! A key is a path relative to the bucket's folder, split at `/`. Keys the tree cannot hold are
-//! refused instead of being rewritten:
+//! A key is a path relative to the bucket's folder, split at `/`. Every segment must be a
+//! valid [`RelPath`] segment: not empty (no `a//b`, no leading `/`), not `.` or `..`, without
+//! NUL, at most 255 bytes; keys the tree cannot hold that way are refused.
 //!
-//! - every segment must be a valid [`RelPath`] segment: not empty (no `a//b`, no leading `/`),
-//!   not `.` or `..`, without NUL, at most 255 bytes;
-//! - and in Unicode NFC. The tree stores NFC names; silently normalizing a key would make a
-//!   listing return other bytes than were written, and sync tools would upload again forever
-//!   or, when deleting, remove what they had just uploaded.
+//! Keys need not be in Unicode NFC, but the tree's names are: a key names the file at its NFC
+//! form, and the file records how the key spelled it (`files.s3_path`), so that listings return
+//! the bytes that were written, in their order, and the file answers only to that spelling
+//! (sync tools would otherwise upload again forever or delete what they just uploaded). Two
+//! keys that differ only in normalization name one place; the second is refused (`409`).
 //!
 //! A key that ends in `/` names a folder (an S3 "folder marker").
 
@@ -73,11 +74,6 @@ pub fn target(bucket: &str, key: &str) -> Result<Target, KeyError> {
                 PathError::Slash | PathError::NotUtf8 => "the key is not a valid path",
             })
         })?;
-        if normalized != segment {
-            return Err(KeyError::Invalid(
-                "the key is not in Unicode NFC; the server stores names in NFC only",
-            ));
-        }
         path = path.join(&normalized);
     }
     Ok(if folder {
@@ -100,6 +96,14 @@ pub fn url_encode(value: &str) -> String {
         }
     }
     out
+}
+
+/// The client path `key` names in `bucket` as the key spells it (the bucket name, then the key
+/// without the `/` of a folder marker), for [`gono_server_dav::ScopedFs::put_object`] and its
+/// kin.
+pub fn spelled(bucket: &str, key: &str) -> String {
+    let key = key.strip_suffix('/').unwrap_or(key);
+    format!("{bucket}/{key}")
 }
 
 /// The continuation token that resumes a listing after `marker`.
@@ -142,9 +146,14 @@ mod tests {
         }
         assert!(target("b", &format!("{}/x", "s".repeat(256))).is_err());
         assert_eq!(target("b", &"k".repeat(1025)), Err(KeyError::TooLong));
-        // NFD (e + combining acute) is refused, NFC accepted.
-        assert!(target("b", "Cafe\u{301}.txt").is_err());
-        assert!(target("b", "Caf\u{e9}.txt").is_ok());
+        // NFD (e + combining acute) names the file at its NFC form; the spelling is kept by
+        // the caller.
+        assert_eq!(
+            target("b", "Cafe\u{301}/x.txt").unwrap(),
+            target("b", "Caf\u{e9}/x.txt").unwrap()
+        );
+        assert_eq!(spelled("b", "Cafe\u{301}/"), "b/Cafe\u{301}");
+        assert_eq!(spelled("b", "a/b.txt"), "b/a/b.txt");
     }
 
     #[test]

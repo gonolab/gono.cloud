@@ -79,7 +79,9 @@ compatible within a major version: released clients keep working with newer serv
   that s3s does not read itself). Large copies use `UploadPartCopy` (whole objects or byte
   ranges); a repeated `CompleteMultipartUpload` (a retry after a lost answer) gets the first
   answer again, as from S3. `ListObjectVersions` lists each object as its only version, `null` (versioning is
-  never enabled), which cleanup tools need. `mc anonymous set download` and `none` work: the anonymous-download bucket policy
+  never enabled), which cleanup tools need. Keys need not be in Unicode NFC (names from older
+  macOS are NFD): the tree stores the NFC name and S3 keeps the key's spelling
+  (`files.s3_path`), in listings too. `mc anonymous set download` and `none` work: the anonymous-download bucket policy
   maps onto the bucket's anonymous access, and other policies answer `NotImplemented`. The web
   file UI offers "Copy public link" for files anyone can download through S3. The `mtime`
   metadata of rclone and other sync tools becomes the file's modification time, so WebDAV and

@@ -43,7 +43,14 @@ impl Harness {
         let temp = self.upload(content);
         let result = self
             .fs
-            .put_object(identity.clone(), &p(client), temp.clone(), meta, condition)
+            .put_object(
+                identity.clone(),
+                &p(client),
+                None,
+                temp.clone(),
+                meta,
+                condition,
+            )
             .await;
         if result.is_err() {
             assert!(
@@ -330,6 +337,7 @@ async fn copies_are_new_versions_with_their_own_metadata() {
             full.clone(),
             &p("src"),
             &p("dst/copy"),
+            None,
             meta.clone(),
             WriteCondition::Always,
             None,
@@ -353,6 +361,7 @@ async fn copies_are_new_versions_with_their_own_metadata() {
             full.clone(),
             &p("src"),
             &p("dst/dated"),
+            None,
             object("md5-src"),
             WriteCondition::Always,
             Some(then),
@@ -367,6 +376,7 @@ async fn copies_are_new_versions_with_their_own_metadata() {
             full.clone(),
             &p("folder"),
             &p("x"),
+            None,
             object("1"),
             WriteCondition::Always,
             None
@@ -380,6 +390,7 @@ async fn copies_are_new_versions_with_their_own_metadata() {
             full.clone(),
             &p("src"),
             &p("dst/copy"),
+            None,
             object("1"),
             WriteCondition::CreateOnly,
             None
@@ -622,4 +633,75 @@ async fn only_folders_without_files_are_removed() {
         Err(ObjectError::Forbidden),
         "a mount root"
     );
+}
+
+/// Writes may name the client path as an S3 key spelled it: the file and the folders created
+/// for it record the spelling, and another spelling of the same place (a key that differs only
+/// in Unicode normalization, in any segment) is refused.
+#[tokio::test]
+async fn spellings_are_recorded_and_other_spellings_refused() {
+    let h = Harness::new().await;
+    let full = h.full();
+    let nfc = "Caf\u{e9}";
+    let nfd = "Cafe\u{301}";
+    let put = |client: String, spelled: String| {
+        let h = &h;
+        let full = full.clone();
+        async move {
+            let temp = h.upload("x");
+            let result =
+                h.fs.put_object(
+                    full,
+                    &p(&client),
+                    Some(&spelled),
+                    temp.clone(),
+                    object("1"),
+                    WriteCondition::Always,
+                )
+                .await;
+            if result.is_err() {
+                std::fs::remove_file(temp).unwrap();
+            }
+            result.map(|_| ())
+        }
+    };
+    put(format!("{nfc}/a.txt"), format!("{nfd}/a.txt"))
+        .await
+        .unwrap();
+    let meta = h.fs.meta();
+    let row = |rel: String| {
+        let meta = meta.clone();
+        let owner = h.owner;
+        async move { meta.get(owner, &p(&rel)).await.unwrap().unwrap() }
+    };
+    assert_eq!(row(nfc.to_owned()).await.spelled(), nfd);
+    assert_eq!(
+        row(format!("{nfc}/a.txt")).await.spelled(),
+        format!("{nfd}/a.txt")
+    );
+    // The same spelling overwrites; another one of the file or of its folder is refused.
+    put(format!("{nfc}/a.txt"), format!("{nfd}/a.txt"))
+        .await
+        .unwrap();
+    assert_eq!(
+        put(format!("{nfc}/a.txt"), format!("{nfc}/a.txt")).await,
+        Err(ObjectError::KeyConflict)
+    );
+    assert_eq!(
+        put(format!("{nfc}/b.txt"), format!("{nfc}/b.txt")).await,
+        Err(ObjectError::KeyConflict)
+    );
+    put(format!("{nfc}/b.txt"), format!("{nfd}/b.txt"))
+        .await
+        .unwrap();
+    // Folder markers: the folder's spelling must match too.
+    assert_eq!(
+        h.fs.put_spelled_folder(full.clone(), &p(nfc), Some(nfc))
+            .await
+            .unwrap_err(),
+        ObjectError::KeyConflict
+    );
+    h.fs.put_spelled_folder(full.clone(), &p(nfc), Some(nfd))
+        .await
+        .unwrap();
 }

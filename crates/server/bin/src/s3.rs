@@ -137,16 +137,22 @@ impl PublicLinks {
     /// publishes it: every file of a `public-read` bucket, and in an `acl` bucket the files
     /// whose current version has the `public-read` ACL (`public_acl`). Virtual-hosted style when
     /// it is enabled, which gives each bucket an origin of its own.
-    pub fn url(&self, rel: &RelPath, public_acl: bool) -> Option<String> {
+    pub fn url(&self, rel: &RelPath, spelled: Option<&str>, public_acl: bool) -> Option<String> {
         let bucket = self.holding(rel).into_iter().find(|bucket| {
             bucket.anonymous == Anonymous::PublicRead
                 || (bucket.anonymous == Anonymous::Acl && public_acl)
         })?;
-        let key = rel.strip_prefix(&bucket.folder)?;
-        if key.as_str().len() > gono_server_s3::keys::MAX_KEY_BYTES {
+        // The key as S3 spelled it (keys need not be in NFC; the tree's names are), which is
+        // the only one the file answers to.
+        let below = rel.strip_prefix(&bucket.folder)?;
+        let key = spelled
+            .and_then(|spelled| spelled.strip_prefix(bucket.folder.as_str()))
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or(below.as_str());
+        if key.len() > gono_server_s3::keys::MAX_KEY_BYTES {
             return None;
         }
-        let key = gono_server_s3::keys::url_encode(key.as_str());
+        let key = gono_server_s3::keys::url_encode(key);
         Some(match self.ui.virtual_host_origin(&bucket.name) {
             Some(origin) => format!("{origin}/{key}"),
             None => format!("{}/{}/{key}", self.ui.endpoint()?, bucket.name),
@@ -279,33 +285,39 @@ mod tests {
         let path = |rel: &str| RelPath::parse(rel).unwrap();
         // An `acl` bucket publishes only files with the public-read ACL.
         assert!(links.needs_acl(&path("Buckets/media/a b.jpg")));
-        assert_eq!(links.url(&path("Buckets/media/a b.jpg"), false), None);
+        assert_eq!(links.url(&path("Buckets/media/a b.jpg"), None, false), None);
         assert_eq!(
             links
-                .url(&path("Buckets/media/2026/a b+c.jpg"), true)
+                .url(&path("Buckets/media/2026/a b+c.jpg"), None, true)
                 .as_deref(),
             Some("https://s3.example.com/media/2026/a%20b%2Bc.jpg")
         );
         // A public-read bucket publishes everything, also below a nested acl bucket.
         assert!(!links.needs_acl(&path("Sites/site/index.html")));
         assert_eq!(
-            links.url(&path("Sites/site/index.html"), false).as_deref(),
+            links
+                .url(&path("Sites/site/index.html"), None, false)
+                .as_deref(),
             Some("https://s3.example.com/site/index.html")
         );
         assert!(!links.needs_acl(&path("Sites/site/inner/x.txt")));
         assert_eq!(
-            links.url(&path("Sites/site/inner/x.txt"), false).as_deref(),
+            links
+                .url(&path("Sites/site/inner/x.txt"), None, false)
+                .as_deref(),
             Some("https://s3.example.com/site/inner/x.txt")
         );
         assert_eq!(
-            links.url(&path("Sites/site/inner/x.txt"), true).as_deref(),
+            links
+                .url(&path("Sites/site/inner/x.txt"), None, true)
+                .as_deref(),
             Some("https://s3.example.com/inner/x.txt"),
             "the innermost bucket that publishes it"
         );
         // Outside every bucket, or the bucket's folder itself: nothing.
         assert!(!links.needs_acl(&path("Documents/a.txt")));
-        assert_eq!(links.url(&path("Documents/a.txt"), true), None);
-        assert_eq!(links.url(&path("Buckets/media"), true), None);
+        assert_eq!(links.url(&path("Documents/a.txt"), None, true), None);
+        assert_eq!(links.url(&path("Buckets/media"), None, true), None);
 
         let virtual_links = PublicLinks {
             ui: Arc::new(ui("https://s3.example.com", Some("s3.example.com"))),
@@ -313,9 +325,21 @@ mod tests {
         };
         assert_eq!(
             virtual_links
-                .url(&path("Sites/site/index.html"), false)
+                .url(&path("Sites/site/index.html"), None, false)
                 .as_deref(),
             Some("https://site.s3.example.com/index.html")
+        );
+        // A key that S3 spelled otherwise (here in NFD) is linked as spelled, the only spelling
+        // the file answers to.
+        assert_eq!(
+            virtual_links
+                .url(
+                    &path("Sites/site/Caf\u{e9}/a.txt"),
+                    Some("Sites/site/Cafe\u{301}/a.txt"),
+                    false
+                )
+                .as_deref(),
+            Some("https://site.s3.example.com/Cafe%CC%81/a.txt")
         );
     }
 

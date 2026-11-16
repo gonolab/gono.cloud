@@ -21,6 +21,11 @@
 //!   writes do not take that lock.
 //! - **S3 metadata of one version**: [`ScopedFs::object`] returns the stored [`ObjectMeta`] only
 //!   while the file on disk is still the version it was written with.
+//! - **Spellings**: S3 keys need not be in NFC; the tree's names are. A write may name the client
+//!   path as its key spelled it; the file and the folders it creates record that spelling
+//!   (`files.s3_path`), and a write whose spelling differs from what is stored there already
+//!   (a key that differs only in Unicode normalization, in any segment) fails with
+//!   [`ObjectError::KeyConflict`]: one file tree cannot hold both.
 //! - Every write runs to completion even if the request is dropped, like every other write.
 //!
 //! WebDAV locks are the caller's concern ([`crate::locks::write_conflict`]), as for the chunked
@@ -71,6 +76,9 @@ pub enum ObjectError {
     ParentIsFile,
     /// The [`WriteCondition`] does not hold.
     PreconditionFailed,
+    /// The path, or a folder on it, is stored with another spelling of its names (see the
+    /// module documentation).
+    KeyConflict,
     /// The file system is full.
     InsufficientStorage,
     /// Anything else; logged where it happened.
@@ -85,6 +93,7 @@ impl std::fmt::Display for ObjectError {
             Self::IsFolder => "the path is a folder",
             Self::ParentIsFile => "a parent of the path is a file",
             Self::PreconditionFailed => "precondition failed",
+            Self::KeyConflict => "stored with another spelling",
             Self::InsufficientStorage => "insufficient storage",
             Self::Failed => "failed",
         })
@@ -214,6 +223,8 @@ struct Target {
     storage: RelPath,
     /// The storage path of the target's mount: parents are created below it, never above.
     mount_root: RelPath,
+    /// The client path of the target's mount.
+    mount_path: RelPath,
 }
 
 impl ScopedFs {
@@ -258,7 +269,8 @@ impl ScopedFs {
     }
 
     /// Installs `temp` as the file at client path `client` with the S3 metadata `object`, if
-    /// `condition` holds, creating missing parent folders.
+    /// `condition` holds, creating missing parent folders. `spelled` is the client path as the
+    /// S3 key spelled it (see the module documentation); `None` keeps what is stored.
     ///
     /// `temp` must be a complete, synced file on the data directory's file system (in `tmp/`).
     /// On error it is left for the caller to remove.
@@ -266,23 +278,32 @@ impl ScopedFs {
         &self,
         identity: Arc<Identity>,
         client: &RelPath,
+        spelled: Option<&str>,
         temp: PathBuf,
         object: ObjectMeta,
         condition: WriteCondition,
     ) -> Result<Arc<Entry>, ObjectError> {
         let target = self.object_target(identity, client, Method::PUT).await?;
+        let spelled = self.spelled_storage(&target, spelled).await?;
         let fs = self.clone();
-        detached(async move { fs.install_object(target, temp, object, condition).await }).await
+        detached(async move {
+            fs.install_object(target, temp, object, condition, spelled)
+                .await
+        })
+        .await
     }
 
     /// Copies the file at client path `from` to client path `to` with the S3 metadata `object`,
     /// if `condition` holds, creating missing parent folders of `to`. The copy is a new version:
     /// its modification time is `modified`, or now.
+    // The arguments are what a CopyObject request names; a struct would only rename them.
+    #[allow(clippy::too_many_arguments)]
     pub async fn copy_object(
         &self,
         identity: Arc<Identity>,
         from: &RelPath,
         to: &RelPath,
+        spelled: Option<&str>,
         object: ObjectMeta,
         condition: WriteCondition,
         modified: Option<SystemTime>,
@@ -297,6 +318,7 @@ impl ScopedFs {
             .cloned()
             .ok_or(ObjectError::NotFound)?;
         let target = self.object_target(identity, to, Method::PUT).await?;
+        let spelled = self.spelled_storage(&target, spelled).await?;
         let root = self.user_root(target.owner);
         let tmp_dir = self.layout().tmp_dir();
         let fs = self.clone();
@@ -322,7 +344,7 @@ impl ScopedFs {
             })
             .await?;
             let result = fs
-                .install_object(target, temp.clone(), object, condition)
+                .install_object(target, temp.clone(), object, condition, spelled)
                 .await;
             if result.is_err() {
                 let _ = tokio::fs::remove_file(&temp).await;
@@ -339,25 +361,118 @@ impl ScopedFs {
         identity: Arc<Identity>,
         client: &RelPath,
     ) -> Result<Arc<Entry>, ObjectError> {
+        self.put_spelled_folder(identity, client, None).await
+    }
+
+    /// [`Self::put_folder`] for an S3 key that spells the client path `spelled` (see the module
+    /// documentation): an existing folder must be spelled that way.
+    pub async fn put_spelled_folder(
+        &self,
+        identity: Arc<Identity>,
+        client: &RelPath,
+        spelled: Option<&str>,
+    ) -> Result<Arc<Entry>, ObjectError> {
         let location = resolve::resolve_client(&identity, client.clone())?;
         if !location.writable(&identity) {
             return Err(ObjectError::Forbidden);
         }
-        let mount_root = location
+        let (mount_root, mount_path) = location
             .mount(&identity)
-            .map(|mount| mount.storage_path.clone())
+            .map(|mount| (mount.storage_path.clone(), mount.mount_path.clone()))
             .ok_or(ObjectError::Forbidden)?;
         let storage = location.storage().cloned().ok_or(ObjectError::Forbidden)?;
         let owner = identity.user_id;
         self.ensure_user(owner).await?;
+        let spelled = match spelled {
+            Some(spelled) => Some(
+                self.spelled_below(owner, &mount_root, &mount_path, spelled)
+                    .await?,
+            ),
+            None => None,
+        };
         let fs = self.clone();
         let ctx = Ctx::new(identity.clone(), RequestInfo::new(Method::PUT));
         detached(async move {
-            fs.create_folders(owner, &mount_root, &storage, true)
+            fs.create_folders(owner, &mount_root, &storage, true, spelled.as_deref())
                 .await?;
+            if let Some(spelled) = &spelled {
+                fs.check_spelling(owner, &storage, spelled).await?;
+            }
             Ok(fs.lookup(&ctx, &location).await?)
         })
         .await
+    }
+
+    /// The storage path `target` names, as the S3 key spells it (`spelled` is the client path
+    /// as spelled).
+    async fn spelled_storage(
+        &self,
+        target: &Target,
+        spelled: Option<&str>,
+    ) -> Result<Option<String>, ObjectError> {
+        match spelled {
+            Some(spelled) => Ok(Some(
+                self.spelled_below(
+                    target.owner,
+                    &target.mount_root,
+                    &target.mount_path,
+                    spelled,
+                )
+                .await?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// The storage path of client path `spelled` (spelled as an S3 key spells it) below the
+    /// mount at `mount_path`, whose storage folder is `mount_root`: the folder's own spelling,
+    /// then the key's.
+    async fn spelled_below(
+        &self,
+        owner: i64,
+        mount_root: &RelPath,
+        mount_path: &RelPath,
+        spelled: &str,
+    ) -> Result<String, ObjectError> {
+        let below = if mount_path.is_root() {
+            Some(spelled)
+        } else {
+            spelled
+                .strip_prefix(mount_path.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+        }
+        .ok_or(ObjectError::Failed)?;
+        if mount_root.is_root() {
+            return Ok(below.to_owned());
+        }
+        let root = self
+            .meta()
+            .get(owner, mount_root)
+            .await
+            .map_err(object_db_error)?;
+        let root = root
+            .as_ref()
+            .map_or(mount_root.as_str(), |row| row.spelled());
+        Ok(format!("{root}/{below}"))
+    }
+
+    /// Fails with [`ObjectError::KeyConflict`] unless the entry at `storage`, if there is one,
+    /// is spelled `spelled`.
+    async fn check_spelling(
+        &self,
+        owner: i64,
+        storage: &RelPath,
+        spelled: &str,
+    ) -> Result<(), ObjectError> {
+        let row = self
+            .meta()
+            .get(owner, storage)
+            .await
+            .map_err(object_db_error)?;
+        match row {
+            Some(row) if row.spelled() != spelled => Err(ObjectError::KeyConflict),
+            _ => Ok(()),
+        }
     }
 
     /// Opens the file at client path `client` for reading, with its S3 metadata as
@@ -477,9 +592,9 @@ impl ScopedFs {
         if !location.writable(&identity) || location.is_mount_root(&identity) {
             return Err(ObjectError::Forbidden);
         }
-        let mount_root = location
+        let (mount_root, mount_path) = location
             .mount(&identity)
-            .map(|mount| mount.storage_path.clone())
+            .map(|mount| (mount.storage_path.clone(), mount.mount_path.clone()))
             .ok_or(ObjectError::Forbidden)?;
         let storage = location.storage().cloned().ok_or(ObjectError::Forbidden)?;
         let owner = identity.user_id;
@@ -490,6 +605,7 @@ impl ScopedFs {
             owner,
             storage,
             mount_root,
+            mount_path,
         })
     }
 
@@ -500,6 +616,7 @@ impl ScopedFs {
         temp: PathBuf,
         object: ObjectMeta,
         condition: WriteCondition,
+        spelled: Option<String>,
     ) -> Result<Arc<Entry>, ObjectError> {
         let Target {
             ctx,
@@ -507,11 +624,26 @@ impl ScopedFs {
             owner,
             storage,
             mount_root,
+            ..
         } = target;
         let _path = self.object_locks().path(owner, &storage).await;
+        let spelled_parent = spelled
+            .as_deref()
+            .and_then(|spelled| spelled.rsplit_once('/'))
+            .map(|(parent, _)| parent);
         if let Some(parent) = storage.parent() {
-            self.create_folders(owner, &mount_root, &parent, true)
+            self.create_folders(owner, &mount_root, &parent, true, spelled_parent)
                 .await?;
+            // Under the path's lock, after the folders: a key that differs only in Unicode
+            // normalization from what is stored on its path cannot be stored too.
+            if let Some(spelled_parent) = spelled_parent
+                && !parent.is_root()
+            {
+                self.check_spelling(owner, &parent, spelled_parent).await?;
+            }
+        }
+        if let Some(spelled) = &spelled {
+            self.check_spelling(owner, &storage, spelled).await?;
         }
         if let WriteCondition::IfMatch(expected) = &condition {
             let current = match self.lookup(&ctx, &location).await {
@@ -573,7 +705,7 @@ impl ScopedFs {
         .await?;
         let row = self
             .meta()
-            .record_object_write(owner, &storage, stat, &object)
+            .record_object_write(owner, &storage, stat, &object, spelled.as_deref())
             .await
             .map_err(object_db_error)?;
         Ok(self.remember_row(&ctx, location, &row, stat))
@@ -588,6 +720,7 @@ impl ScopedFs {
         mount_root: &RelPath,
         dir: &RelPath,
         include_dir: bool,
+        spelled_dir: Option<&str>,
     ) -> Result<(), ObjectError> {
         let mut wanted: Vec<RelPath> = dir
             .ancestors()
@@ -653,8 +786,14 @@ impl ScopedFs {
             })
             .await?;
             if let Some(stat) = created {
+                // The folder as the key spells it: as many segments of the spelled path as the
+                // folder has (normalization never adds or removes a '/').
+                let spelled = spelled_dir.map(|spelled| {
+                    let depth = folder.as_str().split('/').count();
+                    spelled.split('/').take(depth).collect::<Vec<_>>().join("/")
+                });
                 self.meta()
-                    .record_mkdir(owner, &folder, stat.mtime_ns)
+                    .record_spelled_mkdir(owner, &folder, stat.mtime_ns, spelled.as_deref())
                     .await
                     .map_err(object_db_error)?;
             }

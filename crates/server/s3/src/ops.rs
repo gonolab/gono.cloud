@@ -598,6 +598,9 @@ impl GonoS3 {
                 s3_error!(NoSuchKey)
             }
         };
+        if !self.spelled_as(bucket, target.path(), key).await? {
+            return Err(not_found());
+        }
         match &target {
             Target::Folder(client) => {
                 // A folder marker reads as an empty object.
@@ -681,7 +684,11 @@ impl GonoS3 {
             }
             self.state
                 .fs()
-                .put_folder(identity, client)
+                .put_spelled_folder(
+                    identity,
+                    client,
+                    Some(&keys::spelled(&bucket.name, &input.key)),
+                )
                 .await
                 .map_err(|err| error::object(err, false))?;
             return Ok(dto::PutObjectOutput {
@@ -742,6 +749,7 @@ impl GonoS3 {
             .put_object(
                 identity,
                 target.path(),
+                Some(&keys::spelled(&bucket.name, &input.key)),
                 received.temp.path().to_path_buf(),
                 meta,
                 condition,
@@ -1801,6 +1809,7 @@ impl S3 for GonoS3 {
                 identity,
                 &from,
                 &to,
+                Some(&keys::spelled(&destination.name, &input.key)),
                 meta.clone(),
                 condition,
                 upload::mtime_of(&meta),
@@ -1827,6 +1836,9 @@ impl S3 for GonoS3 {
             Target::File(path) => path,
             Target::Folder(_) => return Err(s3_error!(NoSuchKey)),
         };
+        if !self.spelled_as(bucket, &client, &req.input.key).await? {
+            return Err(s3_error!(NoSuchKey));
+        }
         let identity = Self::bucket_identity(&auth, bucket, false)?;
         let (_, meta) =
             self.state
@@ -1878,6 +1890,9 @@ impl S3 for GonoS3 {
             Target::File(path) => path,
             Target::Folder(_) => return Err(s3_error!(NoSuchKey)),
         };
+        if !self.spelled_as(bucket, &client, &input.key).await? {
+            return Err(s3_error!(NoSuchKey));
+        }
         let identity = Self::bucket_identity(&auth, bucket, true)?;
         let entry = self
             .state
@@ -1964,6 +1979,10 @@ impl GonoS3 {
             // Nothing can be stored under such a key, so it is gone already.
             Err(_) => return Ok(()),
         };
+        if !self.spelled_as(bucket, target.path(), key).await? {
+            // Another spelling of the key is stored there: this one names nothing.
+            return Ok(());
+        }
         self.check_locks(bucket, target.path()).await?;
         let identity = Self::bucket_identity(auth, bucket, true)?;
         let result = match &target {
@@ -1976,23 +1995,71 @@ impl GonoS3 {
         }
     }
 
-    /// Installs an assembled multipart upload; see [`crate::multipart::complete`].
+    /// Installs an assembled multipart upload as `key`; see [`crate::multipart::complete`].
     pub(crate) async fn install(
         &self,
         auth: &Authorized,
         bucket: &Bucket,
-        client: &RelPath,
+        key: &str,
         temp: std::path::PathBuf,
         meta: ObjectMeta,
         condition: WriteCondition,
     ) -> S3Result<Arc<Entry>> {
-        self.check_locks(bucket, client).await?;
+        let Target::File(client) = target(bucket, key)? else {
+            return Err(s3_error!(InvalidArgument));
+        };
+        self.check_locks(bucket, &client).await?;
         let identity = Self::bucket_identity(auth, bucket, true)?;
         self.state
             .fs()
-            .put_object(identity, client, temp, meta, condition)
+            .put_object(
+                identity,
+                &client,
+                Some(&keys::spelled(&bucket.name, key)),
+                temp,
+                meta,
+                condition,
+            )
             .await
             .map_err(|err| error::object(err, false))
+    }
+
+    /// Whether what is stored at `client`, the place of `key` in `bucket`, answers to `key`:
+    /// keys need not be in NFC while the tree's names are, so keys that differ only in Unicode
+    /// normalization share one place, which answers only to the spelling it was written with
+    /// (see [`crate::keys`]). True when nothing is there.
+    pub(crate) async fn spelled_as(
+        &self,
+        bucket: &Bucket,
+        client: &RelPath,
+        key: &str,
+    ) -> S3Result<bool> {
+        let storage = storage_of(bucket, client)?;
+        let meta = self.state.fs().meta();
+        let Some(row) = meta
+            .get(bucket.owner_id, &storage)
+            .await
+            .map_err(error::database)?
+        else {
+            return Ok(true);
+        };
+        let key = key.strip_suffix('/').unwrap_or(key);
+        let Some(s3_path) = &row.s3_path else {
+            // Spelled as the tree, which is in NFC: only the NFC key names it.
+            let below = storage
+                .as_str()
+                .strip_prefix(bucket.folder.as_str())
+                .and_then(|rest| rest.strip_prefix('/'));
+            return Ok(below == Some(key));
+        };
+        let root = meta
+            .get(bucket.owner_id, &bucket.folder)
+            .await
+            .map_err(error::database)?;
+        let root = root
+            .as_ref()
+            .map_or(bucket.folder.as_str(), |row| row.spelled());
+        Ok(*s3_path == format!("{root}/{key}"))
     }
 
     /// Checks `condition` against the object at `client` as it is now, before a write that
@@ -2056,6 +2123,9 @@ impl GonoS3 {
             Ok(Target::File(path)) => path,
             _ => return Err(s3_error!(NoSuchKey)),
         };
+        if !self.spelled_as(&source, &from, source_key).await? {
+            return Err(s3_error!(NoSuchKey));
+        }
         Ok((source, from))
     }
 

@@ -1045,7 +1045,7 @@ fn object(etag: &str) -> ObjectMeta {
 impl Fixture {
     async fn put_object(&self, path: &str, size: u64, meta: &ObjectMeta) -> i64 {
         self.store
-            .record_object_write(self.owner, &p(path), file_stat(size), meta)
+            .record_object_write(self.owner, &p(path), file_stat(size), meta, None)
             .await
             .unwrap()
             .id
@@ -1425,4 +1425,144 @@ async fn listings_report_s3_etags_and_fall_back_to_webdav_ones() {
         })
         .collect();
     assert_eq!(etags, [("dav", dav_etag.as_str()), ("s3", "md5")]);
+}
+
+/// S3 keys need not be in NFC, the tree's names are: rows record how S3 spelled them, rows
+/// below a spelled folder inherit the spelling, moves carry it, and listings return and order
+/// the spelled keys.
+#[tokio::test]
+async fn s3_spellings_follow_their_entries() {
+    let f = fixture().await;
+    let nfc = "Caf\u{e9}";
+    let nfd = "Cafe\u{301}";
+    let spelling = |path: &str| {
+        let store = f.store.clone();
+        let owner = f.owner;
+        let path = p(path);
+        async move { store.get(owner, &path).await.unwrap().unwrap().s3_path }
+    };
+    f.mkdir("b").await;
+    // A folder S3 created with an NFD name, and a file S3 wrote below it.
+    f.store
+        .record_spelled_mkdir(
+            f.owner,
+            &p(&format!("b/{nfc}")),
+            5,
+            Some(&format!("b/{nfd}")),
+        )
+        .await
+        .unwrap();
+    f.store
+        .record_object_write(
+            f.owner,
+            &p(&format!("b/{nfc}/s3.txt")),
+            file_stat(1),
+            &object("md5"),
+            Some(&format!("b/{nfd}/s3.txt")),
+        )
+        .await
+        .unwrap();
+    // A write spelled as the tree keeps no spelling of its own.
+    f.store
+        .record_object_write(
+            f.owner,
+            &p("b/plain.txt"),
+            file_stat(1),
+            &object("md5"),
+            Some("b/plain.txt"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spelling("b/plain.txt").await, None);
+    // WebDAV writes below the folder inherit its spelling.
+    f.write(&format!("b/{nfc}/dav.txt"), 1).await;
+    assert_eq!(
+        spelling(&format!("b/{nfc}/dav.txt")).await.as_deref(),
+        Some(format!("b/{nfd}/dav.txt").as_str())
+    );
+
+    // Listings return the spelled keys in the byte order of the spelling: NFD's "e" + U+0301
+    // sorts before "plain", NFC's U+00E9 would sort after it.
+    let listing = f.list("b", "", None, None, 10).await;
+    assert_eq!(
+        names(&listing),
+        [
+            format!("{nfd}/dav.txt"),
+            format!("{nfd}/s3.txt"),
+            "plain.txt".to_owned()
+        ]
+    );
+    let page = f
+        .list("b", "", Some("/"), Some(&format!("{nfd}/")), 10)
+        .await;
+    assert_eq!(names(&page), ["plain.txt"]);
+    // The listing uses its index (`files_s3_listing`).
+    let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN SELECT id FROM files WHERE owner_id = 1 \
+         AND COALESCE(s3_path, rel_path) >= 'b/' AND COALESCE(s3_path, rel_path) < 'b0' \
+         AND is_dir = 0 ORDER BY COALESCE(s3_path, rel_path) LIMIT 5",
+    )
+    .fetch_all(f.store.pool())
+    .await
+    .unwrap();
+    assert!(
+        plan.iter()
+            .any(|(_, _, _, detail)| detail.contains("files_s3_listing")),
+        "{plan:?}"
+    );
+
+    // A move that keeps the name keeps the folder's spelling, and its files' with it.
+    f.mkdir("c").await;
+    f.store
+        .record_move(
+            f.owner,
+            &p(&format!("b/{nfc}")),
+            &p(&format!("c/{nfc}")),
+            dir_stat(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        spelling(&format!("c/{nfc}")).await.as_deref(),
+        Some(format!("c/{nfd}").as_str())
+    );
+    assert_eq!(
+        spelling(&format!("c/{nfc}/s3.txt")).await.as_deref(),
+        Some(format!("c/{nfd}/s3.txt").as_str())
+    );
+    // A rename gives the folder the new (NFC) name, and its files lose the spelling.
+    f.store
+        .record_move(
+            f.owner,
+            &p(&format!("c/{nfc}")),
+            &p("c/renamed"),
+            dir_stat(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spelling("c/renamed").await, None);
+    assert_eq!(spelling("c/renamed/s3.txt").await, None);
+    // A file moved into a spelled folder takes the folder's spelling.
+    f.store
+        .record_spelled_mkdir(
+            f.owner,
+            &p(&format!("c/{nfc}")),
+            5,
+            Some(&format!("c/{nfd}")),
+        )
+        .await
+        .unwrap();
+    f.store
+        .record_move(
+            f.owner,
+            &p("b/plain.txt"),
+            &p(&format!("c/{nfc}/plain.txt")),
+            file_stat(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        spelling(&format!("c/{nfc}/plain.txt")).await.as_deref(),
+        Some(format!("c/{nfd}/plain.txt").as_str())
+    );
 }

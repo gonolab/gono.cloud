@@ -67,6 +67,15 @@ pub struct FileRow {
     /// Creation time as a client reported it (`X-OC-CTime`, `nc:creation_time`), UNIX
     /// seconds; 0 when none did.
     pub creation_time: i64,
+    /// The path as S3 keys spell it, when that differs from `rel_path` (see the `files` table).
+    pub s3_path: Option<String>,
+}
+
+impl FileRow {
+    /// The path as S3 keys spell it: [`FileRow::s3_path`] or else `rel_path`.
+    pub fn spelled(&self) -> &str {
+        self.s3_path.as_deref().unwrap_or(self.rel_path.as_str())
+    }
 }
 
 /// What the file system reports about an entry.
@@ -158,6 +167,7 @@ pub(super) struct Row {
     size: i64,
     favorite: bool,
     creation_time: i64,
+    s3_path: Option<String>,
 }
 
 impl From<Row> for FileRow {
@@ -171,11 +181,13 @@ impl From<Row> for FileRow {
             size: u64::try_from(row.size).unwrap_or(0),
             favorite: row.favorite,
             creation_time: row.creation_time,
+            s3_path: row.s3_path,
         }
     }
 }
 
-const COLUMNS: &str = "id, rel_path, is_dir, etag, mtime_ns, size, favorite, creation_time";
+const COLUMNS: &str =
+    "id, rel_path, is_dir, etag, mtime_ns, size, favorite, creation_time, s3_path";
 
 /// The ETag reported for a file whose metadata was not written by the server: a pure function
 /// of the file id and what the file system reports.
@@ -608,20 +620,23 @@ impl MetaStore {
     /// previous version is removed: it described other content, and an overwritten public
     /// object becomes private.
     pub async fn record_write(&self, owner: i64, rel: &RelPath, stat: DiskStat) -> Result<FileRow> {
-        self.write_version(owner, rel, stat, None).await
+        self.write_version(owner, rel, stat, None, None).await
     }
 
     /// Records that a file was written through the S3 API at `rel`, like
     /// [`MetaStore::record_write`], and stores `object` as the new version's S3 metadata in the
-    /// same transaction.
+    /// same transaction. `spelled` is the path as the S3 key spelled it (NFC of it is `rel`);
+    /// `None` keeps the row's spelling.
     pub async fn record_object_write(
         &self,
         owner: i64,
         rel: &RelPath,
         stat: DiskStat,
         object: &ObjectMeta,
+        spelled: Option<&str>,
     ) -> Result<FileRow> {
-        self.write_version(owner, rel, stat, Some(object)).await
+        self.write_version(owner, rel, stat, Some(object), spelled)
+            .await
     }
 
     async fn write_version(
@@ -630,6 +645,7 @@ impl MetaStore {
         rel: &RelPath,
         stat: DiskStat,
         object: Option<&ObjectMeta>,
+        spelled: Option<&str>,
     ) -> Result<FileRow> {
         debug_assert!(!stat.is_dir);
         let mut tx = db::begin_immediate(&self.pool).await?;
@@ -664,6 +680,13 @@ impl MetaStore {
                 )
             }
         };
+        let row = match spelled {
+            Some(spelled) => FileRow {
+                s3_path: set_spelling(&mut tx, row.id, rel, spelled).await?,
+                ..row
+            },
+            None => row,
+        };
         // A new row has no metadata yet; an overwritten one loses its old version's.
         match object {
             Some(object) => objects::store_object_meta(&mut tx, row.id, object).await?,
@@ -678,6 +701,18 @@ impl MetaStore {
 
     /// Records that a directory was created at `rel`.
     pub async fn record_mkdir(&self, owner: i64, rel: &RelPath, mtime_ns: i64) -> Result<FileRow> {
+        self.record_spelled_mkdir(owner, rel, mtime_ns, None).await
+    }
+
+    /// Records that a directory was created at `rel` for an S3 key that spells it `spelled`
+    /// (`None`: as its parent's spelling and its name say).
+    pub async fn record_spelled_mkdir(
+        &self,
+        owner: i64,
+        rel: &RelPath,
+        mtime_ns: i64,
+        spelled: Option<&str>,
+    ) -> Result<FileRow> {
         let mut tx = db::begin_immediate(&self.pool).await?;
         let stale = select(&mut tx, owner, rel).await?;
         let removed = delete_subtree(&mut tx, owner, rel).await?;
@@ -687,7 +722,10 @@ impl MetaStore {
             mtime_ns,
             size: 0,
         };
-        let row = insert(&mut tx, owner, rel, stat, Etag::Written).await?;
+        let mut row = insert(&mut tx, owner, rel, stat, Etag::Written).await?;
+        if let Some(spelled) = spelled {
+            row.s3_path = set_spelling(&mut tx, row.id, rel, spelled).await?;
+        }
         propagate(&mut tx, owner, rel, -stale_size).await?;
         let event = log_change(&mut tx, owner, row.id, rel, None, ChangeOperation::Create).await?;
         tx.commit().await?;
@@ -741,6 +779,7 @@ impl MetaStore {
 
         let (row, event) = match select(&mut tx, owner, from).await? {
             Some(source) => {
+                respell_moved(&mut tx, owner, &source, from, to).await?;
                 sqlx::query("UPDATE files SET rel_path = ?3 WHERE owner_id = ?1 AND rel_path = ?2")
                     .bind(owner)
                     .bind(from.as_str())
@@ -762,6 +801,7 @@ impl MetaStore {
                     .execute(&mut *tx)
                     .await?;
                 }
+                drop_plain_spellings(&mut tx, owner, to).await?;
                 let size = to_db_size(source.size);
                 propagate(&mut tx, owner, from, -size).await?;
                 propagate(&mut tx, owner, to, size).await?;
@@ -774,10 +814,10 @@ impl MetaStore {
                     ChangeOperation::Move,
                 )
                 .await?;
-                let row = FileRow {
+                let row = select(&mut tx, owner, to).await?.unwrap_or(FileRow {
                     rel_path: to.clone(),
                     ..source
-                };
+                });
                 (row, event)
             }
             None => {
@@ -1155,6 +1195,87 @@ enum Etag {
     Derived,
 }
 
+/// Before the subtree at `from` (whose row is `source`) moves to `to`: gives it the S3
+/// spelling of its new place. The moved entry keeps the spelling of its own name if the move
+/// keeps the name, and everything below keeps the spelling of its path below it; rows whose
+/// spelling ends up equal to their path lose it.
+async fn respell_moved(
+    tx: &mut Tx,
+    owner: i64,
+    source: &FileRow,
+    from: &RelPath,
+    to: &RelPath,
+) -> Result<()> {
+    let old_spelled = source.spelled().to_owned();
+    let parent_spelled = match to.parent().filter(|parent| !parent.is_root()) {
+        Some(parent) => select(tx, owner, &parent).await?.map_or_else(
+            || parent.as_str().to_owned(),
+            |row| row.spelled().to_owned(),
+        ),
+        None => String::new(),
+    };
+    let name = if to.file_name() == from.file_name() {
+        old_spelled
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        to.file_name().unwrap_or_default().to_owned()
+    };
+    let new_spelled = if parent_spelled.is_empty() {
+        name
+    } else {
+        format!("{parent_spelled}/{name}")
+    };
+    if old_spelled == from.as_str() && new_spelled == to.as_str() {
+        // Spelled as the tree on both sides: only rows below with a spelling of their own
+        // change, and their prefix maps as rel_path does.
+        let has_spellings: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM files WHERE owner_id = ?1 AND s3_path IS NOT NULL \
+             AND rel_path >= ?2 AND rel_path < ?3)",
+        )
+        .bind(owner)
+        .bind(format!("{}/", from.as_str()))
+        .bind(format!("{}0", from.as_str()))
+        .fetch_one(&mut **tx)
+        .await?;
+        if !has_spellings {
+            return Ok(());
+        }
+    }
+    // `?4 || substr(spelled, length(?5) + 1)` keeps the part below `from`, with its slash.
+    sqlx::query(
+        "UPDATE files SET s3_path = ?4 || substr(COALESCE(s3_path, rel_path), length(?5) + 1) \
+         WHERE owner_id = ?1 AND (rel_path = ?6 OR (rel_path >= ?2 AND rel_path < ?3))",
+    )
+    .bind(owner)
+    .bind(format!("{}/", from.as_str()))
+    .bind(format!("{}0", from.as_str()))
+    .bind(&new_spelled)
+    .bind(&old_spelled)
+    .bind(from.as_str())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// After a move to `to`: drops the spelling of rows at and below `to` that are spelled as
+/// their path.
+async fn drop_plain_spellings(tx: &mut Tx, owner: i64, to: &RelPath) -> Result<()> {
+    sqlx::query(
+        "UPDATE files SET s3_path = NULL WHERE owner_id = ?1 AND s3_path = rel_path \
+         AND (rel_path = ?4 OR (rel_path >= ?2 AND rel_path < ?3))",
+    )
+    .bind(owner)
+    .bind(format!("{}/", to.as_str()))
+    .bind(format!("{}0", to.as_str()))
+    .bind(to.as_str())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn select(tx: &mut Tx, owner: i64, rel: &RelPath) -> Result<Option<FileRow>> {
     let sql = format!("SELECT {COLUMNS} FROM files WHERE owner_id = ?1 AND rel_path = ?2");
     let row: Option<Row> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
@@ -1191,15 +1312,32 @@ async fn insert(
     etag: Etag,
 ) -> Result<FileRow> {
     let size = to_db_size(stat.size);
+    // Below a folder that S3 spelled otherwise, the new entry is spelled that way too.
+    let s3_path = match (rel.parent(), rel.file_name()) {
+        (Some(parent), Some(name)) if !parent.is_root() => {
+            let parent_spelling: Option<Option<String>> = sqlx::query_scalar(
+                "SELECT s3_path FROM files WHERE owner_id = ?1 AND rel_path = ?2",
+            )
+            .bind(owner)
+            .bind(parent.as_str())
+            .fetch_optional(&mut **tx)
+            .await?;
+            parent_spelling
+                .flatten()
+                .map(|parent| format!("{parent}/{name}"))
+        }
+        _ => None,
+    };
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO files (owner_id, rel_path, is_dir, etag, mtime_ns, size) \
-         VALUES (?1, ?2, ?3, '', ?4, ?5) RETURNING id",
+        "INSERT INTO files (owner_id, rel_path, is_dir, etag, mtime_ns, size, s3_path) \
+         VALUES (?1, ?2, ?3, '', ?4, ?5, ?6) RETURNING id",
     )
     .bind(owner)
     .bind(rel.as_str())
     .bind(stat.is_dir)
     .bind(stat.mtime_ns)
     .bind(size)
+    .bind(s3_path.as_deref())
     .fetch_one(&mut **tx)
     .await?;
     let etag = match (stat.is_dir, etag) {
@@ -1221,7 +1359,25 @@ async fn insert(
         size: stat.size,
         favorite: false,
         creation_time: 0,
+        s3_path,
     })
+}
+
+/// Sets how S3 spells the row `id` at `rel`: `spelled`, or no spelling of its own if that is
+/// `rel` itself. Returns the stored value.
+async fn set_spelling(
+    tx: &mut Tx,
+    id: i64,
+    rel: &RelPath,
+    spelled: &str,
+) -> Result<Option<String>> {
+    let s3_path = (spelled != rel.as_str()).then(|| spelled.to_owned());
+    sqlx::query("UPDATE files SET s3_path = ?2 WHERE id = ?1")
+        .bind(id)
+        .bind(s3_path.as_deref())
+        .execute(&mut **tx)
+        .await?;
+    Ok(s3_path)
 }
 
 /// Deletes the rows at and below `rel` (dead properties follow through `ON DELETE CASCADE`).

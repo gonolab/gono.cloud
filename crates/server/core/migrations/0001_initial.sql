@@ -127,12 +127,21 @@ CREATE TABLE files (
     -- compares it with the local file before it reports a name collision as "same file". UNIX
     -- seconds; 0 when no client reported one, as on Nextcloud.
     creation_time INTEGER NOT NULL DEFAULT 0 CHECK (creation_time >= 0),
+    -- The path as S3 keys spell it, when that differs from rel_path: S3 keys need not be in
+    -- NFC, the tree's names are. NULL: spelled as rel_path. Its NFC form is always rel_path.
+    -- Set for what S3 writes; a row inserted below a spelled folder inherits the folder's
+    -- spelling, and a MOVE carries it along (MetaStore).
+    s3_path       TEXT    COLLATE BINARY,
     -- Also the index for subtree range scans (rule 3 above).
     UNIQUE (owner_id, rel_path)
 ) STRICT;
 
 -- Favorites lookup for the `filter-files` REPORT.
 CREATE INDEX files_favorites ON files (owner_id, rel_path) WHERE favorite = 1;
+
+-- S3 listings: file rows in the byte order of their S3 spelling. Queries must use exactly
+-- this expression and `is_dir = 0` for SQLite to use the index.
+CREATE INDEX files_s3_listing ON files (owner_id, COALESCE(s3_path, rel_path)) WHERE is_dir = 0;
 
 -- S3 buckets: a bucket is a name bound to a folder of its owner's tree, and its objects are the
 -- files below that folder.

@@ -737,11 +737,19 @@ async fn add_public_links(
             HashMap::new()
         }
     };
+    let all: Vec<i64> = targets.iter().flatten().map(|(_, id, _)| *id).collect();
+    let spellings = match state.dav.fs().meta().spellings(owner, &all).await {
+        Ok(spellings) => spellings,
+        Err(err) => {
+            tracing::warn!(error = %err, "cannot read the S3 spellings for public links");
+            HashMap::new()
+        }
+    };
     for (row, target) in rows.iter_mut().zip(targets) {
         if let Some((rel, id, etag)) = target {
             // The ACL belongs to the version it was set for.
             let acl = public.get(id).is_some_and(|recorded| recorded == etag);
-            row.public_link = links.url(rel, acl);
+            row.public_link = links.url(rel, spellings.get(id).map(String::as_str), acl);
         }
     }
 }

@@ -920,7 +920,7 @@ pub(crate) async fn complete(
         s3.install(
             &auth,
             &bucket,
-            &client,
+            &key,
             temp.path().to_path_buf(),
             meta,
             condition,

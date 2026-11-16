@@ -27,6 +27,10 @@ pub(crate) fn object(err: ObjectError, anonymous: bool) -> S3Error {
             conflict("A parent of the key is an object, so nothing can be stored below it")
         }
         ObjectError::PreconditionFailed => s3_error!(PreconditionFailed),
+        ObjectError::KeyConflict => conflict(
+            "A key that differs from this one only in Unicode normalization is stored here; \
+             the file tree holds one of them",
+        ),
         ObjectError::InsufficientStorage => {
             s3_error!(ServiceUnavailable, "The server is out of storage")
         }

@@ -23,6 +23,9 @@
 #               (`upload` refused), virtual-hosted style, rm, rb
 #   restic      init (creates the bucket), two backups, check --read-data, restore, forget
 #               --prune
+#   nfd         a tree with names in Unicode NFD (as older macOS writes them) through the AWS
+#               CLI's sync, rclone and mc mirror: keys keep their spelling in listings, WebDAV
+#               shows the NFC names, and a second sync transfers nothing
 #
 # WebDAV checks that what the clients wrote is what the file tree holds. The script exits
 # non-zero when a scenario fails. Everything is removed again on exit; the clients' own
@@ -45,7 +48,7 @@ RCLONE="${RCLONE:-rclone}"
 MC="${MC:-mc}"
 RESTIC="${RESTIC:-restic}"
 USER_NAME="gono"
-ALL_SCENARIOS=(aws-s3 aws-s3api app-public rclone mc restic)
+ALL_SCENARIOS=(aws-s3 aws-s3api app-public rclone mc restic nfd)
 
 usage() {
   sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -58,7 +61,7 @@ for arg in "$@"; do
       usage
       exit 0
       ;;
-    aws-s3 | aws-s3api | app-public | rclone | mc | restic)
+    aws-s3 | aws-s3api | app-public | rclone | mc | restic | nfd)
       SCENARIOS+=("${arg}")
       ;;
     *)
@@ -107,6 +110,11 @@ for scenario in "${SCENARIOS[@]}"; do
     rclone) require_cmd "${RCLONE}" ;;
     mc) require_cmd "${MC}" ;;
     restic) require_cmd "${RESTIC}" ;;
+    nfd)
+      require_cmd "${AWS}"
+      require_cmd "${RCLONE}"
+      require_cmd "${MC}"
+      ;;
   esac
 done
 
@@ -703,6 +711,69 @@ scenario_restic() {
   run rs forget --keep-last 1 --prune
   run rs check
   unset RESTIC_REPOSITORY RESTIC_PASSWORD
+}
+
+# --- NFD names ----------------------------------------------------------------------------------
+
+scenario_nfd() {
+  local tree="${FILES}/nfd-tree" out conf="${WORK_DIR}/rclone-nfd.conf" keys nfc_name
+  # Names in NFD (e + U+0301, i + U+0308), as HFS+ stored them, and one in NFC.
+  python3 - "${tree}" <<'PYTHON'
+import os, sys, unicodedata
+root = sys.argv[1]
+for name in ["Café/Résumé.txt", "Café/naïve.txt", "plain.txt"]:
+    path = os.path.join(root, name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(name + "\n")
+names = [os.path.join(d, f) for d, _, fs in os.walk(root) for f in fs]
+# The file system must keep the bytes (APFS and ext4 do; HFS+ would decompose anyway).
+assert any(not unicodedata.is_normalized("NFC", n) for n in names), names
+PYTHON
+  nfc_name="$(python3 -c 'print("Café/Résumé.txt")')"
+
+  # The AWS CLI sends the names as they are; the keys keep them.
+  run aws_path s3 mb s3://nfd-aws
+  run aws_path s3 sync "${tree}" s3://nfd-aws/
+  keys="$(capture aws_path s3api list-objects-v2 --bucket nfd-aws --query 'Contents[].Key' --output json)"
+  python3 -c '
+import json, sys, unicodedata
+keys = json.loads(sys.argv[1])
+assert len(keys) == 3, keys
+assert sum(not unicodedata.is_normalized("NFC", k) for k in keys) == 2, keys' "${keys}" ||
+    fail "the AWS CLI's keys lost their spelling: ${keys}"
+  expect_eq "$(dav_status "Buckets/nfd-aws/${nfc_name}")" "207" "WebDAV shows the NFC name"
+  out="$(capture aws_path s3 sync "${tree}" s3://nfd-aws/)"
+  expect_eq "${out}" "" "a second sync uploads nothing"
+
+  # rclone without --local-unicode-normalization: the same, and check finds no difference.
+  cat >"${conf}" <<EOF
+[gono]
+type = s3
+provider = Other
+access_key_id = ${ACCESS_KEY}
+secret_access_key = ${SECRET_KEY}
+endpoint = ${S3_URL}
+region = us-east-1
+force_path_style = true
+EOF
+  # shellcheck disable=SC2329 # called through run and capture
+  rcn() { "${RCLONE}" --config "${conf}" --cache-dir "${WORK_DIR}/rclone-cache" "$@"; }
+  run rcn mkdir gono:nfd-rclone
+  run rcn copy "${tree}" gono:nfd-rclone
+  run rcn check "${tree}" gono:nfd-rclone
+  out="$(capture_all rcn sync -v "${tree}" gono:nfd-rclone)"
+  [[ "${out}" != *"Copied"* ]] || fail "a second rclone sync copied files: ${out}"
+  expect_eq "$(dav_status "Buckets/nfd-rclone/${nfc_name}")" "207" "WebDAV shows the NFC name"
+
+  # mc mirror, compared with mc diff.
+  # shellcheck disable=SC2329 # called through run and capture
+  mcn() { "${MC}" --config-dir "${WORK_DIR}/mc" --no-color --quiet "$@"; }
+  run mcn alias set gononfd "${S3_URL}" "${ACCESS_KEY}" "${SECRET_KEY}" --path on
+  run mcn mb gononfd/nfd-mc
+  run mcn mirror "${tree}" gononfd/nfd-mc
+  out="$(capture mcn diff "${tree}" gononfd/nfd-mc)"
+  expect_eq "${out}" "" "mc diff after mirror"
 }
 
 # --- Run ----------------------------------------------------------------------------------------

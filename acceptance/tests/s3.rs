@@ -865,6 +865,82 @@ async fn anonymous_requests_read_only_what_is_published() {
     s3.clean(&s3.bucket, &prefix).await;
 }
 
+/// Keys need not be in NFC (file names from older macOS are NFD), while the tree's names are:
+/// the file is stored under the NFC name and answers only to the key as it was written, which
+/// listings return.
+#[tokio::test]
+async fn keys_keep_their_unicode_spelling() {
+    let s3 = require!(S3::new(), "S3 is not configured");
+    let prefix = unique_name("s3");
+    let nfd = s3.key(&prefix, "Cafe\u{301}/a.txt");
+    let nfc = s3.key(&prefix, "Caf\u{e9}/a.txt");
+    s3.put(&s3.bucket, &nfd, "decomposed").await;
+
+    let listed = s3
+        .client
+        .list_objects_v2()
+        .bucket(&s3.bucket)
+        .prefix(format!("{prefix}/"))
+        .send()
+        .await
+        .unwrap();
+    let keys: Vec<&str> = listed.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(keys, [nfd.as_str()], "the bytes that were written");
+    assert_eq!(s3.get(&s3.bucket, &nfd).await, b"decomposed");
+    let other = s3
+        .client
+        .get_object()
+        .bucket(&s3.bucket)
+        .key(&nfc)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(other.raw_response().map(|r| r.status().as_u16()), Some(404));
+
+    // The other spelling cannot be stored next to it, neither the file nor in its folder.
+    for key in [nfc.clone(), s3.key(&prefix, "Caf\u{e9}/b.txt")] {
+        let conflict = s3
+            .client
+            .put_object()
+            .bucket(&s3.bucket)
+            .key(&key)
+            .body(ByteStream::from_static(b"composed"))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            conflict.raw_response().map(|r| r.status().as_u16()),
+            Some(409),
+            "{key}"
+        );
+    }
+
+    // WebDAV and the Nextcloud clients see the NFC name.
+    let dav = s3.ctx.dav();
+    let got = dav.get(&s3.webdav_path(&nfc)).await;
+    got.expect(&[200]);
+    assert_eq!(got.text(), "decomposed");
+
+    // Deleting the other spelling deletes nothing; deleting the key deletes the file.
+    s3.client
+        .delete_object()
+        .bucket(&s3.bucket)
+        .key(&nfc)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(s3.get(&s3.bucket, &nfd).await, b"decomposed");
+    s3.client
+        .delete_object()
+        .bucket(&s3.bucket)
+        .key(&nfd)
+        .send()
+        .await
+        .unwrap();
+    dav.get(&s3.webdav_path(&nfc)).await.expect(&[404]);
+    let _ = dav.delete(&s3.webdav_path(&prefix)).await;
+}
+
 #[tokio::test]
 async fn webdav_and_s3_see_the_same_files() {
     let s3 = require!(S3::new(), "S3 is not configured");
