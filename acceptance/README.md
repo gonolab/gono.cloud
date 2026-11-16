@@ -47,7 +47,17 @@ listed test passes, or (with `RUN_LITMUS=1`) when litmus is missing or fails. li
 | `LITMUS=<path>` | `litmus` binary to use instead of the one on `PATH` (set `TESTROOT` too for an uninstalled build). |
 | `KEEP_WORK_DIR=1` | Keep the temporary config, data directory, and logs. |
 | `SERVER_PORT=<port>` | Loopback port of the server instead of a free one. |
+| `S3_PORT=<port>` | Loopback port of the S3 API instead of a free one. |
 | `PUBLIC_URL=<url>` | Public origin (`base_url`) that the suite and litmus use instead of the server's own address: a reverse proxy forwarding to `127.0.0.1:SERVER_PORT`. |
+
+The script turns the S3 API on (with anonymous access allowed), creates the buckets
+`acceptance` (`acl`) and `acceptance-public` (`public-read`, listable) for `gono` and a key with
+access to every bucket, and passes them to the S3 tests (`tests/s3.rs`) in
+`GONO_ACCEPT_S3_ENDPOINT`, `GONO_ACCEPT_S3_ACCESS_KEY`, `GONO_ACCEPT_S3_SECRET_KEY`,
+`GONO_ACCEPT_S3_BUCKET` and `GONO_ACCEPT_S3_PUBLIC_BUCKET`. Against another server, set them
+yourself (the bucket must be bound to the folder `Buckets/<name>`); without them the S3 tests
+are skipped. They use the AWS SDK as it ships, so they also check its default integrity
+checksums and presigned URLs.
 
 To test a reverse proxy configuration, start the proxy so that it forwards a local port to
 `SERVER_PORT`, then run the suite through it; the notify_push tests connect to the WebSocket

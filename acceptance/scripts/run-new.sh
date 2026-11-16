@@ -184,6 +184,7 @@ CARGO_TARGET_DIR="${TARGET_DIR}" cargo build --quiet --manifest-path "${REPO_ROO
 BIN="${TARGET_DIR}/debug/gono-cloud"
 
 PORT="${SERVER_PORT:-$(find_port)}"
+S3_PORT="${S3_PORT:-$(find_port)}"
 SERVER_URL="http://127.0.0.1:${PORT}"
 # Everything a client sees goes through PUBLIC_URL when it is set.
 BASE_URL="${PUBLIC_URL:-${SERVER_URL}}"
@@ -206,6 +207,13 @@ file = "${LOG_FILE}"
 
 [admin]
 enabled = true
+
+[s3]
+enabled = true
+# Another host name than base_url's; the suite talks to s3.bind directly.
+public_url = "http://s3.localhost:${S3_PORT}"
+bind = "127.0.0.1:${S3_PORT}"
+allow_anonymous = true
 EOF
 
 WEB_PASSWORD="$(random_password)"
@@ -223,6 +231,20 @@ SCOPED_PASSWORD="$(mint_app_password gono --label acceptance-scoped \
   --scope /acc-view=/acc-scope/view:view \
   --scope /acc-full=/acc-scope/full:full)"
 USER2_PASSWORD="$(mint_app_password alice@example.com --label acceptance-full)"
+
+echo "==> creating S3 buckets and an access key"
+gono s3 bucket create gono acceptance >/dev/null
+gono s3 bucket set gono acceptance --anonymous acl >/dev/null
+gono s3 bucket create gono acceptance-public >/dev/null
+gono s3 bucket set gono acceptance-public --anonymous public-read --list >/dev/null
+S3_KEY_OUTPUT="$(gono s3 key create gono --label acceptance 2>&1)"
+S3_ACCESS_KEY="$(printf '%s\n' "${S3_KEY_OUTPUT}" | sed -n 's/^Access key id: \([^[:space:]]*\)$/\1/p')"
+S3_SECRET_KEY="$(printf '%s\n' "${S3_KEY_OUTPUT}" | sed -n 's/^Secret key: *\([^[:space:]]*\)$/\1/p')"
+if [[ -z "${S3_ACCESS_KEY}" || -z "${S3_SECRET_KEY}" ]]; then
+  echo "s3 key create did not print a key" >&2
+  printf '%s\n' "${S3_KEY_OUTPUT}" >&2
+  exit 1
+fi
 
 echo "==> starting gono-cloud on ${SERVER_URL} (public URL ${BASE_URL})"
 # Started directly (not through the `gono` function) so that $! is the server itself.
@@ -243,12 +265,19 @@ export GONO_ACCEPT_WEB_PASSWORD="${WEB_PASSWORD}"
 export GONO_ACCEPT_ADMIN_PATH="/apps/manage"
 export GONO_ACCEPT_USER2="alice@example.com"
 export GONO_ACCEPT_PASSWORD2="${USER2_PASSWORD}"
+export GONO_ACCEPT_S3_ENDPOINT="http://127.0.0.1:${S3_PORT}"
+export GONO_ACCEPT_S3_ACCESS_KEY="${S3_ACCESS_KEY}"
+export GONO_ACCEPT_S3_SECRET_KEY="${S3_SECRET_KEY}"
+export GONO_ACCEPT_S3_BUCKET="acceptance"
+export GONO_ACCEPT_S3_PUBLIC_BUCKET="acceptance-public"
 
 ENV_FILE="${WORK_DIR}/accept.env"
 {
   for name in GONO_ACCEPT_BASE_URL GONO_ACCEPT_USER GONO_ACCEPT_PASSWORD \
     GONO_ACCEPT_VIEW_PASSWORD GONO_ACCEPT_SCOPED_PASSWORD GONO_ACCEPT_WEB_PASSWORD \
-    GONO_ACCEPT_ADMIN_PATH GONO_ACCEPT_USER2 GONO_ACCEPT_PASSWORD2; do
+    GONO_ACCEPT_ADMIN_PATH GONO_ACCEPT_USER2 GONO_ACCEPT_PASSWORD2 \
+    GONO_ACCEPT_S3_ENDPOINT GONO_ACCEPT_S3_ACCESS_KEY GONO_ACCEPT_S3_SECRET_KEY \
+    GONO_ACCEPT_S3_BUCKET GONO_ACCEPT_S3_PUBLIC_BUCKET; do
     printf 'export %s=%q\n' "${name}" "${!name}"
   done
 } >"${ENV_FILE}"

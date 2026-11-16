@@ -11,6 +11,9 @@ license = "MIT OR Apache-2.0"
 [workspace]
 
 [dependencies]
+# The S3 tests use the AWS SDK as it ships: with its default checksums (CRC32 in aws-chunked
+# trailers) and SigV4, presigned URLs included.
+aws-sdk-s3 = "1"
 base64 = "0.22"
 futures-util = "0.3"
 percent-encoding = "2"
