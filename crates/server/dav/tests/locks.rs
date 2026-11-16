@@ -213,3 +213,21 @@ async fn locks_follow_storage_paths_across_mounts_and_restarts() {
     .await
     .expect(423);
 }
+
+/// LOCK on an unmapped URL creates an empty file, whose MD5 is that of nothing.
+#[tokio::test]
+async fn files_created_by_lock_have_the_md5_of_nothing() {
+    let h = harness(3600).await;
+    let full = h.full();
+    h.send(&full, "LOCK", "new.txt", &[("Depth", "0")], LOCKINFO)
+        .await
+        .expect(201);
+    let entry =
+        h.fs.stat(full, &gono_server_core::RelPath::parse("new.txt").unwrap())
+            .await
+            .unwrap();
+    assert_eq!(
+        entry.md5_hex().as_deref(),
+        Some("d41d8cd98f00b204e9800998ecf8427e")
+    );
+}

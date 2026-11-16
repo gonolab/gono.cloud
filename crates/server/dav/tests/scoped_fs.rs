@@ -4,6 +4,7 @@
 mod common;
 
 use common::{Harness, dav, mount, nc, oc};
+use gono_server_core::RelPath;
 
 #[tokio::test]
 async fn one_quoted_etag_on_every_interface() {
@@ -611,4 +612,92 @@ async fn favorites_are_found_through_the_mounts() {
         below("private").await,
         Err(dav_server::fs::FsError::NotFound)
     );
+}
+
+/// The MD5 of what a write put there.
+fn md5(content: &str) -> String {
+    use md5::{Digest as _, Md5};
+    Md5::digest(content.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Every write records the MD5 of the new content: a PUT computes it on the way, a partial
+/// update reads the file again, and a COPY carries it (an empty file created by LOCK: see the
+/// lock tests). PROPFIND reports it as `oc:checksums`, and a client's `OC-Checksum` must
+/// match.
+#[tokio::test]
+async fn writes_record_the_md5_of_their_content() {
+    let h = Harness::new().await;
+    let full = h.full();
+    let md5_of = |rel: &'static str| {
+        let h = &h;
+        let full = full.clone();
+        async move {
+            h.fs.stat(full, &RelPath::parse(rel).unwrap())
+                .await
+                .unwrap()
+                .md5_hex()
+        }
+    };
+    h.put(&full, "a.txt", "hello").await.expect(201);
+    assert_eq!(md5_of("a.txt").await, Some(md5("hello")));
+    let listing = h.propfind(&full, "a.txt", "0").await.text();
+    let element = format!("<oc:checksum>MD5:{}</oc:checksum>", md5("hello"));
+    assert!(listing.contains(&element), "{listing}");
+
+    h.send(
+        &full,
+        "PATCH",
+        "a.txt",
+        &[
+            ("Content-Type", "application/x-sabredav-partialupdate"),
+            ("X-Update-Range", "append"),
+        ],
+        " world",
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(h.disk("a.txt")).unwrap(),
+        "hello world"
+    );
+    assert_eq!(md5_of("a.txt").await, Some(md5("hello world")));
+
+    h.send(
+        &full,
+        "COPY",
+        "a.txt",
+        &[("Destination", "/remote.php/dav/files/alice/b.txt")],
+        "",
+    )
+    .await
+    .expect(201);
+    assert_eq!(md5_of("b.txt").await, Some(md5("hello world")));
+
+    // A client's checksum that does not match refuses the upload; the old version stays.
+    let mismatch = format!("MD5:{}", md5("other"));
+    let refused = h
+        .send(&full, "PUT", "a.txt", &[("OC-Checksum", &mismatch)], "new")
+        .await;
+    assert!(!refused.status.is_success(), "{}", refused.status);
+    assert_eq!(
+        std::fs::read_to_string(h.disk("a.txt")).unwrap(),
+        "hello world"
+    );
+    let matching = format!("SHA1:ignored MD5:{}", md5("new").to_ascii_uppercase());
+    h.send(&full, "PUT", "a.txt", &[("OC-Checksum", &matching)], "new")
+        .await
+        .expect(204);
+    assert_eq!(md5_of("a.txt").await, Some(md5("new")));
+    // Another type alone is not checked.
+    h.send(
+        &full,
+        "PUT",
+        "a.txt",
+        &[("OC-Checksum", "SHA1:abc")],
+        "newer",
+    )
+    .await
+    .expect(204);
 }

@@ -313,9 +313,14 @@ impl ScopedFs {
     ) -> Result<Arc<Entry>, ObjectError> {
         let target = self.object_target(identity, client, Method::PUT).await?;
         let spelled = self.spelled_storage(&target, spelled).await?;
+        // A single upload's S3 ETag is the MD5 of its content.
+        let md5 = object
+            .s3_etag
+            .as_deref()
+            .and_then(gono_server_core::meta::md5_from_hex);
         let fs = self.clone();
         detached(async move {
-            fs.install_object(target, temp, object, condition, spelled)
+            fs.install_object(target, temp, object, condition, spelled, md5)
                 .await
         })
         .await
@@ -340,6 +345,13 @@ impl ScopedFs {
         if source.is_dir() {
             return Err(ObjectError::IsFolder);
         }
+        // The same content as the source.
+        let md5 = source.md5.or_else(|| {
+            object
+                .s3_etag
+                .as_deref()
+                .and_then(gono_server_core::meta::md5_from_hex)
+        });
         let source = source
             .location
             .storage()
@@ -372,7 +384,7 @@ impl ScopedFs {
             })
             .await?;
             let result = fs
-                .install_object(target, temp.clone(), object, condition, spelled)
+                .install_object(target, temp.clone(), object, condition, spelled, md5)
                 .await;
             if result.is_err() {
                 let _ = tokio::fs::remove_file(&temp).await;
@@ -737,7 +749,8 @@ impl ScopedFs {
         })
     }
 
-    /// The body of [`Self::put_object`] and [`Self::copy_object`], run detached.
+    /// The body of [`Self::put_object`] and [`Self::copy_object`], run detached. `md5` is the
+    /// MD5 of `temp`'s content, if known.
     async fn install_object(
         &self,
         target: Target,
@@ -745,6 +758,7 @@ impl ScopedFs {
         object: ObjectMeta,
         condition: WriteCondition,
         spelled: Option<String>,
+        md5: Option<[u8; 16]>,
     ) -> Result<Arc<Entry>, ObjectError> {
         let Target {
             ctx,
@@ -786,9 +800,7 @@ impl ScopedFs {
                 Some(current) if current.is_dir() => None,
                 Some(current) => {
                     let meta = self.version_meta(owner, current).await?;
-                    Some(meta.as_ref().map_or(current.etag.clone(), |meta| {
-                        meta.etag_or(&current.etag).to_owned()
-                    }))
+                    Some(current.s3_etag(meta.as_ref()))
                 }
                 None => None,
             };
@@ -853,7 +865,7 @@ impl ScopedFs {
         .await?;
         let row = self
             .meta()
-            .record_object_write(owner, &storage, stat, &object, spelled.as_deref())
+            .record_object_write(owner, &storage, stat, md5, &object, spelled.as_deref())
             .await
             .map_err(object_db_error)?;
         Ok(self.remember_row(&ctx, location, &row, stat))

@@ -58,7 +58,7 @@ mod propfind;
 
 use std::{
     collections::HashMap,
-    io::{self, Write as _},
+    io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -82,6 +82,7 @@ use gono_server_dav::{
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use http_body::Body;
 use http_body_util::{BodyExt as _, Empty, Full};
+use md5::{Digest as _, Md5};
 use rand::RngExt as _;
 use tokio::io::AsyncWriteExt as _;
 
@@ -952,17 +953,28 @@ impl ChunkedUploads {
         // Assemble and install in a task of its own, so that a client that disconnects cannot
         // stop it between the rename and the metadata update.
         let mtime = oc_mtime(headers);
+        let expected_md5 = gono_server_dav::ctx::oc_checksum_md5(headers);
         let fs = self.fs().clone();
         let task_ctx = ctx.clone();
         let names: Vec<String> = chunks.into_iter().map(|(_, name, _, _)| name).collect();
         let source_dir = dir.clone();
         let installed = tokio::spawn(async move {
-            let temp = blocking(move || {
+            let assembled = blocking(move || {
                 let (temp, mut file) = temp_file(&tmp_dir, "assembly")?;
                 let result = (|| {
+                    // Copied through a buffer, which gives the MD5 on the way.
+                    let mut md5 = Md5::new();
+                    let mut buffer = vec![0; 1024 * 1024];
                     for name in &names {
                         let mut chunk = std::fs::File::open(source_dir.join(name))?;
-                        io::copy(&mut chunk, &mut file)?;
+                        loop {
+                            let read = chunk.read(&mut buffer)?;
+                            if read == 0 {
+                                break;
+                            }
+                            md5.update(&buffer[..read]);
+                            file.write_all(&buffer[..read])?;
+                        }
                     }
                     file.flush()?;
                     file.sync_all()?;
@@ -970,10 +982,10 @@ impl ChunkedUploads {
                         let seconds = u64::try_from(mtime).unwrap_or(0);
                         file.set_modified(UNIX_EPOCH + Duration::from_secs(seconds))?;
                     }
-                    Ok(())
+                    Ok(<[u8; 16]>::from(md5.finalize()))
                 })();
                 match result {
-                    Ok(()) => Ok(temp),
+                    Ok(md5) => Ok((temp, md5)),
                     Err(err) => {
                         let _ = std::fs::remove_file(&temp);
                         Err(err)
@@ -988,15 +1000,31 @@ impl ChunkedUploads {
                     FsError::GeneralFailure
                 }
             })?;
-            let installed = fs.install_file(&task_ctx, location, temp.clone()).await;
+            let (temp, md5) = assembled;
+            // A checksum the client sent (`OC-Checksum` of the `MOVE`) must match; the upload
+            // session stays, so the client can upload again.
+            if expected_md5.is_some_and(|expected| expected != md5) {
+                let _ = tokio::fs::remove_file(&temp).await;
+                return Ok(None);
+            }
+            let installed = fs
+                .install_file(&task_ctx, location, temp.clone(), Some(md5))
+                .await;
             if installed.is_err() {
                 let _ = tokio::fs::remove_file(&temp).await;
             }
-            installed
+            installed.map(Some)
         })
         .await
         .map_err(|err| internal("assembly task", &err))?;
-        let (entry, replaced) = installed.map_err(|err| fs_error(err, "install upload"))?;
+        let Some((entry, replaced)) = installed.map_err(|err| fs_error(err, "install upload"))?
+        else {
+            tracing::info!(upload = upload_id, "chunked upload checksum mismatch");
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "The computed checksum does not match the one received from the client.",
+            ));
+        };
 
         // The upload is done; a failure to clean up only leaves work for the background task.
         if let Err(err) = uploads::delete(self.pool(), owner, upload_id).await {

@@ -225,12 +225,10 @@ fn storage_of(bucket: &Bucket, client: &RelPath) -> S3Result<RelPath> {
     Ok(bucket.folder.join_path(&below))
 }
 
-/// The S3 ETag of a file version.
+/// The S3 ETag of a file version: the one stored with it, else the MD5 of its content, else
+/// its WebDAV ETag.
 fn etag_of(entry: &Entry, meta: Option<&ObjectMeta>) -> String {
-    meta.map_or_else(
-        || entry.etag.clone(),
-        |meta| meta.etag_or(&entry.etag).to_owned(),
-    )
+    entry.s3_etag(meta)
 }
 
 /// The content type of `entry`: stored with it, or guessed from its name as for WebDAV.
@@ -604,7 +602,7 @@ impl GonoS3 {
         for entry in listing.entries {
             match entry {
                 ListEntry::Object(object) => listed.objects.push(dto::Object {
-                    e_tag: Some(ETag::Strong(object.etag().to_owned())),
+                    e_tag: Some(ETag::Strong(object.etag())),
                     key: Some(encode(&object.key)),
                     last_modified: Some(timestamp_from_ns(object.file.mtime_ns)),
                     owner: owner.then(|| owner_of(bucket)),
@@ -2168,7 +2166,7 @@ impl S3 for GonoS3 {
             .map_err(|err| error::object(err, false))?;
         Ok(S3Response::new(dto::CopyObjectOutput {
             copy_object_result: Some(dto::CopyObjectResult {
-                e_tag: Some(ETag::Strong(meta.etag_or(&entry.etag).to_owned())),
+                e_tag: Some(ETag::Strong(entry.s3_etag(Some(&meta)))),
                 last_modified: Some(Timestamp::from(entry.modified)),
                 ..Default::default()
             }),

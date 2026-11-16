@@ -54,9 +54,10 @@ pub struct ObjectMeta {
 }
 
 impl ObjectMeta {
-    /// The S3 ETag of a version whose WebDAV ETag is `dav_etag`.
-    pub fn etag_or<'a>(&'a self, dav_etag: &'a str) -> &'a str {
-        self.s3_etag.as_deref().unwrap_or(dav_etag)
+    /// The S3 ETag of a version whose S3 ETag would otherwise be `fallback` (the MD5 of its
+    /// content, or its WebDAV ETag).
+    pub fn etag_or<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.s3_etag.as_deref().unwrap_or(fallback)
     }
 }
 
@@ -238,9 +239,12 @@ pub struct ListedObject {
 }
 
 impl ListedObject {
-    /// The S3 ETag: the stored one, or else the WebDAV ETag.
-    pub fn etag(&self) -> &str {
-        self.s3_etag.as_deref().unwrap_or(&self.file.etag)
+    /// The S3 ETag: the stored one, else the MD5 of the content, else the WebDAV ETag.
+    pub fn etag(&self) -> String {
+        self.s3_etag
+            .clone()
+            .or_else(|| self.file.md5_hex())
+            .unwrap_or_else(|| self.file.etag.clone())
     }
 }
 
@@ -499,7 +503,7 @@ impl MetaStore {
         };
         let sql = format!(
             "SELECT f.id, f.rel_path, f.is_dir, f.etag, f.mtime_ns, f.size, f.favorite, \
-             f.creation_time, f.s3_path, o.s3_etag FROM files f \
+             f.creation_time, f.s3_path, f.md5, o.s3_etag FROM files f \
              LEFT JOIN object_meta o ON o.file_id = f.id \
              WHERE f.owner_id = ?1 AND COALESCE(f.s3_path, f.rel_path) {op} ?2 {upper_clause} \
              AND f.is_dir = 0 \

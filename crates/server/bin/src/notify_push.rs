@@ -551,7 +551,7 @@ mod tests {
                 size: 1,
             };
             self.meta
-                .record_write(self.alice, &RelPath::parse(path).unwrap(), stat)
+                .record_write(self.alice, &RelPath::parse(path).unwrap(), stat, None)
                 .await
                 .unwrap();
         }

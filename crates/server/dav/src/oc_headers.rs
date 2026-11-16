@@ -6,6 +6,7 @@
 //! - `OC-ETag`: the entry's quoted ETag, equal to `ETag` and `DAV:getetag`;
 //! - `OC-FileId`: the entry's `oc:id`;
 //! - `X-NC-Permissions`: the entry's `oc:permissions`;
+//! - `OC-Checksum`: the file's checksums (`MD5:<hex>`), when known;
 //! - `X-OC-MTime: accepted` when a PUT applied `X-OC-MTime`.
 //!
 //! It only adds headers; status and body pass through untouched.
@@ -76,6 +77,9 @@ fn add_headers(headers: &mut http::HeaderMap, info: &OcInfo) {
         insert("oc-fileid", file_id);
     }
     insert("x-nc-permissions", info.permissions);
+    if let Some(checksum) = &info.checksum {
+        insert("oc-checksum", checksum);
+    }
     if info.mtime_accepted {
         insert("x-oc-mtime", "accepted");
     }
@@ -97,6 +101,7 @@ mod tests {
                     file_id: Some("00000007ocinstance01".into()),
                     permissions: "GDNVW",
                     mtime_accepted: true,
+                    checksum: Some("MD5:0cc175b9c0f1b6a831c399e269772661".into()),
                 });
             }
             response
@@ -107,6 +112,10 @@ mod tests {
         assert_eq!(response.headers()["oc-fileid"], "00000007ocinstance01");
         assert_eq!(response.headers()["x-nc-permissions"], "GDNVW");
         assert_eq!(response.headers()["x-oc-mtime"], "accepted");
+        assert_eq!(
+            response.headers()["oc-checksum"],
+            "MD5:0cc175b9c0f1b6a831c399e269772661"
+        );
         assert_eq!(*response.body(), "body");
         assert!(response.extensions().get::<OcInfo>().is_none());
 

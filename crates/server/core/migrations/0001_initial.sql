@@ -132,6 +132,12 @@ CREATE TABLE files (
     -- Set for what S3 writes; a row inserted below a spelled folder inherits the folder's
     -- spelling, and a MOVE carries it along (MetaStore).
     s3_path       TEXT    COLLATE BINARY,
+    -- The MD5 of a file's content (16 bytes), written with the version it describes: by every
+    -- write that streams the content (WebDAV, chunked uploads, single S3 uploads) and by
+    -- `rescan --checksums`; carried by COPY and MOVE. NULL when unknown: for directories, S3
+    -- multipart objects, and content that changed behind the server's back. It is the S3
+    -- ETag of files without one of their own and Nextcloud's `oc:checksums`.
+    md5           BLOB    CHECK (md5 IS NULL OR length(md5) = 16),
     -- Also the index for subtree range scans (rule 3 above).
     UNIQUE (owner_id, rel_path)
 ) STRICT;

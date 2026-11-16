@@ -99,6 +99,15 @@ compatible within a major version: released clients keep working with newer serv
   (`acceptance/scripts/s3-clients.sh`) and a selection of Ceph's s3-tests
   (`acceptance/scripts/s3-tests.sh`).
 
+- **Checksums**: the server records the MD5 of every file it writes (WebDAV and the Nextcloud
+  clients, chunked uploads, the web file UI, single S3 uploads; partial updates are read
+  again, copies keep it) and reports it as `oc:checksums` and `OC-Checksum` (`MD5:<hex>`). The
+  capabilities announce MD5 (`checksums`), so clients send one with their uploads, and an
+  upload whose `OC-Checksum` names another MD5 is refused with 400, as by Nextcloud. Files not
+  written through S3 have their MD5 as S3 ETag. `gono-cloud rescan --checksums` computes the
+  MD5s of files written before, or changed outside Gono Cloud. S3 multipart objects keep their
+  multipart ETag and get no MD5.
+
 ### Changed
 
 - **Rust 1.100** is needed to build from source (the newest stable release; s3s needs 1.96).

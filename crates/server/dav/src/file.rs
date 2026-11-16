@@ -12,6 +12,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use dav_server::fs::{DavFile, DavMetaData, FsError, FsFuture, FsResult};
 use futures_util::FutureExt as _;
 use gono_server_core::RelPath;
+use md5::{Digest as _, Md5};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 
 use crate::{
@@ -75,14 +76,54 @@ impl DavFile for ReadFile {
     }
 }
 
+/// The MD5 of `data`.
+pub(crate) fn md5_of(data: &[u8]) -> [u8; 16] {
+    Md5::digest(data).into()
+}
+
+/// The MD5 of a body as it arrives, in order from its first byte.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Md5Hasher(Md5);
+
+impl Md5Hasher {
+    fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    fn finalize(self) -> [u8; 16] {
+        self.0.finalize().into()
+    }
+}
+
+/// The MD5 of the file at `path`, read from the start.
+pub(crate) fn md5_of_file(path: &Path) -> std::io::Result<[u8; 16]> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Md5::new();
+    let mut buffer = vec![0; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hasher.finalize().into());
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
+/// What a client's checksum mismatch answers, as on Nextcloud.
+const CHECKSUM_MISMATCH: &str =
+    "The computed checksum does not match the one received from the client.";
+
 /// A new version of a file being written by PUT (or PATCH).
 ///
-/// Data goes to a private file in the data directory's `tmp/`. [`DavFile::flush`], which
-/// dav-server calls once after the whole body has arrived, checks the length against
-/// `Content-Length`, syncs the data, applies `X-OC-MTime`, renames the file over the target and
-/// records the new version in the MetaStore. Until then the old version stays untouched; a
-/// failed or aborted upload only leaves the temporary file, which is removed on drop (or at
-/// the next start).
+/// Data goes to a private file in the data directory's `tmp/`, and its MD5 is computed on the
+/// way. [`DavFile::flush`], which dav-server calls once after the whole body has arrived,
+/// checks the length against `Content-Length`, syncs the data, checks the MD5 against an
+/// `OC-Checksum` the client sent, applies `X-OC-MTime`, renames the file over the target and
+/// records the new version with its MD5 in the MetaStore. A partial update (or a write that
+/// seeks) is hashed again from the file. Until then the old version stays untouched; a failed
+/// or aborted upload only leaves the temporary file, which is removed on drop (or at the next
+/// start).
 pub struct WriteFile {
     pub(crate) fs: ScopedFs,
     pub(crate) ctx: Ctx,
@@ -97,6 +138,9 @@ pub struct WriteFile {
     /// `Content-Length` of a full-body PUT; checked before the version is committed.
     pub(crate) expected: Option<u64>,
     pub(crate) committed: Option<Arc<Entry>>,
+    /// The MD5 of what was written so far, while it was written in order from the start of an
+    /// empty file; `None` once that is not so (the file is hashed again at commit).
+    pub(crate) md5: Option<Md5Hasher>,
 }
 
 impl fmt::Debug for WriteFile {
@@ -115,6 +159,9 @@ impl WriteFile {
 
     async fn write_all(&mut self, data: &[u8]) -> FsResult<()> {
         self.file()?.write_all(data).await.map_err(io_error)?;
+        if let Some(md5) = &mut self.md5 {
+            md5.update(data);
+        }
         self.written += u64::try_from(data.len()).unwrap_or(u64::MAX);
         Ok(())
     }
@@ -137,6 +184,21 @@ impl WriteFile {
         let mut file = self.file.take().ok_or(FsError::GeneralFailure)?;
         file.flush().await.map_err(io_error)?;
         file.sync_all().await.map_err(io_error)?;
+        let md5 = match self.md5.take() {
+            Some(md5) => md5.finalize(),
+            None => {
+                let temp = self.temp.clone();
+                blocking(move || md5_of_file(&temp)).await?
+            }
+        };
+        if let Some(expected) = self.ctx.request().oc_checksum_md5
+            && expected != md5
+        {
+            tracing::info!(path = %self.storage, "upload checksum mismatch; discarding it");
+            self.ctx
+                .reject(http::StatusCode::BAD_REQUEST, CHECKSUM_MISMATCH);
+            return Err(FsError::GeneralFailure);
+        }
         let file = file.into_std().await;
         if let Some(mtime) = self.ctx.request().oc_mtime {
             let time = UNIX_EPOCH + Duration::from_secs(u64::try_from(mtime).unwrap_or(0));
@@ -154,7 +216,7 @@ impl WriteFile {
         let location = self.location.clone();
         let entry = detached(async move {
             let stat = blocking(move || install(&root, &storage, &temp, &target)).await?;
-            fs.record_write(&ctx, location, stat).await
+            fs.record_write(&ctx, location, stat, Some(md5)).await
         })
         .await?;
         self.ctx.set_outcome(entry.clone());
@@ -213,6 +275,8 @@ impl DavFile for WriteFile {
     }
 
     fn seek(&mut self, pos: SeekFrom) -> FsFuture<'_, u64> {
+        // Out of order: the MD5 is computed from the file at commit instead.
+        self.md5 = None;
         async move { self.file()?.seek(pos).await.map_err(io_error) }.boxed()
     }
 

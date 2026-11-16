@@ -75,6 +75,8 @@ http-body-util = "0.1.5"
 httpdate = "1.0.3"
 ipnet = "2.12.0"
 libc = "0.2.191"
+# MD5 of file contents (S3 ETags, Nextcloud checksums); the version s3s already uses.
+md-5 = "0.11.0"
 # Content types guessed from file name extensions: the table dav-server uses for WebDAV, so S3
 # reports the same types.
 mime_guess = { version = "2.0.5", default-features = false }

@@ -33,7 +33,14 @@ pub fn permissions(kind: Kind, writable: bool, mount_root: bool, is_virtual: boo
 }
 
 /// Live property names in the ownCloud namespace.
-const OC_LIVE: &[&str] = &["fileid", "id", "permissions", "favorite", "size"];
+const OC_LIVE: &[&str] = &[
+    "fileid",
+    "id",
+    "permissions",
+    "favorite",
+    "size",
+    "checksums",
+];
 /// Live property names in the Nextcloud namespace.
 const NC_LIVE: &[&str] = &["has-preview", "creation_time"];
 
@@ -64,6 +71,12 @@ pub fn settable_live(prop: &DavProp) -> Option<Settable> {
     }
 }
 
+/// The checksums of a file as Nextcloud names them (`oc:checksums`, `OC-Checksum`):
+/// `MD5:<hex>`, if its MD5 is known.
+pub fn oc_checksum(entry: &Entry) -> Option<String> {
+    entry.md5_hex().map(|md5| format!("MD5:{md5}"))
+}
+
 /// `oc:id`: the file id zero-padded to eight digits, followed by the instance id.
 pub fn oc_id(file_id: i64, instance_id: &str) -> String {
     format!("{file_id:08}{instance_id}")
@@ -77,6 +90,8 @@ pub fn live_prop(prop: &DavProp, entry: &Entry, instance_id: &str) -> Option<Vec
         _ => return None,
     };
     let value = match (namespace, prop.name.as_str()) {
+        // As Nextcloud: one `oc:checksum` of `TYPE:value` pairs separated by spaces.
+        (NS_OC, "checksums") => format!("<oc:checksum>{}</oc:checksum>", oc_checksum(entry)?),
         (NS_OC, "fileid") => entry.file_id?.to_string(),
         (NS_OC, "id") => oc_id(entry.file_id?, instance_id),
         (NS_OC, "permissions") => entry.permissions.to_owned(),
@@ -156,6 +171,7 @@ mod tests {
             favorite: true,
             creation_time: 1_700_000_000,
             permissions: "GDNVW",
+            md5: Some([0xab; 16]),
         }
     }
 
@@ -200,13 +216,29 @@ mod tests {
             render(NS_NC, "creation_time").unwrap(),
             "<nc:creation_time xmlns:nc=\"http://nextcloud.org/ns\">1700000000</nc:creation_time>"
         );
+        assert_eq!(
+            render(NS_OC, "checksums").unwrap(),
+            format!(
+                "<oc:checksums xmlns:oc=\"http://owncloud.org/ns\"><oc:checksum>MD5:{}\
+                 </oc:checksum></oc:checksums>",
+                "ab".repeat(16)
+            )
+        );
         assert_eq!(render(NS_OC, "unknown"), None);
         assert_eq!(render("urn:other", "fileid"), None);
 
-        let virtual_entry = entry_fn(None);
+        let virtual_entry = Entry {
+            md5: None,
+            ..entry_fn(None)
+        };
         assert_eq!(
             live_prop(&prop(NS_OC, "fileid", None), &virtual_entry, "oc0"),
             None
+        );
+        assert_eq!(
+            live_prop(&prop(NS_OC, "checksums", None), &virtual_entry, "oc0"),
+            None,
+            "no MD5, no checksums"
         );
         assert!(is_live(&prop(NS_OC, "permissions", None)));
         assert!(!is_live(&prop("urn:x", "permissions", None)));

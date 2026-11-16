@@ -24,6 +24,9 @@ listed under "In scope" is deferred until after v1.
     password.
   - Live properties (`oc:fileid`, `oc:permissions`, `oc:favorite`, ...) and `OC-*` response
     headers.
+  - Checksums: the server records the MD5 of every file it writes and reports it as
+    `oc:checksums` and `OC-Checksum` (`MD5:<hex>`); the capabilities ask clients to send an MD5
+    with their uploads (`OC-Checksum`), and a wrong one refuses the upload with 400.
   - Directory ETag propagation: any change updates the ETag of every ancestor collection.
   - Favorites through `PROPPATCH` and the `filter-files` REPORT (used by the desktop client and
     the iOS app; the Android app lists favorites with `SEARCH`, see the open questions).

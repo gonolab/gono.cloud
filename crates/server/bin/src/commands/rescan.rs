@@ -4,17 +4,22 @@
 //! NFC) and [`MetaStore::reconcile`] updates the metadata in one transaction, logging every
 //! change so that a running server announces it over notify_push within seconds. A dry run
 //! does both steps without changing anything and prints the same report.
+//!
+//! With `--checksums`, the MD5 of every file in the scope that has none is computed afterwards
+//! ([`fill_checksums`]) and recorded for the version that was read, if it is still the current
+//! one; a dry run only counts them.
 
-use std::{fmt::Display, path::Path};
+use std::{fmt::Display, io::Read as _, path::Path};
 
 use anyhow::{Context, bail};
 use gono_server_core::{
     RelPath,
-    meta::{MetaStore, Reconciled},
+    meta::{DiskStat, FileRow, MetaStore, Reconciled},
     rescan::{self, Walk},
-    storage::DataLayout,
+    storage::{DataLayout, lstat_beneath},
     users::{self, User},
 };
+use md5::{Digest as _, Md5};
 
 use super::open_database;
 use crate::cli::RescanArgs;
@@ -76,6 +81,10 @@ async fn rescan_all(
             .await
             .with_context(|| format!("update the metadata of {}", user.username))?;
         print_report(user, &scope, &walked, &report, args.dry_run);
+        if args.checksums {
+            let filled = fill_checksums(&meta, &root, user, &scope, args.dry_run).await?;
+            print_checksums(&filled, args.dry_run);
+        }
         problems += walked.conflicts.len() + walked.skipped.len();
         totals.added_rows += report.added_rows;
         totals.removed_rows += report.removed_rows;
@@ -94,6 +103,107 @@ async fn rescan_all(
         );
     }
     Ok(())
+}
+
+/// Files without an MD5 read per database query.
+const CHECKSUM_BATCH: u32 = 500;
+
+/// What [`fill_checksums`] did.
+#[derive(Debug, Default)]
+struct Checksums {
+    /// Files without an MD5 in the scope.
+    missing: usize,
+    /// MD5s recorded.
+    computed: usize,
+    /// Files that changed or went away while they were read, or are not as recorded (a
+    /// regular rescan updates them first).
+    skipped: usize,
+}
+
+/// Computes and records the MD5 of every file of `user` in `scope` (below `root` on disk)
+/// that has none. The MD5 is recorded only for the version it was read from (same ETag), and
+/// only if the file on disk is the one the metadata describes.
+async fn fill_checksums(
+    meta: &MetaStore,
+    root: &Path,
+    user: &User,
+    scope: &RelPath,
+    dry_run: bool,
+) -> anyhow::Result<Checksums> {
+    let mut done = Checksums::default();
+    let mut after = 0;
+    loop {
+        let batch = meta
+            .files_without_md5(Some(user.id), after, CHECKSUM_BATCH)
+            .await?;
+        let Some((_, last)) = batch.last() else {
+            return Ok(done);
+        };
+        after = last.id;
+        for (_, row) in batch {
+            if !scope.is_root() && !row.rel_path.starts_with(scope) {
+                continue;
+            }
+            done.missing += 1;
+            if dry_run {
+                continue;
+            }
+            let read = {
+                let (root, row) = (root.to_path_buf(), row.clone());
+                tokio::task::spawn_blocking(move || md5_of_recorded(&root, &row)).await?
+            };
+            let recorded = match read {
+                Ok(Some(md5)) => meta.set_md5(row.id, &row.etag, md5).await?,
+                Ok(None) => false,
+                Err(err) => {
+                    tracing::warn!(path = %row.rel_path, error = %err, "cannot read a file");
+                    false
+                }
+            };
+            if recorded {
+                done.computed += 1;
+            } else {
+                done.skipped += 1;
+            }
+        }
+    }
+}
+
+/// The MD5 of the file `row` describes, below `root`: `None` if it is not there as recorded
+/// (a symbolic link on the way, another size or modification time).
+fn md5_of_recorded(root: &Path, row: &FileRow) -> std::io::Result<Option<[u8; 16]>> {
+    let Some(before) = lstat_beneath(root, &row.rel_path)? else {
+        return Ok(None);
+    };
+    let stat = DiskStat::from_metadata(&before);
+    if stat.is_dir || stat.size != row.size || stat.mtime_ns != row.mtime_ns {
+        return Ok(None);
+    }
+    let mut file = std::fs::File::open(row.rel_path.to_fs_path(root))?;
+    // The file opened must still be the one checked above.
+    if DiskStat::from_metadata(&file.metadata()?) != stat {
+        return Ok(None);
+    }
+    let mut hasher = Md5::new();
+    let mut buffer = vec![0; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(Some(hasher.finalize().into()));
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
+fn print_checksums(done: &Checksums, dry_run: bool) {
+    if dry_run {
+        println!("  files without an MD5: {}", done.missing);
+    } else if done.missing > 0 {
+        println!(
+            "  MD5s computed: {}, skipped (changed, or not as recorded): {}",
+            done.computed, done.skipped
+        );
+    }
 }
 
 /// Prints up to [`MAX_LINES`] lines of one kind of change.

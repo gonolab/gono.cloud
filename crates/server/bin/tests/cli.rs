@@ -349,6 +349,59 @@ async fn rescan_reconciles_changes_made_behind_the_servers_back() {
     assert!(text(&missing.stderr).contains("does not exist"));
 }
 
+/// `rescan --checksums` computes the MD5s that files changed behind the server's back lack;
+/// a dry run only counts them.
+#[tokio::test]
+async fn rescan_fills_in_missing_checksums() {
+    let instance = Instance::new();
+    assert!(instance.init().status.success());
+    let files = instance.dir.path().join("data/files/1");
+    std::fs::create_dir_all(files.join("docs")).unwrap();
+    std::fs::write(files.join("docs/a.txt"), "hello").unwrap();
+    std::fs::write(files.join("b.txt"), "hello world").unwrap();
+    let md5s = || async {
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", instance.db().display()))
+            .await
+            .unwrap();
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT rel_path, lower(hex(md5)) FROM files WHERE owner_id = 1 AND is_dir = 0 \
+             ORDER BY rel_path",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        rows
+    };
+
+    let dry = run(&mut instance.command(&["rescan", "admin", "--checksums", "--dry-run"]));
+    assert!(dry.status.success(), "{}", text(&dry.stderr));
+    assert!(
+        text(&dry.stdout).contains("files without an MD5: 0"),
+        "nothing is recorded in a dry run yet: {}",
+        text(&dry.stdout)
+    );
+    let done = run(&mut instance.command(&["rescan", "admin", "--checksums"]));
+    assert!(done.status.success(), "{}", text(&done.stderr));
+    let report = text(&done.stdout);
+    assert!(report.contains("MD5s computed: 2, skipped"), "{report}");
+    assert_eq!(
+        md5s().await,
+        [
+            (
+                "b.txt".to_owned(),
+                Some("5eb63bbbe01eeed093cb22bb8f5acdc3".to_owned())
+            ),
+            (
+                "docs/a.txt".to_owned(),
+                Some("5d41402abc4b2a76b9719d911017c592".to_owned())
+            ),
+        ]
+    );
+    let again = run(&mut instance.command(&["rescan", "--all", "--checksums", "--dry-run"]));
+    assert!(text(&again.stdout).contains("files without an MD5: 0"));
+}
+
 /// The next text frame within ten seconds (pings are answered while reading).
 #[cfg(unix)]
 async fn next_text(

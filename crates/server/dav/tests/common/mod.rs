@@ -23,7 +23,8 @@ pub const PROPFIND_ALL_LIVE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
   <d:prop>
     <d:getetag/><d:getcontentlength/><d:resourcetype/><d:getlastmodified/>
-    <oc:fileid/><oc:id/><oc:permissions/><oc:favorite/><oc:size/><nc:has-preview/>
+    <oc:fileid/><oc:id/><oc:permissions/><oc:favorite/><oc:size/><oc:checksums/>
+    <nc:has-preview/>
   </d:prop>
 </d:propfind>"#;
 

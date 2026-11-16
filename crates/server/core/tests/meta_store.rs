@@ -97,7 +97,7 @@ impl Fixture {
 
     async fn write(&self, path: &str, size: u64) -> i64 {
         self.store
-            .record_write(self.owner, &p(path), file_stat(size))
+            .record_write(self.owner, &p(path), file_stat(size), None)
             .await
             .unwrap()
             .id
@@ -713,11 +713,11 @@ async fn every_logged_change_is_published_after_the_commit() {
 
     let dir = store.record_mkdir(owner, &p("d"), 1).await.unwrap();
     let file = store
-        .record_write(owner, &p("d/f.txt"), file_stat(3))
+        .record_write(owner, &p("d/f.txt"), file_stat(3), None)
         .await
         .unwrap();
     store
-        .record_write(owner, &p("d/f.txt"), file_stat(4))
+        .record_write(owner, &p("d/f.txt"), file_stat(4), None)
         .await
         .unwrap();
     store
@@ -794,16 +794,16 @@ async fn reconcile_adds_removes_and_updates_what_changed_on_disk() {
     let owner = fixture.owner;
     store.record_mkdir(owner, &p("docs"), 1).await.unwrap();
     let kept = store
-        .record_write(owner, &p("docs/kept.txt"), file_stat(10))
+        .record_write(owner, &p("docs/kept.txt"), file_stat(10), None)
         .await
         .unwrap();
     let changed = store
-        .record_write(owner, &p("docs/changed.txt"), file_stat(20))
+        .record_write(owner, &p("docs/changed.txt"), file_stat(20), None)
         .await
         .unwrap();
     store.record_mkdir(owner, &p("old"), 1).await.unwrap();
     store
-        .record_write(owner, &p("old/gone.txt"), file_stat(5))
+        .record_write(owner, &p("old/gone.txt"), file_stat(5), None)
         .await
         .unwrap();
     let root_before = store.get(owner, &RelPath::root()).await.unwrap().unwrap();
@@ -910,11 +910,11 @@ async fn reconcile_of_a_subtree_corrects_sizes_and_leaves_the_rest_alone() {
     store.record_mkdir(owner, &p("a"), 1).await.unwrap();
     store.record_mkdir(owner, &p("a/b"), 1).await.unwrap();
     store
-        .record_write(owner, &p("a/b/f.txt"), file_stat(10))
+        .record_write(owner, &p("a/b/f.txt"), file_stat(10), None)
         .await
         .unwrap();
     store
-        .record_write(owner, &p("other.txt"), file_stat(100))
+        .record_write(owner, &p("other.txt"), file_stat(100), None)
         .await
         .unwrap();
     let a_before = store.get(owner, &p("a")).await.unwrap().unwrap();
@@ -969,7 +969,7 @@ async fn reconcile_fixes_drifted_directory_sizes() {
     let owner = fixture.owner;
     store.record_mkdir(owner, &p("d"), 1).await.unwrap();
     store
-        .record_write(owner, &p("d/f"), file_stat(8))
+        .record_write(owner, &p("d/f"), file_stat(8), None)
         .await
         .unwrap();
     sqlx::query("UPDATE files SET size = 999 WHERE rel_path = 'd'")
@@ -1046,7 +1046,7 @@ fn object(etag: &str) -> ObjectMeta {
 impl Fixture {
     async fn put_object(&self, path: &str, size: u64, meta: &ObjectMeta) -> i64 {
         self.store
-            .record_object_write(self.owner, &p(path), file_stat(size), meta, None)
+            .record_object_write(self.owner, &p(path), file_stat(size), None, meta, None)
             .await
             .unwrap()
             .id
@@ -1148,6 +1148,88 @@ async fn object_meta_belongs_to_one_version() {
         .await
         .unwrap();
     assert_eq!(orphans, 0);
+}
+
+/// The MD5 of a file's content is recorded with the version, carried by COPY and MOVE, dropped
+/// by a write without one and by content that changed on disk, and filled in for the version
+/// it was computed for only.
+#[tokio::test]
+async fn md5s_belong_to_one_version() {
+    let f = fixture().await;
+    f.mkdir("d").await;
+    let md5 = |byte: u8| [byte; 16];
+    let row = |path: &'static str| {
+        let f = &f;
+        async move { f.store.get(f.owner, &p(path)).await.unwrap().unwrap() }
+    };
+    let written = f
+        .store
+        .record_write(f.owner, &p("d/a"), file_stat(3), Some(md5(1)))
+        .await
+        .unwrap();
+    assert_eq!(written.md5, Some(md5(1)));
+    assert_eq!(row("d/a").await.md5_hex().unwrap(), "01".repeat(16));
+
+    f.store
+        .record_copy(
+            f.owner,
+            &p("d"),
+            &p("copy"),
+            &[(RelPath::root(), dir_stat()), (p("a"), file_stat(3))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        row("copy/a").await.md5,
+        Some(md5(1)),
+        "a copy has the same content"
+    );
+    f.store
+        .record_move(f.owner, &p("copy/a"), &p("copy/b"), file_stat(3))
+        .await
+        .unwrap();
+    assert_eq!(row("copy/b").await.md5, Some(md5(1)));
+
+    // Changed behind the server's back: unknown again, and listed for `rescan --checksums`.
+    let changed = DiskStat {
+        mtime_ns: 2_000,
+        ..file_stat(4)
+    };
+    f.store
+        .reconcile(
+            f.owner,
+            &p("copy"),
+            &[],
+            &[(p("copy"), dir_stat()), (p("copy/b"), changed)],
+            false,
+        )
+        .await
+        .unwrap();
+    let stale = row("copy/b").await;
+    assert_eq!(stale.md5, None);
+    let missing = f.store.files_without_md5(None, 0, 10).await.unwrap();
+    assert_eq!(missing.len(), 1);
+    assert_eq!(missing[0], (f.owner, stale.clone()));
+    assert!(
+        f.store
+            .files_without_md5(Some(f.owner + 1), 0, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!f.store.set_md5(stale.id, "old", md5(2)).await.unwrap());
+    assert!(
+        f.store
+            .set_md5(stale.id, &stale.etag, md5(2))
+            .await
+            .unwrap()
+    );
+    assert_eq!(row("copy/b").await.md5, Some(md5(2)));
+    assert_eq!(row("copy/b").await.etag, stale.etag, "the ETag stays");
+
+    // A write that computed none leaves none.
+    f.write("d/a", 5).await;
+    assert_eq!(row("d/a").await.md5, None);
 }
 
 /// The parts of a multipart object are stored with its metadata, in order, and go with it.
@@ -1465,7 +1547,7 @@ async fn listings_report_s3_etags_and_fall_back_to_webdav_ones() {
     f.write("b/dav", 1).await;
     let dav_etag = f.etag("b/dav").await;
     let listing = f.list("b", "", None, None, 10).await;
-    let etags: Vec<(&str, &str)> = listing
+    let etags: Vec<(&str, String)> = listing
         .entries
         .iter()
         .map(|entry| match entry {
@@ -1473,7 +1555,7 @@ async fn listings_report_s3_etags_and_fall_back_to_webdav_ones() {
             ListEntry::CommonPrefix(_) => unreachable!(),
         })
         .collect();
-    assert_eq!(etags, [("dav", dav_etag.as_str()), ("s3", "md5")]);
+    assert_eq!(etags, [("dav", dav_etag.clone()), ("s3", "md5".to_owned())]);
 }
 
 /// S3 keys need not be in NFC, the tree's names are: rows record how S3 spelled them, rows
@@ -1506,6 +1588,7 @@ async fn s3_spellings_follow_their_entries() {
             f.owner,
             &p(&format!("b/{nfc}/s3.txt")),
             file_stat(1),
+            None,
             &object("md5"),
             Some(&format!("b/{nfd}/s3.txt")),
         )
@@ -1517,6 +1600,7 @@ async fn s3_spellings_follow_their_entries() {
             f.owner,
             &p("b/plain.txt"),
             file_stat(1),
+            None,
             &object("md5"),
             Some("b/plain.txt"),
         )

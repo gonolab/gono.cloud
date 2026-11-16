@@ -1039,6 +1039,16 @@ async fn webdav_and_s3_see_the_same_files() {
         .await
         .expect_success();
     assert_eq!(s3.get(&s3.bucket, &key).await, b"via webdav");
+    // Its S3 ETag is the MD5 of the content, which the WebDAV upload recorded.
+    let head = s3
+        .client
+        .head_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.e_tag(), Some("\"0ada0323b9d8bbfacb2b3334b7daf605\""));
     assert_eq!(
         s3.http
             .get(s3.url(&s3.bucket, &key))

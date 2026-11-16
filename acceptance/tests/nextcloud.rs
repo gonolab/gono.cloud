@@ -166,7 +166,95 @@ async fn capabilities_are_public_on_all_aliases() {
             data["capabilities"]["dav"]["chunking"], "1.0",
             "{path}: chunking v2 must be advertised: {body}"
         );
+        assert_eq!(
+            data["capabilities"]["checksums"]["preferredUploadType"], "MD5",
+            "{path}: MD5 upload checksums must be advertised: {body}"
+        );
     }
+}
+
+/// MD5s of what the tests write.
+const MD5_HELLO: &str = "5d41402abc4b2a76b9719d911017c592";
+const MD5_HELLO_WORLD: &str = "5eb63bbbe01eeed093cb22bb8f5acdc3";
+
+/// Every upload records the MD5 of its content, which downloads (`OC-Checksum`) and PROPFIND
+/// (`oc:checksums`) report, and an `OC-Checksum` a client sends with an upload must match it:
+/// a plain PUT and a chunked upload's final MOVE are refused with 400 otherwise.
+#[tokio::test]
+async fn uploads_record_and_check_md5_checksums() {
+    let Some(ctx) = Ctx::new().await else { return };
+    let dav = ctx.dav();
+    let rel = ctx.path("checksummed.txt");
+    dav.put(&rel, "hello").await.expect(&[201]);
+    let got = dav.get(&rel).await;
+    got.expect(&[200]);
+    assert_eq!(
+        got.header("oc-checksum").as_deref(),
+        Some(format!("MD5:{MD5_HELLO}").as_str()),
+        "{}",
+        got.describe()
+    );
+    let listed = dav
+        .propfind(
+            &rel,
+            "0",
+            r#"<?xml version="1.0"?><d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><oc:checksums/></d:prop></d:propfind>"#,
+        )
+        .await;
+    listed.expect(&[207]);
+    assert!(
+        listed
+            .text()
+            .contains(&format!("<oc:checksum>MD5:{MD5_HELLO}</oc:checksum>")),
+        "{}",
+        listed.text()
+    );
+
+    let refused = dav
+        .send(
+            dav.request("PUT", &dav.url(&rel))
+                .header("OC-Checksum", format!("MD5:{MD5_HELLO_WORLD}"))
+                .body("other"),
+        )
+        .await;
+    refused.expect(&[400]);
+    assert_eq!(dav.get(&rel).await.text(), "hello", "the old version stays");
+    dav.send(
+        dav.request("PUT", &dav.url(&rel))
+            .header("OC-Checksum", format!("MD5:{MD5_HELLO_WORLD}"))
+            .body("hello world"),
+    )
+    .await
+    .expect(&[204]);
+
+    // A chunked upload: checked when it is assembled.
+    let chunked = ctx.path("chunked-checksum.txt");
+    let destination = dav.url(&chunked);
+    for (checksum, status) in [(MD5_HELLO, 400), (MD5_HELLO_WORLD, 201)] {
+        let upload = format!("acc-{}", random_id());
+        mkcol_upload(&dav, &upload, &destination, 11)
+            .await
+            .expect(&[201]);
+        for (name, body) in [("00001", &b"hello "[..]), ("00002", b"world")] {
+            put_chunk(&dav, &upload, name, &destination, 11, body)
+                .await
+                .expect(&[201, 204]);
+        }
+        dav.send(
+            dav.request("MOVE", &dav.upload_url(&format!("{upload}/.file")))
+                .header("Destination", &destination)
+                .header("OC-Total-Length", "11")
+                .header("OC-Checksum", format!("MD5:{checksum}")),
+        )
+        .await
+        .expect(&[status]);
+    }
+    let got = dav.get(&chunked).await;
+    assert_eq!(got.text(), "hello world");
+    assert_eq!(
+        got.header("oc-checksum").as_deref(),
+        Some(format!("MD5:{MD5_HELLO_WORLD}").as_str())
+    );
 }
 
 /// The apps switch features by the reported Nextcloud version. Nextcloud Android 35 shows an

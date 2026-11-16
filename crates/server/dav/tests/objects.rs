@@ -248,10 +248,14 @@ async fn if_match_compares_the_s3_etag() {
     .unwrap();
     assert_eq!(h.content("f"), "two");
 
-    // After a WebDAV write the S3 ETag is the WebDAV one.
+    // After a WebDAV write the S3 ETag is the MD5 of the content, which the PUT computed.
     h.put(&full, "f", "three").await.expect(204);
     let (entry, meta) = h.fs.object(full.clone(), &p("f")).await.unwrap();
     assert_eq!(meta, None);
+    // The MD5 of "three".
+    let md5 = "35d6d33467aae9a2e3dccb4b6b027878";
+    assert_eq!(entry.md5_hex().as_deref(), Some(md5));
+    assert_eq!(entry.s3_etag(None), md5);
     assert_eq!(
         h.put_object(
             &full,
@@ -268,7 +272,7 @@ async fn if_match_compares_the_s3_etag() {
         "f",
         "four",
         object("md5-4"),
-        WriteCondition::IfMatch(entry.etag.clone()),
+        WriteCondition::IfMatch(md5.to_owned()),
     )
     .await
     .unwrap();

@@ -389,7 +389,7 @@ async fn direct_download_links_expire_and_follow_their_app_password_and_file() {
         size: 3,
     };
     let file = store
-        .record_write(owner, &RelPath::parse("a.mp4").unwrap(), stat)
+        .record_write(owner, &RelPath::parse("a.mp4").unwrap(), stat, None)
         .await
         .unwrap()
         .id;
@@ -443,7 +443,7 @@ async fn direct_download_links_expire_and_follow_their_app_password_and_file() {
         None
     );
     let file = store
-        .record_write(owner, &RelPath::parse("b.mp4").unwrap(), stat)
+        .record_write(owner, &RelPath::parse("b.mp4").unwrap(), stat, None)
         .await
         .unwrap()
         .id;

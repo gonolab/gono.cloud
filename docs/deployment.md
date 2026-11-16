@@ -661,12 +661,19 @@ WebDAV. After changing files directly (over SSH, Samba, rsync, or by restoring a
 gono rescan alice --dry-run           # show what would change (alias from above)
 gono rescan alice --path Photos/2024  # only this folder of alice's files
 gono rescan --all                     # every account
+gono rescan --all --checksums         # also compute the MD5s that are missing
 ```
 
 `rescan` adds metadata for new files and folders, removes it for missing ones, gives changed
 files new ETags, recomputes folder sizes and renames names that are not Unicode NFC to NFC. It
 may run while the server runs; connected clients learn about the changes through notify_push
 within a few seconds, others at their next poll.
+
+The server records the MD5 of every file it writes: it is the file's checksum for the Nextcloud
+clients (`oc:checksums`) and its ETag in the S3 API. Files changed outside Gono Cloud, and
+files written by an earlier version, have none until `rescan --checksums` reads them (once);
+with `--dry-run` it only counts them. An MD5 is recorded only if the file is still the version
+that was read, so it is safe while the server runs.
 
 ## Uninstalling
 

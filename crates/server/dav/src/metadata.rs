@@ -47,12 +47,28 @@ pub struct Entry {
     pub creation_time: i64,
     /// `oc:permissions` / `X-NC-Permissions`.
     pub permissions: &'static str,
+    /// The MD5 of the file's content, if known (`oc:checksums`, `OC-Checksum`, and the S3 ETag
+    /// of a file not written through S3).
+    pub md5: Option<[u8; 16]>,
 }
 
 impl Entry {
     /// Whether this is a directory.
     pub fn is_dir(&self) -> bool {
         self.kind == Kind::Dir
+    }
+
+    /// [`Entry::md5`] in lowercase hex digits.
+    pub fn md5_hex(&self) -> Option<String> {
+        self.md5.as_ref().map(gono_server_core::meta::md5_hex)
+    }
+
+    /// The S3 ETag of this version with S3 metadata `meta`: the stored one, else the MD5 of
+    /// the content, else the WebDAV ETag.
+    pub fn s3_etag(&self, meta: Option<&gono_server_core::meta::ObjectMeta>) -> String {
+        meta.and_then(|meta| meta.s3_etag.clone())
+            .or_else(|| self.md5_hex())
+            .unwrap_or_else(|| self.etag.clone())
     }
 }
 

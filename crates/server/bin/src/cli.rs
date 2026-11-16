@@ -424,6 +424,12 @@ pub struct RescanArgs {
     /// Report what would change without changing anything.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Also compute the MD5 of every file that has none yet (files written before MD5s were
+    /// recorded, or changed outside Gono Cloud), which is their S3 ETag and Nextcloud checksum.
+    /// Reads every such file once.
+    #[arg(long)]
+    pub checksums: bool,
 }
 
 /// One `--scope <MOUNT>=<STORAGE>:<view|full>` argument.

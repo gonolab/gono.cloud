@@ -337,9 +337,9 @@ impl ScopedFs {
         let kind = if stat.is_dir { Kind::Dir } else { Kind::File };
         // A file changed behind the server's back no longer matches its row; report an ETag
         // derived from what is on disk so that clients never mistake it for the old version.
-        let etag = if stat.is_dir
-            || (row.mtime_ns == stat.mtime_ns && row.size == stat.size && !row.is_dir)
-        {
+        let recorded =
+            stat.is_dir || (row.mtime_ns == stat.mtime_ns && row.size == stat.size && !row.is_dir);
+        let etag = if recorded {
             row.etag.clone()
         } else {
             derived_file_etag(row.id, stat.mtime_ns, stat.size)
@@ -359,6 +359,8 @@ impl ScopedFs {
             size: if stat.is_dir { row.size } else { stat.size },
             favorite: row.favorite,
             creation_time: row.creation_time,
+            // Only while the file is the version the MD5 was recorded for.
+            md5: row.md5.filter(|_| recorded && !stat.is_dir),
         }
     }
 
@@ -397,6 +399,7 @@ impl ScopedFs {
             favorite: false,
             creation_time: 0,
             permissions: props::permissions(Kind::Dir, false, false, true),
+            md5: None,
         }))
     }
 
@@ -562,12 +565,13 @@ impl ScopedFs {
         ctx: &Ctx,
         location: Location,
         stat: DiskStat,
+        md5: Option<[u8; 16]>,
     ) -> FsResult<Arc<Entry>> {
         let storage = location.storage().cloned().ok_or(FsError::Forbidden)?;
         let mut row = self
             .inner
             .meta
-            .record_write(ctx.identity().user_id, &storage, stat)
+            .record_write(ctx.identity().user_id, &storage, stat, md5)
             .await
             .map_err(db_error)?;
         // Only an upload that reports a creation time changes it, as on Nextcloud.
@@ -623,7 +627,8 @@ impl ScopedFs {
                     Ok(disk_stat(&std::fs::symlink_metadata(&target)?))
                 })
                 .await?;
-                fs.record_write(&ctx2, location, stat).await
+                fs.record_write(&ctx2, location, stat, Some(crate::file::md5_of(b"")))
+                    .await
             })
             .await?;
             return Ok(Box::new(CreatedFile { entry }));
@@ -671,6 +676,8 @@ impl ScopedFs {
 
         let ranged = !options.truncate;
         Ok(Box::new(WriteFile {
+            // A partial update starts from the old content: hashed again at commit.
+            md5: (!ranged).then(crate::file::Md5Hasher::default),
             fs: self.clone(),
             ctx: ctx.clone(),
             location,
@@ -712,7 +719,7 @@ impl ScopedFs {
     /// the parent is a real directory inside the tree and that the target is not a
     /// collection, and the parent directory is synced so that the rename survives a crash.
     /// Like every write, this runs to completion even if the request is dropped. On error,
-    /// `temp` is left for the caller to remove.
+    /// `temp` is left for the caller to remove. `md5` is the MD5 of its content, if known.
     ///
     /// Returns the new entry and whether a file was replaced.
     pub async fn install_file(
@@ -720,6 +727,7 @@ impl ScopedFs {
         ctx: &Ctx,
         location: Location,
         temp: PathBuf,
+        md5: Option<[u8; 16]>,
     ) -> FsResult<(Arc<Entry>, bool)> {
         if !location.writable(ctx.identity()) || location.is_mount_root(ctx.identity()) {
             return Err(FsError::Forbidden);
@@ -748,7 +756,7 @@ impl ScopedFs {
                 Ok((disk_stat(&std::fs::symlink_metadata(&target)?), replaced))
             })
             .await?;
-            let entry = fs.record_write(&ctx2, location, stat).await?;
+            let entry = fs.record_write(&ctx2, location, stat, md5).await?;
             Ok((entry, replaced))
         })
         .await?;

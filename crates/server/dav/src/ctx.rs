@@ -43,6 +43,8 @@ pub struct RequestInfo {
     /// `X-OC-CTime` of a PUT or of the `MOVE` that completes a chunked upload, UNIX seconds:
     /// the creation time to record for the written file.
     pub oc_ctime: Option<i64>,
+    /// The MD5 an `OC-Checksum` of a PUT names (`MD5:<hex>`): the upload must have it.
+    pub oc_checksum_md5: Option<[u8; 16]>,
     /// Kind of PROPFIND body.
     pub propfind: PropfindKind,
 }
@@ -57,6 +59,7 @@ impl RequestInfo {
             depth_zero: false,
             oc_mtime: None,
             oc_ctime: None,
+            oc_checksum_md5: None,
             propfind: PropfindKind::default(),
         }
     }
@@ -80,9 +83,22 @@ impl RequestInfo {
                 .and_then(oc_time_seconds)
                 .filter(|&mtime| mtime > 0),
             oc_ctime: oc_ctime(&parts.headers),
+            oc_checksum_md5: oc_checksum_md5(&parts.headers),
             propfind: PropfindKind::default(),
         }
     }
+}
+
+/// The MD5 that an `OC-Checksum` header names (`MD5:<hex>`, among others separated by spaces,
+/// the type in any case), if it names one. Other types (`SHA1`, `Adler32`) are not checked.
+pub fn oc_checksum_md5(headers: &http::HeaderMap) -> Option<[u8; 16]> {
+    headers
+        .get("oc-checksum")
+        .and_then(|value| value.to_str().ok())?
+        .split_whitespace()
+        .filter_map(|checksum| checksum.split_once(':'))
+        .find(|(kind, _)| kind.eq_ignore_ascii_case("MD5"))
+        .and_then(|(_, value)| gono_server_core::meta::md5_from_hex(&value.to_ascii_lowercase()))
 }
 
 /// `X-OC-CTime` (UNIX seconds, a fraction truncated), if sent and positive.
@@ -160,6 +176,9 @@ struct CtxInner {
     cache: Mutex<HashMap<RelPath, Arc<Entry>>>,
     /// The entry the response is about (OC-ETag, OC-FileId, X-NC-Permissions headers).
     outcome: Mutex<Option<Arc<Entry>>>,
+    /// The status and message that answer the request instead of dav-server's response, set by
+    /// a file system call that refused it for a reason dav-server has no status for.
+    rejection: Mutex<Option<(http::StatusCode, &'static str)>>,
     /// Dead properties of entries, by file id. dav-server asks for every requested property
     /// of every entry separately, and clients request dozens of properties the server does not
     /// know; the cache loads each entry's dead properties once (a whole listing at once, see
@@ -175,6 +194,7 @@ impl Ctx {
             request,
             cache: Mutex::new(HashMap::new()),
             outcome: Mutex::new(None),
+            rejection: Mutex::new(None),
             dead_props: Mutex::new(HashMap::new()),
         }))
     }
@@ -227,6 +247,17 @@ impl Ctx {
     /// The entry the response describes, if the request produced or read one.
     pub fn outcome(&self) -> Option<Arc<Entry>> {
         lock(&self.0.outcome).clone()
+    }
+
+    /// Answers the request with `status` and `message` instead of what dav-server makes of
+    /// the failure that follows (for example a 400 for an upload whose checksum is wrong).
+    pub(crate) fn reject(&self, status: http::StatusCode, message: &'static str) {
+        *lock(&self.0.rejection) = Some((status, message));
+    }
+
+    /// The status and message set with [`Ctx::reject`], if any.
+    pub fn rejection(&self) -> Option<(http::StatusCode, &'static str)> {
+        *lock(&self.0.rejection)
     }
 }
 

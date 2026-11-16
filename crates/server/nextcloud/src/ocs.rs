@@ -257,6 +257,12 @@ pub fn capabilities(
             "dav": {
                 "chunking": "1.0",
             },
+            // The server computes MD5s and checks them against `OC-Checksum`; clients then
+            // send one with their uploads.
+            "checksums": {
+                "supportedTypes": ["MD5"],
+                "preferredUploadType": "MD5",
+            },
             "files": {
                 "bigfilechunking": false,
                 "blacklisted_files": [],
@@ -445,6 +451,8 @@ mod tests {
         let document = capabilities("Gono Cloud", "1.0.0", None, None);
         let capabilities = &document["capabilities"];
         assert_eq!(capabilities["dav"]["chunking"], "1.0");
+        assert_eq!(capabilities["checksums"]["supportedTypes"], json!(["MD5"]));
+        assert_eq!(capabilities["checksums"]["preferredUploadType"], "MD5");
         assert!(capabilities["gono_cloud"].get("s3").is_none(), "S3 is off");
         assert_eq!(capabilities["files"]["bigfilechunking"], false);
         assert_eq!(capabilities["files_sharing"]["api_enabled"], false);

@@ -60,6 +60,8 @@ pub struct OcInfo {
     pub permissions: &'static str,
     /// `X-OC-MTime` was applied (`X-OC-MTime: accepted`).
     pub mtime_accepted: bool,
+    /// The file's checksums (`OC-Checksum`), if known.
+    pub checksum: Option<String>,
 }
 
 impl OcInfo {
@@ -70,6 +72,7 @@ impl OcInfo {
             file_id: entry.file_id.map(|id| props::oc_id(id, instance_id)),
             permissions: entry.permissions,
             mtime_accepted,
+            checksum: props::oc_checksum(entry),
         }
     }
 }
@@ -95,6 +98,23 @@ pub(crate) fn simple(status: StatusCode) -> Response<DavBody> {
         .headers_mut()
         .insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
     response
+}
+
+/// A refusal with the error document Nextcloud (SabreDAV) answers it with; `message` is plain
+/// text without markup.
+fn bad_request_body(status: StatusCode, message: &str) -> Response<DavBody> {
+    let message = message
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    xml_body(
+        status,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<d:error xmlns:d=\"DAV:\" \
+             xmlns:s=\"http://sabredav.org/ns\"><s:exception>Sabre\\DAV\\Exception\\BadRequest\
+             </s:exception><s:message>{message}</s:message></d:error>\n"
+        ),
+    )
 }
 
 /// A response with an XML body.
@@ -307,6 +327,9 @@ impl DavService {
             }
         };
 
+        if let Some((status, message)) = ctx.rejection() {
+            return bad_request_body(status, message);
+        }
         let (mut parts, body) = response.into_parts();
         if parts.status.is_success()
             && matches!(

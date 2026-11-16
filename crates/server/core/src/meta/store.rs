@@ -69,6 +69,8 @@ pub struct FileRow {
     pub creation_time: i64,
     /// The path as S3 keys spell it, when that differs from `rel_path` (see the `files` table).
     pub s3_path: Option<String>,
+    /// The MD5 of the file's content, if known (see the `files` table).
+    pub md5: Option<[u8; 16]>,
 }
 
 impl FileRow {
@@ -76,6 +78,28 @@ impl FileRow {
     pub fn spelled(&self) -> &str {
         self.s3_path.as_deref().unwrap_or(self.rel_path.as_str())
     }
+
+    /// [`FileRow::md5`] in lowercase hex digits.
+    pub fn md5_hex(&self) -> Option<String> {
+        self.md5.as_ref().map(md5_hex)
+    }
+}
+
+/// An MD5 in lowercase hex digits (the S3 ETag of a single upload).
+pub fn md5_hex(md5: &[u8; 16]) -> String {
+    md5.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The MD5 that 32 hex digits spell, if they do.
+pub fn md5_from_hex(hex: &str) -> Option<[u8; 16]> {
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut md5 = [0u8; 16];
+    for (index, byte) in md5.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(index * 2..index * 2 + 2)?, 16).ok()?;
+    }
+    Some(md5)
 }
 
 /// What the file system reports about an entry.
@@ -168,6 +192,7 @@ pub(super) struct Row {
     favorite: bool,
     creation_time: i64,
     s3_path: Option<String>,
+    md5: Option<Vec<u8>>,
 }
 
 impl From<Row> for FileRow {
@@ -182,12 +207,13 @@ impl From<Row> for FileRow {
             favorite: row.favorite,
             creation_time: row.creation_time,
             s3_path: row.s3_path,
+            md5: row.md5.and_then(|md5| <[u8; 16]>::try_from(md5).ok()),
         }
     }
 }
 
 const COLUMNS: &str =
-    "id, rel_path, is_dir, etag, mtime_ns, size, favorite, creation_time, s3_path";
+    "id, rel_path, is_dir, etag, mtime_ns, size, favorite, creation_time, s3_path, md5";
 
 /// The ETag reported for a file whose metadata was not written by the server: a pure function
 /// of the file id and what the file system reports.
@@ -618,9 +644,15 @@ impl MetaStore {
     /// below `rel` (for example a directory that was replaced out of band) are removed first,
     /// so that dead properties never survive a delete and re-create. The S3 metadata of the
     /// previous version is removed: it described other content, and an overwritten public
-    /// object becomes private.
-    pub async fn record_write(&self, owner: i64, rel: &RelPath, stat: DiskStat) -> Result<FileRow> {
-        self.write_version(owner, rel, stat, None, None).await
+    /// object becomes private. `md5` is the MD5 of the new content, if the writer computed it.
+    pub async fn record_write(
+        &self,
+        owner: i64,
+        rel: &RelPath,
+        stat: DiskStat,
+        md5: Option<[u8; 16]>,
+    ) -> Result<FileRow> {
+        self.write_version(owner, rel, stat, md5, None, None).await
     }
 
     /// Records that a file was written through the S3 API at `rel`, like
@@ -632,10 +664,11 @@ impl MetaStore {
         owner: i64,
         rel: &RelPath,
         stat: DiskStat,
+        md5: Option<[u8; 16]>,
         object: &ObjectMeta,
         spelled: Option<&str>,
     ) -> Result<FileRow> {
-        self.write_version(owner, rel, stat, Some(object), spelled)
+        self.write_version(owner, rel, stat, md5, Some(object), spelled)
             .await
     }
 
@@ -644,6 +677,7 @@ impl MetaStore {
         owner: i64,
         rel: &RelPath,
         stat: DiskStat,
+        md5: Option<[u8; 16]>,
         object: Option<&ObjectMeta>,
         spelled: Option<&str>,
     ) -> Result<FileRow> {
@@ -687,6 +721,12 @@ impl MetaStore {
             },
             None => row,
         };
+        sqlx::query("UPDATE files SET md5 = ?2 WHERE id = ?1")
+            .bind(row.id)
+            .bind(md5.as_ref().map(<[u8; 16]>::as_slice))
+            .execute(&mut *tx)
+            .await?;
+        let row = FileRow { md5, ..row };
         // A new row has no metadata yet; an overwritten one loses its old version's.
         match object {
             Some(object) => objects::store_object_meta(&mut tx, row.id, object).await?,
@@ -697,6 +737,54 @@ impl MetaStore {
         tx.commit().await?;
         self.publish(&[event]);
         Ok(row)
+    }
+
+    /// Sets the MD5 of file `file_id`'s version with ETag `etag` (`rescan --checksums`).
+    /// Returns `false`, and changes nothing, when the file is gone, is a directory or has been
+    /// written since: the MD5 always describes the version it was computed for. Nothing about
+    /// the content changes, so ETags stay and nothing is logged.
+    pub async fn set_md5(&self, file_id: i64, etag: &str, md5: [u8; 16]) -> Result<bool> {
+        let mut tx = db::begin_immediate(&self.pool).await?;
+        let updated =
+            sqlx::query("UPDATE files SET md5 = ?3 WHERE id = ?1 AND etag = ?2 AND is_dir = 0")
+                .bind(file_id)
+                .bind(etag)
+                .bind(md5.as_slice())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        tx.commit().await?;
+        Ok(updated == 1)
+    }
+
+    /// Up to `limit` files without an MD5 whose ids follow `after`, by id, with their owners:
+    /// what `rescan --checksums` works through. Only the owner `owner`'s, if given.
+    pub async fn files_without_md5(
+        &self,
+        owner: Option<i64>,
+        after: i64,
+        limit: u32,
+    ) -> Result<Vec<(i64, FileRow)>> {
+        #[derive(FromRow)]
+        struct Owned {
+            owner_id: i64,
+            #[sqlx(flatten)]
+            row: Row,
+        }
+        let sql = format!(
+            "SELECT owner_id, {COLUMNS} FROM files WHERE is_dir = 0 AND md5 IS NULL AND id > ?1 \
+             AND (?2 IS NULL OR owner_id = ?2) ORDER BY id LIMIT ?3"
+        );
+        let rows: Vec<Owned> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(after)
+            .bind(owner)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|owned| (owned.owner_id, FileRow::from(owned.row)))
+            .collect())
     }
 
     /// Records that a directory was created at `rel`.
@@ -943,15 +1031,20 @@ impl MetaStore {
                 .bind(source_id)
                 .execute(&mut *tx)
                 .await?;
-                row.creation_time = sqlx::query_scalar(
+                // The same content: the MD5 is the source's, if its size still matches.
+                let (creation_time, md5): (i64, Option<Vec<u8>>) = sqlx::query_as(
                     "UPDATE files SET creation_time = \
-                     (SELECT creation_time FROM files WHERE id = ?2) \
-                     WHERE id = ?1 RETURNING creation_time",
+                     (SELECT creation_time FROM files WHERE id = ?2), \
+                     md5 = (SELECT md5 FROM files WHERE id = ?2 AND is_dir = 0 AND size = ?3) \
+                     WHERE id = ?1 RETURNING creation_time, md5",
                 )
                 .bind(row.id)
                 .bind(source_id)
+                .bind(to_db_size(stat.size))
                 .fetch_one(&mut *tx)
                 .await?;
+                row.creation_time = creation_time;
+                row.md5 = md5.and_then(|md5| <[u8; 16]>::try_from(md5).ok());
             }
             top.get_or_insert(row);
         }
@@ -1078,14 +1171,17 @@ impl MetaStore {
                 continue;
             }
             let etag = derived_file_etag(row.id, stat.mtime_ns, stat.size);
-            sqlx::query("UPDATE files SET etag = ?2, mtime_ns = ?3, size = ?4 WHERE id = ?1")
-                .bind(row.id)
-                .bind(&etag)
-                .bind(stat.mtime_ns)
-                .bind(to_db_size(stat.size))
-                .execute(&mut *tx)
-                .await?;
-            // New content behind the server's back: the S3 metadata described the old one.
+            sqlx::query(
+                "UPDATE files SET etag = ?2, mtime_ns = ?3, size = ?4, md5 = NULL WHERE id = ?1",
+            )
+            .bind(row.id)
+            .bind(&etag)
+            .bind(stat.mtime_ns)
+            .bind(to_db_size(stat.size))
+            .execute(&mut *tx)
+            .await?;
+            // New content behind the server's back: the S3 metadata and the MD5 described the
+            // old one.
             objects::clear_object_meta(&mut tx, row.id).await?;
             if !new_paths.contains(rel) {
                 events.push(
@@ -1409,6 +1505,7 @@ async fn insert(
         favorite: false,
         creation_time: 0,
         s3_path,
+        md5: None,
     })
 }
 

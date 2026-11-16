@@ -40,6 +40,7 @@ pub use objects::{
 };
 pub use store::{
     DeadProp, DiskStat, FileRow, MetaStore, PropChange, Reconciled, derived_file_etag,
+    md5_from_hex, md5_hex,
 };
 
 /// Returns the `[lower, upper)` bounds that select every strict descendant of `dir`.

@@ -552,10 +552,7 @@ pub(crate) async fn upload_part_copy(
                 ObjectError::IsFolder | ObjectError::NotFound => s3_error!(NoSuchKey),
                 other => error::object(other, false),
             })?;
-    let source_etag = meta
-        .as_ref()
-        .map_or(entry.etag.as_str(), |meta| meta.etag_or(&entry.etag))
-        .to_owned();
+    let source_etag = entry.s3_etag(meta.as_ref());
     crate::ops::check_copy_source_conditions(
         &source_etag,
         entry.modified,
