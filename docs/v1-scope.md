@@ -42,8 +42,11 @@ listed under "In scope" is deferred until after v1.
   rename, move, delete, favorites, and an account page for the user's display name, web login
   password and app passwords. English and Chinese; light and dark themes.
 - **S3-compatible API** (unreleased, `docs/s3.md`): buckets that are folders of the users'
-  trees, access keys with per-bucket grants, multipart uploads, canned ACLs, and anonymous
-  downloads of what a bucket publishes, on a host name of its own.
+  trees, access keys with per-bucket grants, multipart uploads (with `UploadPartCopy`), canned
+  ACLs, and anonymous downloads of what a bucket publishes (also through the download bucket
+  policy of `mc anonymous set download`), on a host name of its own, in path and virtual-hosted
+  style; CORS rules and form uploads for browser applications; public links in the web file UI;
+  sync tools' `mtime` metadata as the files' modification time.
 - **CLI**: `init`, `serve`, `config check`, user and app password management (including
   promoting and demoting admins and changing display names), S3 access keys and buckets, and a
   manual `rescan` command.
