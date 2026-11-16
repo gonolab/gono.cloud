@@ -1433,6 +1433,38 @@ mod tests {
             "1.0"
         );
 
+        assert!(
+            capabilities["ocs"]["data"]["capabilities"]["gono_cloud"]
+                .get("s3")
+                .is_none(),
+            "the S3 API is off"
+        );
+
+        // With the S3 API on, the Gono client learns its endpoint, without signing in.
+        let mut state = f.state.clone();
+        state.s3 = Some(Arc::new(S3Ui {
+            public_url: Some(Url::parse("https://s3.example.com/").unwrap()),
+            region: "eu-test-1".to_owned(),
+            bucket_folder: "Buckets".to_owned(),
+            allow_anonymous: true,
+            virtual_host_domain: Some("s3.example.com".to_owned()),
+        }));
+        let mut request = Request::builder()
+            .uri("/ocs/v2.php/cloud/capabilities?format=json")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 0, 2, 1], 4000))));
+        let response = router(state).oneshot(request).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let s3 = &document["ocs"]["data"]["capabilities"]["gono_cloud"]["s3"];
+        assert_eq!(s3["endpoint"], "https://s3.example.com");
+        assert_eq!(s3["region"], "eu-test-1");
+        assert_eq!(s3["virtual_host_domain"], "s3.example.com");
+        assert_eq!(s3["anonymous"], true);
+
         let anonymous = f.send("GET", "/ocs/v2.php/cloud/user", None, &[], "").await;
         assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
         assert!(anonymous.header("www-authenticate").starts_with("Basic"));

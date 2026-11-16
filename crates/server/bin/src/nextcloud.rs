@@ -140,7 +140,16 @@ pub async fn ocs(
                 .push
                 .as_ref()
                 .map(|_| notify_push::Endpoints::new(&state.base_url));
-            let data = ocs::capabilities(PRODUCT_NAME, SERVER_VERSION, push.as_ref());
+            let s3 = state.s3.as_ref().and_then(|ui| {
+                Some(ocs::S3Endpoint {
+                    endpoint: ui.endpoint()?,
+                    region: ui.region.clone(),
+                    virtual_host_domain: ui.virtual_host_domain.clone(),
+                    bucket_folder: ui.bucket_folder.clone(),
+                    anonymous: ui.allow_anonymous,
+                })
+            });
+            let data = ocs::capabilities(PRODUCT_NAME, SERVER_VERSION, push.as_ref(), s3.as_ref());
             return reply(version, format, &Outcome::Ok, data);
         }
         Endpoint::Unknown => return reply(version, format, &Outcome::NotFound, json!([])),

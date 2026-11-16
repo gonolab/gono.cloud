@@ -1520,3 +1520,32 @@ async fn mtime_metadata_sets_the_files_modification_time() {
     assert!(age.abs() < 600, "{age}");
     s3.clean(&s3.bucket, &prefix).await;
 }
+
+#[tokio::test]
+async fn the_capabilities_name_the_s3_endpoint() {
+    let s3 = require!(S3::new(), "S3 is not configured");
+    let capabilities = s3.ctx.capabilities().await;
+    let announced = &capabilities["gono_cloud"]["s3"];
+    let endpoint = announced["endpoint"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no S3 endpoint in {capabilities}"));
+    // The suite talks to s3.bind; the capability names the public URL, on the same port here.
+    let public = url::Url::parse(endpoint).unwrap();
+    let bound = url::Url::parse(&s3.endpoint).unwrap();
+    assert_eq!(
+        public.port_or_known_default(),
+        bound.port_or_known_default()
+    );
+    assert!(!endpoint.ends_with('/'), "{endpoint}");
+    assert_eq!(announced["region"], "us-east-1");
+    assert_eq!(announced["path_style"], true);
+    assert_eq!(announced["bucket_folder"], "Buckets");
+    assert_eq!(announced["anonymous"], true);
+    match env("GONO_ACCEPT_S3_VIRTUAL_HOST_DOMAIN") {
+        Some(domain) => {
+            assert_eq!(announced["virtual_hosted_style"], true);
+            assert_eq!(announced["virtual_host_domain"], domain.as_str());
+        }
+        None => skip("GONO_ACCEPT_S3_VIRTUAL_HOST_DOMAIN is not set"),
+    }
+}

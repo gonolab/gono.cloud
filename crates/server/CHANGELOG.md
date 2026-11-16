@@ -81,8 +81,9 @@ compatible within a major version: released clients keep working with newer serv
   maps onto the bucket's anonymous access, and other policies answer `NotImplemented`. The web
   file UI offers "Copy public link" for files anyone can download through S3. The `mtime`
   metadata of rclone and other sync tools becomes the file's modification time, so WebDAV and
-  the Nextcloud clients see the original time. The acceptance suite drives it with the AWS
-  SDK.
+  the Nextcloud clients see the original time. The `gono_cloud` capability tells the Gono
+  client the S3 endpoint, region and addressing (`gono_cloud.s3`). The acceptance suite drives
+  it with the AWS SDK.
 
 ### Changed
 

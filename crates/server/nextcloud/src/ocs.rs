@@ -197,6 +197,21 @@ fn escape(text: &str) -> String {
     escaped
 }
 
+/// The S3 API of the server, as `gono_cloud.s3` announces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Endpoint {
+    /// `s3.public_url` without a trailing `/`: the endpoint S3 clients are configured with.
+    pub endpoint: String,
+    /// `s3.region`: the region requests are signed for.
+    pub region: String,
+    /// `s3.virtual_host_domain`: buckets are also `<bucket>.<domain>`.
+    pub virtual_host_domain: Option<String>,
+    /// `s3.bucket_folder`: the folder of the user's tree that holds new buckets.
+    pub bucket_folder: String,
+    /// `s3.allow_anonymous`: whether buckets may publish files for anonymous download.
+    pub anonymous: bool,
+}
+
 /// The capabilities document (`ocs.data` of `/cloud/capabilities`).
 ///
 /// Only implemented features are advertised, and features clients would otherwise assume are
@@ -215,10 +230,14 @@ fn escape(text: &str) -> String {
 /// - Login Flow v2 has no Nextcloud capability: clients use it for every server from version 16
 ///   on, which [`status::NEXTCLOUD_VERSION`] satisfies. `gono_cloud.login_flow_v2` states it
 ///   explicitly for the Gono client.
+/// - `gono_cloud.s3` when the S3 API is enabled: its endpoint, region, addressing styles, the
+///   folder of new buckets and whether anonymous downloads are allowed ([`S3Endpoint`]).
+///   Absent while it is off.
 pub fn capabilities(
     product_name: &str,
     server_version: &str,
     push: Option<&crate::notify_push::Endpoints>,
+    s3: Option<&S3Endpoint>,
 ) -> Value {
     let (major, minor, micro) = status::NEXTCLOUD_VERSION;
     let mut document = json!({
@@ -264,6 +283,20 @@ pub fn capabilities(
             },
         },
     });
+    if let Some(s3) = s3 {
+        let mut announced = json!({
+            "endpoint": s3.endpoint,
+            "region": s3.region,
+            "path_style": true,
+            "virtual_hosted_style": s3.virtual_host_domain.is_some(),
+            "bucket_folder": s3.bucket_folder,
+            "anonymous": s3.anonymous,
+        });
+        if let Some(domain) = &s3.virtual_host_domain {
+            announced["virtual_host_domain"] = json!(domain);
+        }
+        document["capabilities"]["gono_cloud"]["s3"] = announced;
+    }
     if let Some(push) = push {
         document["capabilities"]["notify_push"] = json!({
             "type": ["files"],
@@ -409,9 +442,10 @@ mod tests {
 
     #[test]
     fn capabilities_advertise_chunking_and_nothing_unimplemented() {
-        let document = capabilities("Gono Cloud", "1.0.0", None);
+        let document = capabilities("Gono Cloud", "1.0.0", None, None);
         let capabilities = &document["capabilities"];
         assert_eq!(capabilities["dav"]["chunking"], "1.0");
+        assert!(capabilities["gono_cloud"].get("s3").is_none(), "S3 is off");
         assert_eq!(capabilities["files"]["bigfilechunking"], false);
         assert_eq!(capabilities["files_sharing"]["api_enabled"], false);
         for absent in ["notify_push", "notifications", "user_status"] {
@@ -427,7 +461,7 @@ mod tests {
         let endpoints = crate::notify_push::Endpoints::new(
             &url::Url::parse("https://cloud.example.com").unwrap(),
         );
-        let document = capabilities("Gono Cloud", "1.0.0", Some(&endpoints));
+        let document = capabilities("Gono Cloud", "1.0.0", Some(&endpoints), None);
         let push = &document["capabilities"]["notify_push"];
         assert_eq!(push["type"], serde_json::json!(["files"]));
         assert_eq!(
@@ -439,6 +473,36 @@ mod tests {
             "https://cloud.example.com/index.php/apps/notify_push/pre_auth"
         );
         assert_eq!(document["capabilities"]["gono_cloud"]["notify_push"], true);
+    }
+
+    #[test]
+    fn capabilities_tell_the_gono_client_the_s3_endpoint() {
+        let mut s3 = S3Endpoint {
+            endpoint: "https://s3.example.com".to_owned(),
+            region: "eu-central-1".to_owned(),
+            virtual_host_domain: None,
+            bucket_folder: "Buckets".to_owned(),
+            anonymous: false,
+        };
+        let document = capabilities("Gono Cloud", "1.0.0", None, Some(&s3));
+        assert_eq!(
+            document["capabilities"]["gono_cloud"]["s3"],
+            serde_json::json!({
+                "endpoint": "https://s3.example.com",
+                "region": "eu-central-1",
+                "path_style": true,
+                "virtual_hosted_style": false,
+                "bucket_folder": "Buckets",
+                "anonymous": false,
+            })
+        );
+        s3.virtual_host_domain = Some("s3.example.com".to_owned());
+        s3.anonymous = true;
+        let document = capabilities("Gono Cloud", "1.0.0", None, Some(&s3));
+        let announced = &document["capabilities"]["gono_cloud"]["s3"];
+        assert_eq!(announced["virtual_hosted_style"], true);
+        assert_eq!(announced["virtual_host_domain"], "s3.example.com");
+        assert_eq!(announced["anonymous"], true);
     }
 
     #[test]
