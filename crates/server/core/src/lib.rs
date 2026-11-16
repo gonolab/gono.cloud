@@ -21,6 +21,7 @@
 //! - [`direct_downloads`]: links that let media players stream a file without credentials.
 //! - [`rescan`]: walking a user's tree on disk for `gono-cloud rescan`.
 //! - [`secret`]: random tokens and their digests.
+//! - [`sealing`]: secrets stored encrypted because the server must read them back.
 //! - [`stats`]: counts shown on the web admin UI.
 //! - [`error`]: the domain error types.
 
@@ -37,6 +38,7 @@ pub mod meta;
 pub mod password;
 pub mod path;
 pub mod rescan;
+pub mod sealing;
 pub mod secret;
 pub mod settings;
 pub mod stats;

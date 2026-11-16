@@ -6,6 +6,7 @@ use gono_server_core::{
     config::DbConfig,
     db::{self, OpenMode, Pool},
     devices,
+    sealing::Purpose,
     two_factor::{self, Key, TurnedOff, Verification},
     users::{self, NewUser},
     web_sessions,
@@ -261,12 +262,12 @@ fn the_key_file_is_created_once_and_read_back() {
     assert!(Key::create(&path).unwrap());
     assert!(!Key::create(&path).unwrap(), "never overwritten");
     let key = Key::load(&path).unwrap().unwrap();
-    let sealed = key.seal(1, b"x");
+    let sealed = key.seal(Purpose::Totp, 1, b"x");
     assert_eq!(
         Key::load(&path)
             .unwrap()
             .unwrap()
-            .open(1, &sealed)
+            .open(Purpose::Totp, 1, &sealed)
             .as_deref(),
         Some(&b"x"[..])
     );

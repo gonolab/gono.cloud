@@ -4,10 +4,10 @@
 //! - **TOTP** (RFC 6238): HMAC-SHA-1, 6 digits, a 30-second step, the codes of the previous,
 //!   current and next step accepted. A code of a step at or before the last accepted one is
 //!   refused, so a code works once.
-//! - **The secret** (20 random bytes) is stored encrypted with a [`Key`] that lives outside the
-//!   database directory, in the configuration directory: ChaCha20-Poly1305 with a random
-//!   96-bit nonce and the user id as associated data. A copy of the database alone does not
-//!   give the second factor away.
+//! - **The secret** (20 random bytes) is sealed with the [`Key`] that lives outside the
+//!   database directory, in the configuration directory ([`crate::sealing`], purpose
+//!   [`Purpose::Totp`]: the user id is part of the associated data). A copy of the database
+//!   alone does not give the second factor away.
 //! - **Recovery codes**: 10 codes of 16 Crockford base32 characters (80 bits), shown once,
 //!   stored as SHA-256 digests, each usable once.
 //! - **Failures** are counted per account from the audit log (`two_factor.failed`): after
@@ -16,15 +16,10 @@
 //!
 //! Remote access is available only on accounts that have it enrolled.
 
-use std::{
-    fs,
-    io::{self, Write as _},
-    net::IpAddr,
-    path::{Path, PathBuf},
-};
+use std::{net::IpAddr, path::PathBuf};
 
 use rand::RngExt as _;
-use ring::{aead, hmac};
+use ring::hmac;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
@@ -32,6 +27,7 @@ use crate::{
     audit::{self, Actor, Record},
     db::{self, Pool},
     error::{Error, Result},
+    sealing::Purpose,
     secret,
     users::User,
 };
@@ -57,165 +53,14 @@ pub const FAILURES_PER_DAY: i64 = 20;
 /// The issuer authenticator apps show.
 pub const ISSUER: &str = "Gono Cloud";
 
-/// Associated data of the encrypted secret, before the user id.
-const AAD_CONTEXT: &[u8] = b"gono-cloud totp v1";
-
 /// Crockford's base32 alphabet, for recovery codes.
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// RFC 4648 base32 alphabet, for the secret authenticator apps read.
 const BASE32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
-/// The key TOTP secrets are encrypted with: 32 bytes from a file of the configuration
-/// directory (raw bytes, or 64 hex digits).
-#[derive(Clone)]
-pub struct Key(aead::LessSafeKey);
-
-impl std::fmt::Debug for Key {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Key(..)")
-    }
-}
-
-impl Key {
-    /// A key from 32 bytes.
-    pub fn from_bytes(bytes: &[u8; 32]) -> Self {
-        // CHACHA20_POLY1305 takes exactly 32 bytes, so this cannot fail.
-        let unbound = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, bytes)
-            .unwrap_or_else(|_| unreachable!("a 32-byte ChaCha20-Poly1305 key"));
-        Self(aead::LessSafeKey::new(unbound))
-    }
-
-    /// Reads the key file at `path`. `None` if it does not exist.
-    pub fn load(path: &Path) -> Result<Option<Self>> {
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => {
-                return Err(Error::Io {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-        };
-        let key = parse_key(&bytes).ok_or_else(|| Error::Io {
-            path: path.to_path_buf(),
-            source: io::Error::new(
-                io::ErrorKind::InvalidData,
-                "the two-step verification key must be 32 bytes or 64 hex digits",
-            ),
-        })?;
-        Ok(Some(Self::from_bytes(&key)))
-    }
-
-    /// Creates the key file at `path` with 32 random bytes, readable by its owner and group
-    /// only. Returns `false` if it exists already (a dangling symbolic link counts as
-    /// existing): an existing key is never replaced, so read it with [`Key::load`].
-    ///
-    /// The key is written to a temporary file in the same directory, synced, and then linked
-    /// to `path`, which fails if the name is taken. So a crash never leaves a partial key
-    /// behind, and of two processes creating it at once, one wins and the other keeps its key.
-    pub fn create(path: &Path) -> Result<bool> {
-        let io_error = |source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        };
-        if path.symlink_metadata().is_ok() {
-            return Ok(false);
-        }
-        let dir = path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let temp = dir.join(format!(".{name}.{:016x}.tmp", rand::rng().random::<u64>()));
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o640);
-        let mut file = options.open(&temp).map_err(io_error)?;
-        let key: [u8; 32] = rand::rng().random();
-        let linked = file
-            .write_all(&key)
-            .and_then(|()| file.sync_all())
-            .and_then(|()| fs::hard_link(&temp, path));
-        drop(file);
-        // The key lives on under `path`, or the attempt failed: either way the temporary
-        // name goes.
-        let _ = fs::remove_file(&temp);
-        match linked {
-            Ok(()) => {
-                // Best effort: make the new name durable too.
-                #[cfg(unix)]
-                if let Ok(dir) = fs::File::open(dir) {
-                    let _ = dir.sync_all();
-                }
-                Ok(true)
-            }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-            Err(err) => Err(io_error(err)),
-        }
-    }
-
-    fn aad(user_id: i64) -> aead::Aad<Vec<u8>> {
-        let mut aad = AAD_CONTEXT.to_vec();
-        aad.extend_from_slice(&user_id.to_be_bytes());
-        aead::Aad::from(aad)
-    }
-
-    /// Encrypts `secret` for account `user_id`: nonce ‖ ciphertext ‖ tag.
-    pub fn seal(&self, user_id: i64, secret: &[u8]) -> Vec<u8> {
-        let nonce: [u8; aead::NONCE_LEN] = rand::rng().random();
-        let mut sealed = secret.to_vec();
-        // Sealing in place only fails for oversized input, which a TOTP secret is not.
-        if self
-            .0
-            .seal_in_place_append_tag(
-                aead::Nonce::assume_unique_for_key(nonce),
-                Self::aad(user_id),
-                &mut sealed,
-            )
-            .is_err()
-        {
-            return Vec::new();
-        }
-        let mut out = nonce.to_vec();
-        out.extend_from_slice(&sealed);
-        out
-    }
-
-    /// Decrypts what [`Key::seal`] produced for `user_id`; `None` for another key, another
-    /// account or damaged data.
-    pub fn open(&self, user_id: i64, sealed: &[u8]) -> Option<Vec<u8>> {
-        if sealed.len() < aead::NONCE_LEN {
-            return None;
-        }
-        let (nonce, ciphertext) = sealed.split_at(aead::NONCE_LEN);
-        let nonce = aead::Nonce::try_assume_unique_for_key(nonce).ok()?;
-        let mut buffer = ciphertext.to_vec();
-        let plain = self
-            .0
-            .open_in_place(nonce, Self::aad(user_id), &mut buffer)
-            .ok()?;
-        Some(plain.to_vec())
-    }
-}
-
-fn parse_key(bytes: &[u8]) -> Option<[u8; 32]> {
-    if let Ok(key) = <[u8; 32]>::try_from(bytes) {
-        return Some(key);
-    }
-    let text = std::str::from_utf8(bytes).ok()?.trim();
-    if text.len() != 64 {
-        return None;
-    }
-    let mut key = [0u8; 32];
-    for (index, pair) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        let pair = std::str::from_utf8(pair).ok()?;
-        key[index] = u8::from_str_radix(pair, 16).ok()?;
-    }
-    Some(key)
-}
+/// The key TOTP secrets are sealed with ([`Purpose::Totp`]).
+pub use crate::sealing::Key;
 
 /// The default name of the key file, in the configuration directory.
 pub fn default_key_file() -> PathBuf {
@@ -450,7 +295,7 @@ pub async fn enable(
          ON CONFLICT (user_id) DO NOTHING",
     )
     .bind(user_id)
-    .bind(key.seal(user_id, secret))
+    .bind(key.seal(Purpose::Totp, user_id, secret))
     .bind(step)
     .bind(now)
     .execute(&mut *tx)
@@ -612,7 +457,7 @@ pub async fn verify(
         return Ok(Verification::NotEnrolled);
     };
     if let Some(code) = parse_code(input) {
-        let Some(secret) = key.open(user_id, &sealed) else {
+        let Some(secret) = key.open(Purpose::Totp, user_id, &sealed) else {
             return Ok(Verification::WrongKey);
         };
         let Some(step) = matching_step(&secret, code, now, last_step) else {
@@ -784,21 +629,5 @@ mod tests {
             "U is not Crockford"
         );
         assert!(normalize_recovery_code("0000-0000-0000").is_none());
-    }
-
-    #[test]
-    fn sealed_secrets_open_only_for_their_key_and_account() {
-        let key = Key::from_bytes(&[1; 32]);
-        let sealed = key.seal(7, b"secret");
-        assert_eq!(key.open(7, &sealed).as_deref(), Some(&b"secret"[..]));
-        assert!(key.open(8, &sealed).is_none(), "another account");
-        assert!(
-            Key::from_bytes(&[2; 32]).open(7, &sealed).is_none(),
-            "another key"
-        );
-        assert_ne!(sealed, key.seal(7, b"secret"), "a fresh nonce every time");
-        assert!(parse_key(&[3; 32]).is_some());
-        assert!(parse_key("ab".repeat(32).as_bytes()).is_some());
-        assert!(parse_key(b"short").is_none());
     }
 }
