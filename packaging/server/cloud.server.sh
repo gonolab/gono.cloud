@@ -543,14 +543,19 @@ prepare_config() {
 		grep -qxF "$expected" "$config" || die "cannot adapt config.example.toml ($expected missing)"
 	done
 	if [ -n "$RELAY_HOST" ]; then
-		# The [relay] table is the only one that is off by default. QUIC address discovery stays
-		# off until its certificate is in place: the relay would not start without it.
-		sed -e 's|^enabled = false$|enabled = true|' \
+		# Turns on the [relay] table and sets its public_url. Only that table changes: others
+		# have keys of the same names ([s3] has `enabled = false` and `# public_url = ...` too).
+		# QUIC address discovery stays off until its certificate is in place: the relay would
+		# not start without it.
+		sed -e '/^\[relay\]$/,/^\[/{' \
+			-e 's|^enabled = false$|enabled = true|' \
 			-e "s|^# public_url = .*|public_url = \"https://$RELAY_HOST\"|" \
+			-e '}' \
 			"$config" >"$config.relay"
 		mv "$config.relay" "$config"
-		if ! grep -qxF "public_url = \"https://$RELAY_HOST\"" "$config" ||
-			grep -qx 'enabled = false' "$config"; then
+		relay_table=$(sed -n '/^\[relay\]$/,/^\[/p' "$config")
+		if ! printf '%s\n' "$relay_table" | grep -qxF "public_url = \"https://$RELAY_HOST\"" ||
+			! printf '%s\n' "$relay_table" | grep -qx 'enabled = true'; then
 			die "cannot adapt config.example.toml ([relay] missing)"
 		fi
 	fi
