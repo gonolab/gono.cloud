@@ -626,7 +626,7 @@ impl MetaStore {
         for (rel, stat) in entries {
             let row = match select(&mut tx, owner, rel).await? {
                 Some(row) => row,
-                None => insert(&mut tx, owner, rel, *stat, Etag::Derived).await?,
+                None => insert(&mut tx, owner, rel, *stat, Etag::Derived, None).await?,
             };
             rows.push(row);
         }
@@ -687,18 +687,22 @@ impl MetaStore {
         let (row, delta, operation) = match existing {
             Some(old) if !old.is_dir => {
                 let etag = written_file_etag(old.id, stat.mtime_ns, stat.size);
-                sqlx::query("UPDATE files SET etag = ?2, mtime_ns = ?3, size = ?4 WHERE id = ?1")
-                    .bind(old.id)
-                    .bind(&etag)
-                    .bind(stat.mtime_ns)
-                    .bind(to_db_size(stat.size))
-                    .execute(&mut *tx)
-                    .await?;
+                sqlx::query(
+                    "UPDATE files SET etag = ?2, mtime_ns = ?3, size = ?4, md5 = ?5 WHERE id = ?1",
+                )
+                .bind(old.id)
+                .bind(&etag)
+                .bind(stat.mtime_ns)
+                .bind(to_db_size(stat.size))
+                .bind(md5.as_ref().map(<[u8; 16]>::as_slice))
+                .execute(&mut *tx)
+                .await?;
                 let delta = to_db_size(stat.size) - to_db_size(old.size);
                 let row = FileRow {
                     etag,
                     mtime_ns: stat.mtime_ns,
                     size: stat.size,
+                    md5,
                     ..old
                 };
                 (row, delta, ChangeOperation::Modify)
@@ -706,7 +710,7 @@ impl MetaStore {
             stale => {
                 let removed = delete_subtree(&mut tx, owner, rel).await?;
                 let stale_size = stale.map_or(removed, |row| to_db_size(row.size));
-                let row = insert(&mut tx, owner, rel, stat, Etag::Written).await?;
+                let row = insert(&mut tx, owner, rel, stat, Etag::Written, md5).await?;
                 (
                     row,
                     to_db_size(stat.size) - stale_size,
@@ -721,12 +725,6 @@ impl MetaStore {
             },
             None => row,
         };
-        sqlx::query("UPDATE files SET md5 = ?2 WHERE id = ?1")
-            .bind(row.id)
-            .bind(md5.as_ref().map(<[u8; 16]>::as_slice))
-            .execute(&mut *tx)
-            .await?;
-        let row = FileRow { md5, ..row };
         // A new row has no metadata yet; an overwritten one loses its old version's.
         match object {
             Some(object) => objects::store_object_meta(&mut tx, row.id, object).await?,
@@ -812,7 +810,7 @@ impl MetaStore {
             mtime_ns,
             size: 0,
         };
-        let mut row = insert(&mut tx, owner, rel, stat, Etag::Written).await?;
+        let mut row = insert(&mut tx, owner, rel, stat, Etag::Written, None).await?;
         if let Some(spelled) = spelled {
             // `insert` spelled it as its parent; only the name may differ.
             let parent = |path: &str| path.rsplit_once('/').map(|(parent, _)| parent.to_owned());
@@ -958,7 +956,7 @@ impl MetaStore {
                 (row, event)
             }
             None => {
-                let row = insert(&mut tx, owner, to, stat, Etag::Derived).await?;
+                let row = insert(&mut tx, owner, to, stat, Etag::Derived, None).await?;
                 propagate(&mut tx, owner, from, 0).await?;
                 propagate(&mut tx, owner, to, to_db_size(row.size)).await?;
                 let event =
@@ -1021,7 +1019,7 @@ impl MetaStore {
                 stat.size = dir_sizes.get(relative).copied().unwrap_or(0);
             }
             let rel = to.join_path(relative);
-            let mut row = insert(&mut tx, owner, &rel, stat, Etag::Written).await?;
+            let mut row = insert(&mut tx, owner, &rel, stat, Etag::Written, None).await?;
             if let Some(source_id) = sources.get(relative) {
                 sqlx::query(
                     "INSERT INTO dead_props (file_id, namespace, name, xml) \
@@ -1095,7 +1093,7 @@ impl MetaStore {
         let mut adopted: HashSet<RelPath> = HashSet::new();
         for (rel, stat) in &known {
             if select(&mut tx, owner, rel).await?.is_none() {
-                insert(&mut tx, owner, rel, *stat, Etag::Derived).await?;
+                insert(&mut tx, owner, rel, *stat, Etag::Derived, None).await?;
                 adopted.insert(rel.clone());
             }
         }
@@ -1146,7 +1144,7 @@ impl MetaStore {
             if current.contains_key(rel) || known.iter().any(|(known, _)| known == rel) {
                 continue;
             }
-            let row = insert(&mut tx, owner, rel, *stat, Etag::Derived).await?;
+            let row = insert(&mut tx, owner, rel, *stat, Etag::Derived, None).await?;
             report.added_rows += 1;
             let parent_is_new = rel
                 .parent()
@@ -1448,13 +1446,14 @@ async fn select_subtree(tx: &mut Tx, owner: i64, dir: &RelPath) -> Result<Vec<Fi
 }
 
 /// Inserts a row and returns it. Directories start with size 0 unless `stat.size` says
-/// otherwise (used by [`MetaStore::record_copy`]).
+/// otherwise (used by [`MetaStore::record_copy`]). A file's content has the MD5 `md5`, if known.
 async fn insert(
     tx: &mut Tx,
     owner: i64,
     rel: &RelPath,
     stat: DiskStat,
     etag: Etag,
+    md5: Option<[u8; 16]>,
 ) -> Result<FileRow> {
     let size = to_db_size(stat.size);
     // Below a folder that S3 spelled otherwise, the new entry is spelled that way too.
@@ -1474,8 +1473,8 @@ async fn insert(
         _ => None,
     };
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO files (owner_id, rel_path, is_dir, etag, mtime_ns, size, s3_path) \
-         VALUES (?1, ?2, ?3, '', ?4, ?5, ?6) RETURNING id",
+        "INSERT INTO files (owner_id, rel_path, is_dir, etag, mtime_ns, size, s3_path, md5) \
+         VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7) RETURNING id",
     )
     .bind(owner)
     .bind(rel.as_str())
@@ -1483,6 +1482,7 @@ async fn insert(
     .bind(stat.mtime_ns)
     .bind(size)
     .bind(s3_path.as_deref())
+    .bind(md5.as_ref().map(<[u8; 16]>::as_slice))
     .fetch_one(&mut **tx)
     .await?;
     let etag = match (stat.is_dir, etag) {
@@ -1505,7 +1505,7 @@ async fn insert(
         favorite: false,
         creation_time: 0,
         s3_path,
-        md5: None,
+        md5,
     })
 }
 
