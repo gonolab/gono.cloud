@@ -192,3 +192,35 @@ the `nextcloud-desktop-cmd` package.
 | `NEXTCLOUDCMD=<path>` | `nextcloudcmd` binary to use instead of the one on `PATH`. |
 | `NEW_TARGET_DIR=<dir>` | Cargo target directory for the server build. |
 | `KEEP_WORK_DIR=1` | Keep the configuration, data, sync folders and logs (`nextcloudcmd.log`, `server.log`). |
+
+## S3 client scenarios
+
+```sh
+acceptance/scripts/s3-clients.sh              # every scenario
+acceptance/scripts/s3-clients.sh rclone mc    # some of them
+```
+
+Starts the server built from this checkout with the S3 API on (anonymous access allowed,
+virtual-hosted style under `s3.localhost`) and drives it with real clients, one scenario each:
+
+| Scenario | Client | Covers |
+|---|---|---|
+| `aws-s3` | AWS CLI `s3`, virtual-hosted style | `mb`, `sync` (a second sync uploads nothing), a multipart `cp`, `ls`, download, `mv`, `rm --recursive`, `rb` |
+| `aws-s3api` | AWS CLI `s3api`, path style | stored metadata, listings with continuation tokens and common prefixes, ListObjects v1, CopyObject with `REPLACE`, DeleteObjects, a presigned URL, CORS rules with a preflight and a cross-origin GET, the anonymous-download bucket policy, a multipart upload with `UploadPartCopy`, an aborted upload |
+| `app-public` | AWS CLI | what media servers do: `x-amz-acl: public-read` uploads into an `acl` bucket and anonymous downloads in both styles (content type, `nosniff`); private and missing objects, an ACL set back to private and a WebDAV overwrite answer 403; `public-read` into a private bucket fails |
+| `rclone` | rclone | modification times through `X-Amz-Meta-Mtime` (checked over WebDAV), an mtime-only change (copy onto itself), multipart, `check --download`, a second sync that copies nothing, deletion, virtual-hosted style, `purge` |
+| `mc` | MinIO client | `mb`, `cp`, `mirror`, `diff`, `ls`, `cat`, `stat`, `anonymous set download` and `none` (`upload` and `public` refused), virtual-hosted style, `rm`, `rb` |
+| `restic` | restic | `init` (creates the bucket), two backups, `snapshots`, `check --read-data`, `restore`, `forget --prune` |
+
+Every scenario checks what the client wrote through WebDAV as well. The clients keep their
+configuration and caches in the work directory, never in `$HOME`. Virtual-hosted style needs
+`<bucket>.s3.localhost` to resolve to `127.0.0.1`, which macOS and Linux with systemd-resolved
+do without setup; the script stops early otherwise. CI runs it on Linux with the AWS CLI of the
+runner, rclone and restic from Ubuntu, and `mc` built from its last release tag (MinIO no
+longer publishes binaries of it). Locally: `brew install awscli rclone minio-mc restic`.
+
+| Variable | Effect |
+|---|---|
+| `AWS`, `RCLONE`, `MC`, `RESTIC` | Client binaries to use instead of the ones on `PATH`. |
+| `NEW_TARGET_DIR=<dir>` | Cargo target directory for the server build. |
+| `KEEP_WORK_DIR=1` | Keep the configuration, data, client files and logs (`client.log`, `server.log`). |

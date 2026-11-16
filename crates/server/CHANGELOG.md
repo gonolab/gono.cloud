@@ -83,7 +83,8 @@ compatible within a major version: released clients keep working with newer serv
   metadata of rclone and other sync tools becomes the file's modification time, so WebDAV and
   the Nextcloud clients see the original time. The `gono_cloud` capability tells the Gono
   client the S3 endpoint, region and addressing (`gono_cloud.s3`). The acceptance suite drives
-  it with the AWS SDK.
+  it with the AWS SDK, and CI with the AWS CLI, rclone, mc and restic
+  (`acceptance/scripts/s3-clients.sh`).
 
 ### Changed
 

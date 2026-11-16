@@ -87,6 +87,46 @@ jobs:
       - name: nextcloudcmd sync scenarios
         run: acceptance/scripts/nextcloudcmd-scenarios.sh
 
+  # Real S3 clients against the S3 API: the AWS CLI (`s3` and `s3api`, preinstalled on the
+  # runner), rclone and restic as Ubuntu ships them, and mc built from its last release tag
+  # (MinIO no longer publishes mc binaries). Virtual-hosted style uses <bucket>.s3.localhost,
+  # which systemd-resolved answers with the loopback addresses. See
+  # acceptance/scripts/s3-clients.sh.
+  s3-clients:
+    name: S3 clients (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Install rclone, restic and mc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rclone restic
+          GOBIN="${RUNNER_TEMP}/bin" go install github.com/minio/mc@RELEASE.2025-08-13T08-35-41Z
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          aws --version
+          rclone version | head -n 1
+          restic version
+          "${RUNNER_TEMP}/bin/mc" --version | head -n 1
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: S3 client scenarios
+        run: acceptance/scripts/s3-clients.sh
+
   # Packs a debug build the way the release workflow packs release builds (on Linux a static
   # musl build with cargo-zigbuild, as released) and runs the install script end to end on the
   # runner: refused installs, a fresh install as a systemd service or launchd job, WebDAV
