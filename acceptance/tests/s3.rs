@@ -605,6 +605,127 @@ async fn multipart_uploads_assemble_their_parts() {
     s3.clean(&s3.bucket, &prefix).await;
 }
 
+/// Details that Ceph's s3-tests found to differ from S3.
+#[tokio::test]
+async fn requests_and_answers_follow_s3_in_the_details() {
+    let s3 = require!(S3::new(), "S3 is not configured");
+    let prefix = unique_name("s3");
+
+    // A Content-MD5 that is no MD5 is the header's fault (InvalidDigest), not the body's.
+    let err = s3
+        .client
+        .put_object()
+        .bucket(&s3.bucket)
+        .key(s3.key(&prefix, "md5"))
+        .content_md5("aGVsbG8=")
+        .body(ByteStream::from_static(b"hello"))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_service_error().and_then(|e| e.meta().code()),
+        Some("InvalidDigest")
+    );
+
+    // `aws-chunked` describes the request, not the object.
+    let key = s3.key(&prefix, "encoded");
+    s3.client
+        .put_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .content_encoding("gzip, aws-chunked")
+        .body(ByteStream::from_static(b"zzz"))
+        .send()
+        .await
+        .unwrap();
+    let head = s3
+        .client
+        .head_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.content_encoding(), Some("gzip"));
+
+    // A 304 names the version the client holds.
+    let etag = head.e_tag().unwrap().to_owned();
+    let not_modified = s3
+        .client
+        .get_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .if_none_match(&etag)
+        .send()
+        .await
+        .unwrap_err();
+    let raw = not_modified.raw_response().unwrap();
+    assert_eq!(raw.status().as_u16(), 304);
+    assert_eq!(raw.headers().get("etag"), Some(etag.as_str()));
+    assert!(raw.headers().get("last-modified").is_some());
+
+    // Listings: no keys asked for, nothing truncated; an empty delimiter is no delimiter.
+    s3.put(&s3.bucket, &s3.key(&prefix, "dir/a"), "a").await;
+    let zero = s3
+        .client
+        .list_objects_v2()
+        .bucket(&s3.bucket)
+        .prefix(format!("{prefix}/"))
+        .max_keys(0)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(zero.is_truncated(), Some(false));
+    assert!(zero.contents().is_empty());
+    let flat = s3
+        .client
+        .list_objects()
+        .bucket(&s3.bucket)
+        .prefix(format!("{prefix}/"))
+        .delimiter("")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(flat.delimiter(), None);
+    assert!(flat.common_prefixes().is_empty());
+    assert_eq!(flat.contents().len(), 2);
+    assert_eq!(flat.marker(), Some(""));
+
+    // A canned ACL that does not exist is the client's mistake (400), unlike an existing one
+    // that is not supported (501).
+    let bad = s3
+        .client
+        .put_object_acl()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .acl(ObjectCannedAcl::from("public-ready"))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(bad.raw_response().map(|r| r.status().as_u16()), Some(400));
+    let unsupported = s3
+        .client
+        .put_object_acl()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .acl(ObjectCannedAcl::AuthenticatedRead)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        unsupported.raw_response().map(|r| r.status().as_u16()),
+        Some(501)
+    );
+    s3.clean(&s3.bucket, &prefix).await;
+    let _ = s3
+        .client
+        .delete_object()
+        .bucket(&s3.bucket)
+        .key(s3.key(&prefix, "dir/a"))
+        .send()
+        .await;
+}
+
 #[tokio::test]
 async fn copies_and_conditional_writes() {
     let s3 = require!(S3::new(), "S3 is not configured");

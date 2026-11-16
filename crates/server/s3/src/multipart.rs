@@ -185,12 +185,7 @@ pub(crate) async fn create(
     let public = match input.acl.as_ref().map(dto::ObjectCannedACL::as_str) {
         None | Some("private" | "bucket-owner-read" | "bucket-owner-full-control") => false,
         Some("public-read") => true,
-        Some(_) => {
-            return Err(s3_error!(
-                NotImplemented,
-                "Only the canned ACLs private and public-read are supported"
-            ));
-        }
+        Some(other) => return Err(crate::ops::unsupported_acl(other)),
     };
     if public
         && crate::access::Public::of(bucket, state.settings().allow_anonymous).read
@@ -214,7 +209,7 @@ pub(crate) async fn create(
     let meta = ObjectMeta {
         public_read: public,
         content_type: input.content_type,
-        content_encoding: input.content_encoding,
+        content_encoding: upload::stored_content_encoding(input.content_encoding),
         content_disposition: input.content_disposition,
         content_language: input.content_language,
         cache_control: input.cache_control,
@@ -299,7 +294,8 @@ pub(crate) async fn upload_part(
         .as_ref()
         .and_then(s3s::TrailingHeaders::take);
     upload::apply_trailers(&mut claimed, trailers.as_ref())?;
-    let checksum = upload::verify(&received, input.content_md5.as_deref(), &claimed)?;
+    let content_md5 = upload::content_md5(&req.headers, input.content_md5.as_deref());
+    let checksum = upload::verify(&received, content_md5, &claimed)?;
     let etag = received.etag();
     store_part(
         state,

@@ -298,6 +298,28 @@ fn enable(hasher: &mut ChecksumHasher, algorithm: &str) {
     }
 }
 
+/// The `Content-MD5` of a request: the parsed value, or the header as sent when s3s dropped it
+/// (it drops an empty one, which must be refused as `InvalidDigest`).
+pub(crate) fn content_md5<'a>(headers: &'a HeaderMap, parsed: Option<&'a str>) -> Option<&'a str> {
+    parsed.or_else(|| {
+        headers
+            .get(http::header::HeaderName::from_static("content-md5"))
+            .map(|value| value.to_str().unwrap_or("?"))
+    })
+}
+
+/// The `Content-Encoding` to store with an object: without `aws-chunked`, which only describes
+/// how the request carried the body (S3 removes it too); `None` if nothing is left.
+pub(crate) fn stored_content_encoding(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let kept: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("aws-chunked"))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join(", "))
+}
+
 /// Compares what a client announced with what arrived: `Content-MD5` (base64) and every
 /// claimed checksum. Returns the checksum to store with the object: the first claimed one in
 /// [`ALGORITHMS`] order.
@@ -311,7 +333,9 @@ pub(crate) fn verify(
     if let Some(content_md5) = content_md5 {
         let expected = STANDARD
             .decode(content_md5.trim())
-            .map_err(|_| s3_error!(InvalidDigest))?;
+            .ok()
+            .filter(|digest| digest.len() == 16)
+            .ok_or_else(|| s3_error!(InvalidDigest))?;
         if expected != received.md5 {
             return Err(s3_error!(
                 BadDigest,
@@ -341,6 +365,42 @@ pub(crate) fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aws_chunked_is_not_stored_as_a_content_encoding() {
+        let stored = |value: &str| stored_content_encoding(Some(value.to_owned()));
+        assert_eq!(stored("gzip").as_deref(), Some("gzip"));
+        assert_eq!(stored("deflate, gzip").as_deref(), Some("deflate, gzip"));
+        assert_eq!(stored("gzip, aws-chunked").as_deref(), Some("gzip"));
+        assert_eq!(stored("aws-chunked,gzip").as_deref(), Some("gzip"));
+        assert_eq!(stored("aws-chunked"), None);
+        assert_eq!(stored("AWS-CHUNKED, aws-chunked"), None);
+        assert_eq!(stored_content_encoding(None), None);
+    }
+
+    #[test]
+    fn content_md5_must_be_a_base64_md5() {
+        let content = received(b"hello", &[]);
+        let none = Checksum::default();
+        let code = |value: &str| {
+            verify(&content, Some(value), &none)
+                .unwrap_err()
+                .code()
+                .clone()
+        };
+        // Empty, not base64, or not 16 bytes: the header itself is wrong.
+        assert_eq!(code(""), S3ErrorCode::InvalidDigest);
+        assert_eq!(code("not base64!"), S3ErrorCode::InvalidDigest);
+        assert_eq!(code("aGVsbG8="), S3ErrorCode::InvalidDigest);
+        // A well-formed MD5 of other content: the body is wrong.
+        assert_eq!(code("1B2M2Y8AsgTpgAmY7PhCfg=="), S3ErrorCode::BadDigest);
+        assert!(verify(&content, Some("XUFAKrxLKna5cZ2REBfFkg=="), &none).is_ok());
+        // An empty header, which s3s drops, still reaches the check.
+        let mut headers = HeaderMap::new();
+        headers.insert("content-md5", http::HeaderValue::from_static(""));
+        assert_eq!(content_md5(&headers, None), Some(""));
+        assert_eq!(content_md5(&HeaderMap::new(), None), None);
+    }
 
     fn received(content: &[u8], algorithms: &[&str]) -> Received {
         let mut hasher = ChecksumHasher::default();

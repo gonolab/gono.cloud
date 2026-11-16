@@ -162,10 +162,30 @@ fn object_acl(acl: Option<&dto::ObjectCannedACL>) -> S3Result<bool> {
     match acl.map(dto::ObjectCannedACL::as_str) {
         None | Some("private" | "bucket-owner-read" | "bucket-owner-full-control") => Ok(false),
         Some("public-read") => Ok(true),
-        Some(_) => Err(s3_error!(
+        Some(other) => Err(unsupported_acl(other)),
+    }
+}
+
+/// The error for a canned ACL other than the supported ones: `NotImplemented` for the other
+/// canned ACLs of S3, `400 InvalidArgument` for a value that is none of them.
+pub(crate) fn unsupported_acl(value: &str) -> S3Error {
+    const CANNED: [&str; 8] = [
+        "private",
+        "public-read",
+        "public-read-write",
+        "authenticated-read",
+        "aws-exec-read",
+        "bucket-owner-read",
+        "bucket-owner-full-control",
+        "log-delivery-write",
+    ];
+    if CANNED.contains(&value) {
+        s3_error!(
             NotImplemented,
             "Only the canned ACLs private and public-read are supported"
-        )),
+        )
+    } else {
+        s3_error!(InvalidArgument, "The canned ACL is not valid")
     }
 }
 
@@ -253,6 +273,28 @@ fn check_read_conditions(
         (None, Some(since)) if modified <= unix_seconds(since) => Err(s3_error!(NotModified)),
         _ => Ok(()),
     }
+}
+
+/// A `304 Not Modified` carries the object's `ETag` and `Last-Modified`, as from S3, so that
+/// caches can refresh what they hold; other errors are left as they are.
+fn with_validators(mut err: S3Error, etag: &str, modified: SystemTime) -> S3Error {
+    if *err.code() != S3ErrorCode::NotModified {
+        return err;
+    }
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&format!("\"{etag}\"")) {
+        headers.insert(http::header::ETAG, value);
+    }
+    let mut date = Vec::new();
+    if Timestamp::from(modified)
+        .format(dto::TimestampFormat::HttpDate, &mut date)
+        .is_ok()
+        && let Ok(value) = HeaderValue::from_bytes(&date)
+    {
+        headers.insert(http::header::LAST_MODIFIED, value);
+    }
+    err.set_headers(headers);
+    err
 }
 
 /// Evaluates the `x-amz-copy-source-if-*` headers of a copy: like the conditional headers of a
@@ -463,6 +505,17 @@ impl GonoS3 {
         let max = max_keys.map_or(MAX_KEYS, |max| {
             usize::try_from(max.max(0)).unwrap_or(0).min(MAX_KEYS)
         });
+        if max == 0 {
+            // Nothing asked for, nothing more to come: S3 answers an empty page that is not
+            // truncated.
+            return Ok(Listed {
+                objects: Vec::new(),
+                prefixes: Vec::new(),
+                truncated: false,
+                last: None,
+                last_is_prefix: false,
+            });
+        }
         let listing = self
             .state
             .fs()
@@ -666,13 +719,14 @@ impl GonoS3 {
             .as_ref()
             .and_then(s3s::TrailingHeaders::take);
         upload::apply_trailers(&mut claimed, trailers.as_ref())?;
-        let checksum = upload::verify(&received, input.content_md5.as_deref(), &claimed)?;
+        let content_md5 = upload::content_md5(&req.headers, input.content_md5.as_deref());
+        let checksum = upload::verify(&received, content_md5, &claimed)?;
         let etag = received.etag();
         let meta = ObjectMeta {
             s3_etag: Some(etag.clone()),
             public_read: public,
             content_type: input.content_type,
-            content_encoding: input.content_encoding,
+            content_encoding: upload::stored_content_encoding(input.content_encoding),
             content_disposition: input.content_disposition,
             content_language: input.content_language,
             cache_control: input.cache_control,
@@ -817,12 +871,7 @@ impl S3 for GonoS3 {
                     "Anonymous access is off on this server"
                 ));
             }
-            Some(_) => {
-                return Err(s3_error!(
-                    NotImplemented,
-                    "Only the canned ACLs private and public-read are supported"
-                ));
-            }
+            Some(other) => return Err(unsupported_acl(other)),
         };
         if let Some(existing) = s3::bucket(self.state.pool(), name.as_str())
             .await
@@ -1028,7 +1077,8 @@ impl S3 for GonoS3 {
                     "Anonymous access is off on this server"
                 ));
             }
-            _ => {
+            Some(other) => return Err(unsupported_acl(other)),
+            None => {
                 return Err(s3_error!(
                     NotImplemented,
                     "Only the canned ACLs private and public-read are supported"
@@ -1177,12 +1227,17 @@ impl S3 for GonoS3 {
             None => input.start_after.clone(),
         };
         let prefix = input.prefix.clone().unwrap_or_default();
+        // An empty delimiter is no delimiter, and S3 does not echo it.
+        let delimiter = input
+            .delimiter
+            .clone()
+            .filter(|delimiter| !delimiter.is_empty());
         let listed = self
             .list(
                 bucket,
                 ListRequest {
                     prefix: &prefix,
-                    delimiter: input.delimiter.as_deref(),
+                    delimiter: delimiter.as_deref(),
                     start_after: after.as_deref(),
                     max_keys: input.max_keys,
                     url,
@@ -1207,7 +1262,7 @@ impl S3 for GonoS3 {
                 .flatten(),
             contents: Some(listed.objects),
             common_prefixes: Some(listed.prefixes),
-            delimiter: encode(input.delimiter),
+            delimiter: encode(delimiter),
             encoding_type: input.encoding_type,
             start_after: encode(input.start_after),
             ..Default::default()
@@ -1228,12 +1283,17 @@ impl S3 for GonoS3 {
             .as_ref()
             .is_some_and(|encoding| encoding.as_str() == dto::EncodingType::URL);
         let prefix = input.prefix.clone().unwrap_or_default();
+        // An empty delimiter is no delimiter, and S3 does not echo it.
+        let delimiter = input
+            .delimiter
+            .clone()
+            .filter(|delimiter| !delimiter.is_empty());
         let listed = self
             .list(
                 bucket,
                 ListRequest {
                     prefix: &prefix,
-                    delimiter: input.delimiter.as_deref(),
+                    delimiter: delimiter.as_deref(),
                     start_after: input.marker.as_deref(),
                     max_keys: input.max_keys,
                     url,
@@ -1244,10 +1304,12 @@ impl S3 for GonoS3 {
         let encode = |value: Option<String>| {
             value.map(|value| if url { keys::url_encode(&value) } else { value })
         };
+        // In a v1 listing S3 encodes the marker, the delimiter and the keys but not the prefix,
+        // and clients (botocore) decode exactly those; the marker is always there.
         let mut response = S3Response::new(dto::ListObjectsOutput {
             name: Some(bucket.name.clone()),
-            prefix: encode(input.prefix),
-            marker: encode(input.marker),
+            prefix: input.prefix,
+            marker: Some(encode(input.marker).unwrap_or_default()),
             max_keys: Some(input.max_keys.unwrap_or(MAX_KEYS as i32)),
             is_truncated: Some(listed.truncated),
             next_marker: listed
@@ -1256,7 +1318,7 @@ impl S3 for GonoS3 {
                 .flatten(),
             contents: Some(listed.objects),
             common_prefixes: Some(listed.prefixes),
-            delimiter: encode(input.delimiter),
+            delimiter: encode(delimiter),
             encoding_type: input.encoding_type,
             ..Default::default()
         });
@@ -1293,12 +1355,17 @@ impl S3 for GonoS3 {
             .as_ref()
             .is_some_and(|encoding| encoding.as_str() == dto::EncodingType::URL);
         let prefix = input.prefix.clone().unwrap_or_default();
+        // An empty delimiter is no delimiter, and S3 does not echo it.
+        let delimiter = input
+            .delimiter
+            .clone()
+            .filter(|delimiter| !delimiter.is_empty());
         let listed = self
             .list(
                 bucket,
                 ListRequest {
                     prefix: &prefix,
-                    delimiter: input.delimiter.as_deref(),
+                    delimiter: delimiter.as_deref(),
                     start_after: key_marker,
                     max_keys: input.max_keys,
                     url,
@@ -1343,7 +1410,7 @@ impl S3 for GonoS3 {
             next_version_id_marker: ends_with_object.then(|| NULL_VERSION.to_owned()),
             versions: Some(versions),
             common_prefixes: Some(listed.prefixes),
-            delimiter: encode(input.delimiter),
+            delimiter: encode(delimiter),
             encoding_type: input.encoding_type,
             ..Default::default()
         });
@@ -1428,7 +1495,8 @@ impl S3 for GonoS3 {
             input.if_none_match.as_ref(),
             input.if_modified_since.as_ref(),
             input.if_unmodified_since.as_ref(),
-        )?;
+        )
+        .map_err(|err| with_validators(err, &etag, entry.modified))?;
         let size = if entry.is_dir() { 0 } else { entry.size };
         let (start, length, content_range) = match input.range {
             Some(range) => {
@@ -1523,7 +1591,8 @@ impl S3 for GonoS3 {
             input.if_none_match.as_ref(),
             input.if_modified_since.as_ref(),
             input.if_unmodified_since.as_ref(),
-        )?;
+        )
+        .map_err(|err| with_validators(err, &etag, entry.modified))?;
         let size = if entry.is_dir() { 0 } else { entry.size };
         let checksum = if input.checksum_mode.is_some() {
             upload::stored_checksum(meta.as_ref().and_then(|meta| meta.checksum.as_ref()))
@@ -1708,7 +1777,7 @@ impl S3 for GonoS3 {
                 s3_etag,
                 public_read: public,
                 content_type: input.content_type,
-                content_encoding: input.content_encoding,
+                content_encoding: upload::stored_content_encoding(input.content_encoding),
                 content_disposition: input.content_disposition,
                 content_language: input.content_language,
                 cache_control: input.cache_control,
@@ -2078,11 +2147,31 @@ mod tests {
         assert!(!object_acl(Some(&acl("bucket-owner-full-control"))).unwrap());
         assert!(object_acl(Some(&acl("public-read"))).unwrap());
         for unsupported in ["public-read-write", "authenticated-read", "aws-exec-read"] {
-            assert!(
-                object_acl(Some(&acl(unsupported))).is_err(),
+            assert_eq!(
+                *object_acl(Some(&acl(unsupported))).unwrap_err().code(),
+                S3ErrorCode::NotImplemented,
                 "{unsupported}"
             );
         }
+        // A value that is no canned ACL at all is the client's mistake.
+        assert_eq!(
+            *object_acl(Some(&acl("public-ready"))).unwrap_err().code(),
+            S3ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn not_modified_answers_carry_validators() {
+        let at = UNIX_EPOCH + Duration::from_secs(86_400);
+        let err = with_validators(s3_error!(NotModified), "abc", at);
+        let headers = err.headers().unwrap();
+        assert_eq!(headers[http::header::ETAG], "\"abc\"");
+        assert_eq!(
+            headers[http::header::LAST_MODIFIED],
+            "Fri, 02 Jan 1970 00:00:00 GMT"
+        );
+        let other = with_validators(s3_error!(PreconditionFailed), "abc", at);
+        assert!(other.headers().is_none());
     }
 
     #[test]
