@@ -324,6 +324,9 @@ pub(crate) fn check_copy_source_conditions(
     })
 }
 
+/// The region whose CreateBucket answers 200 for a bucket the caller owns already.
+const US_EAST_1: &str = "us-east-1";
+
 /// Which buckets one `ListBuckets` answer lists: those after the continuation token that start
 /// with the prefix, at most `max-buckets` (1 to 10000) of them. Without `max-buckets` every
 /// bucket fits, as S3's default page size is 10000.
@@ -954,11 +957,26 @@ impl S3 for GonoS3 {
             .await
             .map_err(error::database)?
         {
-            return Err(if existing.owner_id == key.user_id {
-                s3_error!(BucketAlreadyOwnedByYou)
+            if existing.owner_id != key.user_id {
+                return Err(s3_error!(BucketAlreadyExists));
+            }
+            // S3 in us-east-1 answers a repeated CreateBucket of one's own bucket with 200 and
+            // resets the bucket's ACL to the requested one (`private` without one); every
+            // other region with BucketAlreadyOwnedByYou. Its objects stay.
+            if region != US_EAST_1 {
+                return Err(s3_error!(BucketAlreadyOwnedByYou));
+            }
+            let mode = if public {
+                Anonymous::PublicRead
             } else {
-                s3_error!(BucketAlreadyExists)
-            });
+                Anonymous::Private
+            };
+            let list = mode != Anonymous::Private && existing.anonymous_list;
+            self.set_anonymous(&auth, &existing, mode, list).await?;
+            return Ok(S3Response::new(dto::CreateBucketOutput {
+                location: Some(format!("/{name}")),
+                ..Default::default()
+            }));
         }
 
         let identity = Self::tree_identity(key);

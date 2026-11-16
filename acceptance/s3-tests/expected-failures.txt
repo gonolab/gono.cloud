@@ -39,11 +39,9 @@ s3tests/functional/test_headers.py::test_object_create_date_and_amz_date
 s3tests/functional/test_headers.py::test_object_create_bad_contentlength_none
 s3tests/functional/test_s3.py::test_object_write_with_chunked_transfer_encoding
 
-# S3 answers a repeated CreateBucket of one's own bucket in us-east-1 with 200 (and resets its
-# ACL); Gono Cloud answers BucketAlreadyOwnedByYou, as S3 does in every other region.
-s3tests/functional/test_s3.py::test_bucket_create_exists
+# RGW answers a repeated CreateBucket of one's own bucket with another ACL with
+# BucketAlreadyExists; S3 in us-east-1, and Gono Cloud there, with 200, resetting the ACL.
 s3tests/functional/test_s3.py::test_bucket_recreate_new_acl
-s3tests/functional/test_s3.py::test_bucket_recreate_not_overriding
 s3tests/functional/test_s3.py::test_bucket_recreate_overwrite_acl
 
 # Design (plan 7): bucket names are 3 to 63 characters of a-z, 0-9 and '-', without dots, so

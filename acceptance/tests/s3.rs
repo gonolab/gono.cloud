@@ -23,7 +23,8 @@ use aws_sdk_s3::{
     presigning::PresigningConfig,
     primitives::{ByteStream, DateTime, DateTimeFormat},
     types::{
-        CompletedMultipartUpload, CompletedPart, CorsConfiguration, CorsRule, ObjectCannedAcl,
+        BucketCannedAcl, CompletedMultipartUpload, CompletedPart, CorsConfiguration, CorsRule,
+        ObjectCannedAcl,
     },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -1762,6 +1763,50 @@ async fn the_download_policy_publishes_a_bucket() {
         .unwrap();
     assert_eq!(anonymous(object).await.unwrap().status(), 403);
     assert_eq!(anonymous(listing).await.unwrap().status(), 403);
+
+    s3.client
+        .delete_object()
+        .bucket(&bucket)
+        .key("a.txt")
+        .send()
+        .await
+        .unwrap();
+    s3.client
+        .delete_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+}
+
+/// In us-east-1 (the region the suite signs for), S3 answers a CreateBucket of a bucket the
+/// caller owns with 200 and resets the bucket's ACL to the requested one; the objects stay.
+#[tokio::test]
+async fn re_creating_ones_bucket_resets_its_acl() {
+    let s3 = require!(S3::new(), "S3 is not configured");
+    let bucket = format!(
+        "recreate-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let create = |acl: Option<BucketCannedAcl>| {
+        s3.client
+            .create_bucket()
+            .bucket(&bucket)
+            .set_acl(acl)
+            .send()
+    };
+    create(Some(BucketCannedAcl::PublicRead)).await.unwrap();
+    s3.put(&bucket, "a.txt", "kept").await;
+    let object = s3.url(&bucket, "a.txt");
+    let anonymous = || s3.http.get(object.clone()).send();
+    assert_eq!(anonymous().await.unwrap().status(), 200);
+
+    // Without an ACL: private again.
+    create(None).await.unwrap();
+    assert_eq!(anonymous().await.unwrap().status(), 403);
+    assert_eq!(s3.get(&bucket, "a.txt").await, b"kept");
+    create(Some(BucketCannedAcl::PublicRead)).await.unwrap();
+    assert_eq!(anonymous().await.unwrap().status(), 200);
 
     s3.client
         .delete_object()
