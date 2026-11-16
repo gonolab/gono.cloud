@@ -54,6 +54,7 @@ use crate::{
     file::{CreatedFile, ReadFile, WriteFile},
     identity::Identity,
     metadata::{DavMeta, Entry, Kind, time_from_ns},
+    objects::ObjectLocks,
     props,
     resolve::{self, Location},
 };
@@ -71,6 +72,8 @@ struct Inner {
     instance_id: String,
     /// Users whose directories and root row are known to exist.
     ready: Mutex<HashSet<i64>>,
+    /// The locks of the object operations.
+    objects: ObjectLocks,
 }
 
 /// Runs blocking file system code on the blocking thread pool.
@@ -129,6 +132,7 @@ impl ScopedFs {
                 meta,
                 instance_id,
                 ready: Mutex::new(HashSet::new()),
+                objects: ObjectLocks::new(),
             }),
         }
     }
@@ -192,8 +196,12 @@ impl ScopedFs {
         self.inner.layout.user_files(owner)
     }
 
+    pub(crate) fn object_locks(&self) -> &ObjectLocks {
+        &self.inner.objects
+    }
+
     /// Creates the user's directories and root row on first access.
-    async fn ensure_user(&self, owner: i64) -> FsResult<()> {
+    pub(crate) async fn ensure_user(&self, owner: i64) -> FsResult<()> {
         if self
             .inner
             .ready
@@ -278,7 +286,7 @@ impl ScopedFs {
         self.lookup(ctx, &location).await
     }
 
-    async fn lookup(&self, ctx: &Ctx, location: &Location) -> FsResult<Arc<Entry>> {
+    pub(crate) async fn lookup(&self, ctx: &Ctx, location: &Location) -> FsResult<Arc<Entry>> {
         match location {
             Location::Virtual { client } => self.virtual_entry(ctx, client).await,
             Location::Storage { .. } => self.lookup_storage(ctx, location).await,
@@ -575,7 +583,7 @@ impl ScopedFs {
     }
 
     /// Caches the entry described by a freshly written row and returns it.
-    fn remember_row(
+    pub(crate) fn remember_row(
         &self,
         ctx: &Ctx,
         location: Location,

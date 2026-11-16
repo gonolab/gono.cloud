@@ -12,6 +12,7 @@
 //! - [`fs`]: `ScopedFs`, the `GuardedFileSystem<Ctx>` implementation (path mapping, virtual
 //!   directories, permission checks).
 //! - [`metadata`]: the `DavMetaData` wrapper that gives every entry a single ETag source.
+//! - [`objects`]: reads and writes by client path with S3's rules, for the S3 API.
 //! - [`props`]: Nextcloud live properties and permissions.
 //! - [`locks`]: the persistent `DavLockSystem`, keyed by storage path.
 //! - [`report`]: the `oc:filter-files` favorites REPORT, served next to dav-server.
@@ -28,6 +29,7 @@ pub mod fs;
 pub mod identity;
 pub mod locks;
 pub mod metadata;
+pub mod objects;
 pub mod oc_headers;
 pub mod props;
 pub mod report;
@@ -39,6 +41,7 @@ pub mod xml_prefix;
 pub use ctx::{Ctx, PropfindKind, RequestInfo};
 pub use fs::ScopedFs;
 pub use identity::{Identity, Mount};
+pub use objects::{ObjectError, WriteCondition};
 pub use oc_headers::OcHeadersLayer;
 pub use service::{DavBody, DavService, OcInfo};
 pub use xml_prefix::{DavPrefixLayer, RewrittenXml};
