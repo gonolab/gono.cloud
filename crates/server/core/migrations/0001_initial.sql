@@ -125,6 +125,36 @@ CREATE TABLE dead_props (
     PRIMARY KEY (file_id, namespace, name)
 ) STRICT;
 
+-- S3 metadata of the current version of a file: what a version written through the S3 API
+-- carries besides its content, and its object ACL. Only files have rows. Every write of the
+-- file that does not come through the S3 API, and every change of its content that `rescan`
+-- finds, deletes the row, so the metadata never describes other content and a public object
+-- becomes private again when it is overwritten. A MOVE keeps the row (same file id); a COPY
+-- does not copy it.
+CREATE TABLE object_meta (
+    file_id             INTEGER PRIMARY KEY REFERENCES files (id) ON DELETE CASCADE,
+    -- The S3 ETag without quotes: the MD5 of the content, or "<MD5 of the part MD5s>-<parts>"
+    -- for a multipart upload. NULL for a version that was not written through the S3 API and
+    -- only got an ACL: its S3 ETag is its WebDAV ETag.
+    s3_etag             TEXT,
+    -- The canned ACL `public-read`: anonymous requests may read the object, if its bucket
+    -- honors object ACLs.
+    public_read         INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
+    content_type        TEXT,
+    content_encoding    TEXT,
+    content_disposition TEXT,
+    content_language    TEXT,
+    cache_control       TEXT,
+    expires             TEXT,
+    -- `x-amz-meta-*` as a JSON object of strings, names in lowercase without the prefix.
+    user_meta           TEXT    NOT NULL DEFAULT '{}',
+    -- The `x-amz-checksum-*` the upload carried: algorithm (`CRC32`, `CRC32C`, `CRC64NVME`,
+    -- `SHA1`, `SHA256`) and the value as sent (base64).
+    checksum_algorithm  TEXT,
+    checksum_value      TEXT,
+    CHECK ((checksum_algorithm IS NULL) = (checksum_value IS NULL))
+) STRICT;
+
 -- Append-only journal of changes per owner, written in the same transaction as the change.
 -- `id` is a monotonically increasing sequence number.
 CREATE TABLE change_log (

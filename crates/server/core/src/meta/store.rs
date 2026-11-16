@@ -36,6 +36,7 @@ use sqlx::FromRow;
 use super::{
     changes::{ChangeEvent, ChangeOperation, ChangeSink},
     descendant_bounds,
+    objects::{self, ObjectMeta},
 };
 use crate::{
     db::{self, Pool, Tx},
@@ -146,8 +147,9 @@ pub struct DeadProp {
     pub xml: Vec<u8>,
 }
 
+/// A `files` row as selected with [`COLUMNS`].
 #[derive(FromRow)]
-struct Row {
+pub(super) struct Row {
     id: i64,
     rel_path: String,
     is_dir: bool,
@@ -602,8 +604,33 @@ impl MetaStore {
     ///
     /// An existing file row keeps its id; otherwise a new id is allocated and stale rows at or
     /// below `rel` (for example a directory that was replaced out of band) are removed first,
-    /// so that dead properties never survive a delete and re-create.
+    /// so that dead properties never survive a delete and re-create. The S3 metadata of the
+    /// previous version is removed: it described other content, and an overwritten public
+    /// object becomes private.
     pub async fn record_write(&self, owner: i64, rel: &RelPath, stat: DiskStat) -> Result<FileRow> {
+        self.write_version(owner, rel, stat, None).await
+    }
+
+    /// Records that a file was written through the S3 API at `rel`, like
+    /// [`MetaStore::record_write`], and stores `object` as the new version's S3 metadata in the
+    /// same transaction.
+    pub async fn record_object_write(
+        &self,
+        owner: i64,
+        rel: &RelPath,
+        stat: DiskStat,
+        object: &ObjectMeta,
+    ) -> Result<FileRow> {
+        self.write_version(owner, rel, stat, Some(object)).await
+    }
+
+    async fn write_version(
+        &self,
+        owner: i64,
+        rel: &RelPath,
+        stat: DiskStat,
+        object: Option<&ObjectMeta>,
+    ) -> Result<FileRow> {
         debug_assert!(!stat.is_dir);
         let mut tx = db::begin_immediate(&self.pool).await?;
         let existing = select(&mut tx, owner, rel).await?;
@@ -637,6 +664,11 @@ impl MetaStore {
                 )
             }
         };
+        // A new row has no metadata yet; an overwritten one loses its old version's.
+        match object {
+            Some(object) => objects::store_object_meta(&mut tx, row.id, object).await?,
+            None => objects::clear_object_meta(&mut tx, row.id).await?,
+        }
         propagate(&mut tx, owner, rel, delta).await?;
         let event = log_change(&mut tx, owner, row.id, rel, None, operation).await?;
         tx.commit().await?;
@@ -964,6 +996,8 @@ impl MetaStore {
                 .bind(to_db_size(stat.size))
                 .execute(&mut *tx)
                 .await?;
+            // New content behind the server's back: the S3 metadata described the old one.
+            objects::clear_object_meta(&mut tx, row.id).await?;
             if !new_paths.contains(rel) {
                 events.push(
                     log_change(&mut tx, owner, row.id, rel, None, ChangeOperation::Modify).await?,

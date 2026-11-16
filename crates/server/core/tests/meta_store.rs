@@ -5,7 +5,10 @@ use gono_server_core::{
     RelPath, Username,
     config::DbConfig,
     db::{self, OpenMode, Pool},
-    meta::{DeadProp, DiskStat, MetaStore, PropChange},
+    meta::{
+        Checksum, DeadProp, DiskStat, ListEntry, MetaStore, ObjectListing, ObjectMeta, ObjectQuery,
+        PropChange,
+    },
     users::{self, NewUser},
 };
 
@@ -1023,4 +1026,366 @@ async fn names_are_searched_by_subtree_ignoring_case() {
     assert_eq!(search("", "%_", 10).await, ["50%_off.txt"]);
     assert_eq!(search("", "txt", 2).await.len(), 2, "limit");
     assert!(search("", "", 10).await.is_empty());
+}
+
+fn object(etag: &str) -> ObjectMeta {
+    ObjectMeta {
+        s3_etag: Some(etag.to_owned()),
+        content_type: Some("image/png".to_owned()),
+        cache_control: Some("max-age=60".to_owned()),
+        user_meta: [("mtime".to_owned(), "1700000000.5".to_owned())].into(),
+        checksum: Some(Checksum {
+            algorithm: "CRC32".to_owned(),
+            value: "AAAAAA==".to_owned(),
+        }),
+        ..ObjectMeta::default()
+    }
+}
+
+impl Fixture {
+    async fn put_object(&self, path: &str, size: u64, meta: &ObjectMeta) -> i64 {
+        self.store
+            .record_object_write(self.owner, &p(path), file_stat(size), meta)
+            .await
+            .unwrap()
+            .id
+    }
+
+    async fn object_meta(&self, path: &str) -> Option<ObjectMeta> {
+        let row = self.store.get(self.owner, &p(path)).await.unwrap()?;
+        self.store.object_meta(row.id).await.unwrap()
+    }
+
+    async fn list(
+        &self,
+        root: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        start_after: Option<&str>,
+        max_entries: usize,
+    ) -> ObjectListing {
+        self.store
+            .list_objects(
+                self.owner,
+                ObjectQuery {
+                    root: &p(root),
+                    prefix,
+                    delimiter,
+                    start_after,
+                    max_entries,
+                },
+            )
+            .await
+            .unwrap()
+    }
+}
+
+/// Objects as `key`, common prefixes as `key/` marked with a trailing `*`.
+fn names(listing: &ObjectListing) -> Vec<String> {
+    listing
+        .entries
+        .iter()
+        .map(|entry| match entry {
+            ListEntry::Object(object) => object.key.clone(),
+            ListEntry::CommonPrefix(prefix) => format!("{prefix}*"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn object_meta_belongs_to_one_version() {
+    let f = fixture().await;
+    f.mkdir("b").await;
+    let id = f.put_object("b/a.png", 3, &object("md5-one")).await;
+    let stored = f.object_meta("b/a.png").await.unwrap();
+    assert_eq!(stored, object("md5-one"));
+    assert_eq!(stored.etag_or("dav"), "md5-one");
+
+    // Another S3 write replaces it; the file keeps its id.
+    let mut second = object("md5-two");
+    second.content_type = None;
+    second.checksum = None;
+    second.user_meta.clear();
+    assert_eq!(f.put_object("b/a.png", 4, &second).await, id);
+    assert_eq!(f.object_meta("b/a.png").await.unwrap(), second);
+
+    // A write that is not an S3 write removes it.
+    assert_eq!(f.write("b/a.png", 5).await, id);
+    assert_eq!(f.object_meta("b/a.png").await, None);
+
+    // A MOVE keeps it, a COPY does not copy it, a DELETE removes it.
+    f.put_object("b/a.png", 6, &object("md5-three")).await;
+    f.store
+        .record_move(f.owner, &p("b/a.png"), &p("b/moved.png"), file_stat(6))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.object_meta("b/moved.png")
+            .await
+            .unwrap()
+            .s3_etag
+            .as_deref(),
+        Some("md5-three")
+    );
+    f.store
+        .record_copy(
+            f.owner,
+            &p("b/moved.png"),
+            &p("b/copy.png"),
+            &[(RelPath::root(), file_stat(6))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.object_meta("b/copy.png").await, None);
+    f.store
+        .record_delete(f.owner, &p("b/moved.png"))
+        .await
+        .unwrap();
+    let orphans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM object_meta WHERE file_id = ?1")
+        .bind(id)
+        .fetch_one(f.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(orphans, 0);
+}
+
+#[tokio::test]
+async fn object_writes_propagate_and_log_like_any_write() {
+    let f = fixture().await;
+    f.mkdir("b").await;
+    let before = f.etags(&["", "b"]).await;
+    f.put_object("b/a.png", 7, &object("md5")).await;
+    assert!(all_changed(&before, &f.etags(&["", "b"]).await));
+    assert_eq!(f.size("").await, 7);
+    assert_eq!(
+        f.changes().await.last().unwrap(),
+        &("create".to_owned(), "b/a.png".to_owned(), None)
+    );
+}
+
+#[tokio::test]
+async fn rescanned_content_drops_object_meta() {
+    let f = fixture().await;
+    f.mkdir("b").await;
+    f.put_object("b/same.png", 1, &object("md5-same")).await;
+    f.put_object("b/changed.png", 2, &object("md5-changed"))
+        .await;
+    let disk = entries(&[
+        ("", None),
+        ("b", None),
+        ("b/same.png", Some(1)),
+        ("b/changed.png", Some(3)),
+    ]);
+    f.store
+        .reconcile(f.owner, &RelPath::root(), &[], &disk, false)
+        .await
+        .unwrap();
+    assert!(f.object_meta("b/same.png").await.is_some());
+    assert_eq!(f.object_meta("b/changed.png").await, None);
+}
+
+#[tokio::test]
+async fn object_acls_apply_to_the_version_they_were_set_for() {
+    let f = fixture().await;
+    f.mkdir("b").await;
+    // A file written through WebDAV gets a row that holds only the ACL.
+    let id = f.write("b/dav.txt", 1).await;
+    let etag = f.etag("b/dav.txt").await;
+    assert!(f.store.set_object_public(id, &etag, true).await.unwrap());
+    let meta = f.object_meta("b/dav.txt").await.unwrap();
+    assert!(meta.public_read);
+    assert_eq!(meta.s3_etag, None);
+    assert_eq!(meta.etag_or(&etag), etag);
+
+    // Setting it again, and clearing it, keeps the S3 metadata of an S3 write.
+    let id = f.put_object("b/s3.png", 1, &object("md5")).await;
+    let etag = f.etag("b/s3.png").await;
+    assert!(f.store.set_object_public(id, &etag, true).await.unwrap());
+    assert!(f.store.set_object_public(id, &etag, true).await.unwrap());
+    let meta = f.object_meta("b/s3.png").await.unwrap();
+    assert!(meta.public_read);
+    assert_eq!(meta.s3_etag.as_deref(), Some("md5"));
+    assert!(f.store.set_object_public(id, &etag, false).await.unwrap());
+    assert!(!f.object_meta("b/s3.png").await.unwrap().public_read);
+
+    // A stale version, a directory and a missing file are refused.
+    f.write("b/s3.png", 2).await;
+    assert!(!f.store.set_object_public(id, &etag, true).await.unwrap());
+    assert_eq!(f.object_meta("b/s3.png").await, None);
+    let dir = f.store.get(f.owner, &p("b")).await.unwrap().unwrap();
+    assert!(
+        !f.store
+            .set_object_public(dir.id, &dir.etag, true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !f.store
+            .set_object_public(i64::MAX, "x", true)
+            .await
+            .unwrap()
+    );
+
+    // Overwriting a public object makes it private again.
+    let id = f.write("b/public.txt", 1).await;
+    let etag = f.etag("b/public.txt").await;
+    f.store.set_object_public(id, &etag, true).await.unwrap();
+    f.write("b/public.txt", 2).await;
+    assert_eq!(f.object_meta("b/public.txt").await, None);
+}
+
+#[tokio::test]
+async fn listings_follow_s3_key_order() {
+    let f = fixture().await;
+    f.mkdir("b").await;
+    f.mkdir("b/a").await;
+    f.mkdir("b/empty").await;
+    f.mkdir("b/a/deep").await;
+    for path in ["b/a-b", "b/a/x", "b/a/deep/y", "b/a0", "b/é", "b/z"] {
+        f.write(path, 1).await;
+    }
+    // Next to the bucket: never listed.
+    f.mkdir("b0").await;
+    f.write("b0/outside", 1).await;
+    f.write("b-outside", 1).await;
+
+    let flat = f.list("b", "", None, None, 100).await;
+    assert_eq!(names(&flat), ["a-b", "a/deep/y", "a/x", "a0", "z", "é"]);
+    assert!(!flat.truncated);
+
+    // `a/` sorts after `a-b` although the folder `a` sorts before it; the empty folder and
+    // the bucket's neighbours never appear.
+    let rolled = f.list("b", "", Some("/"), None, 100).await;
+    assert_eq!(names(&rolled), ["a-b", "a/*", "a0", "z", "é"]);
+
+    assert_eq!(
+        names(&f.list("b", "a/", Some("/"), None, 100).await),
+        ["a/deep/*", "a/x"]
+    );
+    assert_eq!(
+        names(&f.list("b", "a", Some("/"), None, 100).await),
+        ["a-b", "a/*", "a0"]
+    );
+    assert_eq!(
+        names(&f.list("b", "a/d", None, None, 100).await),
+        ["a/deep/y"]
+    );
+    assert!(
+        f.list("b", "nothing", None, None, 100)
+            .await
+            .entries
+            .is_empty()
+    );
+
+    // Delimiters other than `/`.
+    assert_eq!(
+        names(&f.list("b", "", Some("-"), None, 100).await),
+        ["a-*", "a/deep/y", "a/x", "a0", "z", "é"]
+    );
+    assert_eq!(
+        names(&f.list("b", "", Some("ee"), None, 100).await),
+        ["a-b", "a/dee*", "a/x", "a0", "z", "é"]
+    );
+
+    // The root of the tree as the folder.
+    assert_eq!(
+        names(&f.list("", "", Some("/"), None, 100).await),
+        ["b-outside", "b/*", "b0/*"]
+    );
+}
+
+#[tokio::test]
+async fn listings_page_without_losing_or_repeating_entries() {
+    let f = fixture().await;
+    f.mkdir("b").await;
+    f.mkdir("b/a").await;
+    for path in ["b/a-b", "b/a/1", "b/a/2", "b/a/3", "b/a0", "b/c"] {
+        f.write(path, 1).await;
+    }
+    for delimiter in [None, Some("/")] {
+        let complete = names(&f.list("b", "", delimiter, None, 100).await);
+        for page_size in 1..=complete.len() {
+            let mut seen = Vec::new();
+            let mut after: Option<String> = None;
+            loop {
+                let page = f
+                    .list("b", "", delimiter, after.as_deref(), page_size)
+                    .await;
+                assert!(page.entries.len() <= page_size);
+                seen.extend(names(&page));
+                if !page.truncated {
+                    break;
+                }
+                after = Some(page.entries.last().unwrap().marker().to_owned());
+            }
+            assert_eq!(
+                seen, complete,
+                "pages of {page_size}, delimiter {delimiter:?}"
+            );
+        }
+    }
+    // Truncation is reported exactly.
+    let page = f.list("b", "", Some("/"), None, 4).await;
+    assert_eq!(names(&page), ["a-b", "a/*", "a0", "c"]);
+    assert!(!page.truncated);
+    assert!(f.list("b", "", Some("/"), None, 3).await.truncated);
+    let none = f.list("b", "", None, None, 0).await;
+    assert!(none.entries.is_empty() && none.truncated);
+}
+
+#[tokio::test]
+async fn listings_start_after_any_key() {
+    let f = fixture().await;
+    f.mkdir("b").await;
+    f.mkdir("b/a").await;
+    for path in ["b/a-b", "b/a/1", "b/a/2", "b/c"] {
+        f.write(path, 1).await;
+    }
+    // Before the prefix, inside it, after it.
+    assert_eq!(
+        names(&f.list("b", "a/", None, Some("0"), 10).await),
+        ["a/1", "a/2"]
+    );
+    assert_eq!(
+        names(&f.list("b", "a/", None, Some("a/1"), 10).await),
+        ["a/2"]
+    );
+    assert!(
+        f.list("b", "a/", None, Some("b"), 10)
+            .await
+            .entries
+            .is_empty()
+    );
+    // Inside a common prefix: the whole group is skipped.
+    assert_eq!(
+        names(&f.list("b", "", Some("/"), Some("a/1"), 10).await),
+        ["c"]
+    );
+    assert_eq!(
+        names(&f.list("b", "", Some("/"), Some("a/"), 10).await),
+        ["c"]
+    );
+    assert_eq!(
+        names(&f.list("b", "", Some("/"), Some("a"), 10).await),
+        ["a-b", "a/*", "c"]
+    );
+}
+
+#[tokio::test]
+async fn listings_report_s3_etags_and_fall_back_to_webdav_ones() {
+    let f = fixture().await;
+    f.mkdir("b").await;
+    f.put_object("b/s3", 1, &object("md5")).await;
+    f.write("b/dav", 1).await;
+    let dav_etag = f.etag("b/dav").await;
+    let listing = f.list("b", "", None, None, 10).await;
+    let etags: Vec<(&str, &str)> = listing
+        .entries
+        .iter()
+        .map(|entry| match entry {
+            ListEntry::Object(object) => (object.key.as_str(), object.etag()),
+            ListEntry::CommonPrefix(_) => unreachable!(),
+        })
+        .collect();
+    assert_eq!(etags, [("dav", dav_etag.as_str()), ("s3", "md5")]);
 }

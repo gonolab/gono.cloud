@@ -1,8 +1,8 @@
 //! Rules for path-keyed metadata.
 //!
 //! File metadata lives in the `files` table and the tables keyed by it (`dead_props`,
-//! `change_log`). [`MetaStore`] (in [`store`]) is the **only** code that writes to them: every
-//! WebDAV operation becomes exactly one `BEGIN IMMEDIATE` transaction (see
+//! `object_meta`, `change_log`). [`MetaStore`] (in [`store`]) is the **only** code that writes
+//! to them: every WebDAV operation becomes exactly one `BEGIN IMMEDIATE` transaction (see
 //! [`crate::db::begin_immediate`]), and every change bumps the ETag and adjusts the recursive
 //! size (`oc:size`) of all ancestor collections inside that same transaction. Each change is
 //! logged in `change_log` and, after the commit, published as a [`ChangeEvent`] (see
@@ -30,9 +30,13 @@
 //!   `(owner_id, rel_path)` index. [`descendant_bounds`] computes the two bounds.
 
 pub mod changes;
+mod objects;
 mod store;
 
 pub use changes::{ChangeEvent, ChangeOperation, ChangeSink};
+pub use objects::{
+    Checksum, ListEntry, ListedObject, ObjectListing, ObjectMeta, ObjectQuery, prefix_successor,
+};
 pub use store::{
     DeadProp, DiskStat, FileRow, MetaStore, PropChange, Reconciled, derived_file_etag,
 };

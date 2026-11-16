@@ -80,6 +80,7 @@ async fn migrations_apply_to_an_empty_database() {
             "files",
             "locks",
             "login_flows",
+            "object_meta",
             "recovery_codes",
             "retired_usernames",
             "revocations_applied",
@@ -216,6 +217,26 @@ async fn schema_enforces_constraints() {
          VALUES (?1, 'a', 0, 'e', 'yesterday')",
     )
     .await;
+    // S3 metadata belongs to an existing file, and a checksum has an algorithm and a value.
+    let object: i64 = sqlx::query_scalar(
+        "INSERT INTO files (owner_id, rel_path, is_dir, etag, mtime_ns) \
+         VALUES (?1, 'object.bin', 0, 'e', 0) RETURNING id",
+    )
+    .bind(alice)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    rejects("INSERT INTO object_meta (file_id) VALUES (?1 + 100)").await;
+    rejects(
+        "INSERT INTO object_meta (file_id, checksum_algorithm) \
+         SELECT id, 'CRC32' FROM files WHERE owner_id = ?1",
+    )
+    .await;
+    sqlx::query("INSERT INTO object_meta (file_id, public_read) VALUES (?1, 1)")
+        .bind(object)
+        .execute(&pool)
+        .await
+        .unwrap();
     // Locks always expire.
     rejects(
         "INSERT INTO locks (token, owner_id, rel_path, shared, deep, created_at, timeout_at) \
@@ -263,7 +284,12 @@ async fn schema_enforces_constraints() {
         .execute(&pool)
         .await
         .unwrap();
-    for table in ["app_passwords", "app_password_scopes", "files"] {
+    for table in [
+        "app_passwords",
+        "app_password_scopes",
+        "files",
+        "object_meta",
+    ] {
         let sql = format!("SELECT COUNT(*) FROM {table}");
         let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
             .fetch_one(&pool)
