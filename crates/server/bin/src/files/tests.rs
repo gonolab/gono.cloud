@@ -1920,6 +1920,7 @@ fn s3_on(allow_anonymous: bool) -> Option<Arc<crate::s3::S3Ui>> {
         region: "eu-test-1".to_owned(),
         bucket_folder: "Buckets".to_owned(),
         allow_anonymous,
+        virtual_host_domain: None,
     }))
 }
 
@@ -1977,6 +1978,30 @@ async fn the_s3_part_of_the_account_page_is_there_only_while_the_s3_api_is_on() 
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn the_account_page_shows_virtual_hosted_style_when_enabled() {
+    let mut f = fixture().await;
+    f.state.s3 = s3_on(true);
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+    let text = browser.get("/apps/account/").await.text();
+    assert!(!text.contains("Virtual-hosted style"), "{text}");
+
+    let mut ui = (*s3_on(true).unwrap()).clone();
+    ui.virtual_host_domain = Some("s3.example.com".to_owned());
+    f.state.s3 = Some(Arc::new(ui));
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+    let text = browser.get("/apps/account/").await.text();
+    assert!(text.contains("Path style: https://s3.example.com/&#60;bucket&#62;/&#60;key&#62;"));
+    assert!(
+        text.contains(
+            "<br>Virtual-hosted style: https://&#60;bucket&#62;.s3.example.com/&#60;key&#62;"
+        ),
+        "{text}"
     );
 }
 

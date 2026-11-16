@@ -82,7 +82,7 @@
     <section class="panel" id="s3" aria-labelledby="s3-title">
       <div class="panel-head"><div><h2 id="s3-title">{{ chrome.t.s3_title }}</h2><p class="muted small">{{ chrome.t.s3_note }} {{ chrome.t.s3_remove_note }}</p></div></div>
       <div class="panel-body">
-        <dl class="facts"><dt>{{ chrome.t.s3_endpoint }}</dt><dd class="mono">{{ s3.endpoint }}</dd><dt>{{ chrome.t.s3_region }}</dt><dd class="mono">{{ s3.region }}</dd><dt>{{ chrome.t.s3_addressing }}</dt><dd>{{ s3.path_style }}</dd></dl>
+        <dl class="facts"><dt>{{ chrome.t.s3_endpoint }}</dt><dd class="mono">{{ s3.endpoint }}</dd><dt>{{ chrome.t.s3_region }}</dt><dd class="mono">{{ s3.region }}</dd><dt>{{ chrome.t.s3_addressing }}</dt><dd>{% for line in s3.addressing %}{% if !loop.first %}<br>{% endif %}{{ line }}{% endfor %}</dd></dl>
         {%- if !s3.allow_anonymous %}
         <div class="flash warn mt-18" role="status">{{ chrome.t.s3_anonymous_off }}</div>
         {%- endif %}

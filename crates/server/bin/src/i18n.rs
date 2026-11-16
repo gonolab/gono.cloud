@@ -483,6 +483,7 @@ texts! {
     s3_region: "Region", "区域";
     s3_addressing: "Addressing", "寻址方式";
     s3_path_style: "Path style: {}/<bucket>/<key>", "路径风格：{}/<bucket>/<key>";
+    s3_virtual_style: "Virtual-hosted style: {}/<key>", "虚拟主机风格：{}/<key>";
     s3_anonymous_off: "Anonymous access is off on this server: every bucket answers signed requests only, whatever its setting.", "此服务器关闭了匿名访问：无论如何设置，所有存储桶都只响应带签名的请求。";
     s3_no_buckets: "No buckets yet. Create one below, or let an access key with full access to all buckets create them.", "还没有存储桶。可以在下面创建，也可以用对全部存储桶有完全权限的访问密钥创建。";
     s3_bucket: "Bucket", "存储桶";

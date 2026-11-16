@@ -445,6 +445,40 @@ s3.example.com {
 
 Caddy passes `Host` through unchanged by default.
 
+### Virtual-hosted style
+
+With `s3.virtual_host_domain = "s3.example.com"`, buckets are also reachable as
+`<bucket>.s3.example.com`. The proxy then needs:
+
+- a wildcard DNS record, `*.s3.example.com`, pointing at it like `s3.example.com`;
+- a certificate that covers both `s3.example.com` and `*.s3.example.com`. Let's Encrypt issues
+  wildcard certificates only with the DNS-01 challenge (for example `certbot certonly
+  --dns-<provider> -d s3.example.com -d '*.s3.example.com'`, or Caddy with a DNS provider
+  module);
+- the wildcard host name in the same server block, with `Host` passed through as before
+  (the bucket name is part of it, and it is signed).
+
+nginx: `server_name s3.example.com *.s3.example.com;` with the wildcard certificate. Caddy:
+
+```caddyfile
+s3.example.com, *.s3.example.com {
+	tls {
+		dns <provider> <credentials>
+	}
+	request_body {
+		max_size 0
+	}
+	reverse_proxy 127.0.0.1:16104 {
+		flush_interval -1
+		transport http {
+			read_timeout 1h
+		}
+	}
+}
+```
+
+Path style keeps working on `s3.example.com` itself.
+
 ### Checking the S3 API
 
 ```sh

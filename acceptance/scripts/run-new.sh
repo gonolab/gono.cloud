@@ -214,6 +214,8 @@ enabled = true
 public_url = "http://s3.localhost:${S3_PORT}"
 bind = "127.0.0.1:${S3_PORT}"
 allow_anonymous = true
+# Virtual-hosted style: the suite sends <bucket>.s3.localhost to s3.bind without DNS.
+virtual_host_domain = "s3.localhost"
 EOF
 
 WEB_PASSWORD="$(random_password)"
@@ -270,6 +272,7 @@ export GONO_ACCEPT_S3_ACCESS_KEY="${S3_ACCESS_KEY}"
 export GONO_ACCEPT_S3_SECRET_KEY="${S3_SECRET_KEY}"
 export GONO_ACCEPT_S3_BUCKET="acceptance"
 export GONO_ACCEPT_S3_PUBLIC_BUCKET="acceptance-public"
+export GONO_ACCEPT_S3_VIRTUAL_HOST_DOMAIN="s3.localhost"
 
 ENV_FILE="${WORK_DIR}/accept.env"
 {
@@ -277,7 +280,7 @@ ENV_FILE="${WORK_DIR}/accept.env"
     GONO_ACCEPT_VIEW_PASSWORD GONO_ACCEPT_SCOPED_PASSWORD GONO_ACCEPT_WEB_PASSWORD \
     GONO_ACCEPT_ADMIN_PATH GONO_ACCEPT_USER2 GONO_ACCEPT_PASSWORD2 \
     GONO_ACCEPT_S3_ENDPOINT GONO_ACCEPT_S3_ACCESS_KEY GONO_ACCEPT_S3_SECRET_KEY \
-    GONO_ACCEPT_S3_BUCKET GONO_ACCEPT_S3_PUBLIC_BUCKET; do
+    GONO_ACCEPT_S3_BUCKET GONO_ACCEPT_S3_PUBLIC_BUCKET GONO_ACCEPT_S3_VIRTUAL_HOST_DOMAIN; do
     printf 'export %s=%q\n' "${name}" "${!name}"
   done
 } >"${ENV_FILE}"

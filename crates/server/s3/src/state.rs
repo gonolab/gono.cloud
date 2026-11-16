@@ -19,6 +19,8 @@ pub struct S3Settings {
     pub allow_anonymous: bool,
     /// Lifetime of a multipart upload, in seconds.
     pub multipart_ttl_secs: u64,
+    /// The domain of virtual-hosted-style addressing (`<bucket>.<domain>`), if enabled.
+    pub virtual_host_domain: Option<String>,
 }
 
 /// The shared state of the S3 API. Cheap to clone.

@@ -1437,6 +1437,7 @@ async fn admins_see_revoke_and_remove_the_s3_keys_and_buckets_of_an_account() {
         region: "us-east-1".to_owned(),
         bucket_folder: "Buckets".to_owned(),
         allow_anonymous: true,
+        virtual_host_domain: None,
     }));
     let mut browser = Browser::new(&f.state);
     let csrf = browser.root().await;

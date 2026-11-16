@@ -100,6 +100,12 @@ fn s3_settings(s3: &S3Config) -> Vec<(&'static str, String)> {
         ("s3.bucket_folder", s3.bucket_folder.clone()),
         ("s3.allow_anonymous", s3.allow_anonymous.to_string()),
         ("s3.multipart_ttl_secs", s3.multipart_ttl_secs.to_string()),
+        (
+            "s3.virtual_host_domain",
+            s3.virtual_host_domain
+                .clone()
+                .unwrap_or_else(|| "(none: path style only)".to_owned()),
+        ),
     ]
 }
 

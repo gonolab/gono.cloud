@@ -319,6 +319,7 @@ download ([s3.md](s3.md) describes it for users). It is off by default (`[s3]`,
 | **A host name of its own** | For example `s3.example.com`, with DNS pointing at this host and a certificate. It must not be `base_url`'s host name. |
 | **A server block in the reverse proxy** | HTTPS for the host name, forwarded to `s3.bind` (`127.0.0.1:16104`) with `Host` unchanged: [reverse-proxy.md](reverse-proxy.md#the-s3-api). |
 | **The key file** | The secrets of access keys are encrypted with `two_factor.key_file`, like TOTP secrets. `serve` refuses to start the S3 API without it. |
+| **Virtual-hosted style** (optional) | `<bucket>.s3.example.com` besides `s3.example.com/<bucket>`: `s3.virtual_host_domain`, a wildcard DNS record `*.s3.example.com` and a wildcard certificate ([reverse-proxy.md](reverse-proxy.md#virtual-hosted-style)). Path style works without it. |
 
 Turn it on in `/etc/gono-cloud/config.toml` and restart the service:
 
@@ -328,6 +329,8 @@ enabled = true
 public_url = "https://s3.example.com"
 # Let bucket owners publish files for anonymous download. Off by default.
 # allow_anonymous = true
+# Buckets as host names too (<bucket>.s3.example.com); needs wildcard DNS and a certificate.
+# virtual_host_domain = "s3.example.com"
 ```
 
 Then create a bucket and an access key, for example for the admin account (users can do the

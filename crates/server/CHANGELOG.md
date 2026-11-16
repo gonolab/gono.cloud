@@ -71,7 +71,10 @@ compatible within a major version: released clients keep working with newer serv
   through S3; listings come from the metadata database in S3 key order; multipart uploads are
   staged in `s3-uploads/` of the data directory. With `s3.allow_anonymous`, bucket owners can
   publish objects uploaded with the `public-read` ACL or a whole bucket, and allow anonymous
-  listings; anonymous requests only read. The acceptance suite drives it with the AWS SDK.
+  listings; anonymous requests only read. With `s3.virtual_host_domain`, buckets are also
+  addressed by host name (`<bucket>.s3.example.com`, virtual-hosted style; wildcard DNS and
+  certificate needed), and path style keeps working. The acceptance suite drives it with the
+  AWS SDK.
 
 ### Changed
 

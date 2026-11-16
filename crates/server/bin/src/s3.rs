@@ -39,6 +39,8 @@ pub struct S3Ui {
     pub bucket_folder: String,
     /// `s3.allow_anonymous`: whether bucket owners may allow anonymous reads and listings.
     pub allow_anonymous: bool,
+    /// `s3.virtual_host_domain`: buckets are also `<bucket>.<domain>`.
+    pub virtual_host_domain: Option<String>,
 }
 
 impl S3Ui {
@@ -49,6 +51,7 @@ impl S3Ui {
             region: config.region.clone(),
             bucket_folder: config.bucket_folder.clone(),
             allow_anonymous: config.allow_anonymous,
+            virtual_host_domain: config.virtual_host_domain.clone(),
         })
     }
 
@@ -57,6 +60,20 @@ impl S3Ui {
         self.public_url
             .as_ref()
             .map(|url| url.as_str().trim_end_matches('/').to_owned())
+    }
+
+    /// The origin of `bucket` in virtual-hosted style, `<scheme>://<bucket>.<domain>[:<port>]`
+    /// with the scheme and port of the endpoint; `None` without `s3.virtual_host_domain`.
+    pub fn virtual_host_origin(&self, bucket: &str) -> Option<String> {
+        let domain = self.virtual_host_domain.as_deref()?;
+        let scheme = self.public_url.as_ref().map_or("https", Url::scheme);
+        let port = self
+            .public_url
+            .as_ref()
+            .and_then(Url::port)
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default();
+        Some(format!("{scheme}://{bucket}.{domain}{port}"))
     }
 }
 
@@ -139,4 +156,39 @@ async fn log_requests(
         "s3 request"
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ui(public_url: &str, domain: Option<&str>) -> S3Ui {
+        S3Ui {
+            public_url: Some(Url::parse(public_url).unwrap()),
+            region: "us-east-1".to_owned(),
+            bucket_folder: "Buckets".to_owned(),
+            allow_anonymous: false,
+            virtual_host_domain: domain.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn virtual_host_origins_keep_the_endpoints_scheme_and_port() {
+        assert_eq!(
+            ui("https://s3.example.com/", Some("s3.example.com"))
+                .virtual_host_origin("photos")
+                .as_deref(),
+            Some("https://photos.s3.example.com")
+        );
+        assert_eq!(
+            ui("http://s3.localhost:9000", Some("s3.localhost"))
+                .virtual_host_origin("media")
+                .as_deref(),
+            Some("http://media.s3.localhost:9000")
+        );
+        assert_eq!(
+            ui("https://s3.example.com", None).virtual_host_origin("photos"),
+            None
+        );
+    }
 }

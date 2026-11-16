@@ -217,6 +217,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
                 bucket_folder: config.s3.bucket_folder.clone(),
                 allow_anonymous: config.s3.allow_anonymous,
                 multipart_ttl_secs: config.s3.multipart_ttl_secs,
+                virtual_host_domain: config.s3.virtual_host_domain.clone(),
             },
         );
         let bind = config.s3.bind;
@@ -227,6 +228,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
             address = %listener.local_addr().context("read the S3 listener address")?,
             public_url = config.s3.public_url.as_ref().map(ToString::to_string),
             anonymous = config.s3.allow_anonymous,
+            virtual_host_domain = config.s3.virtual_host_domain.as_deref(),
             "S3 API listening"
         );
         let router = crate::s3::router(

@@ -179,8 +179,9 @@ pub struct S3View {
     /// `s3.public_url`.
     pub endpoint: String,
     pub region: String,
-    /// "Path style: https://s3.example.com/<bucket>/<key>".
-    pub path_style: String,
+    /// "Path style: https://s3.example.com/<bucket>/<key>", and the virtual-hosted style if
+    /// enabled, one line each.
+    pub addressing: Vec<String>,
     /// "Creates the folder /Buckets/<name> in your files."
     pub new_bucket_note: String,
     /// `s3.allow_anonymous`.
@@ -214,14 +215,14 @@ struct CreatedPage {
     expiry: String,
     endpoint: String,
     region: String,
-    path_style: String,
+    addressing: Vec<String>,
 }
 
 page!(CreatedPage);
 
-/// The endpoint and the addressing of `ui`, in words.
-fn endpoint(t: &Text, ui: &S3Ui) -> (String, String) {
-    match ui.endpoint() {
+/// The endpoint and the addressing styles of `ui`, in words.
+fn endpoint(t: &Text, ui: &S3Ui) -> (String, Vec<String>) {
+    let (endpoint, path_style) = match ui.endpoint() {
         Some(endpoint) => {
             let path_style = fill(t.s3_path_style, &[&endpoint]);
             (endpoint, path_style)
@@ -230,7 +231,12 @@ fn endpoint(t: &Text, ui: &S3Ui) -> (String, String) {
             t.s3_endpoint_unset.to_owned(),
             fill(t.s3_path_style, &["…"]),
         ),
+    };
+    let mut addressing = vec![path_style];
+    if let Some(origin) = ui.virtual_host_origin("<bucket>") {
+        addressing.push(fill(t.s3_virtual_style, &[&origin]));
     }
+    (endpoint, addressing)
 }
 
 /// What the account page shows of S3, or `None` while the S3 API is off.
@@ -277,11 +283,11 @@ pub(super) async fn view(
         .iter()
         .map(|bucket| BucketRow::new(t, bucket, &when(lang, now, bucket.created_at).0))
         .collect();
-    let (endpoint, path_style) = endpoint(t, ui);
+    let (endpoint, addressing) = endpoint(t, ui);
     Ok(Some(S3View {
         endpoint,
         region: ui.region.clone(),
-        path_style,
+        addressing,
         new_bucket_note: fill(
             t.s3_new_bucket_note,
             &[&format!(
@@ -793,7 +799,7 @@ pub async fn created(State(state): State<AppState>, headers: HeaderMap, uri: Uri
         return web::see_other(&format!("{ACCOUNT}/"), &[]);
     };
     let t = visitor.t();
-    let (endpoint, path_style) = endpoint(t, &ui);
+    let (endpoint, addressing) = endpoint(t, &ui);
     let page = CreatedPage {
         chrome: visitor.chrome(Nav::Account),
         label: key.label,
@@ -803,7 +809,7 @@ pub async fn created(State(state): State<AppState>, headers: HeaderMap, uri: Uri
         expiry: expiry(t, &visitor, db::unix_now(), key.expires_at),
         endpoint,
         region: ui.region.clone(),
-        path_style,
+        addressing,
     };
     web::render(StatusCode::OK, &page)
 }

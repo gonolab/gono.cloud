@@ -9,6 +9,8 @@
 //! - `GONO_ACCEPT_S3_BUCKET`: a bucket of that user that honors object ACLs (`acl`), bound to
 //!   the folder `Buckets/<name>`;
 //! - `GONO_ACCEPT_S3_PUBLIC_BUCKET`: a bucket that is `public-read` with anonymous listing;
+//! - `GONO_ACCEPT_S3_VIRTUAL_HOST_DOMAIN` (optional): the server's `s3.virtual_host_domain`;
+//!   requests to `<bucket>.<domain>` are sent to the endpoint's address, so no DNS is needed;
 //! - a server with `s3.allow_anonymous = true`.
 //!
 //! Every test works below its own random key prefix and deletes what it wrote.
@@ -26,6 +28,8 @@ use gono_acceptance::{Cred, Ctx, require, skip, unique_name};
 
 struct S3 {
     client: Client,
+    access_key: String,
+    secret_key: String,
     endpoint: String,
     bucket: String,
     public_bucket: Option<String>,
@@ -38,11 +42,20 @@ fn env(name: &str) -> Option<String> {
 }
 
 fn client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
+    client_with_style(endpoint, access_key, secret_key, true)
+}
+
+fn client_with_style(
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    path_style: bool,
+) -> Client {
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
         .endpoint_url(endpoint)
-        .force_path_style(true)
+        .force_path_style(path_style)
         .credentials_provider(Credentials::new(
             access_key,
             secret_key,
@@ -72,6 +85,8 @@ impl S3 {
         let endpoint = endpoint.trim_end_matches('/').to_owned();
         Some(S3 {
             client: client(&endpoint, &access_key, &secret_key),
+            access_key,
+            secret_key,
             endpoint,
             bucket,
             public_bucket: env("GONO_ACCEPT_S3_PUBLIC_BUCKET"),
@@ -585,4 +600,101 @@ async fn wrong_credentials_are_refused() {
             .iter()
             .any(|bucket| bucket.name() == Some(s3.bucket.as_str()))
     );
+}
+
+#[tokio::test]
+async fn virtual_hosted_style_names_the_bucket_in_the_host() {
+    let s3 = require!(S3::new(), "S3 is not configured");
+    let Some(domain) = env("GONO_ACCEPT_S3_VIRTUAL_HOST_DOMAIN") else {
+        skip("GONO_ACCEPT_S3_VIRTUAL_HOST_DOMAIN is not set; virtual-hosted style is not checked");
+        return;
+    };
+    let endpoint = url::Url::parse(&s3.endpoint).unwrap();
+    let address = endpoint.socket_addrs(|| None).unwrap()[0];
+    let port = endpoint.port_or_known_default().unwrap();
+    // Every host name below the domain goes to the S3 listener.
+    let mut http = reqwest::Client::builder().resolve(&domain, address);
+    let missing = "no-such-bucket".to_owned();
+    for bucket in [Some(&s3.bucket), s3.public_bucket.as_ref(), Some(&missing)]
+        .into_iter()
+        .flatten()
+    {
+        http = http.resolve(&format!("{bucket}.{domain}"), address);
+    }
+    let http = http.build().unwrap();
+    let virtual_client = client_with_style(
+        &format!("http://{domain}:{port}"),
+        &s3.access_key,
+        &s3.secret_key,
+        false,
+    );
+
+    // Signed requests (presigned, so that the host name never needs DNS) sign the bucket's host.
+    let prefix = unique_name("s3");
+    let key = s3.key(&prefix, "virtual.txt");
+    let presign = PresigningConfig::expires_in(Duration::from_secs(300)).unwrap();
+    let put = virtual_client
+        .put_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .presigned(presign.clone())
+        .await
+        .unwrap();
+    assert!(
+        put.uri()
+            .starts_with(&format!("http://{}.{domain}:{port}/", s3.bucket)),
+        "{}",
+        put.uri()
+    );
+    let response = http.put(put.uri()).body("by host").send().await.unwrap();
+    assert!(response.status().is_success(), "{}", response.status());
+    // Path style sees the same object.
+    assert_eq!(s3.get(&s3.bucket, &key).await, b"by host");
+    let get = virtual_client
+        .get_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .presigned(presign)
+        .await
+        .unwrap();
+    let response = http.get(get.uri()).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "by host");
+
+    // Anonymous downloads and listings by host name, and path style on the domain itself.
+    if let Some(public_bucket) = &s3.public_bucket {
+        let key = s3.key(&prefix, "everyone.txt");
+        s3.put(public_bucket, &key, "everyone").await;
+        for url in [
+            format!("http://{public_bucket}.{domain}:{port}/{key}"),
+            format!("http://{domain}:{port}/{public_bucket}/{key}"),
+        ] {
+            let response = http.get(&url).send().await.unwrap();
+            assert_eq!(response.status(), 200, "{url}");
+            assert_eq!(response.text().await.unwrap(), "everyone", "{url}");
+        }
+        let listing = http
+            .get(format!(
+                "http://{public_bucket}.{domain}:{port}/?list-type=2&prefix={prefix}/"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(listing.status(), 200);
+        let listing = listing.text().await.unwrap();
+        assert!(
+            listing.contains(&format!("<Name>{public_bucket}</Name>")),
+            "{listing}"
+        );
+        assert!(listing.contains("everyone.txt"), "{listing}");
+        s3.clean(public_bucket, &prefix).await;
+    }
+    // A bucket that does not exist is refused like any other.
+    let response = http
+        .get(format!("http://{missing}.{domain}:{port}/key"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    s3.clean(&s3.bucket, &prefix).await;
 }

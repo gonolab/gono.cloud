@@ -392,6 +392,12 @@ pub struct S3Config {
     /// Multipart uploads that are neither completed nor aborted within this many seconds are
     /// removed.
     pub multipart_ttl_secs: u64,
+
+    /// The domain below which buckets are addressed by host name (virtual-hosted style):
+    /// `<bucket>.<domain>`, for example `photos.s3.example.com` for `s3.example.com`. Needs
+    /// wildcard DNS and a wildcard certificate for `*.<domain>`. Path style keeps working.
+    /// `None` (the default): path style only.
+    pub virtual_host_domain: Option<String>,
 }
 
 impl Default for S3Config {
@@ -404,8 +410,33 @@ impl Default for S3Config {
             bucket_folder: "Buckets".to_owned(),
             allow_anonymous: false,
             multipart_ttl_secs: DEFAULT_MULTIPART_TTL_SECS,
+            virtual_host_domain: None,
         }
     }
+}
+
+/// Whether `domain` is a DNS name in lowercase: labels of 1 to 63 letters, digits and `-`, not
+/// starting or ending with `-`, at most 253 characters, no trailing dot, not an IP address.
+fn is_domain(domain: &str) -> bool {
+    (1..=253).contains(&domain.len())
+        && domain.parse::<IpAddr>().is_err()
+        && domain.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        // A name of digits and dots only is an IPv4 address in some notation.
+        && !domain.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+}
+
+/// Whether `host` lies strictly below `domain` (`a.example.com` below `example.com`).
+fn is_below(host: &str, domain: &str) -> bool {
+    host.len() > domain.len()
+        && host.ends_with(domain)
+        && host.as_bytes()[host.len() - domain.len() - 1] == b'.'
 }
 
 /// Whether `region` is an AWS-style region name: lowercase letters, digits and `-`, starting
@@ -861,6 +892,56 @@ impl Config {
         }
         if s3.multipart_ttl_secs == 0 {
             reject("s3.multipart_ttl_secs", "must be greater than 0".to_owned());
+        }
+        if let Some(domain) = &s3.virtual_host_domain {
+            self.validate_virtual_host_domain(domain, reject);
+        }
+    }
+
+    /// Checks `s3.virtual_host_domain`: a DNS name below which no other host of this server
+    /// lies, since such a host would read as a bucket name.
+    fn validate_virtual_host_domain(
+        &self,
+        domain: &str,
+        reject: &mut impl FnMut(&'static str, String),
+    ) {
+        if !is_domain(domain) {
+            reject(
+                "s3.virtual_host_domain",
+                format!(
+                    "{domain:?} is not a domain name: lowercase letters, digits, '-' and '.', \
+                     without a scheme, a port or a trailing dot, for example \"s3.example.com\""
+                ),
+            );
+            return;
+        }
+        let site = self.server.base_url.host_str();
+        let relay = self.relay.public_url.as_ref().and_then(Url::host_str);
+        for (name, host) in [("server.base_url", site), ("relay.public_url", relay)] {
+            if let Some(host) = host
+                && (host.eq_ignore_ascii_case(domain)
+                    || is_below(&host.to_ascii_lowercase(), domain))
+            {
+                reject(
+                    "s3.virtual_host_domain",
+                    format!(
+                        "{name}'s host {host} is or lies below {domain}; it would read as a \
+                         bucket name. Use a domain of its own, such as s3.example.com"
+                    ),
+                );
+            }
+        }
+        if let Some(host) = self.s3.public_url.as_ref().and_then(Url::host_str)
+            && is_below(&host.to_ascii_lowercase(), domain)
+        {
+            reject(
+                "s3.virtual_host_domain",
+                format!(
+                    "s3.public_url's host {host} lies below {domain}, so path-style requests \
+                     would read as requests to a bucket; use {host} itself or a domain that \
+                     does not contain it"
+                ),
+            );
         }
     }
 
@@ -1595,7 +1676,56 @@ mod tests {
         assert_eq!(s3.bucket_folder, "Buckets");
         assert!(!s3.allow_anonymous);
         assert_eq!(s3.multipart_ttl_secs, 7 * 24 * 60 * 60);
+        assert_eq!(s3.virtual_host_domain, None);
         assert!(issue_keys(&parse(MINIMAL)).is_empty());
+    }
+
+    #[test]
+    fn virtual_host_domains_are_checked() {
+        let enabled = "enabled = true\npublic_url = \"https://s3.example.com\"";
+        let domain = |value: &str| {
+            let mut keys = issue_keys(&with_s3(&format!(
+                "{enabled}\nvirtual_host_domain = \"{value}\""
+            )));
+            // "example.com" is above both the site's host and the endpoint's.
+            keys.dedup();
+            keys
+        };
+        for valid in [
+            "s3.example.com",
+            "files.example.org",
+            "s3.localhost",
+            "localhost",
+        ] {
+            assert!(domain(valid).is_empty(), "{valid}");
+        }
+        for invalid in [
+            "",
+            "S3.example.com",
+            "s3.example.com.",
+            "https://s3.example.com",
+            "s3.example.com:9000",
+            "s3..example.com",
+            "-s3.example.com",
+            "s3_example.com",
+            "127.0.0.1",
+            "1.2",
+            "::1",
+            // The site's host, or a domain above it: cloud.example.com would read as a bucket.
+            "cloud.example.com",
+            "example.com",
+        ] {
+            assert_eq!(domain(invalid), ["s3.virtual_host_domain"], "{invalid}");
+        }
+        // The endpoint itself below the domain: path-style requests would name a bucket.
+        let nested = with_s3(
+            "enabled = true\npublic_url = \"https://s3.files.example.org\"\n\
+             virtual_host_domain = \"files.example.org\"",
+        );
+        assert_eq!(issue_keys(&nested), ["s3.virtual_host_domain"]);
+        let mut relay = with_s3(&format!("{enabled}\nvirtual_host_domain = \"example.net\""));
+        relay.relay.public_url = Some(Url::parse("https://relay.example.net").unwrap());
+        assert_eq!(issue_keys(&relay), ["s3.virtual_host_domain"]);
     }
 
     #[test]
