@@ -2698,7 +2698,7 @@ async fn published_files_offer_their_public_link() {
         site_page.contains("<section class=\"pane pane--list\""),
         "{site_page}"
     );
-    assert!(crate::web::STYLE.contains(".pane--list { overflow: visible; }"));
+    assert!(web::STYLE.contains(".pane--list { overflow: visible; }"));
     let photos = browser.get("/apps/files/Buckets/media/2026/").await.text();
     assert!(
         photos.contains("href=\"https://s3.example.com/media/2026/a%20b.jpg\""),
