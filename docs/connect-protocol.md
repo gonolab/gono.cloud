@@ -1309,6 +1309,7 @@ clipboard, no screen, no file names, and no addresses published by devices.
 | `s3.key.created`, `s3.key.revoked` | An S3 access key is created or revoked (`docs/s3.md`) | user, admin, CLI | access key id, label, grants and expiry; client IP; the admin |
 | `s3.bucket.created`, `s3.bucket.removed` | An S3 bucket is created (a new folder) or bound (an existing one), or removed | user, admin, CLI | bucket name, whether the folder is new; client IP, or the access key id through the S3 API; the admin |
 | `s3.bucket.anonymous` | The anonymous access of an S3 bucket changes | user, admin, CLI | bucket name, anonymous access, listing; client IP, or the access key id through the S3 API; the admin |
+| `s3.bucket.cors` | The CORS rules of an S3 bucket are set or removed through the S3 API | user | bucket name, number of rules (0: removed), the access key id |
 
 - **Kept.** Records are kept for 180 days by default (configurable in 2b).
 - **Who sees them.** Users see the records of their own account on the account page. Admins

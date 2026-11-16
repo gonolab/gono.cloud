@@ -94,7 +94,7 @@
         <thead><tr><th>{{ chrome.t.s3_bucket }}</th><th>{{ chrome.t.s3_anonymous }}</th><th class="end"></th></tr></thead>
         <tbody>
         {%- for bucket in s3.buckets %}
-          <tr><td><b class="mono">{{ bucket.name }}</b><div class="small nowrap"><a href="{{ bucket.folder_href }}">{{ bucket.folder }}</a></div><div class="muted small nowrap">{{ bucket.created }}</div></td>
+          <tr><td><b class="mono">{{ bucket.name }}</b><div class="small nowrap"><a href="{{ bucket.folder_href }}">{{ bucket.folder }}</a></div><div class="muted small nowrap">{{ bucket.created }}</div>{% if let Some(cors) = bucket.cors %}<div class="muted small nowrap">{{ cors }}</div>{% endif %}</td>
             <td><form method="post" action="/apps/account/s3/buckets/{{ bucket.id }}/anonymous" class="anon-form">
               <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
               <select id="s3-anon-{{ bucket.id }}" name="anonymous" aria-label="{{ chrome.t.s3_anonymous }} {{ bucket.name }}"{% if !s3.allow_anonymous %} disabled{% endif %}><option value="private"{% if bucket.anonymous == "private" %} selected{% endif %}>{{ chrome.t.s3_anon_private }}</option><option value="acl"{% if bucket.anonymous == "acl" %} selected{% endif %}>{{ chrome.t.s3_anon_acl }}</option><option value="public-read"{% if bucket.anonymous == "public-read" %} selected{% endif %}>{{ chrome.t.s3_anon_public }}</option></select>

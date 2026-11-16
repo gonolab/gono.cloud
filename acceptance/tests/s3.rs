@@ -21,10 +21,14 @@ use aws_sdk_s3::{
     Client,
     config::{BehaviorVersion, Credentials, Region},
     presigning::PresigningConfig,
-    primitives::ByteStream,
-    types::{CompletedMultipartUpload, CompletedPart, ObjectCannedAcl},
+    primitives::{ByteStream, DateTime, DateTimeFormat},
+    types::{
+        CompletedMultipartUpload, CompletedPart, CorsConfiguration, CorsRule, ObjectCannedAcl,
+    },
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gono_acceptance::{Cred, Ctx, require, skip, unique_name};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 struct S3 {
     client: Client,
@@ -38,7 +42,9 @@ struct S3 {
 }
 
 fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.trim().is_empty())
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
@@ -199,7 +205,9 @@ async fn objects_round_trip_with_their_metadata() {
     assert_eq!(head.content_type(), Some("text/plain; charset=utf-8"));
     assert_eq!(head.cache_control(), Some("max-age=60"));
     assert_eq!(
-        head.metadata().and_then(|meta| meta.get("mtime")).map(String::as_str),
+        head.metadata()
+            .and_then(|meta| meta.get("mtime"))
+            .map(String::as_str),
         Some("1700000000.5")
     );
     assert_eq!(s3.get(&s3.bucket, &key).await, b"hello s3");
@@ -358,7 +366,11 @@ async fn multipart_uploads_assemble_their_parts() {
         .send()
         .await
         .unwrap();
-    assert!(done.e_tag().unwrap().ends_with("-2\""), "{:?}", done.e_tag());
+    assert!(
+        done.e_tag().unwrap().ends_with("-2\""),
+        "{:?}",
+        done.e_tag()
+    );
     let mut expected = part1;
     expected.extend_from_slice(&part2);
     assert_eq!(s3.get(&s3.bucket, &key).await, expected);
@@ -561,13 +573,25 @@ async fn webdav_and_s3_see_the_same_files() {
         .await
         .unwrap();
     assert_eq!(
-        s3.http.get(s3.url(&s3.bucket, &key)).send().await.unwrap().status(),
+        s3.http
+            .get(s3.url(&s3.bucket, &key))
+            .send()
+            .await
+            .unwrap()
+            .status(),
         200
     );
-    dav.put(&s3.webdav_path(&key), "via webdav").await.expect_success();
+    dav.put(&s3.webdav_path(&key), "via webdav")
+        .await
+        .expect_success();
     assert_eq!(s3.get(&s3.bucket, &key).await, b"via webdav");
     assert_eq!(
-        s3.http.get(s3.url(&s3.bucket, &key)).send().await.unwrap().status(),
+        s3.http
+            .get(s3.url(&s3.bucket, &key))
+            .send()
+            .await
+            .unwrap()
+            .status(),
         403,
         "an overwritten public object is private again"
     );
@@ -577,20 +601,31 @@ async fn webdav_and_s3_see_the_same_files() {
 #[tokio::test]
 async fn wrong_credentials_are_refused() {
     let s3 = require!(S3::new(), "S3 is not configured");
-    let unknown = client(&s3.endpoint, "GONOAAAAAAAAAAAAAAAA", "x".repeat(40).as_str());
+    let unknown = client(
+        &s3.endpoint,
+        "GONOAAAAAAAAAAAAAAAA",
+        "x".repeat(40).as_str(),
+    );
     let err = unknown.list_buckets().send().await.unwrap_err();
     assert!(format!("{err:?}").contains("InvalidAccessKeyId"), "{err:?}");
 
     let access_key = env("GONO_ACCEPT_S3_ACCESS_KEY").unwrap();
     let wrong_secret = client(&s3.endpoint, &access_key, "y".repeat(40).as_str());
     let err = wrong_secret.list_buckets().send().await.unwrap_err();
-    assert!(format!("{err:?}").contains("SignatureDoesNotMatch"), "{err:?}");
+    assert!(
+        format!("{err:?}").contains("SignatureDoesNotMatch"),
+        "{err:?}"
+    );
 
     // The secret is no app password, and an app password signs nothing.
     let secret = env("GONO_ACCEPT_S3_SECRET_KEY").unwrap();
     let as_basic = s3.ctx.dav_as(&Cred::new(&s3.ctx.cfg.full.user, secret));
     as_basic.propfind("", "0", "").await.expect(&[401]);
-    let as_key = client(&s3.endpoint, &s3.ctx.cfg.full.user, &s3.ctx.cfg.full.password);
+    let as_key = client(
+        &s3.endpoint,
+        &s3.ctx.cfg.full.user,
+        &s3.ctx.cfg.full.password,
+    );
     assert!(as_key.list_buckets().send().await.is_err());
 
     let buckets = s3.client.list_buckets().send().await.unwrap();
@@ -696,5 +731,345 @@ async fn virtual_hosted_style_names_the_bucket_in_the_host() {
         .await
         .unwrap();
     assert_eq!(response.status(), 403);
+    s3.clean(&s3.bucket, &prefix).await;
+}
+
+#[tokio::test]
+async fn cors_rules_answer_browsers() {
+    let s3 = require!(S3::new(), "S3 is not configured");
+    let prefix = unique_name("s3");
+    let key = s3.key(&prefix, "cors.txt");
+    let app = "https://app.example";
+    let object_url = s3.url(&s3.bucket, &key);
+    let preflight = |origin: &str, method: &str, headers: &str| {
+        s3.http
+            .request(reqwest::Method::OPTIONS, &object_url)
+            .header("origin", origin.to_owned())
+            .header("access-control-request-method", method.to_owned())
+            .header("access-control-request-headers", headers.to_owned())
+            .send()
+    };
+    // Without rules, browsers may do nothing.
+    let refused = preflight(app, "PUT", "content-type").await.unwrap();
+    assert_eq!(refused.status(), 403);
+    assert!(
+        refused
+            .text()
+            .await
+            .unwrap()
+            .contains("<Code>AccessForbidden</Code>")
+    );
+
+    let rule = CorsRule::builder()
+        .id("uploads")
+        .allowed_origins(app)
+        .allowed_methods("PUT")
+        .allowed_methods("POST")
+        .allowed_methods("GET")
+        .allowed_headers("*")
+        .expose_headers("ETag")
+        .max_age_seconds(600)
+        .build()
+        .unwrap();
+    s3.client
+        .put_bucket_cors()
+        .bucket(&s3.bucket)
+        .cors_configuration(
+            CorsConfiguration::builder()
+                .cors_rules(rule)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let stored = s3
+        .client
+        .get_bucket_cors()
+        .bucket(&s3.bucket)
+        .send()
+        .await
+        .unwrap();
+    let stored = &stored.cors_rules()[0];
+    assert_eq!(stored.id(), Some("uploads"));
+    assert_eq!(stored.allowed_methods(), ["PUT", "POST", "GET"]);
+    assert_eq!(stored.expose_headers(), ["ETag"]);
+    assert_eq!(stored.max_age_seconds(), Some(600));
+
+    // A preflight request needs no signature.
+    let allowed = preflight(app, "PUT", "content-type, x-amz-date")
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), 200);
+    let header = |response: &reqwest::Response, name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        header(&allowed, "access-control-allow-origin").as_deref(),
+        Some(app)
+    );
+    assert_eq!(
+        header(&allowed, "access-control-allow-methods").as_deref(),
+        Some("PUT, POST, GET")
+    );
+    assert_eq!(
+        header(&allowed, "access-control-allow-headers").as_deref(),
+        Some("content-type, x-amz-date")
+    );
+    assert_eq!(
+        header(&allowed, "access-control-max-age").as_deref(),
+        Some("600")
+    );
+    for (origin, method) in [("https://evil.example", "PUT"), (app, "DELETE")] {
+        let refused = preflight(origin, method, "").await.unwrap();
+        assert_eq!(refused.status(), 403, "{origin} {method}");
+    }
+
+    // The actual request gets the headers too, and the page may read the ETag.
+    let presign = PresigningConfig::expires_in(Duration::from_secs(300)).unwrap();
+    let put = s3
+        .client
+        .put_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .presigned(presign)
+        .await
+        .unwrap();
+    let uploaded = s3
+        .http
+        .put(put.uri())
+        .header("origin", app)
+        .body("from a browser")
+        .send()
+        .await
+        .unwrap();
+    assert!(uploaded.status().is_success(), "{}", uploaded.status());
+    assert_eq!(
+        header(&uploaded, "access-control-allow-origin").as_deref(),
+        Some(app)
+    );
+    assert_eq!(
+        header(&uploaded, "access-control-expose-headers").as_deref(),
+        Some("ETag")
+    );
+    // Even a refusal carries them, so that the page can read the error.
+    let denied = s3
+        .http
+        .get(&object_url)
+        .header("origin", app)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+    assert_eq!(
+        header(&denied, "access-control-allow-origin").as_deref(),
+        Some(app)
+    );
+    let other = s3
+        .http
+        .get(&object_url)
+        .header("origin", "https://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(header(&other, "access-control-allow-origin"), None);
+
+    s3.client
+        .delete_bucket_cors()
+        .bucket(&s3.bucket)
+        .send()
+        .await
+        .unwrap();
+    let gone = s3.client.get_bucket_cors().bucket(&s3.bucket).send().await;
+    let err = gone.unwrap_err().into_service_error();
+    assert_eq!(err.meta().code(), Some("NoSuchCORSConfiguration"));
+    assert_eq!(preflight(app, "PUT", "").await.unwrap().status(), 403);
+    s3.clean(&s3.bucket, &prefix).await;
+}
+
+/// A `multipart/form-data` body with `fields` and then the file.
+fn form_body(boundary: &str, fields: &[(&str, String)], file: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"hello.txt\"\r\nContent-Type: text/plain\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(file);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
+}
+
+impl S3 {
+    /// The fields of a browser form upload into `bucket` below `prefix`, signed for this
+    /// test's key with a policy of `conditions` plus the signature fields.
+    fn signed_form(
+        &self,
+        bucket: &str,
+        conditions: Vec<serde_json::Value>,
+        fields: Vec<(&'static str, String)>,
+    ) -> Vec<(&'static str, String)> {
+        let now = std::time::SystemTime::now();
+        let seconds = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let format = |seconds: u64| {
+            DateTime::from_secs(i64::try_from(seconds).unwrap())
+                .fmt(DateTimeFormat::DateTime)
+                .unwrap()
+        };
+        let amz_date = format(seconds).replace(['-', ':'], "");
+        let credential = format!(
+            "{}/{}/us-east-1/s3/aws4_request",
+            self.access_key,
+            &amz_date[..8]
+        );
+        let mut conditions = conditions;
+        conditions.push(serde_json::json!({ "bucket": bucket }));
+        conditions.push(serde_json::json!({ "x-amz-algorithm": "AWS4-HMAC-SHA256" }));
+        conditions.push(serde_json::json!({ "x-amz-credential": credential }));
+        conditions.push(serde_json::json!({ "x-amz-date": amz_date }));
+        let policy = serde_json::json!({
+            "expiration": format(seconds + 600),
+            "conditions": conditions,
+        });
+        let policy = STANDARD.encode(policy.to_string());
+        let signing_key =
+            aws_sigv4::sign::v4::generate_signing_key(&self.secret_key, now, "us-east-1", "s3");
+        let signature = aws_sigv4::sign::v4::calculate_signature(signing_key, policy.as_bytes());
+        let mut signed = fields;
+        signed.push(("policy", policy));
+        signed.push(("x-amz-algorithm", "AWS4-HMAC-SHA256".to_owned()));
+        signed.push(("x-amz-credential", credential));
+        signed.push(("x-amz-date", amz_date));
+        signed.push(("x-amz-signature", signature));
+        signed
+    }
+
+    async fn post_form(
+        &self,
+        bucket: &str,
+        fields: &[(&str, String)],
+        file: &[u8],
+    ) -> reqwest::Response {
+        let boundary = "gono-acceptance-boundary";
+        self.http
+            .post(format!("{}/{bucket}", self.endpoint))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(form_body(boundary, fields, file))
+            .send()
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn browser_form_uploads_need_a_signed_policy() {
+    let s3 = require!(S3::new(), "S3 is not configured");
+    let prefix = unique_name("s3");
+    let conditions = vec![
+        serde_json::json!(["starts-with", "$key", format!("{prefix}/form/")]),
+        serde_json::json!({ "acl": "public-read" }),
+        serde_json::json!(["starts-with", "$Content-Type", "text/"]),
+        serde_json::json!({ "success_action_status": "201" }),
+        serde_json::json!(["content-length-range", 1, 64]),
+    ];
+    let fields = vec![
+        ("key", format!("{prefix}/form/${{filename}}")),
+        ("acl", "public-read".to_owned()),
+        ("Content-Type", "text/plain".to_owned()),
+        ("success_action_status", "201".to_owned()),
+    ];
+    let signed = s3.signed_form(&s3.bucket, conditions.clone(), fields.clone());
+    let response = s3.post_form(&s3.bucket, &signed, b"posted by a form").await;
+    assert_eq!(response.status(), 201);
+    let body = response.text().await.unwrap();
+    let key = s3.key(&prefix, "form/hello.txt");
+    assert!(body.contains(&format!("<Key>{key}</Key>")), "{body}");
+    // The ETag is the MD5 of the content.
+    assert!(body.contains("db883b2ed4b7aa744af0ee014e91e3ba"), "{body}");
+    assert_eq!(s3.get(&s3.bucket, &key).await, b"posted by a form");
+    let head = s3
+        .client
+        .head_object()
+        .bucket(&s3.bucket)
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.content_type(), Some("text/plain"));
+    // The public-read ACL of the form applies: anyone may download it.
+    let anonymous = s3.http.get(s3.url(&s3.bucket, &key)).send().await.unwrap();
+    assert_eq!(anonymous.status(), 200);
+
+    // The policy's limits hold.
+    let too_large = s3.post_form(&s3.bucket, &signed, &[b'x'; 65]).await;
+    assert_eq!(
+        too_large.status(),
+        400,
+        "{}",
+        too_large.text().await.unwrap()
+    );
+    let mut outside = signed.clone();
+    outside[0].1 = "elsewhere/hello.txt".to_owned();
+    let outside = s3.post_form(&s3.bucket, &outside, b"x").await;
+    assert_eq!(outside.status(), 400);
+    assert!(
+        outside
+            .text()
+            .await
+            .unwrap()
+            .contains("<Code>InvalidPolicyDocument</Code>")
+    );
+    // A forged signature, and a form without any, are refused.
+    let mut forged = signed.clone();
+    let signature = forged
+        .iter_mut()
+        .find(|(name, _)| *name == "x-amz-signature")
+        .unwrap();
+    signature.1 = "0".repeat(64);
+    let forged = s3.post_form(&s3.bucket, &forged, b"x").await;
+    assert_eq!(forged.status(), 403);
+    let unsigned = s3.post_form(&s3.bucket, &fields, b"x").await;
+    assert_eq!(unsigned.status(), 403);
+    assert!(unsigned.text().await.unwrap().contains("AccessDenied"));
+
+    // A form whose length is unknown is refused before its file is read.
+    let endpoint = url::Url::parse(&s3.endpoint).unwrap();
+    let address = endpoint.socket_addrs(|| None).unwrap()[0];
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let boundary = "gono-acceptance-boundary";
+    let body = form_body(boundary, &fields, b"x");
+    let mut request = format!(
+        "POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: multipart/form-data; boundary={boundary}\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+        s3.bucket,
+        endpoint.authority(),
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+    request.extend_from_slice(b"\r\n0\r\n\r\n");
+    stream.write_all(&request).await.unwrap();
+    let mut answer = Vec::new();
+    let _ = stream.read_to_end(&mut answer).await;
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(answer.starts_with("HTTP/1.1 411"), "{answer}");
+    assert!(answer.contains("MissingContentLength"), "{answer}");
     s3.clean(&s3.bucket, &prefix).await;
 }

@@ -104,6 +104,8 @@ pub struct BucketRow {
     pub anonymous_text: String,
     /// Anonymous listing, as stored.
     pub list: bool,
+    /// "CORS: 2 rules", if the bucket has CORS rules (set through the S3 API).
+    pub cors: Option<String>,
 }
 
 impl BucketRow {
@@ -123,6 +125,16 @@ impl BucketRow {
             anonymous: bucket.anonymous.as_str(),
             anonymous_text,
             list: bucket.anonymous_list,
+            cors: bucket.cors.as_deref().map(|stored| {
+                // Only the S3 API writes the rules: a JSON array of rules.
+                let rules = serde_json::from_str::<Vec<serde_json::Value>>(stored)
+                    .map_or(0, |rules| rules.len());
+                if rules == 1 {
+                    t.s3_cors_rule.to_owned()
+                } else {
+                    fill(t.s3_cors_rules, &[&rules.to_string()])
+                }
+            }),
         }
     }
 

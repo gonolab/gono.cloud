@@ -389,6 +389,7 @@ With `s3.enabled`, Gono Cloud serves the S3 API ([s3.md](s3.md)) on `s3.bind`
 | Pass the request path through unchanged (`proxy_pass` without a URI) | Signatures cover the path, encoded as the client sent it. |
 | No limit on the request body, no request buffering | Objects are as large as the disk allows; multipart parts are streamed. |
 | Long read timeouts | `CompleteMultipartUpload` assembles large objects while the connection stays open (the server sends whitespace meanwhile). |
+| No CORS headers of its own, `OPTIONS` passed through | Gono Cloud answers CORS preflight requests and sets the CORS headers from each bucket's rules. |
 
 ### nginx
 

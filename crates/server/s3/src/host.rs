@@ -12,7 +12,7 @@
 //! Bucket names have no dots, so a host with more labels than one below the domain names a
 //! bucket that cannot exist, and s3s refuses it.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use s3s::{
     S3Result,
@@ -34,7 +34,7 @@ impl VirtualHosts {
     }
 
     /// The bucket that `host` names, if any; `None` for path style.
-    fn bucket_of(&self, host: &str) -> Option<String> {
+    pub(crate) fn bucket_of(&self, host: &str) -> Option<String> {
         let host = strip_port(host).to_ascii_lowercase();
         let below = host.strip_suffix(&self.domain)?.strip_suffix('.')?;
         (!below.is_empty()).then(|| below.to_owned())
@@ -49,6 +49,16 @@ fn strip_port(host: &str) -> &str {
     match host.rsplit_once(':') {
         Some((name, port)) if !port.is_empty() && port.parse::<u16>().is_ok() => name,
         _ => host,
+    }
+}
+
+/// A [`VirtualHosts`] shared with the CORS handling.
+#[derive(Debug)]
+pub(crate) struct Shared(pub(crate) Arc<VirtualHosts>);
+
+impl S3Host for Shared {
+    fn parse_host_header<'a>(&'a self, host: &'a str) -> S3Result<VirtualHost<'a>> {
+        self.0.parse_host_header(host)
     }
 }
 

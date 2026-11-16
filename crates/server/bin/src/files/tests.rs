@@ -2032,6 +2032,18 @@ async fn buckets_are_created_bound_changed_and_removed_on_the_account_page() {
     let photos = s3::bucket(&f.state.db, "photos").await.unwrap().unwrap();
     assert_eq!(photos.owner_id, 1);
     assert_eq!(photos.folder.as_str(), "Buckets/photos");
+    // CORS rules come from the S3 API; the page only counts them.
+    assert!(!browser.get("/apps/account/").await.text().contains("CORS:"));
+    s3::set_cors(&f.state.db, 1, photos.id, Some(r#"[{"allowed_origins":["*"],"allowed_methods":["GET"]},{"allowed_origins":["*"],"allowed_methods":["PUT"]}]"#))
+        .await
+        .unwrap();
+    assert!(
+        browser
+            .get("/apps/account/")
+            .await
+            .text()
+            .contains("CORS: 2 rules (set through the S3 API)")
+    );
     assert_eq!(photos.anonymous, Anonymous::Private);
     assert_eq!(
         browser

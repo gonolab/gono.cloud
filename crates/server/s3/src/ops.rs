@@ -43,7 +43,8 @@ use tokio::io::AsyncReadExt as _;
 
 use crate::{
     access::{self, Authorized, Caller},
-    error,
+    cors, error,
+    form::FormAcl,
     keys::{self, Target},
     state::S3State,
     upload,
@@ -656,6 +657,19 @@ fn upload_output(checksum: Option<&gono_server_core::meta::Checksum>) -> dto::Pu
     }
 }
 
+/// s3s's own `PostObject`, which turns the form into a `PutObject`, over [`GonoS3::put`].
+struct FormUpload(GonoS3);
+
+#[async_trait::async_trait]
+impl S3 for FormUpload {
+    async fn put_object(
+        &self,
+        req: S3Request<dto::PutObjectInput>,
+    ) -> S3Result<S3Response<dto::PutObjectOutput>> {
+        Ok(S3Response::new(self.0.put(req).await?))
+    }
+}
+
 /// `X-Content-Type-Options: nosniff` for responses to anonymous requests.
 fn nosniff(headers: &mut HeaderMap, anonymous: bool) {
     if anonymous {
@@ -973,6 +987,64 @@ impl S3 for GonoS3 {
         Ok(S3Response::new(dto::PutBucketAclOutput::default()))
     }
 
+    async fn put_bucket_cors(
+        &self,
+        req: S3Request<dto::PutBucketCorsInput>,
+    ) -> S3Result<S3Response<dto::PutBucketCorsOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        let rules = cors::rules_from_dto(req.input.cors_configuration)?;
+        let stored = cors::to_stored(&rules)?;
+        if !s3::set_cors(self.state.pool(), bucket.owner_id, bucket.id, Some(&stored))
+            .await
+            .map_err(error::database)?
+        {
+            return Err(s3_error!(NoSuchBucket));
+        }
+        self.audit(
+            signing_key(&auth)?,
+            "s3.bucket.cors",
+            json!({ "bucket": bucket.name, "rules": rules.len() }),
+        )
+        .await;
+        Ok(S3Response::new(dto::PutBucketCorsOutput::default()))
+    }
+
+    async fn get_bucket_cors(
+        &self,
+        req: S3Request<dto::GetBucketCorsInput>,
+    ) -> S3Result<S3Response<dto::GetBucketCorsOutput>> {
+        let bucket = authorized(&req)?.bucket()?.clone();
+        let rules = bucket
+            .cors
+            .as_deref()
+            .map(cors::from_stored)
+            .ok_or_else(|| s3_error!(NoSuchCORSConfiguration))?;
+        Ok(S3Response::new(dto::GetBucketCorsOutput {
+            cors_rules: Some(cors::rules_to_dto(rules)),
+        }))
+    }
+
+    async fn delete_bucket_cors(
+        &self,
+        req: S3Request<dto::DeleteBucketCorsInput>,
+    ) -> S3Result<S3Response<dto::DeleteBucketCorsOutput>> {
+        let auth = authorized(&req)?;
+        let bucket = auth.bucket()?;
+        if bucket.cors.is_some() {
+            s3::set_cors(self.state.pool(), bucket.owner_id, bucket.id, None)
+                .await
+                .map_err(error::database)?;
+            self.audit(
+                signing_key(&auth)?,
+                "s3.bucket.cors",
+                json!({ "bucket": bucket.name, "rules": 0 }),
+            )
+            .await;
+        }
+        Ok(S3Response::new(dto::DeleteBucketCorsOutput::default()))
+    }
+
     async fn list_objects_v2(
         &self,
         req: S3Request<dto::ListObjectsV2Input>,
@@ -1083,6 +1155,28 @@ impl S3 for GonoS3 {
         req: S3Request<dto::PutObjectInput>,
     ) -> S3Result<S3Response<dto::PutObjectOutput>> {
         Ok(S3Response::new(self.put(req).await?))
+    }
+
+    async fn post_object(
+        &self,
+        mut req: S3Request<dto::PostObjectInput>,
+    ) -> S3Result<S3Response<dto::PostObjectOutput>> {
+        // The `acl` field, which s3s does not read (see `crate::form`).
+        if req.input.acl.is_none() {
+            match req.extensions.get::<FormAcl>() {
+                Some(FormAcl::Named(acl)) => {
+                    req.input.acl = Some(dto::ObjectCannedACL::from(acl.clone()));
+                }
+                Some(FormAcl::Repeated) => {
+                    return Err(s3_error!(
+                        InvalidArgument,
+                        "The form names an acl more than once"
+                    ));
+                }
+                None => {}
+            }
+        }
+        FormUpload(self.clone()).post_object(req).await
     }
 
     async fn get_object(

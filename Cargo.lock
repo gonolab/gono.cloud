@@ -1680,13 +1680,17 @@ dependencies = [
  "gono-server-core",
  "gono-server-dav",
  "http",
+ "http-body",
+ "http-body-util",
  "mime_guess",
  "rand 0.10.3",
  "s3s",
  "secrecy",
+ "serde",
  "serde_json",
  "time",
  "tokio",
+ "tower-service",
  "tracing",
 ]
 

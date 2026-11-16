@@ -16,13 +16,17 @@ futures-util.workspace = true
 gono-server-core.workspace = true
 gono-server-dav.workspace = true
 http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
 mime_guess.workspace = true
 rand.workspace = true
 s3s.workspace = true
 secrecy.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }
+tower-service.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

@@ -115,9 +115,9 @@ pub fn key_details(key: &S3Key, buckets: &[Bucket]) -> serde_json::Value {
 pub fn router(state: S3State, trusted_proxies: Arc<Vec<IpNet>>) -> Router {
     let service = gono_server_s3::service(state);
     let handler = move |request: Request<Body>| {
-        let mut service = service.clone();
+        let service = service.clone();
         async move {
-            match tower_service::Service::call(&mut service, request).await {
+            match service.call(request).await {
                 Ok(response) => response.map(Body::new),
                 // s3s answers protocol errors itself; what reaches here failed below it.
                 Err(err) => {

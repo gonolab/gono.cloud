@@ -152,6 +152,9 @@ CREATE TABLE s3_buckets (
                            CHECK (anonymous IN ('private', 'acl', 'public-read')),
     -- Anonymous requests may list the bucket.
     anonymous_list INTEGER NOT NULL DEFAULT 0 CHECK (anonymous_list IN (0, 1)),
+    -- The bucket's CORS rules (PutBucketCors) as a JSON array, written and read by the S3 API;
+    -- NULL: none, so browsers may not read responses of other origins.
+    cors           TEXT    CHECK (cors IS NULL OR json_valid(cors)),
     created_at     INTEGER NOT NULL
 ) STRICT;
 

@@ -218,6 +218,30 @@ async fn buckets_can_be_unbound_and_opened_to_anonymous_reads() {
     assert_eq!(stored.anonymous, Anonymous::Acl);
     assert!(stored.anonymous_list);
 
+    // CORS rules are stored as the S3 API wrote them, only for the owner, and only as JSON.
+    assert_eq!(stored.cors, None);
+    let rules = r#"[{"allowed_origins":["https://app.example"],"allowed_methods":["PUT"]}]"#;
+    assert!(
+        !s3::set_cors(&f.pool, bob, bucket.id, Some(rules))
+            .await
+            .unwrap()
+    );
+    assert!(
+        s3::set_cors(&f.pool, alice, bucket.id, Some(rules))
+            .await
+            .unwrap()
+    );
+    let stored = s3::bucket(&f.pool, "public").await.unwrap().unwrap();
+    assert_eq!(stored.cors.as_deref(), Some(rules));
+    assert!(
+        s3::set_cors(&f.pool, alice, bucket.id, Some("not json"))
+            .await
+            .is_err()
+    );
+    assert!(s3::set_cors(&f.pool, alice, bucket.id, None).await.unwrap());
+    let stored = s3::bucket(&f.pool, "public").await.unwrap().unwrap();
+    assert_eq!(stored.cors, None);
+
     assert!(!s3::delete_bucket(&f.pool, bob, bucket.id).await.unwrap());
     assert!(s3::delete_bucket(&f.pool, alice, bucket.id).await.unwrap());
     assert_eq!(s3::bucket(&f.pool, "public").await.unwrap(), None);

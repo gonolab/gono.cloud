@@ -73,8 +73,10 @@ compatible within a major version: released clients keep working with newer serv
   publish objects uploaded with the `public-read` ACL or a whole bucket, and allow anonymous
   listings; anonymous requests only read. With `s3.virtual_host_domain`, buckets are also
   addressed by host name (`<bucket>.s3.example.com`, virtual-hosted style; wildcard DNS and
-  certificate needed), and path style keeps working. The acceptance suite drives it with the
-  AWS SDK.
+  certificate needed), and path style keeps working. Browser applications get per-bucket CORS
+  rules (`PutBucketCors`, `GetBucketCors`, `DeleteBucketCors`; preflight requests are answered
+  before s3s) and form uploads signed with a POST policy (`PostObject`, with the `acl` field
+  that s3s does not read itself). The acceptance suite drives it with the AWS SDK.
 
 ### Changed
 

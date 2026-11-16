@@ -1,8 +1,8 @@
 //! The S3-compatible API of Gono Cloud, built on [`s3s`].
 //!
-//! s3s speaks the protocol: SigV4 in headers and presigned URLs, `aws-chunked` bodies with their
-//! chunk signatures and trailers, the XML of every operation, and error responses. This crate
-//! maps it onto the users' trees:
+//! s3s speaks the protocol: SigV4 in headers, presigned URLs and browser form uploads (POST
+//! policies), `aws-chunked` bodies with their chunk signatures and trailers, the XML of every
+//! operation, and error responses. This crate maps it onto the users' trees:
 //!
 //! - A **bucket** is a folder of its owner's tree ([`gono_server_core::s3`]); its objects are
 //!   the files below it, and a key is a path relative to the folder ([`keys`]). Every write goes
@@ -16,12 +16,16 @@
 //! - **Operations** ([`ops`]) cover buckets, listings, objects with their metadata, ACLs and
 //!   conditional requests, and multipart uploads ([`multipart`]). Everything else answers
 //!   `NotImplemented`, the default of the s3s trait.
+//! - **CORS** ([`cors`]): the rules of each bucket answer preflight requests, which s3s does
+//!   not route, and add their headers to s3s's responses.
 //!
-//! [`service`] builds the `tower` service the server binds to `s3.bind`.
+//! [`service`] builds the [`Service`] the server binds to `s3.bind`.
 
 mod access;
 mod auth;
+mod cors;
 mod error;
+mod form;
 mod host;
 pub mod keys;
 pub mod multipart;
@@ -31,27 +35,217 @@ mod upload;
 
 pub use state::{S3Settings, S3State};
 
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
+use bytes::Bytes;
+use gono_server_core::s3 as buckets;
+use http::{HeaderMap, Method, Request, StatusCode, header};
 use s3s::{
+    Body, HttpError, HttpResponse, S3Error,
     config::{S3Config, StaticConfigProvider},
+    s3_error,
     service::{S3Service, S3ServiceBuilder},
 };
 
-/// The S3 API over `state`, ready to serve.
-pub fn service(state: S3State) -> S3Service {
+/// The S3 API, ready to serve: s3s, with CORS handled around it. Cheap to clone.
+#[derive(Clone)]
+pub struct Service {
+    s3: S3Service,
+    state: S3State,
+    hosts: Option<Arc<host::VirtualHosts>>,
+}
+
+impl std::fmt::Debug for Service {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Service").finish_non_exhaustive()
+    }
+}
+
+/// The S3 API over `state`.
+pub fn service(state: S3State) -> Service {
     let mut builder = S3ServiceBuilder::new(ops::GonoS3::new(state.clone()));
     builder.set_auth(auth::Auth::new(state.clone()));
     builder.set_access(access::Access::new(state.clone()));
-    if let Some(domain) = &state.settings().virtual_host_domain {
-        builder.set_host(host::VirtualHosts::new(domain));
+    let hosts = state
+        .settings()
+        .virtual_host_domain
+        .as_deref()
+        .map(|domain| Arc::new(host::VirtualHosts::new(domain)));
+    if let Some(hosts) = &hosts {
+        builder.set_host(host::Shared(hosts.clone()));
     }
     let mut config = S3Config::default();
     // Clients that sign for another region get the error from which the AWS SDKs learn the
     // right one.
     config.expected_region = state.settings().region.parse().ok();
-    // Browser form uploads are not supported (yet).
-    config.allow_post_signature = false;
+    // Browser form uploads, signed with a policy; unsigned forms are anonymous writes, which
+    // the access check refuses.
+    config.allow_post_signature = true;
     builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(config))));
-    builder.build()
+    Service {
+        s3: builder.build(),
+        state,
+        hosts,
+    }
+}
+
+/// The response of `err`.
+fn error_response(err: S3Error) -> HttpResponse {
+    err.to_http_response().unwrap_or_else(|_| {
+        let mut response = HttpResponse::new(Body::empty());
+        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        response
+    })
+}
+
+/// Whether `headers` describe a form upload (`multipart/form-data`).
+fn is_form(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("multipart/form-data")
+        })
+}
+
+impl Service {
+    /// Answers `request`.
+    ///
+    /// # Errors
+    ///
+    /// What s3s reports for failures below the protocol (S3 errors are responses).
+    pub async fn call<B>(&self, request: Request<B>) -> Result<HttpResponse, HttpError>
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        if request.method() == Method::POST && is_form(request.headers()) {
+            // s3s reads a form upload's file into memory to learn its size when the request
+            // does not say it, and does so before the access check; browsers always say it.
+            if !request.headers().contains_key(header::CONTENT_LENGTH) {
+                return Ok(error_response(s3_error!(MissingContentLength)));
+            }
+            if let Some(boundary) = form::boundary(request.headers()) {
+                let (parts, body) = request.into_parts();
+                let (acl, body) = form::read_acl(body, boundary).await;
+                let mut request = Request::from_parts(parts, body);
+                if let Some(acl) = acl {
+                    request.extensions_mut().insert(acl);
+                }
+                return self.respond(request).await;
+            }
+        }
+        self.respond(request).await
+    }
+
+    /// Answers `request` with s3s, or itself for a preflight request, and adds the CORS
+    /// headers.
+    async fn respond<B>(&self, request: Request<B>) -> Result<HttpResponse, HttpError>
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        if request.method() == Method::OPTIONS {
+            // Only the headers are held across the lookup: a request body need not be `Sync`.
+            let bucket = self.bucket_name(&request);
+            return Ok(self.preflight(request.headers(), bucket).await);
+        }
+        let origin = request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let Some(origin) = origin else {
+            return self.forward(request).await;
+        };
+        let method = request.method().clone();
+        let bucket = self.bucket_name(&request);
+        let mut response = self.forward(request).await?;
+        if let Some(bucket) = bucket
+            && let Some(rules) = self.rules(&bucket).await.ok().flatten()
+            && let Some(rule) = cors::find(&rules, &origin, method.as_str(), &[])
+        {
+            cors::add_headers(response.headers_mut(), rule, &origin, None);
+        }
+        Ok(response)
+    }
+
+    async fn forward<B>(&self, request: Request<B>) -> Result<HttpResponse, HttpError>
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let mut s3 = self.s3.clone();
+        tower_service::Service::call(&mut s3, request).await
+    }
+
+    /// The bucket a request names, the way s3s finds it: in the host name (virtual-hosted
+    /// style, never for an IP address), else in the first path segment.
+    fn bucket_name<B>(&self, request: &Request<B>) -> Option<String> {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .or_else(|| request.uri().authority().map(http::uri::Authority::as_str));
+        if let (Some(hosts), Some(host)) = (&self.hosts, host)
+            && host.parse::<SocketAddr>().is_err()
+            && host.parse::<IpAddr>().is_err()
+            && let Some(bucket) = hosts.bucket_of(host)
+        {
+            return Some(bucket);
+        }
+        let first = request
+            .uri()
+            .path()
+            .trim_start_matches('/')
+            .split('/')
+            .next()?;
+        (!first.is_empty()).then(|| first.to_owned())
+    }
+
+    /// The CORS rules of `bucket`: `None` if it does not exist, belongs to a disabled account
+    /// or has none.
+    async fn rules(&self, bucket: &str) -> Result<Option<Vec<cors::Rule>>, S3Error> {
+        let bucket = buckets::bucket(self.state.pool(), bucket)
+            .await
+            .map_err(error::database)?;
+        Ok(bucket
+            .filter(|bucket| bucket.owner_enabled)
+            .and_then(|bucket| bucket.cors)
+            .map(|stored| cors::from_stored(&stored)))
+    }
+
+    /// Answers a preflight request to `bucket` (see [`cors`]).
+    async fn preflight(&self, headers: &HeaderMap, bucket: Option<String>) -> HttpResponse {
+        let text = |name| headers.get(name).and_then(|value| value.to_str().ok());
+        let (Some(origin), Some(method)) = (
+            text(header::ORIGIN),
+            text(header::ACCESS_CONTROL_REQUEST_METHOD),
+        ) else {
+            return error_response(s3_error!(
+                InvalidRequest,
+                "Insufficient information. Origin and Access-Control-Request-Method are needed."
+            ));
+        };
+        let Some(bucket) = bucket else {
+            return error_response(cors::forbidden());
+        };
+        let rules = match self.rules(&bucket).await {
+            Ok(rules) => rules.unwrap_or_default(),
+            Err(err) => return error_response(err),
+        };
+        let requested = cors::requested_headers(headers);
+        let Some(rule) = cors::find(&rules, origin, method, &requested) else {
+            return error_response(cors::forbidden());
+        };
+        let mut response = HttpResponse::new(Body::empty());
+        cors::add_headers(response.headers_mut(), rule, origin, Some(&requested));
+        response
+    }
 }

@@ -38,6 +38,9 @@ pub(crate) enum Class {
     CreateBucket,
     /// `DeleteBucket`, `PutBucketAcl`.
     BucketAdmin,
+    /// Changing a bucket's settings that grant nothing (`PutBucketCors`, `DeleteBucketCors`):
+    /// a `full` grant on the bucket.
+    BucketConfig,
     /// `HeadBucket`.
     HeadBucket,
     /// Reading a bucket's settings or uploads.
@@ -62,13 +65,17 @@ pub(crate) fn classify(name: &str) -> Class {
         "CreateBucket" => Class::CreateBucket,
         "DeleteBucket" | "PutBucketAcl" => Class::BucketAdmin,
         "HeadBucket" => Class::HeadBucket,
-        "GetBucketLocation" | "GetBucketVersioning" | "GetBucketAcl" | "ListMultipartUploads" => {
-            Class::BucketRead
-        }
+        "PutBucketCors" | "DeleteBucketCors" => Class::BucketConfig,
+        "GetBucketLocation"
+        | "GetBucketVersioning"
+        | "GetBucketAcl"
+        | "GetBucketCors"
+        | "ListMultipartUploads" => Class::BucketRead,
         "ListObjects" | "ListObjectsV2" => Class::List,
         "GetObject" | "HeadObject" => Class::ObjectRead,
         "GetObjectAcl" => Class::ObjectAclRead,
         "PutObject"
+        | "PostObject"
         | "CopyObject"
         | "DeleteObject"
         | "DeleteObjects"
@@ -242,7 +249,7 @@ pub(crate) fn decide(
     };
     let allowed = match class {
         Class::BucketAdmin => may_administer(key),
-        Class::ObjectWrite | Class::Other => permission == Permission::Full,
+        Class::ObjectWrite | Class::BucketConfig | Class::Other => permission == Permission::Full,
         _ => true,
     };
     if allowed {
@@ -330,6 +337,7 @@ mod tests {
             folder: RelPath::parse(&format!("B{id}")).unwrap(),
             anonymous,
             anonymous_list: list,
+            cors: None,
             created_at: 0,
         }
     }
@@ -357,6 +365,9 @@ mod tests {
         assert_eq!(classify("ListObjectsV2"), Class::List);
         assert_eq!(classify("CompleteMultipartUpload"), Class::ObjectWrite);
         assert_eq!(classify("PutBucketAcl"), Class::BucketAdmin);
+        assert_eq!(classify("PutBucketCors"), Class::BucketConfig);
+        assert_eq!(classify("GetBucketCors"), Class::BucketRead);
+        assert_eq!(classify("PostObject"), Class::ObjectWrite);
         assert_eq!(classify("PutBucketPolicy"), Class::Other);
     }
 
@@ -402,6 +413,14 @@ mod tests {
             Some(S3ErrorCode::AccessDenied)
         );
         assert!(decide(&writer, Some(&own), Class::ObjectWrite, false).is_ok());
+        assert!(
+            decide(&writer, Some(&own), Class::BucketConfig, false).is_ok(),
+            "CORS rules need a full grant on the bucket only"
+        );
+        assert_eq!(
+            code(decide(&reader, Some(&own), Class::BucketConfig, false)),
+            Some(S3ErrorCode::AccessDenied)
+        );
         for caller in [&reader, &writer] {
             for class in [Class::CreateBucket, Class::BucketAdmin] {
                 assert_eq!(
@@ -449,6 +468,7 @@ mod tests {
         );
         for class in [
             Class::ObjectWrite,
+            Class::BucketConfig,
             Class::ObjectAclRead,
             Class::BucketRead,
             Class::BucketAdmin,
