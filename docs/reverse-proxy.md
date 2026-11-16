@@ -376,3 +376,83 @@ curl -si --http1.1 -o /dev/null -w '%{http_code}\n' \
 The admin UI's overview shows the relay's host name, the allowed devices connected right now,
 the traffic it relayed and the connections it refused; its Relay page lists the connected
 devices and the sessions devices reported.
+
+## The S3 API
+
+With `s3.enabled`, Gono Cloud serves the S3 API ([s3.md](s3.md)) on `s3.bind`
+(`127.0.0.1:16104` by default), and the proxy terminates HTTPS for it:
+
+| Requirement | Why |
+|---|---|
+| A host name of its own, `s3.public_url` (for example `s3.example.com`) | S3 clients address buckets right below the root (`/<bucket>/<key>`), and files published for anonymous download must never be served from the site's host name. |
+| Pass `Host` through unchanged | S3 signatures (SigV4) cover the `Host` header; a proxy that rewrites it breaks every signed request. |
+| Pass the request path through unchanged (`proxy_pass` without a URI) | Signatures cover the path, encoded as the client sent it. |
+| No limit on the request body, no request buffering | Objects are as large as the disk allows; multipart parts are streamed. |
+| Long read timeouts | `CompleteMultipartUpload` assembles large objects while the connection stays open (the server sends whitespace meanwhile). |
+
+### nginx
+
+```nginx
+upstream gono_s3 {
+    server 127.0.0.1:16104;
+    keepalive 16;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name s3.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/s3.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/s3.example.com/privkey.pem;
+
+    client_max_body_size 0;
+    proxy_request_buffering off;
+    proxy_buffering off;
+    proxy_read_timeout 1h;
+    proxy_send_timeout 1h;
+
+    location / {
+        proxy_pass http://gono_s3;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+    }
+}
+```
+
+The S3 API does not limit anonymous downloads. To limit requests per client address, add
+`limit_req_zone $binary_remote_addr zone=s3:10m rate=20r/s;` at the `http` level and
+`limit_req zone=s3 burst=40;` to the `location`.
+
+### Caddy
+
+```caddyfile
+s3.example.com {
+	request_body {
+		max_size 0
+	}
+	reverse_proxy 127.0.0.1:16104 {
+		flush_interval -1
+		transport http {
+			read_timeout 1h
+		}
+	}
+}
+```
+
+Caddy passes `Host` through unchanged by default.
+
+### Checking the S3 API
+
+```sh
+# Anonymous requests reach Gono Cloud: expect an AccessDenied document (403) from it, not an
+# error page of the proxy.
+curl -i https://s3.example.com/
+
+# A signed request, with the access key of `gono-cloud s3 key create`.
+aws --endpoint-url https://s3.example.com s3 ls
+```
+

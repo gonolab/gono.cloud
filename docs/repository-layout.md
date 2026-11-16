@@ -30,8 +30,10 @@ other's way.
 │       │                   Login Flow v2 documents, notify_push hub
 │       ├── connect/        gono-server-connect: the device directory and the control channel of
 │       │                   remote access (registration, presence, addresses, pairing, revocation)
-│       └── relay/          gono-server-relay: the iroh relay through which devices reach each
+│       ├── relay/          gono-server-relay: the iroh relay through which devices reach each
 │                           other, with its admission and counters
+│       └── s3/             gono-server-s3: the S3-compatible API on s3s (buckets are folders of
+│                           the users' trees; access keys, ACLs, multipart uploads)
 ├── packaging/
 │   └── server/             Release archive contents (systemd unit, launchd job, README), the
 │                           install script, the packing script and the install test

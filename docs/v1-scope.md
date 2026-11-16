@@ -41,8 +41,12 @@ listed under "In scope" is deferred until after v1.
   JavaScript; drag and drop, folders and resumable chunked uploads with it), new folders,
   rename, move, delete, favorites, and an account page for the user's display name, web login
   password and app passwords. English and Chinese; light and dark themes.
+- **S3-compatible API** (unreleased, `docs/s3.md`): buckets that are folders of the users'
+  trees, access keys with per-bucket grants, multipart uploads, canned ACLs, and anonymous
+  downloads of what a bucket publishes, on a host name of its own.
 - **CLI**: `init`, `serve`, `config check`, user and app password management (including
-  promoting and demoting admins and changing display names), and a manual `rescan` command.
+  promoting and demoting admins and changing display names), S3 access keys and buckets, and a
+  manual `rescan` command.
 - **Packaging**: release archives for Linux (x86_64 and aarch64, static binaries for any
   distribution) and macOS (Apple silicon and Intel), a hardened systemd unit, a launchd job and an install script
   for installs, upgrades and uninstalls (see `docs/deployment.md`).

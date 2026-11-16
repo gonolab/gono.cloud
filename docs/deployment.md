@@ -308,6 +308,43 @@ statement and address (`docs/connect-threat-model.md`, section 2). Keep it on a 
 an administration you trust as much as the server; a hosting panel that manages it is part of
 that.
 
+## The S3 API
+
+S3 clients and applications can upload files to Gono Cloud and publish them for anonymous
+download ([s3.md](s3.md) describes it for users). It is off by default (`[s3]`,
+`enabled = false`). What it needs:
+
+| | |
+|---|---|
+| **A host name of its own** | For example `s3.example.com`, with DNS pointing at this host and a certificate. It must not be `base_url`'s host name. |
+| **A server block in the reverse proxy** | HTTPS for the host name, forwarded to `s3.bind` (`127.0.0.1:16104`) with `Host` unchanged: [reverse-proxy.md](reverse-proxy.md#the-s3-api). |
+| **The key file** | The secrets of access keys are encrypted with `two_factor.key_file`, like TOTP secrets. `serve` refuses to start the S3 API without it. |
+
+Turn it on in `/etc/gono-cloud/config.toml` and restart the service:
+
+```toml
+[s3]
+enabled = true
+public_url = "https://s3.example.com"
+# Let bucket owners publish files for anonymous download. Off by default.
+# allow_anonymous = true
+```
+
+Then create a bucket and an access key, for example for the admin account (users can do the
+same on their account page):
+
+```sh
+sudo -u gono-cloud gono-cloud s3 bucket create admin photos
+sudo -u gono-cloud gono-cloud s3 key create admin --label "photo app"
+# Publish objects uploaded with the public-read ACL (needs allow_anonymous):
+sudo -u gono-cloud gono-cloud s3 bucket set admin photos --anonymous acl
+```
+
+`s3 key create` prints the access key id and the secret key once. Without `--bucket` the key
+reaches every bucket of the account; `--bucket photos:view` limits it to reading one bucket.
+`s3 key list`, `s3 key delete`, `s3 bucket list`, `s3 bucket bind` (an existing folder) and
+`s3 bucket unbind` manage the rest.
+
 ## The relay
 
 Devices of Gono products (Input Show today) connect to each other directly when they can. When
@@ -557,7 +594,8 @@ the service.
 A complete backup consists of:
 
 - the configuration, `/etc/gono-cloud/config.toml`, and the key of two-step verification next
-  to it, `/etc/gono-cloud/two-factor.key` (keep it apart from copies of the database);
+  to it, `/etc/gono-cloud/two-factor.key` (keep it apart from copies of the database; it also
+  encrypts the secrets of S3 access keys);
 - the database, `/var/lib/gono-cloud/gono-cloud.db`: accounts, app passwords, file metadata
   (ids, ETags, favorites, locks) and the instance id;
 - the data directory, `/var/lib/gono-cloud/data/`: the users' files.

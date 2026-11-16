@@ -58,9 +58,25 @@ compatible within a major version: released clients keep working with newer serv
   encrypted with a key in the configuration directory, `two_factor.key_file`
   (`two-factor.key`), which the install script, `init` and `serve` create when missing; back it
   up with the configuration. App passwords are unaffected.
+- **An S3-compatible API** (`docs/s3.md`), built on s3s 0.17: a bucket is a folder of its
+  owner's tree, so files uploaded through S3 appear in WebDAV, the Nextcloud clients and the web
+  file UI, and theirs in S3. Configured by a new `[s3]` table and off by default; `serve` runs it
+  on `s3.bind` (`127.0.0.1:16104`) behind a host name of its own (`s3.public_url`). Clients sign
+  with SigV4 (headers and presigned URLs, `aws-chunked` bodies with trailer checksums) using
+  access keys created on the account page, in the admin UI or with `gono-cloud s3 key`; their
+  secrets are encrypted with `two_factor.key_file`, which the S3 API therefore requires.
+  Buckets are created there, with `gono-cloud s3 bucket`, or with `CreateBucket` (in
+  `s3.bucket_folder`, `Buckets/` by default), or bound to existing folders. Objects keep their
+  MD5 ETag, content type, user metadata and checksum until they are overwritten other than
+  through S3; listings come from the metadata database in S3 key order; multipart uploads are
+  staged in `s3-uploads/` of the data directory. With `s3.allow_anonymous`, bucket owners can
+  publish objects uploaded with the `public-read` ACL or a whole bucket, and allow anonymous
+  listings; anonymous requests only read. The acceptance suite drives it with the AWS SDK.
 
 ### Changed
 
+- **Rust 1.100** is needed to build from source (the newest stable release; s3s needs 1.96).
+  CI no longer checks a separate minimum version, and release builds use 1.100.0.
 - `config check` and `serve` no longer warn about an empty `relay.allowed_endpoints`, since
   `serve` admits the registered devices; `gono-cloud relay` on a host of its own still does.
 - The credentials of devices registered for remote access are not listed among app passwords,
