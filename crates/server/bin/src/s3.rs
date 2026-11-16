@@ -218,7 +218,8 @@ pub fn router(state: S3State, trusted_proxies: Arc<Vec<IpNet>>) -> Router {
         ))
 }
 
-/// Logs method, redacted target, status, duration and client address of an S3 request.
+/// Logs method, redacted target, status, duration, client address and request id (the
+/// `x-amz-request-id` the client got) of an S3 request.
 async fn log_requests(
     State(trusted_proxies): State<Arc<Vec<IpNet>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -230,12 +231,18 @@ async fn log_requests(
     let target = redact(request.uri());
     let client = client_ip(peer.ip(), request.headers(), &trusted_proxies);
     let response = next.run(request).await;
+    let request_id = response
+        .headers()
+        .get("x-amz-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
     tracing::info!(
         %method,
         %target,
         status = response.status().as_u16(),
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         %client,
+        request_id,
         "s3 request"
     );
     response

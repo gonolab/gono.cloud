@@ -89,7 +89,9 @@ s3tests/functional/test_s3.py::test_object_delete_key_bucket_gone
 s3tests/functional/test_s3.py::test_object_raw_get_bucket_gone
 s3tests/functional/test_s3.py::test_object_raw_get_object_gone
 
-# s3s answers an expired or out-of-range presigned URL with 400, S3 with 403.
+# X-Amz-Expires below 0 or above a week is refused before the signature with 400
+# AuthorizationQueryParametersError, as by S3 and MinIO; RGW answers 403. (Presigned URLs that
+# have expired get 403 AccessDenied.)
 s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_max_range
 s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_positive_range
 s3tests/functional/test_s3.py::test_object_raw_put_authenticated_expired
@@ -97,6 +99,3 @@ s3tests/functional/test_s3.py::test_object_raw_put_authenticated_expired
 # fails_on_rgw: RGW-specific expectations of key and metadata encodings.
 s3tests/functional/test_s3.py::test_object_read_unreadable
 s3tests/functional/test_s3.py::test_object_set_get_unicode_metadata
-
-# s3s writes no RequestId into error documents.
-s3tests/functional/test_s3.py::test_object_requestid_matches_header_on_error

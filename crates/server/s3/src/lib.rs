@@ -18,6 +18,8 @@
 //!   `NotImplemented`, the default of the s3s trait.
 //! - **CORS** ([`cors`]): the rules of each bucket answer preflight requests, which s3s does
 //!   not route, and add their headers to s3s's responses.
+//! - **Request ids**: every response carries one in `x-amz-request-id`, and every error document
+//!   in `RequestId`, as from S3 (s3s writes neither); the request log records it.
 //!
 //! [`service`] builds the [`Service`] the server binds to `s3.bind`.
 
@@ -43,7 +45,8 @@ use std::{
 
 use bytes::Bytes;
 use gono_server_core::s3 as buckets;
-use http::{HeaderMap, Method, Request, StatusCode, header};
+use http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
+use rand::RngExt as _;
 use s3s::{
     Body, HttpError, HttpResponse, S3Error,
     config::{S3Config, StaticConfigProvider},
@@ -102,6 +105,57 @@ fn error_response(err: S3Error) -> HttpResponse {
     })
 }
 
+/// A new request id: 16 hexadecimal digits, like S3's.
+fn new_request_id() -> String {
+    format!("{:016X}", rand::rng().random::<u64>())
+}
+
+/// Gives `response` the request id `id`: in `x-amz-request-id`, and in an error document that
+/// is held in memory (every one s3s and this crate write; a multipart completion's error after
+/// its keep-alive has started is streamed and keeps its document as it is).
+fn stamp_request_id(response: &mut HttpResponse, id: &str) {
+    let Ok(value) = HeaderValue::from_str(id) else {
+        return;
+    };
+    response
+        .headers_mut()
+        .insert(s3s::header::X_AMZ_REQUEST_ID, value);
+    if response.status().is_success() {
+        return;
+    }
+    let Some(stamped) = response
+        .body()
+        .bytes()
+        .and_then(|body| with_request_id(&body, id))
+    else {
+        return;
+    };
+    if response.headers().contains_key(header::CONTENT_LENGTH) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(stamped.len()));
+    }
+    *response.body_mut() = Body::from(stamped);
+}
+
+/// `document`, an S3 error document without a `RequestId`, with `<RequestId>id</RequestId>` as
+/// the last element of `Error`; `None` for anything else.
+fn with_request_id(document: &[u8], id: &str) -> Option<Vec<u8>> {
+    const END: &[u8] = b"</Error>";
+    if document.windows(11).any(|window| window == b"<RequestId>") {
+        return None;
+    }
+    let end = document
+        .windows(END.len())
+        .rposition(|window| window == END)?;
+    let element = format!("<RequestId>{id}</RequestId>");
+    let mut stamped = Vec::with_capacity(document.len() + element.len());
+    stamped.extend_from_slice(&document[..end]);
+    stamped.extend_from_slice(element.as_bytes());
+    stamped.extend_from_slice(&document[end..]);
+    Some(stamped)
+}
+
 /// Whether `headers` describe a form upload (`multipart/form-data`).
 fn is_form(headers: &HeaderMap) -> bool {
     headers
@@ -122,6 +176,18 @@ impl Service {
     ///
     /// What s3s reports for failures below the protocol (S3 errors are responses).
     pub async fn call<B>(&self, request: Request<B>) -> Result<HttpResponse, HttpError>
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let id = new_request_id();
+        let mut response = self.answer(request).await?;
+        stamp_request_id(&mut response, &id);
+        Ok(response)
+    }
+
+    /// Answers `request`: form uploads are prepared for s3s first.
+    async fn answer<B>(&self, request: Request<B>) -> Result<HttpResponse, HttpError>
     where
         B: http_body::Body<Data = Bytes> + Send + 'static,
         B::Error: std::error::Error + Send + Sync + 'static,
@@ -248,5 +314,46 @@ impl Service {
         let mut response = HttpResponse::new(Body::empty());
         cors::add_headers(response.headers_mut(), rule, origin, Some(&requested));
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_documents_get_the_request_id() {
+        let document =
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NoSuchKey</Code></Error>";
+        assert_eq!(
+            with_request_id(document, "ABC").unwrap(),
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NoSuchKey</Code><RequestId>ABC</RequestId></Error>"
+        );
+        assert_eq!(
+            with_request_id(b"<Error><RequestId>X</RequestId></Error>", "ABC"),
+            None
+        );
+        assert_eq!(with_request_id(b"", "ABC"), None);
+        assert_eq!(with_request_id(b"<ListBucketResult/>", "ABC"), None);
+    }
+
+    #[test]
+    fn responses_get_the_request_id() {
+        let mut error = error_response(s3_error!(NoSuchBucket));
+        stamp_request_id(&mut error, "0123456789ABCDEF");
+        assert_eq!(error.headers()["x-amz-request-id"], "0123456789ABCDEF");
+        let body = String::from_utf8(error.body().bytes().unwrap().to_vec()).unwrap();
+        assert!(
+            body.ends_with("<RequestId>0123456789ABCDEF</RequestId></Error>"),
+            "{body}"
+        );
+        let mut ok = HttpResponse::new(Body::from("<ListAllMyBucketsResult/>".to_owned()));
+        stamp_request_id(&mut ok, "0123456789ABCDEF");
+        assert_eq!(ok.headers()["x-amz-request-id"], "0123456789ABCDEF");
+        assert_eq!(
+            ok.body().bytes().unwrap(),
+            Bytes::from_static(b"<ListAllMyBucketsResult/>")
+        );
+        assert_eq!(new_request_id().len(), 16);
     }
 }
