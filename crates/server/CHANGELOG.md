@@ -153,6 +153,15 @@ compatible within a major version: released clients keep working with newer serv
 - The web file UI cut off the menu of the last files of a short folder at the bottom of the
   list, so their actions (rename, move, delete, and now "Copy public link") could not be
   reached there.
+- A WebDAV `PUT` (also the Nextcloud clients' and the web file UI's uploads in one request)
+  now syncs the folder after it renames the new file into place, as S3 writes and chunked
+  uploads already did, so an upload that was answered survives a crash (on macOS the sync is
+  an `F_FULLFSYNC`). Where the disk is the limit, this costs throughput: in
+  `acceptance/scripts/s3-load.sh` with `WEBDAV=1` on macOS (5000 files of 2 KiB through S3 and
+  as many through WebDAV at the same time), uploads per second fell from 155 to 127 at 4
+  transfers per client and from 159 to 139 at 16, the median WebDAV write taking 54 ms instead
+  of 38 ms and 194 ms instead of 164 ms; at 64 transfers, where the database writer is the
+  limit, they stayed at about 150 (146 before, 151 after).
 
 ## [1.2.0] - 2026-11-12
 

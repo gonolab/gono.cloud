@@ -119,11 +119,11 @@ const CHECKSUM_MISMATCH: &str =
 /// Data goes to a private file in the data directory's `tmp/`, and its MD5 is computed on the
 /// way. [`DavFile::flush`], which dav-server calls once after the whole body has arrived,
 /// checks the length against `Content-Length`, syncs the data, checks the MD5 against an
-/// `OC-Checksum` the client sent, applies `X-OC-MTime`, renames the file over the target and
-/// records the new version with its MD5 in the MetaStore. A partial update (or a write that
-/// seeks) is hashed again from the file. Until then the old version stays untouched; a failed
-/// or aborted upload only leaves the temporary file, which is removed on drop (or at the next
-/// start).
+/// `OC-Checksum` the client sent, applies `X-OC-MTime`, renames the file over the target, syncs
+/// the folder and records the new version with its MD5 in the MetaStore. A partial update (or a
+/// write that seeks) is hashed again from the file. Until then the old version stays untouched;
+/// a failed or aborted upload only leaves the temporary file, which is removed on drop (or at
+/// the next start).
 pub struct WriteFile {
     pub(crate) fs: ScopedFs,
     pub(crate) ctx: Ctx,
@@ -226,7 +226,8 @@ impl WriteFile {
 }
 
 /// Moves the finished temporary file over the target, after checking (again) that the parent
-/// is still a real directory inside the tree. Returns the target's stat.
+/// is still a real directory inside the tree, and syncs the parent so that the rename survives
+/// a crash, like [`ScopedFs::install_file`] and the S3 object writes. Returns the target's stat.
 fn install(
     root: &Path,
     storage: &RelPath,
@@ -239,6 +240,11 @@ fn install(
         _ => return Err(std::io::ErrorKind::NotFound.into()),
     }
     std::fs::rename(temp, target)?;
+    // The data was synced before the rename; without this the new name itself could be lost
+    // in a crash after the client was answered (`sync_all` is `F_FULLFSYNC` on macOS).
+    if let Some(dir) = target.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
     let meta = std::fs::symlink_metadata(target)?;
     Ok(disk_stat(&meta))
 }
@@ -324,5 +330,47 @@ impl DavFile for CreatedFile {
 
     fn flush(&mut self) -> FsFuture<'_, ()> {
         std::future::ready(Ok(())).boxed()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+
+    /// A folder sync is invisible until a crash, but it needs the folder opened, which a folder
+    /// that may be written and searched but not read refuses: there the rename goes through
+    /// and the sync cannot, so `install` fails only if it syncs the folder after the rename.
+    #[test]
+    fn install_syncs_the_folder_after_the_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        let storage = RelPath::parse("dir/file").unwrap();
+        let target = storage.to_fs_path(root.path());
+
+        // A readable folder: installed, as every PUT is.
+        let temp = root.path().join("first.tmp");
+        std::fs::write(&temp, b"first").unwrap();
+        let stat = install(root.path(), &storage, &temp, &target).unwrap();
+        assert_eq!(stat.size, 5);
+        assert!(!temp.exists());
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::File::open(&dir).is_ok() {
+            // Running as root, which reads any folder: nothing to observe.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let temp = root.path().join("second.tmp");
+        std::fs::write(&temp, b"second").unwrap();
+        let result = install(root.path(), &storage, &temp, &target);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        // It failed after the rename, in the sync, and not before it.
+        assert!(!temp.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"second");
     }
 }
