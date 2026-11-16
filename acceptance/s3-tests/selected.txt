@@ -5,8 +5,8 @@
 # Chosen from a run of every test of test_s3.py and test_headers.py
 # (S3_TESTS_SELECT=all scripts/s3-tests.sh): every test of the protocol surface of docs/s3.md.
 # Left out: tests of features outside it (versioning, lifecycle, object lock, encryption,
-# tagging, website, select, logging, IAM and STS, public access blocks, GetObjectAttributes,
-# bucket policies, explicit ACL grants), Signature Version 2 (form uploads included; SigV4
+# tagging, website, select, logging, IAM and STS, public access blocks, bucket
+# policies, explicit ACL grants), Signature Version 2 (form uploads included; SigV4
 # forms are covered by tests/s3.rs), tests marked fails_on_aws, and RGW extensions (usage
 # headers, unordered listings, tenants, torrents). Tests that fail are listed with their
 # reason in expected-failures.txt.
@@ -175,6 +175,10 @@ s3tests/functional/test_s3.py::test_cors_presigned_get_object
 s3tests/functional/test_s3.py::test_cors_presigned_put_object
 s3tests/functional/test_s3.py::test_cors_presigned_put_object_with_acl
 s3tests/functional/test_s3.py::test_delete_marker_nonversioned
+s3tests/functional/test_s3.py::test_get_checksum_object_attributes
+s3tests/functional/test_s3.py::test_get_multipart_checksum_object_attributes
+s3tests/functional/test_s3.py::test_get_multipart_object_attributes
+s3tests/functional/test_s3.py::test_get_object_attributes
 s3tests/functional/test_s3.py::test_get_object_ifmatch_failed
 s3tests/functional/test_s3.py::test_get_object_ifmatch_good
 s3tests/functional/test_s3.py::test_get_object_ifmodifiedsince_failed
@@ -183,6 +187,8 @@ s3tests/functional/test_s3.py::test_get_object_ifnonematch_failed
 s3tests/functional/test_s3.py::test_get_object_ifnonematch_good
 s3tests/functional/test_s3.py::test_get_object_ifunmodifiedsince_failed
 s3tests/functional/test_s3.py::test_get_object_ifunmodifiedsince_good
+s3tests/functional/test_s3.py::test_get_paginated_multipart_object_attributes
+s3tests/functional/test_s3.py::test_get_single_multipart_object_attributes
 s3tests/functional/test_s3.py::test_list_buckets_paginated
 s3tests/functional/test_s3.py::test_list_multipart_upload
 s3tests/functional/test_s3.py::test_multi_object_delete
