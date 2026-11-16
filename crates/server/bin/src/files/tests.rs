@@ -2692,6 +2692,13 @@ async fn published_files_offer_their_public_link() {
         "{site_page}"
     );
     assert!(site_page.contains("Copy public link"));
+    // The link sits in the row menu, which opens below its row: the listing's pane must not
+    // clip it, or the menus of the last rows of a short folder are cut off.
+    assert!(
+        site_page.contains("<section class=\"pane pane--list\""),
+        "{site_page}"
+    );
+    assert!(crate::web::STYLE.contains(".pane--list { overflow: visible; }"));
     let photos = browser.get("/apps/files/Buckets/media/2026/").await.text();
     assert!(
         photos.contains("href=\"https://s3.example.com/media/2026/a%20b.jpg\""),

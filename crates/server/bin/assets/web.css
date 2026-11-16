@@ -758,6 +758,11 @@ progress::-moz-progress-bar { border-radius: var(--r-pill); background: var(--ac
 }
 .file-row:hover { background: var(--panel-alt); }
 .file-row:has(.file-row__check:checked) { background: var(--accent-soft); }
+/* Folder listings: a row's menu opens below the row and would be cut off at the pane's edge in
+   a short folder, so this pane does not clip; the last row rounds its own lower corners for its
+   hover and selection background instead. */
+.pane--list { overflow: visible; }
+.pane--list > .rows:last-child > .file-row:last-child { border-end-start-radius: var(--r); border-end-end-radius: var(--r); }
 .file-row__check { inline-size: 16px; block-size: 16px; margin: 0; }
 .kind {
   display: grid;

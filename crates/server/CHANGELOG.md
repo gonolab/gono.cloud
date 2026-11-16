@@ -106,6 +106,12 @@ compatible within a major version: released clients keep working with newer serv
   script of 1.0 to 1.2 sets `path = "/gono-admin"`; change it to `"/apps/manage"` or remove the
   line to move the admin UI, and adjust reverse proxy rules that restrict the old path.
 
+### Fixed
+
+- The web file UI cut off the menu of the last files of a short folder at the bottom of the
+  list, so their actions (rename, move, delete, and now "Copy public link") could not be
+  reached there.
+
 ## [1.2.0] - 2026-11-12
 
 A web file UI and account page in the browser, and every page in English or Chinese. There are
