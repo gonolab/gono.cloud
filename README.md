@@ -34,7 +34,7 @@ service on `127.0.0.1:16102`. Then put a reverse proxy with HTTPS in front of it
 `https://cloud.example.com`. [`docs/deployment.md`](docs/deployment.md) covers manual
 installation, accounts, upgrades, backups and uninstalling.
 
-To build from source instead (Rust 1.94 or newer):
+To build from source instead (Rust 1.100 or newer):
 
 ```sh
 cargo build --release --locked

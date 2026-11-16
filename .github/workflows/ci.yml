@@ -246,24 +246,3 @@ jobs:
 
       - name: Dials under UDP filters
         run: sudo crates/client/connect/scripts/test-udp-paths.sh target/debug/examples/udp-paths
-
-  msrv:
-    name: Minimum supported Rust version
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install Rust
-        run: |
-          msrv="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
-          test -n "${msrv}"
-          echo "Workspace rust-version: ${msrv}"
-          rustup toolchain install "${msrv}" --profile minimal
-          rustup default "${msrv}"
-
-      - name: Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check
-        run: cargo check --workspace --all-targets --locked

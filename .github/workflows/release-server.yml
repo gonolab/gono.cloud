@@ -28,7 +28,7 @@ env:
   CARGO_INCREMENTAL: "0"
   # Release builds use exactly this toolchain, so that a tag always builds the same way. Bump it
   # deliberately (the CI jobs follow stable).
-  RUST_TOOLCHAIN: "1.99.1"
+  RUST_TOOLCHAIN: "1.100.0"
   # Oldest macOS the binaries run on.
   MACOSX_DEPLOYMENT_TARGET: "11.0"
 

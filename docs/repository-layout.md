@@ -139,7 +139,8 @@ cannot be resolved, `apps/desktop` gets its own `[workspace]` and lock file, the
 
 ### Minimum Rust version
 
-`rust-version` is set once for the workspace (`[workspace.package]` in the root `Cargo.toml`),
-and CI checks the workspace with exactly that toolchain. A crate that needs a newer compiler,
-for example because of Tauri or UniFFI, overrides `rust-version` in its own manifest instead of
-raising it for everyone.
+`rust-version` is set once for the workspace (`[workspace.package]` in the root `Cargo.toml`).
+When it has to go up, it is raised to the newest stable release of the time, and CI builds with
+the latest stable release only: there is no separate job for the minimum version. A crate that
+needs a newer compiler than the rest, for example because of Tauri or UniFFI, overrides
+`rust-version` in its own manifest instead of raising it for everyone.

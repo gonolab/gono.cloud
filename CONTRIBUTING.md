@@ -16,7 +16,7 @@ protocol changes.
 
 ## Building
 
-You need Rust 1.94 or newer (the `rust-version` of the workspace); CI uses the latest stable
+You need Rust 1.100 or newer (the `rust-version` of the workspace); CI uses the latest stable
 release. SQLite is compiled in, so no system libraries are needed.
 
 ```sh
@@ -35,7 +35,6 @@ Run these before sending a change; CI runs the same on Linux and macOS:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo +1.94 check --workspace --locked      # the minimum supported Rust version
 ```
 
 For changes to the server's behavior, also run the acceptance suite, which builds the server,
