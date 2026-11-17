@@ -10,6 +10,13 @@ compatible within a major version: released clients keep working with newer serv
 
 ## [Unreleased]
 
+### Removed
+
+- **macOS releases**: releases after 2.0.0 have no macOS archives (`aarch64-apple-darwin`,
+  `x86_64-apple-darwin`) and no launchd job, and the install script and the deployment guide
+  cover Linux with systemd only. CI no longer builds or tests on macOS. An installation of 2.0.0
+  on macOS keeps running, but cannot be upgraded with the install script.
+
 ## [2.0.0] - 2026-11-17
 
 An S3-compatible API whose buckets are folders of the users' trees, a relay and remote access

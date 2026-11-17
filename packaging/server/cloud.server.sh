@@ -1,5 +1,5 @@
 #!/bin/sh
-# Gono Cloud server installer for Linux (systemd) and macOS (launchd).
+# Gono Cloud server installer for Linux with systemd.
 #
 # Installs or upgrades a release: takes the release archive for this machine (downloaded from
 # GitHub, or a local file), verifies it against SHA256SUMS, installs the binary, creates the
@@ -22,11 +22,10 @@ DEFAULT_VERSION=""
 REPO="gonolab/gono.cloud"
 
 SERVICE_NAME="gono-cloud"
-LAUNCHD_LABEL="cloud.gono.server"
 
 usage() {
 	cat <<'EOF'
-Install, upgrade or uninstall the Gono Cloud server (Linux with systemd, or macOS).
+Install, upgrade or uninstall the Gono Cloud server (Linux with systemd).
 
 Usage:
   sudo sh cloud.server.sh [--version VERSION] --base-url URL [options]   fresh install
@@ -61,12 +60,12 @@ Other:
                           database, the files, the logs and the service user are kept.
   -h, --help              Show this help.
 
-Paths (Linux / macOS):
+Paths:
   binary         /usr/local/bin/gono-cloud
-  configuration  /etc/gono-cloud/config.toml   /usr/local/etc/gono-cloud/config.toml
-  state          /var/lib/gono-cloud           /usr/local/var/gono-cloud
-  logs           journalctl -u gono-cloud      /usr/local/var/log/gono-cloud/
-  service user   gono-cloud                    _gono-cloud
+  configuration  /etc/gono-cloud/config.toml
+  state          /var/lib/gono-cloud
+  logs           journalctl -u gono-cloud
+  service user   gono-cloud
 EOF
 }
 
@@ -168,17 +167,10 @@ VERSION=${VERSION#v}
 # ---------------------------------------------------------------------------------------------
 
 detect_platform() {
-	case $(uname -s) in
-	Linux) OS=linux ;;
-	Darwin) OS=macos ;;
-	*) die "unsupported operating system $(uname -s); Linux with systemd and macOS are supported" ;;
-	esac
+	[ "$(uname -s)" = Linux ] ||
+		die "unsupported operating system $(uname -s); release builds and the installer are for Linux with systemd"
 
 	ARCH=$(uname -m)
-	# A shell running under Rosetta reports x86_64 on Apple silicon.
-	if [ "$OS" = macos ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then
-		ARCH=arm64
-	fi
 	case $ARCH in
 	x86_64 | amd64) ARCH=x86_64 ;;
 	aarch64 | arm64) ARCH=aarch64 ;;
@@ -186,27 +178,15 @@ detect_platform() {
 	esac
 
 	BIN=/usr/local/bin/gono-cloud
-	if [ "$OS" = linux ]; then
-		# Statically linked against musl: runs on any distribution, with or without glibc.
-		TARGET=$ARCH-unknown-linux-musl
-		CONFIG_DIR=/etc/gono-cloud
-		STATE_DIR=/var/lib/gono-cloud
-		LOG_DIR=""
-		SERVICE_USER=gono-cloud
-		ROOT_GROUP=root
-		UNIT=/etc/systemd/system/$SERVICE_NAME.service
-		DROPIN_DIR=/etc/systemd/system/$SERVICE_NAME.service.d
-		DROPIN=$DROPIN_DIR/10-install-data-dir.conf
-	else
-		TARGET=$ARCH-apple-darwin
-		CONFIG_DIR=/usr/local/etc/gono-cloud
-		STATE_DIR=/usr/local/var/gono-cloud
-		LOG_DIR=/usr/local/var/log/gono-cloud
-		SERVICE_USER=_gono-cloud
-		ROOT_GROUP=wheel
-		PLIST=/Library/LaunchDaemons/$LAUNCHD_LABEL.plist
-	fi
+	# Statically linked against musl: runs on any distribution, with or without glibc.
+	TARGET=$ARCH-unknown-linux-musl
+	CONFIG_DIR=/etc/gono-cloud
+	STATE_DIR=/var/lib/gono-cloud
+	SERVICE_USER=gono-cloud
 	SERVICE_GROUP=$SERVICE_USER
+	UNIT=/etc/systemd/system/$SERVICE_NAME.service
+	DROPIN_DIR=/etc/systemd/system/$SERVICE_NAME.service.d
+	DROPIN=$DROPIN_DIR/10-install-data-dir.conf
 	CONFIG_FILE=$CONFIG_DIR/config.toml
 }
 
@@ -216,16 +196,10 @@ need_command() {
 
 preflight() {
 	[ "$(id -u)" = 0 ] || die "run the installer as root, for example: sudo sh $0 ..."
-	if [ "$OS" = linux ]; then
-		[ -d /run/systemd/system ] || die "systemd is not running; the installer sets the server up as a systemd service. Without systemd (Alpine with OpenRC, containers), run the binary from the release archive yourself: see docs/deployment.md"
-		for command in systemctl useradd groupadd getent tar gzip; do
-			need_command "$command"
-		done
-	else
-		for command in launchctl dscl tar sudo; do
-			need_command "$command"
-		done
-	fi
+	[ -d /run/systemd/system ] || die "systemd is not running; the installer sets the server up as a systemd service. Without systemd (Alpine with OpenRC, containers), run the binary from the release archive yourself: see docs/deployment.md"
+	for command in systemctl useradd groupadd getent tar gzip; do
+		need_command "$command"
+	done
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -271,7 +245,7 @@ sha256_of() {
 
 # Runs a command as the service user, from the state directory, with the service's umask.
 as_service_user() {
-	if [ "$OS" = linux ] && command -v runuser >/dev/null 2>&1; then
+	if command -v runuser >/dev/null 2>&1; then
 		(cd "$STATE_DIR" && umask 027 && runuser -u "$SERVICE_USER" -- "$@")
 	else
 		need_command sudo
@@ -336,55 +310,18 @@ obtain_release() {
 # ---------------------------------------------------------------------------------------------
 
 ensure_service_user() {
-	if [ "$OS" = linux ]; then
-		if ! getent group "$SERVICE_GROUP" >/dev/null; then
-			log "Creating group $SERVICE_GROUP"
-			groupadd --system "$SERVICE_GROUP"
-		fi
-		if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
-			log "Creating user $SERVICE_USER"
-			nologin=/usr/sbin/nologin
-			[ -x "$nologin" ] || nologin=/sbin/nologin
-			[ -x "$nologin" ] || nologin=/bin/false
-			useradd --system --gid "$SERVICE_GROUP" --home-dir "$STATE_DIR" --no-create-home \
-				--shell "$nologin" --comment "Gono Cloud" "$SERVICE_USER"
-		fi
-		return
+	if ! getent group "$SERVICE_GROUP" >/dev/null; then
+		log "Creating group $SERVICE_GROUP"
+		groupadd --system "$SERVICE_GROUP"
 	fi
-
-	# macOS: a hidden system user and group with the same free id below 500.
-	if dscl . -read "/Users/$SERVICE_USER" >/dev/null 2>&1; then
-		return
+	if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+		log "Creating user $SERVICE_USER"
+		nologin=/usr/sbin/nologin
+		[ -x "$nologin" ] || nologin=/sbin/nologin
+		[ -x "$nologin" ] || nologin=/bin/false
+		useradd --system --gid "$SERVICE_GROUP" --home-dir "$STATE_DIR" --no-create-home \
+			--shell "$nologin" --comment "Gono Cloud" "$SERVICE_USER"
 	fi
-	used=$(
-		dscl . -list /Users UniqueID | awk '{ print $2 }'
-		dscl . -list /Groups PrimaryGroupID | awk '{ print $2 }'
-	)
-	id=450
-	while [ "$id" -gt 300 ]; do
-		if ! printf '%s\n' "$used" | grep -qx "$id"; then
-			break
-		fi
-		id=$((id - 1))
-	done
-	[ "$id" -gt 300 ] || die "no free user id between 301 and 450 for $SERVICE_USER"
-	log "Creating user and group $SERVICE_USER (id $id)"
-	if ! dscl . -read "/Groups/$SERVICE_GROUP" >/dev/null 2>&1; then
-		dscl . -create "/Groups/$SERVICE_GROUP"
-		dscl . -create "/Groups/$SERVICE_GROUP" PrimaryGroupID "$id"
-		dscl . -create "/Groups/$SERVICE_GROUP" RealName "Gono Cloud"
-		dscl . -create "/Groups/$SERVICE_GROUP" Password '*'
-	fi
-	gid=$(dscl . -read "/Groups/$SERVICE_GROUP" PrimaryGroupID | awk '{ print $2 }')
-	dscl . -create "/Users/$SERVICE_USER"
-	dscl . -create "/Users/$SERVICE_USER" UniqueID "$id"
-	dscl . -create "/Users/$SERVICE_USER" PrimaryGroupID "$gid"
-	dscl . -create "/Users/$SERVICE_USER" RealName "Gono Cloud"
-	dscl . -create "/Users/$SERVICE_USER" NFSHomeDirectory /var/empty
-	dscl . -create "/Users/$SERVICE_USER" UserShell /usr/bin/false
-	dscl . -create "/Users/$SERVICE_USER" Password '*'
-	dscl . -create "/Users/$SERVICE_USER" IsHidden 1
-	dscacheutil -flushcache 2>/dev/null || true
 }
 
 # Creates a directory with the given mode and owner, leaving existing directories alone.
@@ -435,48 +372,23 @@ ensure_two_factor_key() {
 # Service
 # ---------------------------------------------------------------------------------------------
 
-service_loaded() {
-	if [ "$OS" = linux ]; then
-		systemctl is-active --quiet "$SERVICE_NAME.service"
-	else
-		launchctl print "system/$LAUNCHD_LABEL" >/dev/null 2>&1
-	fi
-}
-
 stop_service() {
-	if service_loaded; then
+	if systemctl is-active --quiet "$SERVICE_NAME.service"; then
 		log "Stopping the service"
-		if [ "$OS" = linux ]; then
-			systemctl stop "$SERVICE_NAME.service"
-		else
-			launchctl bootout "system/$LAUNCHD_LABEL" || true
-		fi
+		systemctl stop "$SERVICE_NAME.service"
 	fi
 }
 
 install_service() {
-	if [ "$OS" = linux ]; then
-		install -m 0644 -o root -g root "$PAYLOAD/systemd/$SERVICE_NAME.service" "$UNIT"
-		systemctl daemon-reload
-		systemctl enable --quiet "$SERVICE_NAME.service"
-		log "Installed $UNIT"
-	else
-		# launchd reads the file again only when the job is loaded, so unload it first.
-		if launchctl print "system/$LAUNCHD_LABEL" >/dev/null 2>&1; then
-			launchctl bootout "system/$LAUNCHD_LABEL" || true
-		fi
-		install -m 0644 -o root -g wheel "$PAYLOAD/launchd/$LAUNCHD_LABEL.plist" "$PLIST"
-		log "Installed $PLIST"
-	fi
+	install -m 0644 -o root -g root "$PAYLOAD/systemd/$SERVICE_NAME.service" "$UNIT"
+	systemctl daemon-reload
+	systemctl enable --quiet "$SERVICE_NAME.service"
+	log "Installed $UNIT"
 }
 
 start_service() {
 	log "Starting the service"
-	if [ "$OS" = linux ]; then
-		systemctl restart "$SERVICE_NAME.service"
-	else
-		launchctl bootstrap system "$PLIST"
-	fi
+	systemctl restart "$SERVICE_NAME.service"
 }
 
 wait_until_healthy() {
@@ -495,11 +407,7 @@ wait_until_healthy() {
 		sleep 1
 		attempt=$((attempt + 1))
 	done
-	if [ "$OS" = linux ]; then
-		warn "the server did not answer on http://$bind/healthz within 30 seconds; see: journalctl -u $SERVICE_NAME -n 50"
-	else
-		warn "the server did not answer on http://$bind/healthz within 30 seconds; see: $LOG_DIR/gono-cloud.log"
-	fi
+	warn "the server did not answer on http://$bind/healthz within 30 seconds; see: journalctl -u $SERVICE_NAME -n 50"
 	return 1
 }
 
@@ -650,15 +558,6 @@ install_release() {
 	ensure_service_user
 	ensure_dir "$CONFIG_DIR" 0750 root "$SERVICE_GROUP"
 	ensure_dir "$STATE_DIR" 0750 "$SERVICE_USER" "$SERVICE_GROUP"
-	if [ -n "$LOG_DIR" ]; then
-		ensure_dir "$LOG_DIR" 0750 "$SERVICE_USER" "$SERVICE_GROUP"
-		log_file=$LOG_DIR/gono-cloud.log
-		if ! [ -e "$log_file" ]; then
-			: >"$log_file"
-			chown "$SERVICE_USER:$SERVICE_GROUP" "$log_file"
-			chmod 0640 "$log_file"
-		fi
-	fi
 
 	old_version=""
 	if [ -x "$BIN" ]; then
@@ -672,7 +571,7 @@ install_release() {
 
 	# Replace the binary atomically: a running server keeps its old copy until it restarts.
 	mkdir -p "$(dirname "$BIN")"
-	install -m 0755 -o root -g "$ROOT_GROUP" "$PAYLOAD/gono-cloud" "$BIN.new"
+	install -m 0755 -o root -g root "$PAYLOAD/gono-cloud" "$BIN.new"
 	mv -f "$BIN.new" "$BIN"
 	if [ -n "$old_version" ]; then
 		log "Replaced gono-cloud $old_version with $NEW_VERSION at $BIN"
@@ -697,7 +596,7 @@ install_release() {
 			RELAY_CONFIGURED=1
 		fi
 	fi
-	if [ "$OS" = linux ] && [ "$fresh_config" = 1 ]; then
+	if [ "$fresh_config" = 1 ]; then
 		case $DATA_DIR in
 		"$STATE_DIR"/*) ;;
 		*)
@@ -732,13 +631,8 @@ install_release() {
 }
 
 summary() {
-	if [ "$OS" = linux ]; then
-		status="systemctl status $SERVICE_NAME"
-		logs="journalctl -u $SERVICE_NAME"
-	else
-		status="sudo launchctl print system/$LAUNCHD_LABEL"
-		logs="$LOG_DIR/gono-cloud.log"
-	fi
+	status="systemctl status $SERVICE_NAME"
+	logs="journalctl -u $SERVICE_NAME"
 	cat <<EOF
 
 Gono Cloud $NEW_VERSION is installed.
@@ -798,22 +692,12 @@ EOF
 # ---------------------------------------------------------------------------------------------
 
 uninstall() {
-	if [ "$OS" = linux ]; then
-		if [ -f "$UNIT" ]; then
-			systemctl disable --now "$SERVICE_NAME.service" || true
-			rm -f "$UNIT" "$DROPIN"
-			rmdir "$DROPIN_DIR" 2>/dev/null || true
-			systemctl daemon-reload
-			log "Removed the systemd service"
-		fi
-	else
-		if launchctl print "system/$LAUNCHD_LABEL" >/dev/null 2>&1; then
-			launchctl bootout "system/$LAUNCHD_LABEL" || true
-		fi
-		if [ -f "$PLIST" ]; then
-			rm -f "$PLIST"
-			log "Removed the launchd job"
-		fi
+	if [ -f "$UNIT" ]; then
+		systemctl disable --now "$SERVICE_NAME.service" || true
+		rm -f "$UNIT" "$DROPIN"
+		rmdir "$DROPIN_DIR" 2>/dev/null || true
+		systemctl daemon-reload
+		log "Removed the systemd service"
 	fi
 	if [ -f "$BIN" ]; then
 		rm -f "$BIN"
@@ -827,19 +711,10 @@ Gono Cloud is uninstalled. Kept, so that nothing is lost by accident:
   configuration  $CONFIG_DIR
   state          $STATE_DIR (database, backups and, by default, the files)
 EOF
-	if [ -n "$LOG_DIR" ]; then
-		printf '  logs           %s\n' "$LOG_DIR"
-	fi
 	printf '  service user   %s\n\n' "$SERVICE_USER"
 	printf '%s\n' 'Remove them yourself once you no longer need them. A data directory chosen with' \
 		'--data-dir is named in the configuration (storage.data_dir).'
-	if [ "$OS" = linux ]; then
-		printf '  sudo rm -r %s %s\n  sudo userdel %s\n' "$CONFIG_DIR" "$STATE_DIR" "$SERVICE_USER"
-	else
-		printf '  sudo rm -r %s %s %s\n' "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR"
-		printf '  sudo dscl . -delete /Users/%s\n  sudo dscl . -delete /Groups/%s\n' \
-			"$SERVICE_USER" "$SERVICE_GROUP"
-	fi
+	printf '  sudo rm -r %s %s\n  sudo userdel %s\n' "$CONFIG_DIR" "$STATE_DIR" "$SERVICE_USER"
 }
 
 # ---------------------------------------------------------------------------------------------

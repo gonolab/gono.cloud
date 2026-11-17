@@ -4,18 +4,16 @@ This guide installs the Gono Cloud server as a system service, puts it behind a 
 and covers the day-to-day operation: accounts, logs, upgrades, backups, `rescan` and
 uninstalling. The reverse proxy itself is described in [reverse-proxy.md](reverse-proxy.md).
 
-Commands below use the Linux paths. On macOS, replace them as listed in
-[Paths](#paths) (for example `_gono-cloud` instead of `gono-cloud` and
-`/usr/local/etc/gono-cloud/config.toml` instead of `/etc/gono-cloud/config.toml`).
+Release builds and the install script are for Linux. The server builds and runs on macOS
+from source for development (see `CONTRIBUTING.md`), but there are no macOS releases.
 
 ## Requirements
 
 | | |
 |---|---|
 | **Linux** | x86_64 or aarch64, any distribution: the binary is statically linked (musl) and needs no C library, so glibc-based and musl-based systems (Alpine) work alike. The install script and the unit need systemd; systemd 247 or newer applies every hardening option of the unit, older versions ignore some of them with a warning. Without systemd, run the binary from the archive with your own service manager ([Installing by hand](#installing-by-hand)). |
-| **macOS** | macOS 11 or newer, Apple silicon or Intel. |
 | **Reverse proxy** | nginx or Caddy on the same host, terminating HTTPS for a domain name. Gono Cloud has no TLS of its own and listens on `127.0.0.1:16102`. |
-| **Storage** | A local file system for the database and the data directory; the data directory must be a single file system. A case-sensitive file system (ext4, XFS, Btrfs, case-sensitive APFS) is recommended: on a case-insensitive one, `Report.pdf` and `report.pdf` cannot coexist. Keep the SQLite database off network file systems. |
+| **Storage** | A local file system for the database and the data directory; the data directory must be a single file system. A case-sensitive file system (ext4, XFS, Btrfs) is recommended: on a case-insensitive one, `Report.pdf` and `report.pdf` cannot coexist. Keep the SQLite database off network file systems. |
 
 ## Installing with the install script
 
@@ -46,7 +44,7 @@ The script:
    absolute paths, and validates it;
 5. runs `gono-cloud init` as the service user, which creates the database and the first admin
    account and asks for its web login password;
-6. installs the systemd unit (or the launchd job on macOS), enables and starts it, and waits
+6. installs the systemd unit, enables and starts it, and waits
    until the server answers on `http://127.0.0.1:16102/healthz`.
 
 It never overwrites an existing configuration, database or data directory. Steps 4 and 5 only
@@ -72,22 +70,22 @@ The install script checks the archive against `SHA256SUMS`. To check the release
 hand, and that they were built by this repository's release workflow:
 
 ```sh
-sha256sum --check --ignore-missing SHA256SUMS      # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
 gh attestation verify gono-cloud-2.0.0-x86_64-unknown-linux-musl.tar.gz --repo gonolab/gono.cloud
 ```
 
 ### Paths
 
-| | Linux | macOS |
-|---|---|---|
-| Binary | `/usr/local/bin/gono-cloud` | `/usr/local/bin/gono-cloud` |
-| Configuration | `/etc/gono-cloud/config.toml` | `/usr/local/etc/gono-cloud/config.toml` |
-| Database | `/var/lib/gono-cloud/gono-cloud.db` | `/usr/local/var/gono-cloud/gono-cloud.db` |
-| Files | `/var/lib/gono-cloud/data/` | `/usr/local/var/gono-cloud/data/` |
-| Database backups of upgrades | `/var/lib/gono-cloud/backups/` | `/usr/local/var/gono-cloud/backups/` |
-| Logs | the journal: `journalctl -u gono-cloud` | `/usr/local/var/log/gono-cloud/gono-cloud.log` |
-| Service | `/etc/systemd/system/gono-cloud.service` | `/Library/LaunchDaemons/cloud.gono.server.plist` |
-| Service user and group | `gono-cloud` | `_gono-cloud` (hidden) |
+| | |
+|---|---|
+| Binary | `/usr/local/bin/gono-cloud` |
+| Configuration | `/etc/gono-cloud/config.toml` |
+| Database | `/var/lib/gono-cloud/gono-cloud.db` |
+| Files | `/var/lib/gono-cloud/data/` |
+| Database backups of upgrades | `/var/lib/gono-cloud/backups/` |
+| Logs | the journal: `journalctl -u gono-cloud` |
+| Service | `/etc/systemd/system/gono-cloud.service` |
+| Service user and group | `gono-cloud` |
 
 The configuration is owned by root and readable by the service group (`0640`); the service only
 reads it. The database and the files belong to the service user and are not readable by other
@@ -218,7 +216,7 @@ for devices is available only on accounts that have it on.
 
 - **The server's clock must be right** (NTP): codes change every 30 seconds.
 - **The key file.** The TOTP secrets are encrypted with the key in `two_factor.key_file`,
-  `/etc/gono-cloud/two-factor.key` (on macOS `/usr/local/etc/gono-cloud/two-factor.key`). The
+  `/etc/gono-cloud/two-factor.key`. The
   install script creates it at the path the configuration names (32 random bytes,
   `root:gono-cloud`, mode 0640) and never replaces it, nor a symbolic link put there;
   `config check` shows whether it exists. Keep it out of the data directory and the database's
@@ -265,17 +263,6 @@ ReadWritePaths=/srv/gono-cloud/data
 # A more detailed log filter (see "Logs"):
 Environment=GONO_CLOUD_LOG=info,gono_server_dav=debug
 ```
-
-On macOS:
-
-```sh
-sudo launchctl print system/cloud.gono.server             # status
-sudo launchctl kickstart -k system/cloud.gono.server      # restart
-sudo launchctl bootout system/cloud.gono.server           # stop until the next boot
-sudo launchctl bootstrap system /Library/LaunchDaemons/cloud.gono.server.plist  # start again
-```
-
-launchd restarts the server after a crash, but not after a clean exit, and starts it at boot.
 
 ### Changing the configuration
 
@@ -448,8 +435,6 @@ data directory (`caddy environ` shows it), in
 `certificates/acme-v02.api.letsencrypt.org-directory/relay.example.com/relay.example.com.crt`
 and `.key`.
 
-On macOS the directory is `/usr/local/etc/gono-cloud/relay-tls/` and the group `_gono-cloud`.
-
 ### Hosts in mainland China
 
 Cloud providers in mainland China (Tencent Cloud, Alibaba Cloud and others) intercept plain
@@ -535,18 +520,11 @@ the same `[relay]` on that host.
 
 ## Logs
 
-On Linux the server logs to the journal:
+The server logs to the journal:
 
 ```sh
 journalctl -u gono-cloud -f                 # follow
 journalctl -u gono-cloud --since today
-```
-
-On macOS it logs to `/usr/local/var/log/gono-cloud/gono-cloud.log`. That file is not rotated;
-to empty it while the server runs:
-
-```sh
-sudo sh -c ': > /usr/local/var/log/gono-cloud/gono-cloud.log'
 ```
 
 Every request is logged at level `info` with its method, path, status, duration and client
@@ -604,7 +582,7 @@ it: there were no production deployments to carry over. The install script of 2.
 stops, without changing anything, when it finds a 1.x server with its database, and a 2.0.0
 server refuses to start on a 1.x database. The configuration of 1.x keeps working and the files
 stay, but accounts, app passwords and file metadata (ids, favorites, locks) start anew. To start
-over (Linux paths; see [Paths](#paths) for macOS):
+over:
 
 1. Stop the service: `sudo systemctl stop gono-cloud`.
 2. Move the database and the data directory away, and keep them until the new installation
@@ -647,8 +625,7 @@ The database is SQLite in WAL mode: committed changes may still sit in the write
 produce a backup that misses recent changes or is corrupt.** Use one of these:
 
 - **While the server runs**, with SQLite's online backup, which writes a consistent snapshot to
-  a single file (needs the `sqlite3` command line tool, for example `apt install sqlite3`;
-  macOS includes it):
+  a single file (needs the `sqlite3` command line tool, for example `apt install sqlite3`):
 
   ```sh
   sudo -u gono-cloud mkdir -p /var/lib/gono-cloud/backups
@@ -667,7 +644,7 @@ produce a backup that misses recent changes or is corrupt.** Use one of these:
 
 Back up the data directory with any file-level tool (restic, Borg, rsync, a file system
 snapshot). Files that change during the backup may be captured in an intermediate state, as
-with any live file server; a file system snapshot (LVM, ZFS, Btrfs, APFS) avoids that.
+with any live file server; a file system snapshot (LVM, ZFS, Btrfs) avoids that.
 
 Back up the database first and the files right after it. Files that change in between do not
 matter: `rescan` reconciles the metadata with the files after a restore.
@@ -725,14 +702,6 @@ Remove them yourself when you no longer need them:
 ```sh
 sudo rm -r /etc/gono-cloud /var/lib/gono-cloud
 sudo userdel gono-cloud
-```
-
-On macOS:
-
-```sh
-sudo rm -r /usr/local/etc/gono-cloud /usr/local/var/gono-cloud /usr/local/var/log/gono-cloud
-sudo dscl . -delete /Users/_gono-cloud
-sudo dscl . -delete /Groups/_gono-cloud
 ```
 
 A data directory chosen with `--data-dir` is wherever `storage.data_dir` in the configuration

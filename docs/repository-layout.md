@@ -35,7 +35,7 @@ other's way.
 │       └── s3/             gono-server-s3: the S3-compatible API on s3s (buckets are folders of
 │                           the users' trees; access keys, ACLs, multipart uploads)
 ├── packaging/
-│   └── server/             Release archive contents (systemd unit, launchd job, README), the
+│   └── server/             Release archive contents (systemd unit, README), the
 │                           install script, the packing script and the install test
 ├── acceptance/             Black-box HTTP acceptance suite, its own workspace (see its README)
 ├── docs/                   Operator and project documentation

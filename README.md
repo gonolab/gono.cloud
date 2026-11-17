@@ -20,7 +20,7 @@ two-step verification of web sign-ins, a relay and remote access for Gono device
 ## Quick start
 
 Release builds exist for Linux (x86_64 and aarch64; static binaries for any distribution, the
-install script needs systemd) and macOS 11 or newer. Download the install script of the newest
+install script needs systemd). Download the install script of the newest
 [server release](https://github.com/gonolab/gono.cloud/releases) and run it with the address
 users will open:
 

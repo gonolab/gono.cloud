@@ -29,7 +29,7 @@ prints where to find their credentials.
 
 ## Checks
 
-Run these before sending a change; CI runs the same on Linux and macOS:
+Run these before sending a change; CI runs the same on Linux:
 
 ```sh
 cargo fmt --all --check
@@ -55,11 +55,10 @@ For changes to `packaging/server/`:
 
 ```sh
 shellcheck -s sh packaging/server/*.sh
-plutil -lint packaging/server/launchd/*.plist   # macOS
 ```
 
 `packaging/server/test-install.sh` installs a system service and creates a system user, so it
-runs only in CI, where the `install` job exercises the install script on Linux and macOS.
+runs only in CI, where the `install` job exercises the install script on Linux.
 `packaging/server/test-relay.sh` sets the relay up behind nginx in the same way and checks its
 probes (the `relay` job). To run either on a Linux workstation, use a throwaway container with
 systemd as its init (podman, rootless works), with an archive and the probe built for Linux:

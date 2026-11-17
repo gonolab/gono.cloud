@@ -12,14 +12,13 @@ those archives are made of and the scripts that build and install them.
 |---|---|
 | `gono-cloud` | The server and its command line interface |
 | `config.example.toml` | Annotated configuration |
-| `systemd/gono-cloud.service` (Linux) | Hardened systemd unit |
-| `launchd/cloud.gono.server.plist` (macOS) | launchd job |
+| `systemd/gono-cloud.service` | Hardened systemd unit |
 | `CHANGELOG.md` | Changes of each server release |
 | `LICENSE-APACHE`, `LICENSE-MIT` | The license: MIT OR Apache-2.0, at your option |
 
-The Linux binaries are fully static (musl, with mimalloc as the memory allocator): they need no
-C library on the system and run on any x86_64 or aarch64 Linux distribution, glibc-based or not
-(Alpine). The install script additionally needs systemd. macOS builds need macOS 11 or newer.
+Releases are for Linux only. The binaries are fully static (musl, with mimalloc as the memory
+allocator): they need no C library on the system and run on any x86_64 or aarch64 Linux
+distribution, glibc-based or not (Alpine). The install script additionally needs systemd.
 
 ### musl notes
 
@@ -58,13 +57,13 @@ backups and uninstalling:
 
 | File | Purpose |
 |---|---|
-| `cloud.server.sh` | Installer for Linux (systemd) and macOS (launchd); `--help` lists its options |
+| `cloud.server.sh` | Installer for Linux with systemd; `--help` lists its options |
 | `package.sh` | Packs a compiled binary into a release archive |
 | `test-install.sh` | End-to-end test of `cloud.server.sh`; installs a service, so it only runs in CI |
 | `test-relay.sh` | End-to-end test of the relay behind nginx under systemd: its probes, QAD and a certificate renewal; CI only too |
 | `test-in-container.sh` | Runs `test-install.sh` or `test-relay.sh` in a throwaway systemd container (podman) |
 | `test-static.sh` | Checks that a Linux archive's binary is static and runs without glibc (containers) |
-| `systemd/`, `launchd/` | Service definitions shipped in the archives |
+| `systemd/` | Service definition shipped in the archives |
 | `zigbuild-requirements.txt` | Pinned zig toolchain for the static Linux builds |
 
 The release workflow, `.github/workflows/release-server.yml`, builds the archives when a

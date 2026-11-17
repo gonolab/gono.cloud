@@ -1,10 +1,10 @@
 name: Release (server)
 
 # Builds the server release when a `server-v<version>` tag is pushed: archives for Linux (x86_64,
-# aarch64; fully static musl binaries that need no C library on the system) and macOS (Apple
-# silicon, Intel), the install script and SHA256SUMS. The archives are tested with the install
-# script on real systems and in containers without glibc, signed with build provenance
-# attestations and attached to a draft GitHub release that a maintainer reviews and publishes.
+# aarch64; fully static musl binaries that need no C library on the system), the install script
+# and SHA256SUMS. The archives are tested with the install script on real systems and in
+# containers without glibc, signed with build provenance attestations and attached to a draft
+# GitHub release that a maintainer reviews and publishes.
 #
 # Run it by hand (Actions > Release (server) > Run workflow) for a dry run: it builds and tests
 # everything and uploads the release files as a workflow artifact, but attests nothing and
@@ -29,8 +29,6 @@ env:
   # Release builds use exactly this toolchain, so that a tag always builds the same way. Bump it
   # deliberately (the CI jobs follow stable).
   RUST_TOOLCHAIN: "1.100.0"
-  # Oldest macOS the binaries run on.
-  MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
   prepare:
@@ -79,10 +77,9 @@ jobs:
 
           ## Install
 
-          On Linux with systemd (any distribution: the Linux binaries are static and need no glibc)
-          or macOS 11 or newer, download the install script and run it as root. It downloads the
-          archive for the machine, checks it against \`SHA256SUMS\` and sets the server up as a
-          service:
+          On Linux with systemd (any distribution: the binaries are static and need no glibc),
+          download the install script and run it as root. It downloads the archive for the
+          machine, checks it against \`SHA256SUMS\` and sets the server up as a service:
 
           \`\`\`sh
           curl -fsSLo cloud.server.sh https://gono.dev/cloud.server.sh
@@ -123,11 +120,6 @@ jobs:
             runner: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
-          - target: aarch64-apple-darwin
-            runner: macos-15
-          # Cross-compiled on Apple silicon; run under Rosetta when the runner has it.
-          - target: x86_64-apple-darwin
-            runner: macos-15
     env:
       TARGET: ${{ matrix.target }}
     steps:
@@ -145,7 +137,6 @@ jobs:
       # cargo-zigbuild compiles the C parts (SQLite, mimalloc) with zig's musl toolchain and links
       # everything statically. Both come from PyPI, pinned by hash.
       - name: Install zig and cargo-zigbuild
-        if: runner.os == 'Linux'
         run: |
           python3 -m venv "${RUNNER_TEMP}/zigbuild"
           "${RUNNER_TEMP}/zigbuild/bin/pip" install --require-hashes --no-deps \
@@ -153,36 +144,21 @@ jobs:
           echo "${RUNNER_TEMP}/zigbuild/bin" >> "${GITHUB_PATH}"
 
       - name: Build
-        run: |
-          if [ "${RUNNER_OS}" = Linux ]; then
-            cargo zigbuild --release --locked -p gono-server --target "${TARGET}"
-          else
-            cargo build --release --locked -p gono-server --target "${TARGET}"
-          fi
+        run: cargo zigbuild --release --locked -p gono-server --target "${TARGET}"
 
       - name: Smoke test
         run: |
           binary="target/${TARGET}/release/gono-cloud"
           file "${binary}"
-          if [ "${RUNNER_OS}" = Linux ]; then
-            # Fully static: no program interpreter and no shared libraries.
-            readelf -lW "${binary}" > segments.txt
-            readelf -dW "${binary}" > dynamic.txt
-            cat dynamic.txt
-            if grep -q INTERP segments.txt || grep -q NEEDED dynamic.txt; then
-              echo "::error::${TARGET}: the binary is not fully static"
-              exit 1
-            fi
+          # Fully static: no program interpreter and no shared libraries.
+          readelf -lW "${binary}" > segments.txt
+          readelf -dW "${binary}" > dynamic.txt
+          cat dynamic.txt
+          if grep -q INTERP segments.txt || grep -q NEEDED dynamic.txt; then
+            echo "::error::${TARGET}: the binary is not fully static"
+            exit 1
           fi
-          if [ "${TARGET}" = x86_64-apple-darwin ]; then
-            if arch -x86_64 /usr/bin/true 2>/dev/null; then
-              arch -x86_64 "${binary}" --version
-            else
-              echo "::warning::Rosetta is not available; the x86_64 macOS binary was not run"
-            fi
-          else
-            "${binary}" --version
-          fi
+          "${binary}" --version
 
       - name: Package
         run: packaging/server/package.sh "${TARGET}" "target/${TARGET}/release/gono-cloud" dist
@@ -247,8 +223,6 @@ jobs:
             runner: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
-          - target: aarch64-apple-darwin
-            runner: macos-15
     env:
       ARCHIVE: dist/gono-cloud-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.tar.gz
     steps:
@@ -266,7 +240,6 @@ jobs:
       # No interpreter, no shared libraries, and init/serve/SIGTERM in an image holding nothing
       # but the binary, on Alpine (musl) and on CentOS 7 (glibc 2.17).
       - name: Run without glibc
-        if: runner.os == 'Linux'
         run: packaging/server/test-static.sh "${ARCHIVE}"
 
       - name: Install, upgrade and uninstall

@@ -26,7 +26,6 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          - macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -162,11 +161,11 @@ jobs:
           S3_TESTS: ${{ github.workspace }}/s3-tests
         run: acceptance/scripts/s3-tests.sh
 
-  # Packs a debug build the way the release workflow packs release builds (on Linux a static
-  # musl build with cargo-zigbuild, as released) and runs the install script end to end on the
-  # runner: refused installs, a fresh install as a systemd service or launchd job, WebDAV
-  # through the service, the CLI's root guard, a graceful stop, an upgrade and the uninstall.
-  # On Linux it also checks that the binary is static and runs without glibc. See
+  # Packs a debug build the way the release workflow packs release builds (a static musl build
+  # with cargo-zigbuild, as released) and runs the install script end to end on the runner:
+  # refused installs, a fresh install as a systemd service, WebDAV through the service, the
+  # CLI's root guard, a graceful stop, an upgrade, a refused upgrade from 1.x and the uninstall.
+  # It also checks that the binary is static and runs without glibc. See
   # packaging/server/test-install.sh and test-static.sh.
   install:
     name: Install script (${{ matrix.os }})
@@ -176,7 +175,6 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          - macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -185,12 +183,9 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          if [ "${RUNNER_OS}" = Linux ]; then
-            rustup target add "$(uname -m)-unknown-linux-musl"
-          fi
+          rustup target add "$(uname -m)-unknown-linux-musl"
 
       - name: Install zig and cargo-zigbuild
-        if: runner.os == 'Linux'
         run: |
           python3 -m venv "${RUNNER_TEMP}/zigbuild"
           "${RUNNER_TEMP}/zigbuild/bin/pip" install --require-hashes --no-deps \
@@ -200,35 +195,23 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Lint the scripts and service files
+      - name: Lint the scripts
         run: |
-          if [ "${RUNNER_OS}" = Linux ]; then
-            command -v shellcheck >/dev/null || sudo apt-get install -y --no-install-recommends shellcheck
-            shellcheck --version | sed -n 2p
-            shellcheck -s sh packaging/server/*.sh
-          else
-            plutil -lint packaging/server/launchd/*.plist
-          fi
+          command -v shellcheck >/dev/null || sudo apt-get install -y --no-install-recommends shellcheck
+          shellcheck --version | sed -n 2p
+          shellcheck -s sh packaging/server/*.sh
 
       - name: Build
         run: |
-          if [ "${RUNNER_OS}" = Linux ]; then
-            target="$(uname -m)-unknown-linux-musl"
-            cargo zigbuild --locked -p gono-server --target "${target}"
-            binary="target/${target}/debug/gono-cloud"
-          else
-            target="$(rustc -vV | sed -n 's/^host: //p')"
-            cargo build --locked -p gono-server
-            binary="target/debug/gono-cloud"
-          fi
+          target="$(uname -m)-unknown-linux-musl"
+          cargo zigbuild --locked -p gono-server --target "${target}"
           echo "TARGET=${target}" >> "${GITHUB_ENV}"
-          echo "BINARY=${binary}" >> "${GITHUB_ENV}"
+          echo "BINARY=target/${target}/debug/gono-cloud" >> "${GITHUB_ENV}"
 
       - name: Package
         run: packaging/server/package.sh "${TARGET}" "${BINARY}" dist
 
       - name: Static binary without glibc
-        if: runner.os == 'Linux'
         run: packaging/server/test-static.sh dist/*.tar.gz
 
       - name: Install, upgrade and uninstall

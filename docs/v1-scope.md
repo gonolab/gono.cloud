@@ -63,8 +63,9 @@ listed under "In scope" is deferred until after v1.
   promoting and demoting admins and changing display names), S3 access keys and buckets, and a
   manual `rescan` command.
 - **Packaging**: release archives for Linux (x86_64 and aarch64, static binaries for any
-  distribution) and macOS (Apple silicon and Intel), a hardened systemd unit, a launchd job and an install script
-  for installs, upgrades and uninstalls (see `docs/deployment.md`).
+  distribution), a hardened systemd unit and an install script for installs, upgrades and
+  uninstalls (see `docs/deployment.md`). Releases up to 2.0.0 also had macOS archives and a
+  launchd job; later ones are Linux only.
 
 ## Out of scope for v1
 
@@ -112,10 +113,9 @@ mimalloc as the global allocator (other builds keep the system allocator). On 4 
 Linux VM, PROPFIND and GET with 64 concurrent requests) musl's allocator, mimalloc and glibc's
 allocator measured within noise of each other; mimalloc guards against the lock contention that
 grows with the number of cores. musl's resolver and thread stack sizes do not affect the server
-(see `packaging/server/README.md`). The Intel macOS build is cross-compiled on Apple silicon,
-which costs one more build job.
+(see `packaging/server/README.md`).
 
-The server runs as a dedicated system user (`gono-cloud`, `_gono-cloud` on macOS) that owns the
+The server runs as a dedicated system user (`gono-cloud`) that owns the
 database and the data directory. The configuration belongs to root and is only readable by the
 service. The command line refuses to run as root against such an installation, because files it
 created would be unusable for the service.
@@ -127,8 +127,8 @@ Decided for after v1:
 - Making the failed-login rate limits, the upload, Login Flow and session lifetimes, and the
   interval at which the server polls the change log for `rescan` changes configurable. They are
   constants today.
-- Rotating log files. Under systemd the journal rotates the logs; the launchd job on macOS and
-  `logging.file` append to one file without rotation.
+- Rotating log files. Under systemd the journal rotates the logs; `logging.file` appends to one
+  file without rotation.
 
 ## Open questions
 

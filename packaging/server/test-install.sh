@@ -31,24 +31,13 @@ RELAY_HOST=relay.example.com
 RELAY_ADDR=127.0.0.1:16103
 BIN=/usr/local/bin/gono-cloud
 
-case $(uname -s) in
-Linux)
-	os=linux
-	user=gono-cloud
-	config=/etc/gono-cloud/config.toml
-	state=/var/lib/gono-cloud
-	;;
-Darwin)
-	os=macos
-	user=_gono-cloud
-	config=/usr/local/etc/gono-cloud/config.toml
-	state=/usr/local/var/gono-cloud
-	;;
-*)
-	echo "error: unsupported system $(uname -s)" >&2
+[ "$(uname -s)" = Linux ] || {
+	echo "error: the installer supports Linux only, not $(uname -s)" >&2
 	exit 1
-	;;
-esac
+}
+user=gono-cloud
+config=/etc/gono-cloud/config.toml
+state=/var/lib/gono-cloud
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -56,11 +45,7 @@ trap 'rm -rf "$work"' EXIT
 step() { printf '\n### %s\n' "$*"; }
 
 dump_logs() {
-	if [ "$os" = linux ]; then
-		sudo journalctl -u gono-cloud --no-pager -n 100 || true
-	else
-		sudo tail -n 100 /usr/local/var/log/gono-cloud/gono-cloud.log || true
-	fi
+	sudo journalctl -u gono-cloud --no-pager -n 100 || true
 }
 
 fail() {
@@ -102,11 +87,7 @@ wait_until_healthy() {
 }
 
 owner_and_mode() {
-	if [ "$os" = linux ]; then
-		sudo stat -c '%U:%G %a' "$1"
-	else
-		sudo stat -f '%Su:%Sg %Lp' "$1"
-	fi
+	sudo stat -c '%U:%G %a' "$1"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -156,12 +137,8 @@ wait_until_healthy
 curl -fsS "http://$ADDR/status.php" | tee "$work/status"
 echo
 grep -q '"installed":true' "$work/status" || fail "status.php does not report an installed server"
-if [ "$os" = linux ]; then
-	systemctl is-active gono-cloud
-	systemctl is-enabled gono-cloud
-else
-	sudo launchctl print system/cloud.gono.server | grep -q "state = running" || fail "the launchd job is not running"
-fi
+systemctl is-active gono-cloud
+systemctl is-enabled gono-cloud
 
 step "Ownership and modes"
 [ "$(owner_and_mode "$config")" = "root:$user 640" ] || fail "config: $(owner_and_mode "$config")"
@@ -204,36 +181,16 @@ status=$(curl -s -o /dev/null -w '%{http_code}' -u "admin:$token" -X PROPFIND -H
 [ "$status" = 207 ] || fail "PROPFIND answered $status"
 sudo test -f "$state/data/files/1/hello.txt" || fail "the file is not in the data directory"
 
-if [ "$os" = linux ]; then
-	step "systemd unit verification and exposure"
-	sudo systemd-analyze verify /etc/systemd/system/gono-cloud.service
-	systemd-analyze security gono-cloud.service --no-pager | tail -n 1
-fi
+step "systemd unit verification and exposure"
+sudo systemd-analyze verify /etc/systemd/system/gono-cloud.service
+systemd-analyze security gono-cloud.service --no-pager | tail -n 1
 
 step "SIGTERM stops the server cleanly"
-if [ "$os" = linux ]; then
-	sudo systemctl stop gono-cloud
-	result=$(systemctl show gono-cloud -p Result --value)
-	code=$(systemctl show gono-cloud -p ExecMainStatus --value)
-	[ "$result" = success ] && [ "$code" = 0 ] || fail "stop: Result=$result ExecMainStatus=$code"
-	sudo systemctl start gono-cloud
-else
-	sudo launchctl kill SIGTERM system/cloud.gono.server
-	attempt=0
-	while sudo launchctl print system/cloud.gono.server | grep -q "state = running"; do
-		attempt=$((attempt + 1))
-		[ "$attempt" -lt 45 ] || fail "the server did not stop after SIGTERM"
-		sleep 1
-	done
-	sudo launchctl print system/cloud.gono.server | grep "last exit code"
-	sudo launchctl print system/cloud.gono.server | grep -q "last exit code = 0" || fail "unclean exit"
-	# KeepAlive restarts the job only after a failure.
-	sleep 12
-	if sudo launchctl print system/cloud.gono.server | grep -q "state = running"; then
-		fail "launchd restarted the server after a clean exit"
-	fi
-	sudo launchctl kickstart system/cloud.gono.server
-fi
+sudo systemctl stop gono-cloud
+result=$(systemctl show gono-cloud -p Result --value)
+code=$(systemctl show gono-cloud -p ExecMainStatus --value)
+[ "$result" = success ] && [ "$code" = 0 ] || fail "stop: Result=$result ExecMainStatus=$code"
+sudo systemctl start gono-cloud
 wait_until_healthy
 
 step "Upgrade keeps the configuration and the files and backs the database up"
@@ -283,11 +240,7 @@ wait_until_healthy
 step "Uninstall keeps the configuration, the data and the service user"
 sudo sh "$installer" --uninstall
 [ ! -e "$BIN" ] || fail "$BIN is still there"
-if [ "$os" = linux ]; then
-	[ ! -e /etc/systemd/system/gono-cloud.service ] || fail "the unit is still installed"
-else
-	[ ! -e /Library/LaunchDaemons/cloud.gono.server.plist ] || fail "the launchd job is still installed"
-fi
+[ ! -e /etc/systemd/system/gono-cloud.service ] || fail "the unit is still installed"
 if curl -fsS "http://$ADDR/healthz" >/dev/null 2>&1; then fail "the server still answers"; fi
 sudo test -f "$config" || fail "the configuration was removed"
 sudo test -f "$state/gono-cloud.db" || fail "the database was removed"

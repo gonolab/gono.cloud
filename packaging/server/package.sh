@@ -5,8 +5,8 @@
 #
 # Writes <output directory>/gono-cloud-<version>-<target>.tar.gz, where <version> is the
 # workspace version in Cargo.toml. The archive holds one directory of the same name with the
-# binary, the licenses, config.example.toml, the server changelog, a short README and the service
-# file for the platform (systemd unit or launchd job). Entries are sorted, owned by 0:0 and
+# binary, the licenses, config.example.toml, the server changelog, a short README and the systemd
+# unit. Releases are built for Linux only. Entries are sorted, owned by 0:0 and
 # dated SOURCE_DATE_EPOCH (default: the time of the last commit), and gzip records no name or
 # time, so packing the same binary twice gives the same archive.
 #
@@ -41,9 +41,8 @@ version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
 
 case $target in
 *-linux-*) service_dir=systemd service_file=gono-cloud.service ;;
-*-apple-darwin) service_dir=launchd service_file=cloud.gono.server.plist ;;
 *)
-	echo "error: unsupported target $target" >&2
+	echo "error: unsupported target $target; releases are built for Linux only" >&2
 	exit 1
 	;;
 esac
@@ -80,7 +79,7 @@ done
 if tar --version 2>/dev/null | grep -q 'GNU tar'; then
 	owner="--owner=0 --group=0 --numeric-owner"
 else
-	# bsdtar (macOS); COPYFILE_DISABLE keeps AppleDouble files out of the archive.
+	# bsdtar (packing on a Mac); COPYFILE_DISABLE keeps AppleDouble files out of the archive.
 	owner="--uid 0 --gid 0 --numeric-owner --no-xattrs --no-acls --no-fflags"
 	export COPYFILE_DISABLE=1
 fi
