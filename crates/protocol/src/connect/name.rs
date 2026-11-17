@@ -8,9 +8,13 @@
 //!   server trims it and stores the result.
 //! - [`check_statement_name`] for a name inside a signed statement, which the server relays byte
 //!   for byte and cannot trim: it must be trimmed already.
+//! - [`is_slug`] for the `product` and `platform` shown next to a name.
 
 /// Longest name, in characters.
 pub const MAX_NAME_CHARS: usize = 64;
+
+/// Longest `product` or `platform`, in characters.
+pub const MAX_SLUG_CHARS: usize = 32;
 
 /// Why a name is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +82,16 @@ pub fn check_statement_name(name: &str) -> Result<&str, NameError> {
         return Err(NameError::Untrimmed);
     }
     check_name(name)
+}
+
+/// Whether `value` is a valid `product` or `platform` (protocol 2.1): `[a-z0-9-]{1,32}`.
+/// Approvers show the `platform` of a pairing statement next to the name, so these are checked
+/// in statements as well as at registration.
+pub fn is_slug(value: &str) -> bool {
+    (1..=MAX_SLUG_CHARS).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 fn is_bidi_control(c: char) -> bool {
@@ -165,5 +179,24 @@ mod tests {
             check_statement_name("Home \u{202E}CP"),
             Err(NameError::Bidi)
         );
+    }
+
+    #[test]
+    fn slugs() {
+        for slug in ["input-show", "windows", "harmonyos", "a", &"a".repeat(32)] {
+            assert!(is_slug(slug), "{slug:?}");
+        }
+        for value in [
+            "",
+            "Input Show",
+            "Windows",
+            "ios\u{202E}",
+            "mac\nos",
+            "macos ",
+            "\u{FF4D}acos",
+            &"a".repeat(33),
+        ] {
+            assert!(!is_slug(value), "{value:?}");
+        }
     }
 }

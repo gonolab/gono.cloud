@@ -1083,8 +1083,10 @@ impl Session {
             || statement.server != self.connect.origin
             || statement.account != self.username
             || statement::decode_bytes(&statement.nonce).is_none_or(|nonce| nonce.len() != 32)
-            // Approvers show the name in their prompt (protocol 2.1).
+            // Approvers show the name and the platform in their prompt (protocol 2.1).
             || name::check_statement_name(&statement.requester.name).is_err()
+            || !name::is_slug(&statement.requester.platform)
+            || !name::is_slug(&statement.requester.product)
         {
             return refused(
                 id,
@@ -1206,6 +1208,8 @@ impl Session {
             && statement.introduced.len() <= limits::MAX_INTRODUCED
             // Every device shows these names in its notice (protocol 2.1).
             && name::check_statement_name(&statement.subject.name).is_ok()
+            && name::is_slug(&statement.subject.platform)
+            && name::is_slug(&statement.subject.product)
             && statement
                 .introduced
                 .iter()

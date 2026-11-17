@@ -122,24 +122,19 @@ impl FromStr for EndpointId {
     }
 }
 
-/// Checks a `product` or `platform` value: `[a-z0-9-]{1,32}`.
+/// Checks a `product` or `platform` value: `[a-z0-9-]{1,32}` (gono-protocol's `is_slug`).
 pub fn check_slug(field: &'static str, value: &str) -> Result<String> {
-    if value.is_empty() || value.len() > 32 {
-        return Err(Error::InvalidDevice {
-            field,
-            reason: "must be 1 to 32 characters long",
-        });
+    use gono_protocol::connect::name::{MAX_SLUG_CHARS, is_slug};
+
+    if is_slug(value) {
+        return Ok(value.to_owned());
     }
-    if !value
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    {
-        return Err(Error::InvalidDevice {
-            field,
-            reason: "may only contain lowercase letters, digits and '-'",
-        });
-    }
-    Ok(value.to_owned())
+    let reason = if value.is_empty() || value.len() > MAX_SLUG_CHARS {
+        "must be 1 to 32 characters long"
+    } else {
+        "may only contain lowercase letters, digits and '-'"
+    };
+    Err(Error::InvalidDevice { field, reason })
 }
 
 /// Checks a device name as protocol 2.1 says: trimmed, 1 to [`MAX_NAME_CHARS`] characters, no

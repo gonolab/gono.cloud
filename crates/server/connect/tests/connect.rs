@@ -708,7 +708,7 @@ async fn an_approval_reaches_the_introduced_devices_and_the_newcomer() {
     let mut work = f.device(alice, "alice", &key(3), "Work PC").await;
 
     let nonce = statement::encode_bytes(&[9; 32]);
-    let request_from = |name: &str| {
+    let request_from = |name: &str, platform: &str| {
         Signed::sign(
             &Statement::PairRequest(PairRequest {
                 server: SERVER.to_owned(),
@@ -716,7 +716,7 @@ async fn an_approval_reaches_the_introduced_devices_and_the_newcomer() {
                 requester: DeviceSummary {
                     endpoint_id: work.id(),
                     name: name.to_owned(),
-                    platform: "windows".to_owned(),
+                    platform: platform.to_owned(),
                     product: "input-show".to_owned(),
                 },
                 nonce: nonce.clone(),
@@ -725,13 +725,16 @@ async fn an_approval_reaches_the_introduced_devices_and_the_newcomer() {
             &work.key,
         )
     };
-    let request = request_from("Work PC");
-    // Statements are relayed unchanged, so their names must be trimmed already (protocol 2.1).
-    let untrimmed = [
-        request_from("Work PC\n\n\n"),
-        request_from("\u{3000}Work PC"),
+    let request = request_from("Work PC", "windows");
+    // Statements are relayed unchanged, so their names must be trimmed already, and approvers
+    // show the platform next to the name (protocol 2.1).
+    let malformed = [
+        request_from("Work PC\n\n\n", "windows"),
+        request_from("\u{3000}Work PC", "windows"),
+        request_from("Work PC", "ios\u{202E}"),
+        request_from("Work PC", "Windows"),
     ];
-    for bad in untrimmed {
+    for bad in malformed {
         let refused = work
             .request(|id| ClientMessage::PairRequest { id, request: bad })
             .await;
@@ -795,7 +798,7 @@ async fn an_approval_reaches_the_introduced_devices_and_the_newcomer() {
 
     let now = db::unix_now();
     let (phone_id, phone_key, home_id) = (phone.id(), phone.key.clone(), home.id());
-    let approval_at = |nonce: &str, issued_at: i64, expires_at: i64| {
+    let approval_from = |nonce: &str, issued_at: i64, expires_at: i64, platform: &str| {
         Signed::sign(
             &Statement::PairApproval(PairApproval {
                 server: SERVER.to_owned(),
@@ -804,7 +807,7 @@ async fn an_approval_reaches_the_introduced_devices_and_the_newcomer() {
                 subject: DeviceSummary {
                     endpoint_id: work_id,
                     name: "Work PC".to_owned(),
-                    platform: "windows".to_owned(),
+                    platform: platform.to_owned(),
                     product: "input-show".to_owned(),
                 },
                 request_nonce: nonce.to_owned(),
@@ -821,7 +824,18 @@ async fn an_approval_reaches_the_introduced_devices_and_the_newcomer() {
             &phone_key,
         )
     };
+    let approval_at = |nonce: &str, issued_at: i64, expires_at: i64| {
+        approval_from(nonce, issued_at, expires_at, "windows")
+    };
     let approval = |nonce: &str| approval_at(nonce, now, now + 3600);
+    let bad_platform = phone
+        .request(|id| ClientMessage::PairApprove {
+            id,
+            request_id: request_id.clone(),
+            approval: approval_from(&nonce, now, now + 3600, "ios\u{202E}"),
+        })
+        .await;
+    assert_eq!(error_code(&bad_platform), Some(ErrorCode::BadRequest));
     let wrong_nonce = phone
         .request(|id| ClientMessage::PairApprove {
             id,

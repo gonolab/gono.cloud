@@ -19,7 +19,7 @@ use iroh::{EndpointId, SecretKey};
 
 use crate::protocol::{
     DeviceId, Signed, Statement, limits,
-    name::check_statement_name,
+    name::{check_statement_name, is_slug},
     statement::{DeviceSummary, Introduced, PairApproval},
 };
 
@@ -196,6 +196,9 @@ pub fn check(
     }
     check_statement_name(&approval.subject.name)
         .map_err(|_| Refusal::Malformed("the newcomer's name"))?;
+    if !is_slug(&approval.subject.platform) || !is_slug(&approval.subject.product) {
+        return Err(Refusal::Malformed("the newcomer's platform or product"));
+    }
     if approval
         .introduced
         .iter()
@@ -655,6 +658,27 @@ mod tests {
         assert_eq!(
             check(&untrimmed, &view, &context(&t)),
             Err(Refusal::Malformed("the newcomer's name"))
+        );
+
+        // The platform and the product are shown next to the name.
+        let mut subject = summary(&n, "Work PC");
+        subject.platform = "ios\u{202E}".to_owned();
+        let bad_platform = sign(
+            &a,
+            &context(&a),
+            subject,
+            NONCE,
+            vec![Introduced {
+                endpoint_id: DeviceId(t.public()),
+                name: "Home PC".to_owned(),
+                allow_incoming: true,
+                allow_outgoing: false,
+            }],
+            3600,
+        );
+        assert_eq!(
+            check(&bad_platform, &view, &context(&t)),
+            Err(Refusal::Malformed("the newcomer's platform or product"))
         );
     }
 
