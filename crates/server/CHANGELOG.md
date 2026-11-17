@@ -10,6 +10,18 @@ compatible within a major version: released clients keep working with newer serv
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-17
+
+An S3-compatible API whose buckets are folders of the users' trees, a relay and remote access
+for devices, two-step verification of web sign-ins, and an MD5 checksum of every file. **The
+database starts anew**: a 1.x database cannot be migrated to 2.0.0, so an upgrade from 1.x
+starts with a new database, new accounts and new app passwords, while the configuration and
+the files stay. The install script stops before it changes anything when it finds 1.x;
+"Upgrading from 1.x" in `docs/deployment.md` describes the steps. On `https` sites everyone
+signs in to the web pages again once (their cookies are renamed). The admin UI moves to
+`/apps/manage/` unless the configuration sets `admin.path`, as the one written by the 1.x
+install script does (`/gono-admin`). Building from source needs Rust 1.100.
+
 ### Added
 
 - A relay through which devices (Input Show, and later other Gono products) reach each other
@@ -131,12 +143,12 @@ compatible within a major version: released clients keep working with newer serv
 - The credentials of devices registered for remote access are not listed among app passwords,
   and cannot be deleted as app passwords.
 
-- **The database schema is one file again**, `0001_initial.sql`, which also holds the tables of
-  remote access (the device directory, its event log, the audit log, two-step verification).
-  There are no production deployments yet, so the schema is edited in place until the first
-  one; migrations become append-only from then on. A database created by an earlier version
-  is refused (its migration checksums differ) and must be created again with
-  `gono-cloud init`.
+- **The database schema starts anew** in one file, `0001_initial.sql`, which also holds the
+  tables of remote access (the device directory, its event log, the audit log, two-step
+  verification) and of the S3 API. A database of 1.x is refused (its migration checksums
+  differ) and must be created again with `gono-cloud init`; the install script stops, without
+  changing anything, when it would upgrade a 1.x server (see "Upgrading from 1.x" in
+  `docs/deployment.md`). Migrations are append-only from this release on.
 - The web admin UI moves to `/apps/manage/` by default (`admin.path`), next to the web file UI
   and the account page; `admin.path` may now be `/apps/manage` although `/apps` is otherwise
   reserved. Configurations that set `path` keep their path: the one written by the install
@@ -321,7 +333,8 @@ their tags stay as they are.
 - Documentation: deployment (`docs/deployment.md`), reverse proxies (`docs/reverse-proxy.md`),
   v1 scope and the mobile test checklist.
 
-[Unreleased]: https://github.com/gonolab/gono.cloud/compare/server-v1.2.0...HEAD
+[Unreleased]: https://github.com/gonolab/gono.cloud/compare/server-v2.0.0...HEAD
+[2.0.0]: https://github.com/gonolab/gono.cloud/compare/server-v1.2.0...server-v2.0.0
 [1.2.0]: https://github.com/gonolab/gono.cloud/compare/server-v1.1.1...server-v1.2.0
 [1.1.1]: https://github.com/gonolab/gono.cloud/compare/server-v1.1.0...server-v1.1.1
 [1.1.0]: https://github.com/gonolab/gono.cloud/compare/server-v1.0.0...server-v1.1.0

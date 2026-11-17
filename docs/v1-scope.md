@@ -36,8 +36,8 @@ listed under "In scope" is deferred until after v1.
     through which the mobile apps stream media that is not downloaded yet (Android video and
     audio, iOS video). A link acts with the app password that asked for it and ends with it.
 - **Multiple users** with per-app-password mount scopes (`view` or `full`).
-- **Two-step verification** (TOTP and recovery codes) of every web sign-in; app passwords are
-  unaffected.
+- **Two-step verification** (since 2.0; TOTP and recovery codes) of every web sign-in; app
+  passwords are unaffected.
 - **notify_push** for real-time change notifications.
 - **Web admin UI**: server overview, accounts (create, enable and disable, admin role, display
   name, web login password, delete) and app passwords. On by default since 1.2.
@@ -46,14 +46,19 @@ listed under "In scope" is deferred until after v1.
   JavaScript; drag and drop, folders and resumable chunked uploads with it), new folders,
   rename, move, delete, favorites, and an account page for the user's display name, web login
   password and app passwords. English and Chinese; light and dark themes.
-- **S3-compatible API** (unreleased, `docs/s3.md`): buckets that are folders of the users'
+- **S3-compatible API** (since 2.0, `docs/s3.md`): buckets that are folders of the users'
   trees, access keys with per-bucket grants, multipart uploads (with `UploadPartCopy`), canned
   ACLs, and anonymous downloads of what a bucket publishes (also through the download bucket
   policy of `mc anonymous set download`), on a host name of its own, in path and virtual-hosted
   style; CORS rules and form uploads for browser applications; public links in the web file UI;
   sync tools' `mtime` metadata as the files' modification time; keys in any Unicode
   normalization, kept as written; version listings of the one `null` version, for cleanup
-  tools. Checked in CI with the AWS CLI, rclone, mc, restic and a selection of Ceph's s3-tests.
+  tools; multipart checksums, object and bucket tags, lifecycle expiry of what S3 wrote, and
+  static websites on a domain of their own. Checked in CI with the AWS CLI, rclone, mc, restic
+  and a selection of Ceph's s3-tests.
+- **Relay and remote access** (since 2.0, `docs/connect-protocol.md`): the iroh relay through
+  which Gono devices reach each other, and the device directory, control channel, pairing and
+  revocation of remote access for accounts with two-step verification.
 - **CLI**: `init`, `serve`, `config check`, user and app password management (including
   promoting and demoting admins and changing display names), S3 access keys and buckets, and a
   manual `rescan` command.

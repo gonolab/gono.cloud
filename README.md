@@ -4,8 +4,8 @@ Gono Cloud is a self-hosted WebDAV file server compatible with Nextcloud clients
 
 ## Status
 
-Version 1.0.0 is the first release of the rewrite on top of
-[dav-server-rs](https://github.com/messense/dav-server-rs); see the
+Version 2.0.0 is the current release of the rewrite on top of
+[dav-server-rs](https://github.com/messense/dav-server-rs), which 1.0.0 began; see the
 [changelog](crates/server/CHANGELOG.md) and [`docs/v1-scope.md`](docs/v1-scope.md). Nextcloud
 clients can use it: users and app passwords, WebDAV under `/remote.php/dav/files/<user>/` with
 Nextcloud live properties, ETags and locks, read-only or scoped app passwords, `status.php`,
@@ -13,7 +13,8 @@ capabilities and the OCS user endpoints, favorites with the `filter-files` REPOR
 upload v2, Login Flow v2 with an explicit consent page, notify_push for real-time change
 notifications, a web file UI and account page in the browser, a web admin UI, an
 S3-compatible API whose buckets are folders of the users' trees ([`docs/s3.md`](docs/s3.md)),
-and `gono-cloud rescan` for files changed directly in the data directory. The desktop client is tested with `nextcloudcmd` in CI; the mobile apps with
+two-step verification of web sign-ins, a relay and remote access for Gono devices
+([`docs/connect-protocol.md`](docs/connect-protocol.md)), and `gono-cloud rescan` for files changed directly in the data directory. The desktop client is tested with `nextcloudcmd` in CI; the mobile apps with
 [`docs/mobile-checklist.md`](docs/mobile-checklist.md).
 
 ## Quick start
