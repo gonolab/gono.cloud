@@ -57,7 +57,10 @@ self-hosted relays.
 - The cloud may revoke devices, since revocation only removes trust.
 - Unattended access (nobody at the device, the lock screen, Ctrl+Alt+Del) is off by default and
   is switched on per device.
-- Two-factor authentication on the account is required before remote control ships.
+- Two-factor authentication on the account is required before remote control ships. During
+  development it is not enforced (user's decision, 2026-11-17): gono-cloud's
+  `[connect] require_two_factor` defaults to false, so that test accounts need no
+  authenticator. Turning the default back to true is a release gate (R10).
 
 ---
 
@@ -187,7 +190,7 @@ Control      gono-cloud: accounts, device directory, presence, authorization,
 | Address lookup | Devices implement iroh's `AddressLookup` by asking over the control channel. The server returns addresses only for devices the caller is authorized to reach |
 | Relay | Embeds `iroh_relay::server::Server`. `AccessControl` admits only registered, unrevoked `EndpointId`s; `ClientRateLimit` limits each client. `Limits::accept_conn_limit` is not implemented in 1.4.1, so new connections are limited at the reverse proxy or in `AccessControl` |
 | Audit | Who connected to which device, when, direct or relayed, for how long and how much traffic. Never content |
-| Two-factor authentication | Required for accounts with remote control enabled |
+| Two-factor authentication | Required for accounts with remote control enabled, by `[connect] require_two_factor = true`. **Temporarily not required** (2026-11-17): during development the default is false, so every enabled account has remote access (consent page, `connect` / `lookup`, relay admission) and two-step verification stays voluntary; `config check`, the log and the admin UI warn. The default must be true again before remote control is released (R10, release gate) |
 | UI | The account page lists the user's devices, their presence and revocation. The admin UI shows relay load and sessions (`RelayMetrics`): a Relay page at `/apps/manage/relay` with the settings, the counters, the connected devices, the reported sessions and the refused tombstones |
 
 ### 3.3 Devices
@@ -506,7 +509,8 @@ and 2; Phase 4 needs the gates listed in it. The sizes are estimates.
   weeks. **Implemented**: TOTP with recovery codes, the second step at `/login/two-step` for every
   web sign-in, enrolment and renewal on the account page, resets in the admin UI and the CLI,
   the secrets encrypted with `two_factor.key_file`, which the install script creates. Remote
-  access now works end to end for accounts that turn it on.
+  access now works end to end for accounts that turn it on. Since 2026-11-17 it is not
+  required during development (`[connect] require_two_factor`, default false; R10).
   - TOTP with recovery codes;
   - the second step at every web sign-in: the file UI, the admin UI and Login Flow v2's consent
     page (app passwords of devices are unaffected);
@@ -521,7 +525,9 @@ and 2; Phase 4 needs the gates listed in it. The sizes are estimates.
   - a fresh install with `--relay-host` behind nginx answers the relay's own probes:
     `/generate_204` on port 80, and QAD on UDP 7842 with the copied certificate, also after a
     renewal;
-  - two-factor authentication is live for remote-control accounts.
+  - two-factor authentication is live for remote-control accounts, and required by default
+    (`connect.require_two_factor = true`) before remote control is released (R10). While the
+    default is false for development, this item is not done.
 - **Status** (2026-11-16, test host and tests):
   - Unauthorized devices: covered by the tests of `crates/server/connect` and the review of
     the implementation (threat model 9).
@@ -534,7 +540,8 @@ and 2; Phase 4 needs the gates listed in it. The sizes are estimates.
     checks that QAD serves the new one without a restart. A renewal on the test host is still
     to be observed: the one forced on 2026-11-16 failed at the CA's HTTP-01 check, outside
     gono-cloud, and the panel's own is due about 2027-01-15.
-  - Two-step verification: live (2c).
+  - Two-step verification: live (2c). Not required during development since 2026-11-17
+    (`connect.require_two_factor` defaults to false, R10).
 
 ### 4.4 Phase 3: remote access in Input Show
 
@@ -559,7 +566,9 @@ and 2; Phase 4 needs the gates listed in it. The sizes are estimates.
   - HarmonyOS, as the controlled side;
   - a phone, as the controller.
 
-  The security review must also be signed off, and two-factor authentication must be live.
+  The security review must also be signed off, and two-factor authentication must be live and
+  required again: **release gate**, gono-cloud's `connect.require_two_factor` defaults to true
+  (R10).
 
 ### 4.5 Phase 4: the LAN path onto iroh
 
@@ -624,7 +633,7 @@ and 2; Phase 4 needs the gates listed in it. The sizes are estimates.
 | R7 | Dialing needs the key | Typed-address pairing changes | The "who are you" exchange (D5) |
 | R8 | The relay path is TCP; a direct path can die silently | Pointer stalls under loss on relayed sessions. While a dead direct path stays selected, nothing gets through: 15 s with iroh's path timers | V8; prefer direct paths; show "direct / relayed" in the UI. gono-connect's remote endpoint abandons a silent path after 3 s, so a session moves to the relay about 3.1 s after the drop (3.3); 3 s rather than 2 or 2.5 s abandons the fewest working paths, at the price of releasing held keys once (Input Show's 2 s timeout, 3.7). After that it stays relayed until iroh punches again: at once on an address change, otherwise at iroh's 60 s upgrade check, 42–55 s after UDP returned in the test (V8; upstream draft) |
 | R9 | NAT conditions in China: CGNAT is common, and some networks throttle UDP | A lower direct rate, higher relay cost | V8; IPv6 bound on every endpoint (3.5); relays close to users; bitrate caps on relayed paths; D10 |
-| R10 | Remote control raises the stakes: account takeover, a compromised server vouching for a fake device, unattended access | Abuse | Signed approvals from an already-trusted device (3.4); two-factor authentication; notices on every device; audit; unattended access off by default |
+| R10 | Remote control raises the stakes: account takeover, a compromised server vouching for a fake device, unattended access | Abuse | Signed approvals from an already-trusted device (3.4); two-factor authentication; notices on every device; audit; unattended access off by default. **Two-factor authentication is temporarily not required** (2026-11-17): `[connect] require_two_factor` defaults to false during development, so a leaked web password alone registers devices (threat model R10). **Release gate:** the default returns to true before remote control is released (4.3, 4.4) |
 | R11 | Background limits on phones | Phones are poor controlled devices | Computers are controlled; phones control and view |
 | R12 | Remote access makes self-hosting harder: a second host name and certificate, UDP 7842, a certificate hand-over, a port-80 exception; in mainland China, port 80 intercepted for domains without an ICP filing | Fewer self-hosters enable it; relays that half work (QAD failing after a renewal, probes redirected); certificates that cannot renew over HTTP-01 | The installer's `--relay-host`, documentation (DNS-01 for unfiled mainland hosts), `config check`, the relay's own probes in part 2a's done criteria (3.6, 4.3), the install test under systemd, and devices that need no port 80 (no captive-portal check) |
 
