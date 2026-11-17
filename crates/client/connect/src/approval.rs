@@ -78,6 +78,9 @@ pub trait TrustView {
     /// For the newcomer N (8.5, check 5): whether N sent the pairing request with
     /// `request_nonce` and still keeps it, and N's user confirmed the `remote-sas` pairing with
     /// `approver` for that request (8.2 step 3). False for every nonce N does not know.
+    ///
+    /// It may stay true after N applied an approval of the request: [`check`] lets N apply one
+    /// approval per request through its consumed approvals (see [`Consumed::approver`]).
     fn confirmed_request(&self, request_nonce: &str, approver: &EndpointId) -> bool;
 
     /// Whether the local policy accepts vouched devices on its own (8.5, check 8).
@@ -155,11 +158,14 @@ pub struct Addition {
 /// The entry of the consumed approvals to store with the additions (8.1, 8.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Consumed {
-    /// The approver.
+    /// The approver. On the newcomer N, N's own key instead: N accepts one approval per request
+    /// (8.5, check 5), so the entry for its own request stands for every approver.
     pub approver: EndpointId,
     /// The nonce of the request.
     pub request_nonce: String,
-    /// Keep it until then (UNIX seconds): the approval's `expires_at` plus [`SKEW_SECS`].
+    /// Keep it until then (UNIX seconds): the approval's `expires_at` plus [`SKEW_SECS`]. On
+    /// the newcomer, at least [`limits::MAX_APPROVAL_SECS`] plus [`SKEW_SECS`] from now, which
+    /// outlasts the nonce of the request that N keeps (8.1) and so every other approval of it.
     pub keep_until: i64,
 }
 
@@ -208,6 +214,11 @@ pub fn check(
     }
     let approver = approval.approver.0;
     let newcomer = approval.subject.endpoint_id.0;
+    // A device never applies its own approval. That also leaves its own key in the consumed
+    // approvals to its own requests (check 9).
+    if approver == context.me {
+        return Err(Refusal::NotForThisDevice);
+    }
     if approval
         .introduced
         .iter()
@@ -285,15 +296,28 @@ pub fn check(
     if context.now >= approval.expires_at || context.now < approval.issued_at - SKEW_SECS {
         return Err(Refusal::NotValidNow);
     }
-    // 9. Never twice.
-    if view.is_consumed(&approver, &approval.request_nonce) {
-        return Err(Refusal::Consumed);
-    }
-    let consumed = Consumed {
+    // 9. Never twice. The newcomer accepts one approval per request (check 5), whoever signed
+    // it: it records the approval of its own request under its own key, which no approval
+    // carries as its approver, and keeps that entry as long as it keeps the request's nonce.
+    let mut consumed = Consumed {
         approver,
         request_nonce: approval.request_nonce.clone(),
         keep_until: approval.expires_at.saturating_add(SKEW_SECS),
     };
+    if newcomer == me {
+        consumed.approver = me;
+        consumed.keep_until = consumed.keep_until.max(
+            context
+                .now
+                .saturating_add(limits::MAX_APPROVAL_SECS)
+                .saturating_add(SKEW_SECS),
+        );
+    }
+    if view.is_consumed(&approver, &approval.request_nonce)
+        || view.is_consumed(&consumed.approver, &approval.request_nonce)
+    {
+        return Err(Refusal::Consumed);
+    }
     Ok(Applicable {
         // 8. The local policy.
         needs_user: !view.accepts_vouched(),
@@ -484,6 +508,71 @@ mod tests {
         assert_eq!(added.endpoint_id, t.public());
         assert!(!added.allow_incoming, "T may not control N");
         assert!(added.allow_outgoing, "N may control T");
+        // Recorded under N's own key, for every approver of its request.
+        assert_eq!(applicable.consumed.approver, n.public());
+        assert_eq!(applicable.consumed.request_nonce, NONCE);
+        assert_eq!(
+            applicable.consumed.keep_until,
+            NOW + 30 * 24 * 60 * 60 + SKEW_SECS
+        );
+    }
+
+    #[test]
+    fn the_newcomer_applies_one_approval_per_request() {
+        // N's user confirmed the comparison with two approvers for the same request; only the
+        // first approval that passes applies (8.5, check 5).
+        let (a, b, n, t) = (key(1), key(4), key(2), key(3));
+        let mut view = View::default();
+        for approver in [&a, &b] {
+            view.entries
+                .insert(approver.public(), direct(Method::RemoteSas, true, true));
+            view.confirmed.insert((NONCE.to_owned(), approver.public()));
+        }
+        let first = check(&approval_by(&a, &n, &[&t]), &view, &context(&n)).unwrap();
+        view.consumed.insert((
+            first.consumed.approver,
+            first.consumed.request_nonce.clone(),
+        ));
+        for approver in [&a, &b] {
+            assert_eq!(
+                check(&approval_by(approver, &n, &[&t]), &view, &context(&n)),
+                Err(Refusal::Consumed)
+            );
+        }
+        // A short approval does not shorten the entry: it outlasts the request's nonce.
+        let short = sign(
+            &a,
+            &context(&a),
+            summary(&n, "Work PC"),
+            NONCE,
+            Vec::new(),
+            60,
+        );
+        let applicable = check(
+            &short,
+            &View {
+                consumed: HashSet::new(),
+                ..view
+            },
+            &context(&n),
+        );
+        assert_eq!(
+            applicable.unwrap().consumed.keep_until,
+            NOW + 30 * 24 * 60 * 60 + SKEW_SECS
+        );
+    }
+
+    #[test]
+    fn a_device_never_applies_its_own_approval() {
+        // Even with an entry for itself, and introduced by itself.
+        let (a, n) = (key(1), key(2));
+        let mut view = View::default();
+        view.entries
+            .insert(a.public(), direct(Method::RemoteSas, true, true));
+        assert_eq!(
+            check(&approval_by(&a, &n, &[&a]), &view, &context(&a)),
+            Err(Refusal::NotForThisDevice)
+        );
     }
 
     #[test]

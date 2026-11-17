@@ -829,7 +829,10 @@ Devices also keep:
 - the set of endpoint IDs they have seen revoked (9.3);
 - the set of **consumed approvals**, keyed by `(approver, request_nonce)`, each until its
   `expires_at` plus 10 minutes (8.5). It is stored with the trust list, so it is lost only
-  together with it;
+  together with it. On N, the approval of its own request is kept as `(N, request_nonce)`
+  instead, which stands for every approver, until 30 days and 10 minutes after N applied it
+  (or its `expires_at` plus 10 minutes, if that is later): N applies one approval per request
+  (8.5, check 5);
 - on N, the nonce of each pairing request it sent, while the request is open and for the
   longest validity of an approval after it (8.5, check 5).
 
@@ -1009,7 +1012,8 @@ A device D that receives `pair.approved` accepts it only if all of these hold:
 8. D's local policy allows vouched devices. This is a setting that the device's user can turn
    off. When it is off, D keeps the approval as a notice that the local user can accept or
    ignore.
-9. `(approver, request_nonce)` is not in D's set of consumed approvals (8.1).
+9. `(approver, request_nonce)` is not in D's set of consumed approvals (8.1), and on N,
+   `(N, request_nonce)` is not either.
 
 An approval whose names, or whose `subject`'s `platform` and `product`, break 2.1 is malformed
 and fails as well.
@@ -1028,7 +1032,8 @@ and fails as well.
   included, caps the flags in any case.
 - D records `method: vouched`, `vouched_by`, `request_nonce` and `remote` (8.1).
 - **Once only.** D adds `(approver, request_nonce)` to its consumed approvals when it applies
-  the approval, or when its user dismisses the notice of check 8. An approval in that set is
+  the approval, or when its user dismisses the notice of check 8; N adds `(N, request_nonce)`
+  (8.1). An approval in that set is
   never applied again, whatever happened to the entries since: a vouched entry that the user
   removed stays removed, even when the server delivers the approval again (a replay, or an
   event log replayed from `since = 0`). Only a new request, which needs the user to open a
