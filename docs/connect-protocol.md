@@ -41,7 +41,11 @@ It does not cover:
 3. **Addresses are hints.** A device dials a peer by its key, and the TLS handshake fails on any
    other key. So a false address the server or the relay hands out can make a connection fail,
    but it cannot make a device talk to the wrong peer.
-4. **Remote access needs two-step verification** on the account (13).
+4. **Remote access needs two-step verification** on the account (13). **Temporarily not
+   enforced:** while remote control is in development, the server's
+   `connect.require_two_factor` defaults to false and remote access is open to every enabled
+   account (13.1). The default must be true again before remote control is released; that is a
+   release gate (plan R10).
 5. **LAN use does not depend on gono-cloud.** Input Show's LAN mode needs no account and sends
    nothing to the server, and none of this protocol applies to it.
 
@@ -54,7 +58,7 @@ It does not cover:
 | Short ID | The first 8 bytes of the endpoint ID in upper-case hex, grouped in fours: `AB12-CD34-EF56-7890`. This is the form Input Show shows to people |
 | Account | A gono-cloud user. Every device belongs to exactly one account |
 | Directory | The server's list of the devices of each account (6) |
-| Remote access available | The account is enabled and has two-step verification enrolled (13) |
+| Remote access available | The account is enabled and, when the server requires it (`connect.require_two_factor`, 13.1), has two-step verification enrolled |
 | Trust list | A device's local list of the peers it accepts, each with how it was added (8.1) |
 | Direct pairing | A trust-list entry added by the 6-digit comparison code, on the LAN or over a remote connection, or in person by QR or invite code |
 | Vouched pairing | A trust-list entry added because a direct pairing approved it (8) |
@@ -189,6 +193,9 @@ origin the user entered.
 - **`server`** is the server origin that devices put into their statements.
 - **`relay_url`** is the relay's `relay.public_url`. Devices configure their iroh endpoint
   with exactly this relay (`RelayMode::custom`) and no other (plan 3.5).
+- **`two_factor_required`** is the server's `connect.require_two_factor`: whether remote
+  access needs two-step verification on the account (13.1). It is false only while remote
+  control is in development.
 - **What devices check.** A device refuses a discovery document:
   - whose `version` it does not implement;
   - whose `server` is not the origin it fetched the document from, serialized as in 2.1;
@@ -258,9 +265,10 @@ The consent page for a device:
   does not get file access (4.5).
 
 Rules:
-- **Two-step verification.** The page grants a device only to an account that has two-step
-  verification enrolled. An account without it is first led through enrolment (13.2), and then
-  comes back to the consent page.
+- **Two-step verification.** When the server requires it (13.1), the page grants a device
+  only to an account that has two-step verification enrolled. An account without it is first
+  led through enrolment (13.2), and then comes back to the consent page. When it is not
+  required, the page grants the device without it.
 - **Device limit.** The page refuses when the account already has 50 unrevoked devices (15).
 - **No early answers.** Nothing on the page reveals whether the endpoint ID is registered
   anywhere. That is decided only when the flow completes (4.4), after the user has granted
@@ -478,9 +486,9 @@ seconds, it decides by the `error` code: `bad_signature`, `bad_request`, `not_fo
 }
 ```
 
-- **`remote_access`** is false when the account lacks two-step verification. While it is
-  false, `connect`, `lookup` and the pairing requests are refused with `two_factor_required`,
-  and the device shows where to turn verification on.
+- **`remote_access`** is false when the account lacks two-step verification and the server
+  requires it (13.1). While it is false, `connect`, `lookup` and the pairing requests are
+  refused with `two_factor_required`, and the device shows where to turn verification on.
 - **`devices`** is the full state of the directory. A device always acts on it, even when
   `events_truncated` is true (5.6).
 
@@ -1214,7 +1222,7 @@ device that is still in its user's hands.
 | Action | Who | Allowed when |
 |---|---|---|
 | Start registration (4.1) | anyone | rate limits |
-| Grant registration (4.2) | a signed-in user | password and second step passed; two-step verification enrolled; under the device limit |
+| Grant registration (4.2) | a signed-in user | password and second step passed; two-step verification enrolled if the server requires it (13.1); under the device limit |
 | Complete registration (4.3) | the device | the flow is granted; the proof is valid; the endpoint is not taken or revoked (4.4) |
 | Open the control channel (5) | a device | active; valid `hello` proof |
 | Read the directory (6.2) | a device | same account |
@@ -1267,7 +1275,8 @@ through `Server::relay_service()` → `RelayService::clients()` → `Clients::di
 (iroh-relay 1.4.1). This happens when:
 - the device is revoked or signs out;
 - its account is disabled or deleted;
-- two-step verification is turned off or reset on its account.
+- two-step verification is turned off or reset on its account, while the server requires it
+  (13.1).
 
 Every 2 seconds the server also checks each device connected to the relay against the admitted
 keys and disconnects those no longer admitted. That ends connections a disconnect could not
@@ -1372,8 +1381,17 @@ the feature `session-reports`.
 - App passwords do not go through it, so existing devices and Nextcloud clients keep working.
 - It does not protect the WebDAV files of an account against a leaked app password.
 
-**Remote access needs it.** Remote access is available only on accounts that have it (4.2,
-10, 11.1).
+**Remote access needs it** when the server requires it: `connect.require_two_factor = true`.
+Then remote access is available only on accounts that have it (4.2, 10, 11.1), and the
+discovery document says `"two_factor_required": true` (3).
+
+**Temporarily not required.** While remote control is in development,
+`connect.require_two_factor` defaults to false, so that test accounts need no authenticator:
+granting a registration, `connect`, `lookup`, pairing and relay admission then need an enabled
+account only. Accounts can still turn two-step verification on, and their web sign-ins then
+need the second step as described here. `gono-cloud config check`, the log of `serve` and the
+admin UI warn while it is false and the relay is enabled. **Release gate:** the default must be
+true again, and this paragraph removed, before remote control is released (plan R10).
 
 ### 13.2 TOTP and enrolment
 
@@ -1441,7 +1459,7 @@ the feature `session-reports`.
 - **Turning it off** needs the password and a code (TOTP or recovery).
 - **Resetting.** An admin resets it in the admin UI, and the operator with
   `gono-cloud user reset-two-factor <user>`; a running server picks either up within seconds.
-- **Effects of either:**
+- **Effects of either**, while the server requires it (13.1):
   - remote access becomes unavailable;
   - the account's devices are disconnected from the relay (11.2);
   - they get `account {"remote_access": false}`;

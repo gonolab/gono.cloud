@@ -145,15 +145,26 @@ bind = "127.0.0.1:16103"
 
 # Devices that may use the relay besides those registered for remote access, by device id: the
 # 64 hex digits that Input Show shows for a device. `serve` admits the registered devices of
-# accounts with two-step verification on its own, when base_url is https; `gono-cloud relay` on
-# a host of its own admits only this list. Every other device is refused, and the log names it.
-# Default: [].
+# accounts with remote access ([connect]) on its own, when base_url is https; `gono-cloud relay`
+# on a host of its own admits only this list. Every other device is refused, and the log names
+# it. Default: [].
 allowed_endpoints = []
 
 # Most bytes per second the relay reads from one device connection, and the largest burst it
 # reads at once. Unlimited unless set.
 # max_client_bytes_per_sec = 2097152
 # max_client_burst_bytes = 262144
+
+[connect]
+# Remote access of devices, served by `serve` while the relay is enabled (docs/deployment.md,
+# "Remote access").
+
+# Whether remote access needs two-step verification on the account: registering a device,
+# finding and reaching the account's other devices, and using the relay. TEMPORARY: it defaults
+# to false only while remote control is in development, so that test accounts need no
+# authenticator; config check warns about it. The default becomes true before remote control is
+# released. Two-step verification still works for accounts that turn it on. Default: false.
+# require_two_factor = true
 
 [s3]
 # The S3-compatible API: S3 clients and applications upload files with an access key, and files

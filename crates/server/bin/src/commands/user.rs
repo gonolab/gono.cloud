@@ -125,10 +125,17 @@ pub async fn run(config_path: &Path, command: UserCommand) -> anyhow::Result<()>
         UserCommand::ResetTwoFactor { username } => {
             let user = users::get(&pool, &username).await?;
             if two_factor::disable(&pool, user.id, TurnedOff::Cli, None, db::unix_now()).await? {
-                println!(
-                    "Reset the two-step verification of {username}. A running server ends the \
-                     remote access of its devices within seconds."
-                );
+                if config.connect.require_two_factor {
+                    println!(
+                        "Reset the two-step verification of {username}. A running server ends \
+                         the remote access of its devices within seconds."
+                    );
+                } else {
+                    println!(
+                        "Reset the two-step verification of {username}. Its devices keep remote \
+                         access, since connect.require_two_factor is false."
+                    );
+                }
             } else {
                 println!("{username} has no two-step verification.");
             }

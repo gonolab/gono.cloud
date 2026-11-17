@@ -375,7 +375,8 @@ impl Session {
         now: i64,
     ) -> gono_server_core::Result<String> {
         let pool = &self.connect.pool;
-        let remote_access = devices::remote_access(pool, self.user_id).await?;
+        let remote_access =
+            devices::remote_access(pool, self.user_id, self.connect.requires_two_factor()).await?;
         if self
             .connect
             .hub
@@ -672,7 +673,13 @@ impl Session {
                 return refused(id, ErrorCode::Unavailable, "try again later");
             }
         }
-        match devices::remote_access(&self.connect.pool, self.user_id).await {
+        match devices::remote_access(
+            &self.connect.pool,
+            self.user_id,
+            self.connect.requires_two_factor(),
+        )
+        .await
+        {
             Ok(true) => Ok(()),
             Ok(false) => refused(
                 id,

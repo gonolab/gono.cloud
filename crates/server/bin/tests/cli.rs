@@ -834,6 +834,30 @@ fn the_relay_command_needs_the_relay_enabled() {
     assert!(stderr.contains("relay.enabled is false"), "{stderr}");
 }
 
+#[test]
+fn config_check_warns_while_remote_access_needs_no_two_step_verification() {
+    let instance = Instance::new();
+    instance.enable_relay();
+    let check = text(&run(&mut instance.command(&["config", "check"])).stdout);
+    assert!(
+        check.contains("connect.require_two_factor") && check.contains(" false\n"),
+        "{check}"
+    );
+    assert!(
+        check.contains("warning: connect.require_two_factor is false"),
+        "{check}"
+    );
+
+    let mut config = std::fs::read_to_string(instance.config()).unwrap();
+    config.push_str("\n[connect]\nrequire_two_factor = true\n");
+    std::fs::write(instance.config(), config).unwrap();
+    let check = text(&run(&mut instance.command(&["config", "check"])).stdout);
+    assert!(
+        !check.contains("warning: connect.require_two_factor"),
+        "{check}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn serve_runs_the_relay_and_stops_it_on_sigterm() {
@@ -854,8 +878,10 @@ fn serve_runs_the_relay_and_stops_it_on_sigterm() {
     // A loopback origin serves remote connectivity, whose relay admits the directory's devices.
     let discovery = wait_for_get(&mut child, instance.addr, "/gono/v1/connect");
     assert!(discovery.starts_with("HTTP/1.1 200"), "{discovery}");
+    // Without a [connect] table, the development default: no two-step verification needed
+    // (plan R10), and a warning that says so.
     assert!(
-        discovery.contains("\"two_factor_required\":true"),
+        discovery.contains("\"two_factor_required\":false"),
         "{discovery}"
     );
 
@@ -863,6 +889,10 @@ fn serve_runs_the_relay_and_stops_it_on_sigterm() {
     assert!(logs.contains("relay listening"), "{logs}");
     assert!(logs.contains("relay stopped"), "{logs}");
     assert!(logs.contains("remote connectivity enabled"), "{logs}");
+    assert!(
+        logs.contains("connect.require_two_factor is false"),
+        "{logs}"
+    );
 }
 
 #[cfg(unix)]

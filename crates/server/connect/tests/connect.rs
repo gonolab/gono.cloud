@@ -20,6 +20,7 @@ use gono_server_core::{
     login_flows,
     users::{self, NewUser},
 };
+use gono_server_relay::Admission as _;
 use iroh_base::SecretKey;
 use secrecy::SecretString;
 
@@ -33,6 +34,11 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with(true).await
+}
+
+/// A fixture with `connect.require_two_factor` set to `require_two_factor`.
+async fn fixture_with(require_two_factor: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let config = DbConfig {
         path: dir.path().join("gono-cloud.db"),
@@ -49,6 +55,7 @@ async fn fixture() -> Fixture {
             base_url: SERVER.parse().unwrap(),
             relay_url: "https://relay.example.com".parse().unwrap(),
             audit_retention_secs: 3600,
+            require_two_factor,
         },
     )
     .await
@@ -678,7 +685,39 @@ async fn remote_access_needs_two_step_verification() {
         })
         .await;
     assert_eq!(error_code(&answer), Some(ErrorCode::TwoFactorRequired));
-    assert!(devices::admissible(&f.pool).await.unwrap().is_empty());
+    assert!(devices::admissible(&f.pool, true).await.unwrap().is_empty());
+    assert!(f.connect.discovery().two_factor_required);
+}
+
+#[tokio::test]
+async fn remote_access_needs_no_two_step_verification_unless_required() {
+    // `connect.require_two_factor = false`, the development default (plan R10).
+    let f = fixture_with(false).await;
+    assert!(!f.connect.discovery().two_factor_required);
+    let carol = f.user("carol", false).await;
+    let mut phone = f.device(carol, "carol", &key(1), "a").await;
+    let home = f.device(carol, "carol", &key(2), "b").await;
+    let target = home.id();
+    let answer = phone
+        .request(|id| ClientMessage::Connect {
+            id,
+            target,
+            service: "inputshow/1".to_owned(),
+            purpose: Purpose::Session,
+            request_id: None,
+        })
+        .await;
+    assert!(matches!(answer, ServerMessage::Result { .. }), "{answer:?}");
+    let lookup = phone
+        .request(|id| ClientMessage::Lookup { id, target })
+        .await;
+    assert!(matches!(lookup, ServerMessage::Result { .. }), "{lookup:?}");
+
+    let directory = f.connect.directory();
+    directory.refresh().await.unwrap();
+    for seed in [1, 2] {
+        assert!(directory.admits(&key(seed).public()), "device {seed}");
+    }
 }
 
 #[tokio::test]
@@ -906,7 +945,7 @@ async fn a_revoked_device_is_closed_and_the_others_hear_of_it() {
     let alice = f.user("alice", true).await;
     let mut home = f.device(alice, "alice", &key(1), "Home PC").await;
     let mut laptop = f.device(alice, "alice", &key(2), "Laptop").await;
-    assert_eq!(devices::admissible(&f.pool).await.unwrap().len(), 2);
+    assert_eq!(devices::admissible(&f.pool, true).await.unwrap().len(), 2);
 
     let laptop_key = EndpointId(*laptop.id().as_bytes());
     let revoked = devices::revoke(

@@ -212,7 +212,8 @@ an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password, 
 code, and keep the ten recovery codes it shows once. From then on every web sign-in (the file
 UI, the admin UI, the sign-in pages of Nextcloud apps and devices) asks for a code after the
 password. App passwords do not change: devices and Nextcloud apps keep working. Remote access
-for devices is available only on accounts that have it on.
+for devices is available only on accounts that have it on, once `[connect]
+require_two_factor` is true; during development it defaults to false ("Remote access").
 
 - **The server's clock must be right** (NTP): codes change every 30 seconds.
 - **The key file.** The TOTP secrets are encrypted with the key in `two_factor.key_file`,
@@ -484,9 +485,21 @@ protocol is [connect-protocol.md](connect-protocol.md), and
   client: it opens a link, the user signs in with the web login password, and the consent page
   names the device, its platform and its short device ID, which the device shows as well. The
   device gets a credential of its own, without access to files.
-- **Two-step verification is required.** Only accounts with two-step verification on
-  ("Two-step verification" above) register devices, reach each other's addresses and use the
-  relay. The consent page of a device leads through turning it on and comes back.
+- **Two-step verification is required** when `[connect] require_two_factor = true`. Then only
+  accounts with two-step verification on ("Two-step verification" above) register devices,
+  reach each other's addresses and use the relay, and the consent page of a device leads
+  through turning it on and comes back.
+- **For now it is not required by default.** While remote control is in development,
+  `require_two_factor` defaults to false, so that test accounts need no authenticator: every
+  enabled account registers devices and uses the relay, and two-step verification stays
+  voluntary (users who turn it on still enter codes at every web sign-in). `config check`, the
+  log of `serve` and the admin UI warn about it. This is a temporary setting: the default
+  becomes true before remote control is released. To require it now:
+
+  ```toml
+  [connect]
+  require_two_factor = true
+  ```
 - **The account page** lists the account's devices, whether they are online, and lets a device
   ask the account's other devices to pair for an hour.
 - **Stopping remote access** for a device that stays in use: "Stop remote access" on the

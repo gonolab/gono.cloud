@@ -1150,6 +1150,7 @@ async fn admins_revoke_devices_after_a_second_confirmation() {
                 base_url: "https://cloud.example.com".parse().unwrap(),
                 relay_url: "https://relay.example.com".parse().unwrap(),
                 audit_retention_secs: 3600,
+                require_two_factor: true,
             },
         )
         .await

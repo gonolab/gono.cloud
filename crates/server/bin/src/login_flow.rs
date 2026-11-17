@@ -321,7 +321,8 @@ fn consent_page(
 }
 
 /// Why a device registration cannot be granted to `user_id` (`docs/connect-protocol.md`,
-/// 4.2): the account has no two-step verification, or holds the most devices already.
+/// 4.2): the account has no two-step verification while the server requires it
+/// (`connect.require_two_factor`), or holds the most devices already.
 async fn device_refusal(
     state: &AppState,
     headers: &HeaderMap,
@@ -329,9 +330,10 @@ async fn device_refusal(
     page: &str,
 ) -> Option<Response> {
     let checked = async {
-        let enrolled = two_factor::is_enrolled(&state.db, user_id).await?;
+        let two_factor_ok = !state.remote_access_needs_two_factor()
+            || two_factor::is_enrolled(&state.db, user_id).await?;
         let devices = devices::count_active(&state.db, user_id).await?;
-        Ok::<_, gono_server_core::Error>((enrolled, devices))
+        Ok::<_, gono_server_core::Error>((two_factor_ok, devices))
     }
     .await;
     let chrome = Chrome::for_request(headers);

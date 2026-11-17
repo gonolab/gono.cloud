@@ -301,7 +301,7 @@ the user notice:
 | What the attacker has | What it gives |
 |---|---|
 | The web password only, two-step verification on | Nothing beyond the failed second step. The user sees "your password was entered correctly" on the account page (protocol 13.3) |
-| The web password only, no two-step verification | The account's files (outside this document) and no remote access, which is unavailable without verification. The attacker could enrol verification with its own authenticator, lock the user out, and register devices of its own, which get the directory and the relay but **no device's trust**: pairing still needs the comparison code on a device of the user's. Enrolling ends every other browser session, the user's included, which the user notices; an admin reset restores the account. Every user should enrol |
+| The web password only, no two-step verification | The account's files (outside this document) and no remote access, which is unavailable without verification. The attacker could enrol verification with its own authenticator, lock the user out, and register devices of its own, which get the directory and the relay but **no device's trust**: pairing still needs the comparison code on a device of the user's. Enrolling ends every other browser session, the user's included, which the user notices; an admin reset restores the account. Every user should enrol. **While `connect.require_two_factor` is false** (development, protocol 13.1; R10), the attacker needs no enrolment: it registers devices of its own at once, without ending the user's sessions, and they get the directory, presence and the relay, still without any device's trust |
 | A device's app password only (a proxy log, a leaked config) | No file access (protocol 4.5). No control channel either, since `hello` needs a signature by the device key (protocol 5.2). It can sign the device out (protocol 9.4), which is a denial of service: the device needs the user's consent to register again, and the key stays bound to the account |
 | Password and a live second-step code (real-time phishing) | A web session: register devices, revoke devices (each confirmed twice), turn verification off, read the audit log and presence. **No device trust:** pairing still needs the comparison code on a device of the user's |
 
@@ -333,7 +333,8 @@ on the same server can:
   pairing connection that the server announced for a pending request (C8);
 - limits on pending handshakes and on the handshake rate (C8);
 - admission only of registered devices of accounts with two-step verification (S7), so the
-  people on a self-hosted relay are the operator's own users.
+  people on a self-hosted relay are the operator's own users. While two-step verification is
+  not required (protocol 13.1, R10), any enabled account's devices are admitted.
 
 **What a stranger can still do after a handshake.** The remote endpoint accepts any client
 key in the TLS handshake and closes unknown keys right after it. iroh, however, acts on the
@@ -487,13 +488,13 @@ These are the rules the analysis depends on. V9, the security review, checks eac
 
 | # | Requirement | Protocol |
 |---|---|---|
-| S1 | `connect`, `lookup`, pairing and relay admission only for accounts with two-step verification | 4.2, 10, 11.1 |
+| S1 | `connect`, `lookup`, pairing and relay admission only for accounts with two-step verification. **Not enforced during development** (`connect.require_two_factor = false`, R10); enforced again before remote control is released | 4.2, 10, 11.1, 13.1 |
 | S2 | Statements are stored and relayed byte for byte; the server never creates or alters one | 2.3 |
 | S3 | Device addresses live in memory only: never in the database, the audit log or the server log | 7 |
 | S4 | The first disclosure of a device's addresses to a peer is a recorded `connect` that the target is told about | 7.2, 7.3 |
 | S5 | Every statement is verified before it is stored or relayed | 2.3 |
 | S6 | Revocation needs a second confirmation. It then tombstones the key, deletes the app password, closes the control channel, disconnects the relay at once, refuses the key everywhere (connections opened just before it included), and pushes the event. Signing out never frees a key from its account | 9.1, 9.2, 9.4, 11.2 |
-| S7 | The relay admits only active devices of accounts with two-step verification, besides the static list. A device that stops being admissible is disconnected at once, and a regular sweep catches any connection a disconnect missed | 11 |
+| S7 | The relay admits only active devices of accounts with two-step verification (of enabled accounts while S1 is not enforced, R10), besides the static list. A device that stops being admissible is disconnected at once, and a regular sweep catches any connection a disconnect missed | 11 |
 | S8 | No answer tells a device anything about another account (`not_found`) | 5.3, 10 |
 | S9 | Registration proves the key, with the server origin and a fresh challenge signed. The consent page shows product, platform, name and short ID with a warning. Nothing reveals before consent whether an endpoint is registered | 4 |
 | S10 | The limits of protocol 15, kept per device so that reconnecting resets none of them | 15 |
@@ -538,6 +539,7 @@ These are the rules the analysis depends on. V9, the security review, checks eac
 | R7 | Other users of the same relay can cause handshakes and probe presence | iroh-relay 1.4.1 decides per connection | Per-pair policy on hosted relays |
 | R8 | A compromised server together with a malicious directly paired device from another account can introduce devices | Mitigated: only entries the local user marked as their own (`remote`, protocol 8.1) may vouch. What remains needs the user to have marked such a device as their own, and the approval is announced | — |
 | R9 | A peer that has not heard of a revocation can be reached directly by the revoked key | Bounded by C14 | Measure the delays in 2b |
+| R10 | **Temporary:** remote access needs no two-step verification (`connect.require_two_factor = false`, the default during development), so S1 and S7 are not enforced and a leaked web password alone registers devices (5.5) | Development only: test accounts need no authenticator, and devices still get no trust without the comparison code. `config check`, the log and the admin UI warn | **Release gate:** the default returns to true before remote control is released (protocol 13.1, plan R10) |
 
 ---
 

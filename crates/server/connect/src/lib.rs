@@ -70,6 +70,9 @@ pub struct ConnectConfig {
     pub relay_url: Url,
     /// How long audit records are kept, in seconds.
     pub audit_retention_secs: i64,
+    /// `connect.require_two_factor`: whether remote access needs two-step verification on the
+    /// account (protocol 13). False only while remote control is in development.
+    pub require_two_factor: bool,
 }
 
 impl ConnectConfig {
@@ -108,7 +111,7 @@ pub struct Connect {
 impl Connect {
     /// Creates the state of remote connectivity and reads the directory.
     pub async fn new(pool: Pool, config: ConnectConfig) -> gono_server_core::Result<Arc<Self>> {
-        let directory = Arc::new(Directory::new(pool.clone()));
+        let directory = Arc::new(Directory::new(pool.clone(), config.require_two_factor));
         directory.refresh().await?;
         Ok(Arc::new(Self {
             origin: origin(&config.base_url),
@@ -145,6 +148,12 @@ impl Connect {
     /// The relay URL devices must use.
     pub fn relay_url(&self) -> &str {
         self.config.relay_url.as_str()
+    }
+
+    /// Whether remote access needs two-step verification on the account
+    /// (`connect.require_two_factor`).
+    pub fn requires_two_factor(&self) -> bool {
+        self.config.require_two_factor
     }
 
     /// Ends every control connection with `1001 Going Away` and refuses new ones, when the
@@ -184,7 +193,7 @@ impl Connect {
             login: login.to_string(),
             websocket: websocket.to_string(),
             relay_url: self.relay_url().to_owned(),
-            two_factor_required: true,
+            two_factor_required: self.config.require_two_factor,
         }
     }
 
@@ -517,13 +526,15 @@ impl Connect {
                 );
             }
         }
-        let available: HashSet<i64> = match devices::remote_access_accounts(&self.pool).await {
-            Ok(accounts) => accounts.into_iter().collect(),
-            Err(err) => {
-                tracing::warn!(error = %err, "cannot read remote access of accounts");
-                return;
-            }
-        };
+        let available: HashSet<i64> =
+            match devices::remote_access_accounts(&self.pool, self.config.require_two_factor).await
+            {
+                Ok(accounts) => accounts.into_iter().collect(),
+                Err(err) => {
+                    tracing::warn!(error = %err, "cannot read remote access of accounts");
+                    return;
+                }
+            };
         for user_id in self.hub.accounts() {
             let remote_access = available.contains(&user_id);
             if self.hub.set_remote_access(user_id, remote_access) {
@@ -606,6 +617,8 @@ pub fn entry(device: &Device, online: bool) -> Option<DeviceEntry> {
 #[derive(Debug)]
 pub struct Directory {
     pool: Pool,
+    /// `connect.require_two_factor`.
+    require_two_factor: bool,
     /// Held while the directory is read, so that an older read never replaces a newer one.
     refreshing: tokio::sync::Mutex<()>,
     admitted: RwLock<HashSet<EndpointId>>,
@@ -616,9 +629,10 @@ pub struct Directory {
 }
 
 impl Directory {
-    fn new(pool: Pool) -> Self {
+    fn new(pool: Pool, require_two_factor: bool) -> Self {
         Self {
             pool,
+            require_two_factor,
             refreshing: tokio::sync::Mutex::new(()),
             admitted: RwLock::new(HashSet::new()),
             revoked: RwLock::new(HashMap::new()),
@@ -630,7 +644,10 @@ impl Directory {
     pub async fn refresh(&self) -> gono_server_core::Result<()> {
         let _serialized = self.refreshing.lock().await;
         let admitted: HashSet<EndpointId> =
-            devices::admissible(&self.pool).await?.into_iter().collect();
+            devices::admissible(&self.pool, self.require_two_factor)
+                .await?
+                .into_iter()
+                .collect();
         let revoked: HashMap<EndpointId, i64> = devices::revoked_keys(&self.pool)
             .await?
             .into_iter()

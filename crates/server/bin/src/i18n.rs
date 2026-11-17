@@ -410,6 +410,7 @@ texts! {
     notice_revoked: "The app password was revoked.", "app password 已吊销。";
     tf_title: "Two-step verification", "两步验证";
     tf_note: "Protects your sign-ins with a code from an authenticator app on your phone. Remote access for your devices needs it.", "用手机上身份验证器 app 生成的验证码保护你的登录。设备远程访问需要先开启它。";
+    tf_note_optional: "Protects your sign-ins with a code from an authenticator app on your phone.", "用手机上身份验证器 app 生成的验证码保护你的登录。";
     tf_on_since: "On since {}.", "已开启，开启时间：{}。";
     tf_recovery_left: "Recovery codes left: {}.", "剩余恢复码：{} 个。";
     tf_unavailable: "Not available: the server has no key file for it. Ask the operator.", "暂不可用：服务器缺少两步验证的密钥文件，请联系管理员。";
@@ -431,10 +432,12 @@ texts! {
     tf_recovery_saved: "I have saved them", "我已保存";
     notice_tf_on: "Two-step verification is on.", "两步验证已开启。";
     notice_tf_off: "Two-step verification is off. Remote access for your devices stays off until you turn it on again.", "两步验证已关闭。在重新开启之前，你的设备无法远程访问。";
+    notice_tf_off_optional: "Two-step verification is off.", "两步验证已关闭。";
     a_tf_on: "On since {}", "已开启：{}";
     a_tf_off: "Off", "未开启";
     a_tf_reset: "Reset two-step verification", "重置两步验证";
     a_notice_tf_reset: "Two-step verification was reset. The account signs in with its password alone until it turns it on again, and its devices have no remote access until then.", "两步验证已重置。在重新开启之前，这个账号只用密码登录，它的设备也无法远程访问。";
+    a_notice_tf_reset_optional: "Two-step verification was reset. The account signs in with its password alone until it turns it on again.", "两步验证已重置。在重新开启之前，这个账号只用密码登录。";
     remote_devices: "Remote devices", "远程设备";
     remote_devices_note: "Devices registered for remote access. To stop remote access for a device you keep using, sign it out with “Stop remote access”: it keeps its pairings and can sign in again. Revoke a device that is lost, stolen or compromised: its key can never be used again, and your other devices forget it, on the local network as well.", "已注册远程访问的设备。只想停止某台仍在使用的设备的远程访问时，请点“停止远程访问”：它保留所有配对，之后可以重新登录。设备丢失、被盗或被入侵时请吊销：它的密钥将永远作废，你的其他设备也会忘记它，局域网上也一样。";
     no_remote_devices: "No device is registered for remote access yet.", "还没有设备注册远程访问。";
@@ -657,6 +660,7 @@ texts! {
     a_relay_cert_reload: "{}, read again every {}", "{}，每 {} 重新读取一次";
     a_relay_admission: "Who may connect", "谁可以连接";
     a_relay_admits_registered: "Devices registered for remote access, on enabled accounts with two-step verification, and relay.allowed_endpoints ({})", "开启了两步验证的账号下注册了远程访问的设备，以及 relay.allowed_endpoints（{} 台）";
+    a_relay_admits_registered_optional: "Devices registered for remote access, on enabled accounts, and relay.allowed_endpoints ({}); two-step verification is not required (connect.require_two_factor = false, for development only)", "已启用账号下注册了远程访问的设备，以及 relay.allowed_endpoints（{} 台）；不要求两步验证（connect.require_two_factor = false，仅限开发期）";
     a_relay_admits_listed: "Only relay.allowed_endpoints ({}): remote access is off, since base_url is not https", "只有 relay.allowed_endpoints（{} 台）：base_url 不是 https，远程访问未开启";
     a_relay_rate_limit: "Rate limit per connection", "每个连接的速率上限";
     a_relay_unlimited: "None", "不限";

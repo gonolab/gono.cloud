@@ -53,7 +53,7 @@ async fn codes_and_recovery_codes_work_once() {
         .await
         .unwrap();
     assert_eq!(codes.len(), two_factor::RECOVERY_CODES);
-    assert!(devices::remote_access(&pool, alice).await.unwrap());
+    assert!(devices::remote_access(&pool, alice, true).await.unwrap());
     assert!(matches!(
         two_factor::enable(&pool, &key, alice, &secret, step, None, None, NOW).await,
         Err(Error::TwoFactorEnrolled)
@@ -146,7 +146,7 @@ async fn codes_and_recovery_codes_work_once() {
             .await
             .unwrap()
     );
-    assert!(!devices::remote_access(&pool, alice).await.unwrap());
+    assert!(!devices::remote_access(&pool, alice, true).await.unwrap());
     assert_eq!(
         two_factor::verify(&pool, &key, alice, &next, None, later)
             .await

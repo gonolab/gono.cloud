@@ -806,8 +806,12 @@ async fn relay_view(
     }
     settings.push(fact(
         t.a_relay_admission,
-        if state.connect.is_some() {
-            fill(t.a_relay_admits_registered, &[&listed])
+        if let Some(connect) = &state.connect {
+            if connect.requires_two_factor() {
+                fill(t.a_relay_admits_registered, &[&listed])
+            } else {
+                fill(t.a_relay_admits_registered_optional, &[&listed])
+            }
         } else {
             fill(t.a_relay_admits_listed, &[&listed])
         },
@@ -1622,7 +1626,10 @@ async fn user_page(
         Some("renamed") => Some(t.a_notice_renamed.to_owned()),
         Some("password") => Some(t.a_notice_password.to_owned()),
         Some("device-revoked") => Some(t.notice_device_revoked.to_owned()),
-        Some("two-factor-reset") => Some(t.a_notice_tf_reset.to_owned()),
+        Some("two-factor-reset") if state.remote_access_needs_two_factor() => {
+            Some(t.a_notice_tf_reset.to_owned())
+        }
+        Some("two-factor-reset") => Some(t.a_notice_tf_reset_optional.to_owned()),
         Some("revoked") => Some(t.notice_revoked.to_owned()),
         Some("s3-key-revoked") => Some(t.s3_notice_key_revoked.to_owned()),
         Some("s3-bucket-private") => Some(t.a_s3_notice_private.to_owned()),

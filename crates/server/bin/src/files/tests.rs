@@ -1104,6 +1104,7 @@ async fn remote_devices_are_revoked_after_a_second_confirmation() {
             base_url: ORIGIN.parse().unwrap(),
             relay_url: "https://relay.example.com".parse().unwrap(),
             audit_retention_secs: 3600,
+            require_two_factor: true,
         },
     )
     .await
@@ -1230,6 +1231,7 @@ async fn remote_access_stops_for_a_device_without_revoking_it() {
             base_url: ORIGIN.parse().unwrap(),
             relay_url: "https://relay.example.com".parse().unwrap(),
             audit_retention_secs: 3600,
+            require_two_factor: true,
         },
     )
     .await
@@ -1500,6 +1502,42 @@ async fn two_step_verification_guards_every_later_sign_in() {
     assert_eq!(off.location(), "/apps/account/?done=two-factor-off");
     let mut fifth = Browser::new(&f.state);
     assert_eq!(password_step(&mut fifth).await.location(), "/apps/files/");
+}
+
+#[tokio::test]
+async fn the_account_page_says_whether_remote_access_needs_two_step_verification() {
+    for required in [true, false] {
+        let mut f = fixture().await;
+        let connect = gono_server_connect::Connect::new(
+            f.state.db.clone(),
+            gono_server_connect::ConnectConfig {
+                base_url: ORIGIN.parse().unwrap(),
+                relay_url: "https://relay.example.com".parse().unwrap(),
+                audit_retention_secs: 3600,
+                require_two_factor: required,
+            },
+        )
+        .await
+        .unwrap();
+        f.state.connect = Some(connect);
+        let mut browser = Browser::new(&f.state);
+        browser.sign_in().await;
+        let page = browser
+            .get("/apps/account/?done=two-factor-off")
+            .await
+            .text();
+        assert!(page.contains("Two-step verification is off."), "{page}");
+        assert_eq!(
+            page.contains("Remote access for your devices needs it."),
+            required,
+            "{page}"
+        );
+        assert_eq!(
+            page.contains("Remote access for your devices stays off"),
+            required,
+            "{page}"
+        );
+    }
 }
 
 #[tokio::test]

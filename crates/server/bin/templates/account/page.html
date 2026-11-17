@@ -181,7 +181,7 @@
   <div class="stack">
     <section class="panel" id="two-factor"><div class="panel-body">
       <h2>{{ chrome.t.tf_title }}</h2>
-      <p class="muted small">{{ chrome.t.tf_note }}</p>
+      <p class="muted small">{{ two_factor.note }}</p>
       {%- if !two_factor.failures.is_empty() %}
       <div class="flash bad" role="alert">{{ chrome.t.tf_failures }}{% for failure in two_factor.failures %}<div>{{ failure }}</div>{% endfor %}</div>
       {%- endif %}

@@ -108,6 +108,17 @@ pub struct AppState {
     pub s3: Option<Arc<S3Ui>>,
 }
 
+impl AppState {
+    /// Whether remote access needs two-step verification on the account
+    /// (`connect.require_two_factor`). True while remote connectivity is off, so that the pages
+    /// describe two-step verification as they will once it is required again.
+    pub fn remote_access_needs_two_factor(&self) -> bool {
+        self.connect
+            .as_ref()
+            .is_none_or(|connect| connect.requires_two_factor())
+    }
+}
+
 /// Compresses the XML bodies of WebDAV responses (PROPFIND, REPORT, error documents) when the
 /// client accepts gzip, as Nextcloud does for PROPFIND: a listing of 20,000 photos is about
 /// 70 MB of XML and under 1 MB compressed. File contents are never compressed, so `GET` keeps

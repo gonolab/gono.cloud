@@ -12,9 +12,9 @@
 //! - **Event log** (5.6). `device.added`, `device.revoked` and `pair.approved` are appended in
 //!   the same transaction as the change. Their bodies are the event's fields as the protocol
 //!   sends them, without `type` and `seq`.
-//! - **Remote access** is available for an account that is enabled and has two-step
-//!   verification enrolled ([`remote_access`]); only its active devices are admitted to the
-//!   relay ([`admissible`]).
+//! - **Remote access** is available for an account that is enabled and, when the server
+//!   requires it (`connect.require_two_factor`), has two-step verification enrolled
+//!   ([`remote_access`]); only its active devices are admitted to the relay ([`admissible`]).
 
 use std::{fmt, net::IpAddr, str::FromStr};
 
@@ -1084,27 +1084,31 @@ pub async fn purge_events(pool: &Pool, before: i64) -> Result<u64> {
     Ok(purged)
 }
 
-/// Whether remote access is available on account `user_id`: it is enabled and has two-step
-/// verification enrolled.
-pub async fn remote_access(pool: &Pool, user_id: i64) -> Result<bool> {
+/// Whether remote access is available on account `user_id`: it is enabled and, if
+/// `require_two_factor` (`connect.require_two_factor`), has two-step verification enrolled.
+pub async fn remote_access(pool: &Pool, user_id: i64, require_two_factor: bool) -> Result<bool> {
     let available: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM users u JOIN two_factor t ON t.user_id = u.id \
-         WHERE u.id = ?1 AND u.enabled = 1",
+        "SELECT 1 FROM users u LEFT JOIN two_factor t ON t.user_id = u.id \
+         WHERE u.id = ?1 AND u.enabled = 1 AND (?2 = 0 OR t.user_id IS NOT NULL)",
     )
     .bind(user_id)
+    .bind(require_two_factor)
     .fetch_optional(pool)
     .await?;
     Ok(available.is_some())
 }
 
 /// The keys the relay admits from the directory (protocol 11.1): registered devices (neither
-/// revoked nor signed out) of enabled accounts with two-step verification.
-pub async fn admissible(pool: &Pool) -> Result<Vec<EndpointId>> {
+/// revoked nor signed out) of enabled accounts, with two-step verification if
+/// `require_two_factor`.
+pub async fn admissible(pool: &Pool, require_two_factor: bool) -> Result<Vec<EndpointId>> {
     let keys: Vec<Vec<u8>> = sqlx::query_scalar(
         "SELECT d.endpoint_id FROM devices d JOIN users u ON u.id = d.user_id \
-         JOIN two_factor t ON t.user_id = u.id \
-         WHERE d.app_password_id IS NOT NULL AND u.enabled = 1",
+         LEFT JOIN two_factor t ON t.user_id = u.id \
+         WHERE d.app_password_id IS NOT NULL AND u.enabled = 1 \
+         AND (?1 = 0 OR t.user_id IS NOT NULL)",
     )
+    .bind(require_two_factor)
     .fetch_all(pool)
     .await?;
     Ok(keys
@@ -1132,11 +1136,14 @@ pub async fn enabled_accounts(pool: &Pool) -> Result<Vec<i64>> {
         .await?)
 }
 
-/// The accounts on which remote access is available: enabled, with two-step verification.
-pub async fn remote_access_accounts(pool: &Pool) -> Result<Vec<i64>> {
+/// The accounts on which remote access is available: enabled, with two-step verification if
+/// `require_two_factor`.
+pub async fn remote_access_accounts(pool: &Pool, require_two_factor: bool) -> Result<Vec<i64>> {
     Ok(sqlx::query_scalar(
-        "SELECT u.id FROM users u JOIN two_factor t ON t.user_id = u.id WHERE u.enabled = 1",
+        "SELECT u.id FROM users u LEFT JOIN two_factor t ON t.user_id = u.id \
+         WHERE u.enabled = 1 AND (?1 = 0 OR t.user_id IS NOT NULL)",
     )
+    .bind(require_two_factor)
     .fetch_all(pool)
     .await?)
 }

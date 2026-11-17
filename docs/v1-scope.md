@@ -58,7 +58,8 @@ listed under "In scope" is deferred until after v1.
   and a selection of Ceph's s3-tests.
 - **Relay and remote access** (since 2.0, `docs/connect-protocol.md`): the iroh relay through
   which Gono devices reach each other, and the device directory, control channel, pairing and
-  revocation of remote access for accounts with two-step verification.
+  revocation of remote access for accounts with two-step verification (not required by default
+  while remote control is in development: `[connect] require_two_factor`).
 - **CLI**: `init`, `serve`, `config check`, user and app password management (including
   promoting and demoting admins and changing display names), S3 access keys and buckets, and a
   manual `rescan` command.

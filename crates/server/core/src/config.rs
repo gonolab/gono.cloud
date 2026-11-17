@@ -71,6 +71,9 @@ pub struct Config {
     /// `[relay]`: the relay through which devices reach each other.
     #[serde(default)]
     pub relay: RelayConfig,
+    /// `[connect]`: remote access of devices (`docs/connect-protocol.md`).
+    #[serde(default)]
+    pub connect: ConnectConfig,
     /// `[s3]`: the S3-compatible API.
     #[serde(default)]
     pub s3: S3Config,
@@ -273,6 +276,23 @@ impl Default for FilesUiConfig {
     fn default() -> Self {
         Self { enabled: true }
     }
+}
+
+/// `[connect]` table: remote access of devices (`docs/connect-protocol.md`), served by `serve`
+/// when the relay is enabled.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConnectConfig {
+    /// Whether remote access needs two-step verification on the account (protocol 13): granting
+    /// a device registration, `connect`, `lookup` and pairing on the control channel, and
+    /// admission to the relay. True keeps all of these to accounts with two-step verification.
+    ///
+    /// **Temporary.** It defaults to false only while remote control is in development, so that
+    /// test accounts need no authenticator; two-step verification still works for the accounts
+    /// that turn it on. The default must become true before remote control is released (a
+    /// release gate of the plan, R10), and [`Config::warnings`] reports false while the relay
+    /// is enabled.
+    pub require_two_factor: bool,
 }
 
 /// `[two_factor]` table: two-step verification (TOTP) of web sign-ins.
@@ -1048,6 +1068,15 @@ impl Config {
 
         let relay = &self.relay;
         if relay.enabled {
+            if !self.connect.require_two_factor {
+                warnings.push(
+                    "connect.require_two_factor is false: remote access (device registration, \
+                     the device directory and the relay) is open to accounts without two-step \
+                     verification; this is for development only, set it to true before remote \
+                     control is released"
+                        .to_owned(),
+                );
+            }
             // An empty relay.allowed_endpoints is normal: `serve` admits the devices registered
             // for remote access. `gono-cloud relay` on a host of its own warns about it.
             if relay.qad_bind.is_none() {
@@ -1414,9 +1443,37 @@ mod tests {
         tls_key = "relay-tls/privkey.pem"
     "#;
 
-    /// `MINIMAL` with a `[relay]` table.
+    /// `MINIMAL` with a `[relay]` table, and remote access that needs two-step verification
+    /// (the warning about it has a test of its own).
     fn with_relay(table: &str) -> Config {
-        parse(&format!("{MINIMAL}\n[relay]\n{table}"))
+        parse(&format!(
+            "{MINIMAL}\n[relay]\n{table}\n[connect]\nrequire_two_factor = true\n"
+        ))
+    }
+
+    #[test]
+    fn remote_access_without_two_step_verification_is_warned_about() {
+        // The development default (plan R10): no `[connect]` table.
+        let open = parse(&format!("{MINIMAL}\n[relay]\n{RELAY}"));
+        assert!(!open.connect.require_two_factor);
+        let warnings = open.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("connect.require_two_factor is false")
+                && warnings[0].contains("before remote control is released"),
+            "{warnings:?}"
+        );
+
+        let required = with_relay(RELAY);
+        assert!(required.connect.require_two_factor);
+        assert!(required.warnings().is_empty(), "{:?}", required.warnings());
+
+        // Without the relay there is no remote access to warn about.
+        assert!(!parse(MINIMAL).connect.require_two_factor);
+        assert!(parse(MINIMAL).warnings().is_empty());
+
+        let unknown = Config::from_toml(&format!("{MINIMAL}\n[connect]\nrequire_2fa = true\n"));
+        assert!(unknown.is_err());
     }
 
     /// [`RELAY`] with `extra` keys and the given allowed devices.

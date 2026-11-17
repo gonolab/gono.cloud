@@ -406,6 +406,12 @@ mod tests {
     }
 
     async fn fixture(two_factor: bool) -> Fixture {
+        fixture_with(two_factor, true).await
+    }
+
+    /// Alice with or without two-step verification, on a server with
+    /// `connect.require_two_factor` set to `require_two_factor`.
+    async fn fixture_with(two_factor: bool, require_two_factor: bool) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let layout = DataLayout::new(dir.path().join("data"));
         layout.create().unwrap();
@@ -457,6 +463,7 @@ mod tests {
                 base_url: base_url.clone(),
                 relay_url: "https://relay.example.com".parse().unwrap(),
                 audit_retention_secs: 3600,
+                require_two_factor,
             },
         )
         .await
@@ -798,9 +805,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_consent_page_names_the_device_and_needs_two_step_verification() {
-        for two_factor in [false, true] {
-            let f = fixture(two_factor).await;
+    async fn the_consent_page_names_the_device_and_needs_two_step_verification_if_required() {
+        // (two-step verification on the account, connect.require_two_factor)
+        for (two_factor, required) in [(false, true), (true, true), (false, false)] {
+            let f = fixture_with(two_factor, required).await;
+            let (_, discovery) = f.send("GET", paths::DISCOVERY, &[], String::new()).await;
+            assert!(
+                discovery.contains(&format!("\"two_factor_required\":{required}")),
+                "{discovery}"
+            );
             let (started, token) = f.start(&key(4), "Work PC").await;
             let session = web_sessions::create(&f.state.db, f.alice, db::unix_now())
                 .await
@@ -831,7 +844,7 @@ mod tests {
                 )
                 .await;
             let (poll_status, _) = f.poll(&key(4), &started).await;
-            if two_factor {
+            if two_factor || !required {
                 assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
                 assert_eq!(poll_status, StatusCode::OK);
             } else {

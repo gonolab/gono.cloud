@@ -10,6 +10,17 @@ compatible within a major version: released clients keep working with newer serv
 
 ## [Unreleased]
 
+### Changed
+
+- **Remote access no longer requires two-step verification by default, for now.** A new
+  `[connect]` table has `require_two_factor`, which defaults to false while remote control is
+  in development: every enabled account can then register devices, find and reach its other
+  devices and use the relay, and two-step verification stays voluntary (accounts that turn it
+  on still enter a code at every web sign-in). The discovery document says
+  `"two_factor_required": false`, and `config check`, the log of `serve` and the admin UI warn
+  while the relay is enabled. **To keep 2.0.0's behaviour, set `require_two_factor = true`.**
+  The default becomes true again before remote control is released.
+
 ### Removed
 
 - **macOS releases**: releases after 2.0.0 have no macOS archives (`aarch64-apple-darwin`,

@@ -67,6 +67,10 @@ pub fn run(config_path: &Path) -> anyhow::Result<()> {
     ];
     if config.relay.enabled {
         settings.extend(relay_settings(&config.relay));
+        settings.push((
+            "connect.require_two_factor",
+            config.connect.require_two_factor.to_string(),
+        ));
     }
     settings.push(("s3.enabled", config.s3.enabled.to_string()));
     if config.s3.enabled {

@@ -196,6 +196,8 @@ pub struct TwoFactorView {
     pub recovery_used: Vec<String>,
     /// Where to continue once it is on (a local path).
     pub next: String,
+    /// What it is for: with or without "remote access needs it" (`connect.require_two_factor`).
+    pub note: &'static str,
 }
 
 /// `account/page.html`.
@@ -437,6 +439,11 @@ async fn two_factor_view(
             .map(|(at, client_ip)| at_from(at, client_ip.as_deref()))
             .collect();
     Ok(TwoFactorView {
+        note: if state.remote_access_needs_two_factor() {
+            t.tf_note
+        } else {
+            t.tf_note_optional
+        },
         available: state.web.two_factor_key().is_some(),
         on: status.map(|status| fill(t.tf_on_since, &[&when(lang, now, status.enabled_at).0])),
         recovery_left: status
@@ -1072,7 +1079,10 @@ pub async fn show(
         Some("device-signed-out") => Some(t.notice_device_signed_out.to_owned()),
         Some("pairing") => Some(t.notice_pairing_open.to_owned()),
         Some("two-factor-on") => Some(t.notice_tf_on.to_owned()),
-        Some("two-factor-off") => Some(t.notice_tf_off.to_owned()),
+        Some("two-factor-off") if state.remote_access_needs_two_factor() => {
+            Some(t.notice_tf_off.to_owned())
+        }
+        Some("two-factor-off") => Some(t.notice_tf_off_optional.to_owned()),
         _ => None,
     };
     let options = PageOptions {

@@ -128,6 +128,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
                     base_url: base_url.clone(),
                     relay_url,
                     audit_retention_secs: audit::DEFAULT_RETENTION_SECS,
+                    require_two_factor: config.connect.require_two_factor,
                 },
             )
             .await
