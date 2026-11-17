@@ -14,12 +14,14 @@ use secrecy::SecretString;
 /// SHA-384 checksums (as computed by sqlx, equal to `shasum -a 384 <file>`) of every published
 /// migration.
 ///
-/// Empty until the first production deployment: until then the schema is the single file
-/// `0001_initial.sql`, edited in place (see its header). From that deployment on, a migration
+/// 2.0.0 published `0001_initial.sql` (edited in place until then, see its header). A migration
 /// counts as published once it is merged into `main`, and sqlx refuses to open databases whose
 /// applied migrations changed. Pin every published migration here, and if this test fails
 /// because you edited one, revert the edit and add a new migration instead.
-const RELEASED_MIGRATIONS: &[(i64, &str)] = &[];
+const RELEASED_MIGRATIONS: &[(i64, &str)] = &[(
+    1,
+    "2060239bbdb962568d0c845569d862cd025874056e4f2129e446f86fda96d6dd400d5487816af1a07e94b0305c36d097",
+)];
 
 fn db_config(dir: &Path) -> DbConfig {
     DbConfig {

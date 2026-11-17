@@ -8,10 +8,10 @@
 //!   queued at the gate neither hold pool connections (which readers need meanwhile) nor sleep
 //!   in SQLite's busy handler (which wakes them late, in steps of up to 100 ms, and gives up
 //!   after `busy_timeout`). The busy timeout still covers other processes (the CLI).
-//! - Migrations live in `crates/server/core/migrations/` and are embedded into the binary. Until
-//!   the first production deployment the schema is the single file `0001_initial.sql`, edited
-//!   in place; from then on migrations are append-only. See the header of that file, and
-//!   [`crate::meta`] for the path comparison rules every query must follow.
+//! - Migrations live in `crates/server/core/migrations/` and are embedded into the binary. They
+//!   are append-only since 2.0.0, which published `0001_initial.sql` (the schema edited in
+//!   place until then). See the header of that file, and [`crate::meta`] for the path
+//!   comparison rules every query must follow.
 
 use std::{
     collections::HashMap,

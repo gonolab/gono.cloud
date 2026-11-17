@@ -2,13 +2,11 @@
 --
 -- Rules that apply to this file and every later migration:
 --
--- 1. One file until the first production deployment. Gono Cloud has no production deployments
---    yet, so the whole schema lives in this file and is edited in place; a database created
---    from an older version of the file must be created again (sqlx refuses it, because the
---    file's checksum changed). From the first production deployment on, migrations are
---    append-only: a published migration is never edited, reformatted or renamed, schema
---    changes go into a new, higher-numbered file, and `crates/server/core/tests/migrations.rs`
---    pins the checksum of every published migration.
+-- 1. Published with 2.0.0; migrations are append-only since. Until then the whole schema lived
+--    in this file and was edited in place, so a database of 1.x must be created again (sqlx
+--    refuses it, because this file's checksum differs). A published migration is never edited,
+--    reformatted or renamed: schema changes go into a new, higher-numbered file, and
+--    `crates/server/core/tests/migrations.rs` pins the checksum of every published migration.
 --
 -- 2. `rel_path` columns use BINARY collation (spelled out explicitly below). Paths compare
 --    byte-for-byte; `Foo` and `foo` are different files.
