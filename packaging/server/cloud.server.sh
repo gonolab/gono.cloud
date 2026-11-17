@@ -525,6 +525,23 @@ backup_database() {
 	log "Backed the database up to $target"
 }
 
+# Stops before anything changes when the installed server is 1.x and its database exists: 2.0
+# starts with a new database schema, which databases of 1.x cannot be migrated to.
+refuse_upgrade_from_1x() {
+	db=$1
+	[ -x "$BIN" ] || return 0
+	installed=$("$BIN" --version 2>/dev/null) || return 0
+	installed=${installed#gono-cloud }
+	case $installed in
+	1.*) ;;
+	*) return 0 ;;
+	esac
+	case $NEW_VERSION in
+	1.*) return 0 ;;
+	esac
+	die "gono-cloud $installed cannot be upgraded to $NEW_VERSION in place: $NEW_VERSION starts with a new database schema, which the database of $installed cannot be migrated to. Nothing was changed. To start over with $NEW_VERSION, stop the service, move $db and the data directory away (keep them), and run the installer again; see \"Upgrading from 1.x\" in docs/deployment.md"
+}
+
 # Writes the configuration of a fresh install to $WORK/config.toml and validates it.
 prepare_config() {
 	db_path=$1
@@ -624,6 +641,7 @@ install_release() {
 		db_path=$(setting "$PAYLOAD/gono-cloud" "$CONFIG_FILE" db.path)
 		# A configuration without a database: an earlier install stopped before `init`.
 		[ -e "$db_path" ] || needs_init=1
+		[ "$needs_init" = 1 ] || refuse_upgrade_from_1x "$db_path"
 	fi
 	if [ "$needs_init" = 1 ] && [ "$PASSWORD_STDIN" = 0 ] && ! [ -t 0 ]; then
 		die "a fresh install creates the first admin account: run the installer from a terminal, or pass --admin-password-stdin"

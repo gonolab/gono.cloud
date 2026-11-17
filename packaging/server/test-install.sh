@@ -1,7 +1,7 @@
 #!/bin/sh
 # End-to-end test of cloud.server.sh on a throwaway machine: refused installs, a fresh install, the
 # running service, WebDAV through the (sandboxed) service, the root guard of the CLI, a
-# graceful stop, an upgrade and the uninstall.
+# graceful stop, an upgrade, a refused upgrade from 1.x and the uninstall.
 #
 # Usage: packaging/server/test-install.sh <cloud.server.sh> <archive> [<SHA256SUMS>]
 #
@@ -262,6 +262,22 @@ sudo test -L "$key" || fail "the upgrade replaced the key link"
 if sudo test -e "$key.gone"; then fail "the upgrade created the target of the key link"; fi
 sudo rm "$key"
 sudo mv "$key.saved" "$key"
+wait_until_healthy
+
+step "An upgrade from 1.x stops before it changes anything"
+sudo cp -p "$BIN" "$work/gono-cloud.real"
+printf '#!/bin/sh\necho "gono-cloud 1.2.0"\n' >"$work/gono-cloud.old"
+sudo install -m 0755 "$work/gono-cloud.old" "$BIN"
+backups_before=$(sudo ls "$state/backups" | wc -l)
+if run_installer </dev/null >"$work/out" 2>&1; then
+	cat "$work/out"
+	fail "the installer upgraded 1.2.0 in place"
+fi
+cat "$work/out"
+grep -q "cannot be upgraded to .* in place" "$work/out" || fail "no explanation of the refused upgrade"
+sudo cmp -s "$work/gono-cloud.old" "$BIN" || fail "the refused upgrade replaced the binary"
+[ "$backups_before" = "$(sudo ls "$state/backups" | wc -l)" ] || fail "the refused upgrade made a backup"
+sudo install -m 0755 "$work/gono-cloud.real" "$BIN"
 wait_until_healthy
 
 step "Uninstall keeps the configuration, the data and the service user"
