@@ -77,7 +77,8 @@ compatible within a major version: released clients keep working with newer serv
   certificate needed), and path style keeps working. Browser applications get per-bucket CORS
   rules (`PutBucketCors`, `GetBucketCors`, `DeleteBucketCors`; preflight requests are answered
   before s3s) and form uploads signed with a POST policy (`PostObject`, with the `acl` field
-  that s3s does not read itself). Large copies use `UploadPartCopy` (whole objects or byte
+  that s3s does not read itself, read ahead with s3s's own form parser and rules so that it is
+  always the value the policy was checked against). Large copies use `UploadPartCopy` (whole objects or byte
   ranges); a repeated `CompleteMultipartUpload` (a retry after a lost answer) gets the first
   answer again, as from S3. Writes take the conditions `If-None-Match` (`*` or an ETag) and
   `If-Match` (an ETag or `*`). `ListBuckets` answers in pages. In `us-east-1`, a `CreateBucket` of one's own bucket

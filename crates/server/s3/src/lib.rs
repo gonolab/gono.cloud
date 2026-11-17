@@ -96,6 +96,9 @@ pub fn service(state: S3State) -> Service {
     // Browser form uploads, signed with a policy; unsigned forms are anonymous writes, which
     // the access check refuses.
     config.allow_post_signature = true;
+    // The form parser's limit on a part's header block and on a field, the one the server's
+    // own read of a form's fields uses (see `form`).
+    config.form_max_field_size = form::MAX_FIELD_SIZE;
     builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(config))));
     Service {
         s3: builder.build(),
@@ -164,19 +167,6 @@ fn with_request_id(document: &[u8], id: &str) -> Option<Vec<u8>> {
     Some(stamped)
 }
 
-/// Whether `headers` describe a form upload (`multipart/form-data`).
-fn is_form(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .trim_start()
-                .to_ascii_lowercase()
-                .starts_with("multipart/form-data")
-        })
-}
-
 impl Service {
     /// Answers `request`.
     ///
@@ -218,18 +208,36 @@ impl Service {
                 )
                 .await);
         }
-        if request.method() == Method::POST && is_form(request.headers()) {
+        if request.method() == Method::POST
+            && let Some(media) = form::media_type(request.headers())
+        {
             // s3s reads a form upload's file into memory to learn its size when the request
             // does not say it, and does so before the access check; browsers always say it.
             if !request.headers().contains_key(header::CONTENT_LENGTH) {
                 return Ok(error_response(s3_error!(MissingContentLength)));
             }
-            if let Some(boundary) = form::boundary(request.headers()) {
+            if let Some(boundary) = media.get_param(mime::BOUNDARY) {
+                let boundary = boundary.as_str().to_owned();
                 let (parts, body) = request.into_parts();
-                let (acl, body) = form::read_acl(body, boundary).await;
+                let (found, body) = form::read_ahead(body, &boundary).await;
                 let mut request = Request::from_parts(parts, body);
-                if let Some(acl) = acl {
-                    request.extensions_mut().insert(acl);
+                match found {
+                    form::ReadAhead::Fields(Some(acl)) => {
+                        request.extensions_mut().insert(acl);
+                    }
+                    form::ReadAhead::Fields(None) | form::ReadAhead::Failed => {}
+                    form::ReadAhead::TooLarge => {
+                        return Ok(error_response(s3_error!(
+                            MaxPostPreDataLengthExceededError,
+                            "The fields of the form before its file are too large"
+                        )));
+                    }
+                    form::ReadAhead::Malformed => {
+                        return Ok(error_response(s3_error!(
+                            MalformedPOSTRequest,
+                            "The body of the form is not well-formed multipart/form-data"
+                        )));
+                    }
                 }
                 return self.respond(request).await;
             }

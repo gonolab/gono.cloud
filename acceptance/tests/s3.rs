@@ -1670,6 +1670,76 @@ async fn browser_form_uploads_need_a_signed_policy() {
     s3.clean(&s3.bucket, &prefix).await;
 }
 
+/// A form upload applies the `acl` that s3s checked against the policy, however its parts
+/// are written: forms that a parser of its own reads differently from s3s's cannot make an
+/// object public that the policy keeps private.
+#[tokio::test]
+async fn form_uploads_take_the_acl_the_policy_checked() {
+    let s3 = require!(S3::new(), "S3 is not configured");
+    let prefix = unique_name("s3");
+    let boundary = "gono-acceptance-boundary";
+    let signed = |folder: &str| {
+        s3.signed_form(
+            &s3.bucket,
+            vec![
+                serde_json::json!(["starts-with", "$key", format!("{prefix}/{folder}/")]),
+                serde_json::json!({ "acl": "private" }),
+            ],
+            vec![
+                ("key", format!("{prefix}/{folder}/${{filename}}")),
+                ("acl", "private".to_owned()),
+            ],
+        )
+    };
+    let private = async |folder: &str, fields: Vec<(&str, String)>| {
+        let response = s3.post_form(&s3.bucket, &fields, b"form").await;
+        assert_eq!(
+            response.status(),
+            204,
+            "{folder}: {}",
+            response.text().await.unwrap()
+        );
+        let key = s3.key(&prefix, &format!("{folder}/hello.txt"));
+        assert_eq!(s3.get(&s3.bucket, &key).await, b"form");
+        let anonymous = s3.http.get(s3.url(&s3.bucket, &key)).send().await.unwrap();
+        assert_eq!(anonymous.status(), 403, "{folder}");
+    };
+
+    // A part with two names: its first counts, so the policy's `acl` is the one applied.
+    let mut fields = vec![("x-ignore-a\"; name=\"acl", "public-read".to_owned())];
+    fields.extend(signed("names").into_iter().map(|(name, value)| match name {
+        "acl" => ("acl\"; name=\"x-ignore-b", value),
+        _ => (name, value),
+    }));
+    private("names", fields).await;
+
+    // A delimiter inside a value is data, and a part with a file name that is not named
+    // `file` is a field.
+    let mut fields = vec![
+        (
+            "x-ignore-a",
+            format!(
+                "x--{boundary}\r\nContent-Disposition: form-data; name=\"acl\"\r\n\r\npublic-read"
+            ),
+        ),
+        ("x-ignore-z\"; filename=\"q", "q".to_owned()),
+    ];
+    fields.extend(signed("delimiter"));
+    private("delimiter", fields).await;
+
+    // Two acl fields, one of them hidden from a reader that stops at the first file name.
+    let mut fields = vec![
+        ("acl", "public-read".to_owned()),
+        ("x-ignore-z\"; filename=\"q", "q".to_owned()),
+    ];
+    fields.extend(signed("twice"));
+    let response = s3.post_form(&s3.bucket, &fields, b"form").await;
+    assert_eq!(response.status(), 400);
+    assert!(response.text().await.unwrap().contains("InvalidArgument"));
+
+    s3.clean(&s3.bucket, &prefix).await;
+}
+
 #[tokio::test]
 async fn parts_can_be_copied_from_objects() {
     let s3 = require!(S3::new(), "S3 is not configured");

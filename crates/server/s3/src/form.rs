@@ -2,20 +2,41 @@
 //!
 //! s3s takes a form's canned ACL only from a field `x-amz-acl`, while S3 and the tools that
 //! build forms (for example boto3's `generate_presigned_post`) name it `acl`. The fields of a
-//! form come before its file, so the server reads ahead until the file begins (at most
-//! [`READ_AHEAD`] bytes), takes the `acl` field, and hands the body on unchanged. s3s then checks
-//! every field of the signed form, `acl` included, against the policy: the value read here is the
-//! one the policy allows. A form that names `acl` twice is refused, so that the value read here
-//! and the value s3s checks cannot differ.
+//! form come before its file, so the server reads ahead until the file begins, takes the `acl`
+//! field, and hands the body on unchanged. s3s then checks every field of the signed form, `acl`
+//! included, against the policy.
+//!
+//! The value taken here must be the one s3s checks, or a form could carry an `acl` that its
+//! policy never allowed. So the form is read exactly as s3s reads it:
+//! - the same media type rules ([`media_type`]: one `Content-Type` header, parsed with `mime`);
+//! - the same parser (`s3s-multipart`) with the same header limit ([`MAX_FIELD_SIZE`]);
+//! - the same reading of a part: its last `Content-Disposition` header, that header's first
+//!   `name`, and the file being the part named `file`.
+//!
+//! A form that names `acl` more than once is refused (s3s would check only one of the values),
+//! and so is a form that the parser cannot read or whose fields do not end within
+//! [`READ_AHEAD`] bytes: the upload never goes on with an `acl` that was not found the way s3s
+//! finds it.
 
-use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt as _;
+use std::{
+    pin::Pin,
+    task::{Context, Poll, ready},
+};
+
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt as _};
 use http::{HeaderMap, header};
 use http_body::Frame;
-use http_body_util::{BodyExt, BodyStream, StreamBody};
+use http_body_util::{BodyStream, StreamBody};
+use s3s_multipart::{Boundary, Multipart, parse_content_disposition};
 
-/// Most bytes of a form read ahead for its fields.
+/// Most bytes of a form read ahead for its fields: a form whose file starts later is refused.
 const READ_AHEAD: usize = 1024 * 1024;
+
+/// Most bytes of a part's header block and of a field, here and in s3s
+/// (`form_max_field_size`, set from this in `crate::service`), so that both parsers read the
+/// same forms.
+pub(crate) const MAX_FIELD_SIZE: usize = 1024 * 1024;
 
 /// The `acl` field of a form upload, for the operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,116 +47,140 @@ pub(crate) enum FormAcl {
     Repeated,
 }
 
-/// The boundary of a `multipart/form-data` body, from its `Content-Type`.
-pub(crate) fn boundary(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(header::CONTENT_TYPE)?.to_str().ok()?;
-    let (kind, parameters) = value.split_once(';')?;
-    if !kind.trim().eq_ignore_ascii_case("multipart/form-data") {
+/// What reading a form ahead found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReadAhead {
+    /// The fields before the file were read: the form's `acl`, if it names one.
+    Fields(Option<FormAcl>),
+    /// The fields do not end within [`READ_AHEAD`] bytes.
+    TooLarge,
+    /// The form cannot be read (no file part, a part without a name, a malformed body).
+    Malformed,
+    /// The body failed; the failure is handed on to s3s with the body.
+    Failed,
+}
+
+/// The media type of a request that s3s answers as a form upload when it is a `POST`: exactly
+/// one `Content-Type` header, valid UTF-8 and not empty, that `mime` parses as
+/// `multipart/form-data` (s3s's `extract_mime`). The boundary is its `boundary` parameter.
+pub(crate) fn media_type(headers: &HeaderMap) -> Option<mime::Mime> {
+    let mut values = headers.get_all(header::CONTENT_TYPE).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
         return None;
     }
-    parameters.split(';').find_map(|parameter| {
-        let (name, value) = parameter.split_once('=')?;
-        name.trim()
-            .eq_ignore_ascii_case("boundary")
-            .then(|| value.trim().trim_matches('"').to_owned())
-            .filter(|boundary| !boundary.is_empty())
-    })
-}
-
-/// Positions of `needle` in `haystack`.
-fn positions(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return Vec::new();
+    let value = std::str::from_utf8(value.as_bytes()).ok()?;
+    if value.is_empty() {
+        return None;
     }
-    (0..=haystack.len() - needle.len())
-        .filter(|&at| &haystack[at..at + needle.len()] == needle)
-        .collect()
+    let media = value.parse::<mime::Mime>().ok()?;
+    (media.type_() == mime::MULTIPART && media.subtype() == mime::FORM_DATA).then_some(media)
 }
 
-/// The name of a part and whether it is a file, from its headers.
-fn part_name(headers: &[u8]) -> Option<(String, bool)> {
-    let headers = std::str::from_utf8(headers).ok()?;
-    let disposition = headers.split("\r\n").find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.trim()
-            .eq_ignore_ascii_case("content-disposition")
-            .then_some(value)
-    })?;
-    let mut name = None;
-    let mut file = false;
-    for parameter in disposition.split(';').skip(1) {
-        let Some((key, value)) = parameter.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches('"');
-        match key.trim().to_ascii_lowercase().as_str() {
-            "name" => name = Some(value.to_owned()),
-            "filename" => file = true,
-            _ => {}
+/// A field name, value or header parameter as s3s takes it: UTF-8 or a malformed form.
+fn text(bytes: &[u8]) -> Result<String, ()> {
+    std::str::from_utf8(bytes).map(str::to_owned).map_err(drop)
+}
+
+/// The `acl` of the form that `parser` reads: the fields up to the part named `file`, each
+/// part read as s3s's `transform_multipart` reads it.
+async fn acl_of<S>(parser: &mut Multipart<S>) -> Result<Option<FormAcl>, ()>
+where
+    S: Stream<Item = Result<Bytes, s3s_multipart::Error>> + Send + Unpin,
+{
+    let mut acl = None;
+    loop {
+        // A form that ends without a file is malformed for s3s too.
+        let mut part = parser.next_part().await.map_err(drop)?.ok_or(())?;
+        let mut name = None;
+        while let Some(header) = part.next_header().await.map_err(drop)? {
+            if header.name.eq_ignore_ascii_case("content-disposition") {
+                // The last header wins, with the first `name` it carries (none when it has
+                // none).
+                name = parse_content_disposition(header.value)
+                    .and_then(|disposition| disposition.name)
+                    .map(text)
+                    .transpose()?;
+            }
+        }
+        let name = name.ok_or(())?;
+        if name.eq_ignore_ascii_case("file") {
+            return Ok(acl);
+        }
+        let mut value = Vec::new();
+        while let Some(chunk) = part.next_data().await.map_err(drop)? {
+            value.extend_from_slice(&chunk);
+            if value.len() > MAX_FIELD_SIZE {
+                return Err(());
+            }
+        }
+        let value = text(&value)?;
+        // s3s compares field names in lower case.
+        if name.eq_ignore_ascii_case("acl") {
+            acl = Some(match acl {
+                None => FormAcl::Named(value),
+                Some(_) => FormAcl::Repeated,
+            });
         }
     }
-    let name = name?;
-    let file = file || name.eq_ignore_ascii_case("file");
-    Some((name, file))
 }
 
-/// The complete fields at the start of a form body: each part between two delimiters, up to
-/// the file. Returns the fields and whether the file (or the end of the form) was reached.
-fn fields(buffer: &[u8], boundary: &str) -> (Vec<(String, Vec<u8>)>, bool) {
-    let delimiter = format!("--{boundary}");
-    let starts = positions(buffer, delimiter.as_bytes());
-    let mut fields = Vec::new();
-    for (index, &start) in starts.iter().enumerate() {
-        let part_start = start + delimiter.len();
-        if buffer[part_start..].starts_with(b"--") {
-            // The closing delimiter: the form is complete.
-            return (fields, true);
+/// The body of a form as the parser reads it: every frame is kept for the replay, and no more
+/// than [`READ_AHEAD`] bytes are asked for.
+struct Recording<'a, B: http_body::Body> {
+    body: Pin<&'a mut B>,
+    read: &'a mut Vec<Frame<Bytes>>,
+    failed: &'a mut Option<B::Error>,
+    too_large: &'a mut bool,
+    bytes: usize,
+}
+
+impl<B> Stream for Recording<'_, B>
+where
+    B: http_body::Body<Data = Bytes>,
+{
+    type Item = Result<Bytes, s3s_multipart::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            // The parser asks for more only while the file has not begun; a frame that
+            // carries the start of the file as well is never cut.
+            if this.bytes >= READ_AHEAD {
+                *this.too_large = true;
+                return Poll::Ready(Some(Err(s3s_multipart::Error::stream_read_failed(
+                    "the fields of the form are too large",
+                ))));
+            }
+            match ready!(this.body.as_mut().poll_frame(cx)) {
+                None => return Poll::Ready(None),
+                Some(Err(err)) => {
+                    *this.failed = Some(err);
+                    return Poll::Ready(Some(Err(s3s_multipart::Error::stream_read_failed(
+                        "the body of the form failed",
+                    ))));
+                }
+                Some(Ok(frame)) => {
+                    let data = frame.data_ref().cloned();
+                    this.read.push(frame);
+                    if let Some(data) = data {
+                        this.bytes += data.len();
+                        return Poll::Ready(Some(Ok(data)));
+                    }
+                }
+            }
         }
-        let part_end = starts.get(index + 1).copied();
-        let tail = &buffer[part_start..part_end.unwrap_or(buffer.len())];
-        let tail = tail.strip_prefix(b"\r\n").unwrap_or(tail);
-        let Some(split) = positions(tail, b"\r\n\r\n").first().copied() else {
-            return (fields, false);
-        };
-        let Some((name, file)) = part_name(&tail[..split]) else {
-            continue;
-        };
-        if file {
-            return (fields, true);
-        }
-        // A field is complete once the next delimiter has arrived.
-        if part_end.is_none() {
-            return (fields, false);
-        }
-        let value = &tail[split + 4..];
-        let value = value.strip_suffix(b"\r\n").unwrap_or(value);
-        fields.push((name, value.to_vec()));
     }
-    (fields, false)
 }
 
-/// The `acl` of `fields`, if any.
-fn acl_of(fields: &[(String, Vec<u8>)]) -> Option<FormAcl> {
-    let mut named = fields
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("acl"));
-    let first = named.next()?;
-    if named.next().is_some() {
-        return Some(FormAcl::Repeated);
-    }
-    Some(FormAcl::Named(
-        String::from_utf8_lossy(&first.1).into_owned(),
-    ))
-}
-
-/// Reads the fields of the form `body` (with `boundary`) ahead, and returns the `acl` field
+/// Reads the fields of the form `body` (with `boundary`) ahead, and returns what they hold
 /// and the whole body again.
-pub(crate) async fn read_acl<B>(
+pub(crate) async fn read_ahead<B>(
     body: B,
-    boundary: String,
+    boundary: &str,
 ) -> (
-    Option<FormAcl>,
-    StreamBody<impl futures_util::Stream<Item = Result<Frame<Bytes>, B::Error>> + Send>,
+    ReadAhead,
+    StreamBody<impl Stream<Item = Result<Frame<Bytes>, B::Error>> + Send + use<B>>,
 )
 where
     B: http_body::Body<Data = Bytes> + Send + 'static,
@@ -143,102 +188,212 @@ where
 {
     let mut body = Box::pin(body);
     let mut read: Vec<Frame<Bytes>> = Vec::new();
-    let mut buffer = BytesMut::new();
     let mut failed = None;
-    let acl = loop {
-        let (found, done) = fields(&buffer, &boundary);
-        if done || buffer.len() > READ_AHEAD {
-            break acl_of(&found);
+    let mut too_large = false;
+    let found = match Boundary::new(boundary.as_bytes()) {
+        Err(_) => Err(()),
+        Ok(boundary) => {
+            let recording = Recording {
+                body: body.as_mut(),
+                read: &mut read,
+                failed: &mut failed,
+                too_large: &mut too_large,
+                bytes: 0,
+            };
+            let mut parser = Multipart::new(recording, &boundary, MAX_FIELD_SIZE);
+            acl_of(&mut parser).await
         }
-        match body.frame().await {
-            Some(Ok(frame)) => {
-                if let Some(data) = frame.data_ref() {
-                    buffer.extend_from_slice(data);
-                }
-                read.push(frame);
-            }
-            Some(Err(err)) => {
-                failed = Some(err);
-                break None;
-            }
-            None => break acl_of(&fields(&buffer, &boundary).0),
+    };
+    let found = if failed.is_some() {
+        ReadAhead::Failed
+    } else if too_large {
+        ReadAhead::TooLarge
+    } else {
+        match found {
+            Ok(acl) => ReadAhead::Fields(acl),
+            Err(()) => ReadAhead::Malformed,
         }
     };
     let replay = futures_util::stream::iter(read.into_iter().map(Ok).chain(failed.map(Err)));
-    (acl, StreamBody::new(replay.chain(BodyStream::new(body))))
+    (found, StreamBody::new(replay.chain(BodyStream::new(body))))
 }
 
 #[cfg(test)]
 mod tests {
+    use http_body_util::BodyExt;
+
     use super::*;
 
-    fn form(fields: &[(&str, &str)], boundary: &str) -> Vec<u8> {
-        let mut body = Vec::new();
-        for (name, value) in fields {
-            body.extend_from_slice(
-                format!(
-                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
-                )
-                .as_bytes(),
-            );
+    const FILE: &str = "Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n\r\n\
+                        content";
+
+    /// A form of `parts` (each its header lines and value, joined by an empty line) and a file,
+    /// with the boundary `B`.
+    fn raw(parts: &[&str]) -> Vec<u8> {
+        let mut body = String::new();
+        for part in parts.iter().chain([&FILE]) {
+            body.push_str("--B\r\n");
+            body.push_str(part);
+            body.push_str("\r\n");
         }
-        body.extend_from_slice(
-            format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
-                 filename=\"a.txt\"\r\n\r\ncontent\r\n--{boundary}--\r\n"
-            )
-            .as_bytes(),
-        );
-        body
+        body.push_str("--B--\r\n");
+        body.into_bytes()
     }
 
-    #[test]
-    fn boundaries_come_from_the_content_type() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_TYPE,
-            "multipart/form-data; boundary=\"abc def\"".parse().unwrap(),
-        );
-        assert_eq!(boundary(&headers).as_deref(), Some("abc def"));
-        headers.insert(
-            header::CONTENT_TYPE,
-            "Multipart/Form-Data;charset=utf-8; Boundary=xyz"
-                .parse()
-                .unwrap(),
-        );
-        assert_eq!(boundary(&headers).as_deref(), Some("xyz"));
-        headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
-        assert_eq!(boundary(&headers), None);
+    /// A part of a plain field.
+    fn field(name: &str, value: &str) -> String {
+        format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}")
     }
 
-    #[test]
-    fn fields_before_the_file_are_read() {
-        let body = form(&[("key", "a/${filename}"), ("acl", "public-read")], "b0");
-        let (found, done) = fields(&body, "b0");
-        assert!(done);
-        assert_eq!(found.len(), 2);
-        assert_eq!(acl_of(&found), Some(FormAcl::Named("public-read".into())));
-        // A field is taken only once it is complete.
-        let cut = body.len() - 120;
-        let (found, done) = fields(&body[..30], "b0");
-        assert!(!done && found.is_empty());
-        assert!(fields(&body[..cut], "b0").0.len() <= 2);
-        let twice = form(&[("acl", "private"), ("ACL", "public-read")], "b0");
-        assert_eq!(acl_of(&fields(&twice, "b0").0), Some(FormAcl::Repeated));
-        assert_eq!(acl_of(&fields(&form(&[("key", "k")], "b0"), "b0").0), None);
-    }
-
-    #[tokio::test]
-    async fn the_body_is_handed_on_unchanged() {
-        let body = form(&[("acl", "public-read"), ("key", "k")], "xyz");
+    /// Reads `body` ahead in chunks of `chunk` bytes; checks that it is handed on unchanged.
+    async fn read_chunked(body: &[u8], chunk: usize) -> ReadAhead {
         let chunks: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = body
-            .chunks(7)
+            .chunks(chunk)
             .map(|chunk| Ok(Frame::data(Bytes::copy_from_slice(chunk))))
             .collect();
         let source = StreamBody::new(futures_util::stream::iter(chunks));
-        let (acl, replayed) = read_acl(source, "xyz".to_owned()).await;
-        assert_eq!(acl, Some(FormAcl::Named("public-read".into())));
+        let (found, replayed) = read_ahead(source, "B").await;
         let collected = BodyExt::collect(replayed).await.unwrap().to_bytes();
-        assert_eq!(collected, Bytes::from(body));
+        assert_eq!(collected, Bytes::copy_from_slice(body));
+        found
+    }
+
+    async fn read(body: &[u8]) -> ReadAhead {
+        let whole = read_chunked(body, body.len().max(1)).await;
+        assert_eq!(read_chunked(body, 7).await, whole);
+        whole
+    }
+
+    fn named(acl: &str) -> ReadAhead {
+        ReadAhead::Fields(Some(FormAcl::Named(acl.to_owned())))
+    }
+
+    #[test]
+    fn the_media_type_is_read_as_s3s_reads_it() {
+        let boundary = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, value.parse().unwrap());
+            media_type(&headers).and_then(|media| {
+                media
+                    .get_param(mime::BOUNDARY)
+                    .map(|b| b.as_str().to_owned())
+            })
+        };
+        assert_eq!(
+            boundary("multipart/form-data; boundary=\"abc def\"").as_deref(),
+            Some("abc def")
+        );
+        assert_eq!(
+            boundary("Multipart/Form-Data;charset=utf-8; Boundary=xyz").as_deref(),
+            Some("xyz")
+        );
+        assert_eq!(boundary("text/plain"), None);
+        // Two Content-Type headers: s3s does not take the request as a form.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::CONTENT_TYPE,
+            "multipart/form-data; boundary=a".parse().unwrap(),
+        );
+        headers.append(
+            header::CONTENT_TYPE,
+            "multipart/form-data; boundary=b".parse().unwrap(),
+        );
+        assert!(media_type(&headers).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_acl_before_the_file_is_read() {
+        let form = raw(&[&field("key", "a/${filename}"), &field("acl", "public-read")]);
+        assert_eq!(read(&form).await, named("public-read"));
+        assert_eq!(
+            read(&raw(&[&field("key", "k")])).await,
+            ReadAhead::Fields(None)
+        );
+        let twice = raw(&[&field("acl", "private"), &field("ACL", "public-read")]);
+        assert_eq!(
+            read(&twice).await,
+            ReadAhead::Fields(Some(FormAcl::Repeated))
+        );
+        // No file part, or a part without a name: s3s refuses the form as well.
+        assert_eq!(
+            read(b"--B\r\n\r\nx\r\n--B--\r\n").await,
+            ReadAhead::Malformed
+        );
+        let unnamed = raw(&["Content-Disposition: form-data\r\n\r\nx"]);
+        assert_eq!(read(&unnamed).await, ReadAhead::Malformed);
+    }
+
+    // Forms that read differently with a parser of its own than with s3s's: the acl found
+    // is always the one s3s checks against the policy (or the form is refused).
+
+    #[tokio::test]
+    async fn a_delimiter_inside_a_value_is_data() {
+        let smuggled = field(
+            "x-ignore-a",
+            "x--B\r\nContent-Disposition: form-data; name=\"acl\"\r\n\r\npublic-read",
+        );
+        let form = raw(&[&smuggled, &field("acl", "private")]);
+        assert_eq!(read(&form).await, named("private"));
+    }
+
+    #[tokio::test]
+    async fn only_the_part_named_file_is_the_file() {
+        let stopper =
+            "Content-Disposition: form-data; name=\"x-ignore-z\"; filename=\"q\"\r\n\r\nq";
+        let form = raw(&[stopper, &field("acl", "private")]);
+        assert_eq!(read(&form).await, named("private"));
+        let form = raw(&[
+            &field("acl", "public-read"),
+            stopper,
+            &field("acl", "private"),
+        ]);
+        assert_eq!(
+            read(&form).await,
+            ReadAhead::Fields(Some(FormAcl::Repeated))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_name_of_a_part_counts() {
+        let smuggled =
+            "Content-Disposition: form-data; name=\"x-ignore-a\"; name=\"acl\"\r\n\r\npublic-read";
+        let hidden =
+            "Content-Disposition: form-data; name=\"acl\"; name=\"x-ignore-b\"\r\n\r\nprivate";
+        assert_eq!(read(&raw(&[smuggled, hidden])).await, named("private"));
+        assert_eq!(read(&raw(&[smuggled])).await, ReadAhead::Fields(None));
+        // A quoted `;` belongs to the name.
+        let quoted =
+            "Content-Disposition: form-data; name=\"x-ignore-a;name=acl\"\r\n\r\npublic-read";
+        assert_eq!(read(&raw(&[quoted])).await, ReadAhead::Fields(None));
+    }
+
+    #[tokio::test]
+    async fn the_last_content_disposition_of_a_part_counts() {
+        let part = "Content-Disposition: form-data; name=\"acl\"\r\n\
+                    Content-Disposition: form-data; name=\"x-ignore-a\"\r\n\r\npublic-read";
+        assert_eq!(read(&raw(&[part])).await, ReadAhead::Fields(None));
+    }
+
+    #[tokio::test]
+    async fn fields_beyond_the_read_ahead_are_refused() {
+        let filler = "f".repeat(512 * 1024);
+        let form = raw(&[
+            &field("acl", "public-read"),
+            &field("x-ignore-1", &filler),
+            &field("x-ignore-2", &filler),
+            &field("acl", "private"),
+        ]);
+        assert_eq!(read_chunked(&form, 16 * 1024).await, ReadAhead::TooLarge);
+        // A body that arrives in one piece, file included, is read as a whole.
+        let form = raw(&[&field("acl", "public-read"), &field("x-ignore-1", &filler)]);
+        let mut whole = form.clone();
+        whole.splice(
+            whole.len() - 9..whole.len() - 9,
+            "z".repeat(READ_AHEAD).bytes(),
+        );
+        assert_eq!(
+            read_chunked(&whole, whole.len()).await,
+            named("public-read")
+        );
     }
 }
