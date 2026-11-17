@@ -165,6 +165,16 @@ compatible within a major version: released clients keep working with newer serv
   of 38 ms and 194 ms instead of 164 ms; at 64 transfers, where the database writer is the
   limit, they stayed at about 150 (146 before, 151 after).
 
+### Security
+
+- On an `https` site, the cookies of web sessions, pending sign-ins and CSRF tokens are named
+  with the `__Host-` prefix (`__Host-gono_session`, `__Host-gono_csrf`,
+  `__Host-gono_two_step`), which browsers accept only from the site's own host. Pages served
+  by another host of the same site (the S3 API serves files its users upload) could otherwise
+  set a session cookie for the parent domain and sign a visitor's browser into another
+  account. A request that carries one of these cookies twice now counts as signed out.
+  Upgrading signs everyone out of the web pages once.
+
 ## [1.2.0] - 2026-11-12
 
 A web file UI and account page in the browser, and every page in English or Chinese. There are

@@ -174,6 +174,9 @@ impl Reply {
     }
 }
 
+/// The session cookie of the fixture's `https` origin.
+const SESSION_COOKIE: &str = "__Host-gono_session";
+
 /// A browser: keeps cookies, sends forms.
 struct Browser {
     router: Router,
@@ -302,7 +305,7 @@ async fn only_admins_sign_in_and_only_with_the_web_password() {
     let device = browser.sign_in("root", &f.root_device).await;
     assert_eq!(device.status, StatusCode::FORBIDDEN);
     assert!(device.body.contains("Wrong username or password"));
-    assert!(!browser.cookies.contains_key("gono_session"));
+    assert!(!browser.cookies.contains_key(SESSION_COOKIE));
 
     // A non-admin's correct password does not open the admin UI.
     let alice = browser.sign_in("alice", ALICE_PASSWORD).await;
@@ -312,7 +315,7 @@ async fn only_admins_sign_in_and_only_with_the_web_password() {
         "{}",
         alice.body
     );
-    assert!(!browser.cookies.contains_key("gono_session"));
+    assert!(!browser.cookies.contains_key(SESSION_COOKIE));
 
     let root = browser.sign_in("root", ROOT_PASSWORD).await;
     assert_eq!(root.status, StatusCode::SEE_OTHER);
@@ -373,7 +376,7 @@ async fn non_admin_sessions_are_refused() {
     let mut browser = Browser::new(&f.state);
     browser
         .cookies
-        .insert("gono_session".into(), token.expose_secret().to_owned());
+        .insert(SESSION_COOKIE.into(), token.expose_secret().to_owned());
     let page = browser.get(&path("/users")).await;
     assert_eq!(page.status, StatusCode::FORBIDDEN);
     assert!(page.body.contains("Not an administrator"));

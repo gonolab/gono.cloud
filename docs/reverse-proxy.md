@@ -42,7 +42,8 @@ trusted_proxies = ["127.0.0.1", "::1"]
   `base_url`:
   - absolute URLs handed to clients: Login Flow v2 links, and the notify_push endpoints in the
     capabilities (`wss://cloud.example.com/push/ws` when `base_url` is `https://...`);
-  - the `Secure` flag of browser cookies (set when `base_url` is `https`);
+  - the `Secure` flag of browser cookies, and the `__Host-` prefix of the cookies of sessions,
+    sign-ins and CSRF tokens (both when `base_url` is `https`);
   - the origin check of every HTML form (Login Flow and the web admin UI): a browser that
     sends `Origin: https://cloud.example.com` is accepted only if that is `base_url`'s origin.
 

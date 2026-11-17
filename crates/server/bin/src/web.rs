@@ -25,6 +25,11 @@
 //!   ([`gono_server_core::web_sessions`]) and sets the [`SESSION_COOKIE`] (`HttpOnly`,
 //!   `SameSite=Lax`, `Secure` when the public origin is HTTPS). App passwords never create a
 //!   session, and sessions never authenticate WebDAV requests.
+//! - **Cookie names**: on an HTTPS origin the cookies of sessions, sign-ins and CSRF tokens are
+//!   named with the [`HOST_PREFIX`], which browsers accept only from this host itself. Other
+//!   hosts of the same site (the S3 API's serves pages its users uploaded) can set cookies for
+//!   the whole site, but none of these; a request that carries a cookie more than once is taken
+//!   to carry it not at all ([`cookie`]).
 //! - **CSRF**: every form carries a token. Before sign-in it is a double-submit token: a random
 //!   value in the [`CSRF_COOKIE`] (`SameSite=Strict`) repeated in the form. After sign-in it
 //!   is derived from the session token, which the page cannot read; the script sends it in a
@@ -68,6 +73,11 @@ use crate::{
 
 /// Cookie holding the session token.
 pub const SESSION_COOKIE: &str = "gono_session";
+
+/// Prefix of the names of [`SESSION_COOKIE`], [`CSRF_COOKIE`] and [`TWO_STEP_COOKIE`] on an
+/// HTTPS origin. Browsers accept a cookie named so only from the host itself, with `Secure`,
+/// `Path=/` and no `Domain`, so no other host of the site can plant one.
+pub const HOST_PREFIX: &str = "__Host-";
 
 /// Cookie holding the double-submit CSRF token of forms shown before sign-in.
 pub const CSRF_COOKIE: &str = "gono_csrf";
@@ -359,17 +369,21 @@ fn dummy_hash() -> &'static str {
     })
 }
 
-/// The value of cookie `name` in the request.
+/// The value of cookie `name` in the request, or `None` when the request carries it more than
+/// once: then another host of the site, or a path below the pages, has set one of them, and
+/// which one is ours cannot be told.
 pub fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
+    let mut values = headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(';'))
-        .find_map(|pair| {
+        .filter_map(|pair| {
             let (key, value) = pair.trim().split_once('=')?;
             (key == name).then(|| value.trim_matches('"').to_owned())
-        })
+        });
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
 }
 
 /// The CSRF token of forms shown to the holder of session `token`.
@@ -466,7 +480,7 @@ impl Web {
 
     /// The username of the sign-in waiting for its second step in this request, if any.
     pub fn pending_user(&self, headers: &HeaderMap) -> Option<String> {
-        let token = cookie(headers, TWO_STEP_COOKIE)?;
+        let token = cookie(headers, &self.cookie_name(TWO_STEP_COOKIE))?;
         self.pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -618,7 +632,7 @@ impl Web {
     /// Checks the second step of the sign-in of this request: a TOTP code or a recovery code
     /// (`docs/connect-protocol.md`, 13.3).
     pub async fn second_step(&self, client: IpAddr, headers: &HeaderMap, code: &str) -> SecondStep {
-        let Some(token) = cookie(headers, TWO_STEP_COOKIE) else {
+        let Some(token) = cookie(headers, &self.cookie_name(TWO_STEP_COOKIE)) else {
             return SecondStep::Expired;
         };
         let digest = secret::digest(&token);
@@ -800,6 +814,17 @@ impl Web {
             .filter(|entry| entry.until > now)
     }
 
+    /// The name of cookie `base` on this origin: with the [`HOST_PREFIX`] for the cookies of
+    /// sessions, sign-ins and CSRF tokens on an HTTPS origin (whose `Set-Cookie` values carry
+    /// `Secure` and `Path=/` and no `Domain`, as the prefix asks), as it is otherwise.
+    pub fn cookie_name(&self, base: &str) -> String {
+        if self.secure && [SESSION_COOKIE, CSRF_COOKIE, TWO_STEP_COOKIE].contains(&base) {
+            format!("{HOST_PREFIX}{base}")
+        } else {
+            base.to_owned()
+        }
+    }
+
     fn cookie_header(
         &self,
         name: &str,
@@ -807,6 +832,7 @@ impl Web {
         same_site: &str,
         max_age: Option<u32>,
     ) -> HeaderValue {
+        let name = self.cookie_name(name);
         let mut cookie = format!("{name}={value}; Path=/; HttpOnly; SameSite={same_site}");
         if self.secure {
             cookie.push_str("; Secure");
@@ -842,7 +868,7 @@ impl Web {
 
     /// The signed-in account of the request and its session token, if it has a live session.
     pub async fn session(&self, headers: &HeaderMap) -> Option<(SessionUser, String)> {
-        let token = cookie(headers, SESSION_COOKIE)?;
+        let token = cookie(headers, &self.cookie_name(SESSION_COOKIE))?;
         match web_sessions::lookup(&self.pool, &token, db::unix_now()).await {
             Ok(user) => user.map(|user| (user, token)),
             Err(err) => {
@@ -935,7 +961,7 @@ impl Web {
     /// The CSRF token for a form shown before sign-in, and the `Set-Cookie` value to send
     /// with the page. An existing token is kept, so that several open pages stay valid.
     pub fn login_csrf(&self, headers: &HeaderMap) -> (String, HeaderValue) {
-        let token = cookie(headers, CSRF_COOKIE)
+        let token = cookie(headers, &self.cookie_name(CSRF_COOKIE))
             .filter(|token| {
                 token.len() == CSRF_CHARS && token.bytes().all(|b| b.is_ascii_alphanumeric())
             })
@@ -946,7 +972,7 @@ impl Web {
 
     /// Whether a form submitted before sign-in carries the token of its CSRF cookie.
     pub fn check_login_csrf(&self, headers: &HeaderMap, submitted: &str) -> bool {
-        cookie(headers, CSRF_COOKIE).is_some_and(|expected| {
+        cookie(headers, &self.cookie_name(CSRF_COOKIE)).is_some_and(|expected| {
             !expected.is_empty()
                 && secret::constant_time_eq(expected.as_bytes(), submitted.as_bytes())
         })
@@ -1495,6 +1521,65 @@ mod tests {
         assert_eq!(cookie(&headers, SESSION_COOKIE).as_deref(), Some("abc"));
         assert_eq!(cookie(&headers, CSRF_COOKIE).as_deref(), Some("xyz"));
         assert_eq!(cookie(&headers, "b"), None);
+        // A cookie named twice (one set by another host of the site, say) counts as absent.
+        headers.append(header::COOKIE, "gono_session=planted".parse().unwrap());
+        assert_eq!(cookie(&headers, SESSION_COOKIE), None);
+        assert_eq!(cookie(&headers, CSRF_COOKIE).as_deref(), Some("xyz"));
+    }
+
+    #[tokio::test]
+    async fn cookies_of_https_origins_are_host_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = gono_server_core::config::DbConfig {
+            path: dir.path().join("db.sqlite"),
+            max_connections: 2,
+            busy_timeout_secs: 5,
+        };
+        let pool = db::connect(&config, db::OpenMode::CreateIfMissing)
+            .await
+            .unwrap();
+        db::migrate(&pool).await.unwrap();
+        let limiter = Arc::new(RateLimiter::new());
+        let https = Web::new(
+            pool.clone(),
+            limiter.clone(),
+            &Url::parse("https://cloud.example.com").unwrap(),
+        );
+        let http = Web::new(pool, limiter, &Url::parse("http://localhost:8080").unwrap());
+        let token = SecretString::from("t".repeat(43));
+        let set = https.session_cookie(&token);
+        let set = set.to_str().unwrap();
+        assert!(set.starts_with(&format!("__Host-gono_session={}; Path=/;", "t".repeat(43))));
+        assert!(set.contains("; Secure") && !set.contains("Domain"), "{set}");
+        let removal = https.removal_cookie(CSRF_COOKIE);
+        assert!(removal.to_str().unwrap().starts_with("__Host-gono_csrf=;"));
+        assert!(
+            https
+                .two_step_removal()
+                .to_str()
+                .unwrap()
+                .starts_with("__Host-gono_two_step=;")
+        );
+        // The theme is no secret and keeps its name.
+        assert_eq!(https.cookie_name(THEME_COOKIE), THEME_COOKIE);
+        // A plain HTTP origin (a test installation) cannot use the prefix.
+        assert!(
+            http.session_cookie(&token)
+                .to_str()
+                .unwrap()
+                .starts_with("gono_session=")
+        );
+
+        // The pages read only the prefixed cookie: one set by another host of the site under
+        // the plain name is not taken up.
+        let csrf = |cookies: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, cookies.parse().unwrap());
+            https.login_csrf(&headers).0
+        };
+        let kept = "a".repeat(CSRF_CHARS);
+        assert_eq!(csrf(&format!("__Host-gono_csrf={kept}")), kept);
+        assert_ne!(csrf(&format!("gono_csrf={kept}")), kept);
     }
 
     fn pending(user_id: i64, client: IpAddr) -> Pending {
