@@ -37,7 +37,8 @@ compatible within a major version: released clients keep working with newer serv
   access, keeps a control channel open (`/gono/v1/ws`, a WebSocket the reverse proxy must
   forward like `/push/ws`), sees the account's other devices and their presence, gets their
   addresses only through recorded connection requests, and passes pairing requests and signed
-  approvals between devices. The relay admits these devices besides `relay.allowed_endpoints`.
+  approvals between devices, refusing statements whose device names hide or reorder text or
+  carry white space at their edges (protocol 2.1). The relay admits these devices besides `relay.allowed_endpoints`.
   Only accounts with two-step verification on have remote access. The account page lists the
   devices, and stops remote access for one that stays in use ("Stop remote access" signs it
   out, keeping its pairings);

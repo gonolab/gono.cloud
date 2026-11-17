@@ -19,7 +19,7 @@ use iroh::{EndpointId, SecretKey};
 
 use crate::protocol::{
     DeviceId, Signed, Statement, limits,
-    name::check_name,
+    name::check_statement_name,
     statement::{DeviceSummary, Introduced, PairApproval},
 };
 
@@ -194,11 +194,12 @@ pub fn check(
     if approval.server != context.server || approval.account != context.account {
         return Err(Refusal::OtherAccount);
     }
-    check_name(&approval.subject.name).map_err(|_| Refusal::Malformed("the newcomer's name"))?;
+    check_statement_name(&approval.subject.name)
+        .map_err(|_| Refusal::Malformed("the newcomer's name"))?;
     if approval
         .introduced
         .iter()
-        .any(|device| check_name(&device.name).is_err())
+        .any(|device| check_statement_name(&device.name).is_err())
     {
         return Err(Refusal::Malformed("an introduced device's name"));
     }
@@ -335,7 +336,7 @@ fn addition(
 ) -> Addition {
     Addition {
         endpoint_id: endpoint_id.0,
-        name: name.trim().to_owned(),
+        name: name.to_owned(),
         allow_incoming,
         allow_outgoing,
         method: Method::Vouched,
@@ -635,6 +636,26 @@ mod tests {
             check(&bidi, &view, &context(&t)),
             Err(Refusal::Malformed(_))
         ));
+
+        // Statements travel unchanged, so a name with line breaks or padding at its edges is
+        // refused rather than trimmed.
+        let untrimmed = sign(
+            &a,
+            &context(&a),
+            summary(&n, "Work PC\n\n\n"),
+            NONCE,
+            vec![Introduced {
+                endpoint_id: DeviceId(t.public()),
+                name: "Home PC".to_owned(),
+                allow_incoming: true,
+                allow_outgoing: false,
+            }],
+            3600,
+        );
+        assert_eq!(
+            check(&untrimmed, &view, &context(&t)),
+            Err(Refusal::Malformed("the newcomer's name"))
+        );
     }
 
     #[test]

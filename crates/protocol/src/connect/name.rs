@@ -3,6 +3,11 @@
 //! Names are self-asserted and reach approval prompts and notices on other devices, so they must
 //! not be able to hide or reorder what the user reads: no control characters, no bidirectional
 //! controls, and no invisible characters. Prompts show the short ID next to every name.
+//!
+//! - [`check_name`] for a name a device sends on its own, at registration or in a rename: the
+//!   server trims it and stores the result.
+//! - [`check_statement_name`] for a name inside a signed statement, which the server relays byte
+//!   for byte and cannot trim: it must be trimmed already.
 
 /// Longest name, in characters.
 pub const MAX_NAME_CHARS: usize = 64;
@@ -18,6 +23,8 @@ pub enum NameError {
     Bidi,
     /// An invisible character: zero-width, a filler, a variation selector, a tag, …
     Invisible,
+    /// White space at the start or the end of a name inside a signed statement.
+    Untrimmed,
 }
 
 impl NameError {
@@ -28,6 +35,7 @@ impl NameError {
             Self::Control => "must not contain control characters",
             Self::Bidi => "must not contain bidirectional controls",
             Self::Invisible => "must not contain invisible characters",
+            Self::Untrimmed => "must not start or end with white space",
         }
     }
 }
@@ -58,6 +66,18 @@ pub fn check_name(name: &str) -> Result<&str, NameError> {
         }
     }
     Ok(name)
+}
+
+/// Checks a name inside a signed statement (`pair-request`, `pair-approval`) as protocol 2.1
+/// says. Statements travel unchanged, so the name is checked as it is: white space at its
+/// edges, which [`check_name`] would trim away first, is refused. Otherwise line breaks,
+/// carriage returns and padding at the edges would reach the approver's prompt and could push
+/// the short ID out of view.
+pub fn check_statement_name(name: &str) -> Result<&str, NameError> {
+    if name.trim() != name {
+        return Err(NameError::Untrimmed);
+    }
+    check_name(name)
 }
 
 fn is_bidi_control(c: char) -> bool {
@@ -116,5 +136,34 @@ mod tests {
         assert_eq!(check_name("Home PC\u{FEFF}"), Err(NameError::Invisible));
         assert_eq!(check_name("Home\u{3164}PC"), Err(NameError::Invisible));
         assert_eq!(check_name("Home PC\u{E0041}"), Err(NameError::Invisible));
+    }
+
+    #[test]
+    fn statement_names_must_be_trimmed_already() {
+        assert_eq!(check_statement_name("Work PC"), Ok("Work PC"));
+        assert_eq!(check_statement_name("小明的 iPhone"), Ok("小明的 iPhone"));
+        for name in [
+            " Work PC",
+            "Work PC ",
+            "Work PC\r",
+            "\nWork PC",
+            "Work PC\u{85}",
+            "\u{2028}Work PC",
+            "Work PC\u{3000}\u{3000}",
+            "\u{A0}Work PC",
+        ] {
+            assert_eq!(
+                check_statement_name(name),
+                Err(NameError::Untrimmed),
+                "{name:?}"
+            );
+        }
+        // The other rules still hold.
+        assert_eq!(check_statement_name(""), Err(NameError::Length));
+        assert_eq!(check_statement_name("Home\nPC"), Err(NameError::Control));
+        assert_eq!(
+            check_statement_name("Home \u{202E}CP"),
+            Err(NameError::Bidi)
+        );
     }
 }

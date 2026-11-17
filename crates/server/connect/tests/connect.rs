@@ -708,21 +708,35 @@ async fn an_approval_reaches_the_introduced_devices_and_the_newcomer() {
     let mut work = f.device(alice, "alice", &key(3), "Work PC").await;
 
     let nonce = statement::encode_bytes(&[9; 32]);
-    let request = Signed::sign(
-        &Statement::PairRequest(PairRequest {
-            server: SERVER.to_owned(),
-            account: "alice".to_owned(),
-            requester: DeviceSummary {
-                endpoint_id: work.id(),
-                name: "Work PC".to_owned(),
-                platform: "windows".to_owned(),
-                product: "input-show".to_owned(),
-            },
-            nonce: nonce.clone(),
-            issued_at: db::unix_now(),
-        }),
-        &work.key,
-    );
+    let request_from = |name: &str| {
+        Signed::sign(
+            &Statement::PairRequest(PairRequest {
+                server: SERVER.to_owned(),
+                account: "alice".to_owned(),
+                requester: DeviceSummary {
+                    endpoint_id: work.id(),
+                    name: name.to_owned(),
+                    platform: "windows".to_owned(),
+                    product: "input-show".to_owned(),
+                },
+                nonce: nonce.clone(),
+                issued_at: db::unix_now(),
+            }),
+            &work.key,
+        )
+    };
+    let request = request_from("Work PC");
+    // Statements are relayed unchanged, so their names must be trimmed already (protocol 2.1).
+    let untrimmed = [
+        request_from("Work PC\n\n\n"),
+        request_from("\u{3000}Work PC"),
+    ];
+    for bad in untrimmed {
+        let refused = work
+            .request(|id| ClientMessage::PairRequest { id, request: bad })
+            .await;
+        assert_eq!(error_code(&refused), Some(ErrorCode::BadRequest));
+    }
     let answer = work
         .request(|id| ClientMessage::PairRequest {
             id,
