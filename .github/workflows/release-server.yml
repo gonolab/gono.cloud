@@ -200,7 +200,7 @@ jobs:
         run: |
           cd dist
           set -- *.tar.gz
-          test "$#" -eq 4
+          test "$#" -eq 2
           sha256sum -- "$@" cloud.server.sh > SHA256SUMS
           cat SHA256SUMS
 
