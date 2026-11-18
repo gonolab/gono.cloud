@@ -10,6 +10,14 @@ compatible within a major version: released clients keep working with newer serv
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-11-18
+
+Remote access no longer requires two-step verification by default while remote control is in
+development, and releases are for Linux only. There are no database migrations: an upgrade
+from 2.0.0 keeps the database, the accounts and the devices. To keep 2.0.0's behaviour, set
+`require_two_factor = true` in a `[connect]` table. An installation of 2.0.0 on macOS keeps
+running, but the install script no longer upgrades it.
+
 ### Changed
 
 - **Remote access no longer requires two-step verification by default, for now.** A new
@@ -351,7 +359,8 @@ their tags stay as they are.
 - Documentation: deployment (`docs/deployment.md`), reverse proxies (`docs/reverse-proxy.md`),
   v1 scope and the mobile test checklist.
 
-[Unreleased]: https://github.com/gonolab/gono.cloud/compare/server-v2.0.0...HEAD
+[Unreleased]: https://github.com/gonolab/gono.cloud/compare/server-v2.0.1...HEAD
+[2.0.1]: https://github.com/gonolab/gono.cloud/compare/server-v2.0.0...server-v2.0.1
 [2.0.0]: https://github.com/gonolab/gono.cloud/compare/server-v1.2.0...server-v2.0.0
 [1.2.0]: https://github.com/gonolab/gono.cloud/compare/server-v1.1.1...server-v1.2.0
 [1.1.1]: https://github.com/gonolab/gono.cloud/compare/server-v1.1.0...server-v1.1.1
