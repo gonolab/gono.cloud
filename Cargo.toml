@@ -19,7 +19,7 @@ exclude = ["acceptance"]
 resolver = "3"
 
 [workspace.package]
-version = "2.0.1"
+version = "2.0.2"
 edition = "2024"
 # The newest stable release when it was last raised (for S3 support; s3s 0.17 itself needs
 # 1.96). CI builds with the latest stable release; there is no separate check of this version.
