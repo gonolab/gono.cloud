@@ -1509,9 +1509,29 @@ pub fn element_ids(html: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `html` holds `word` with no ASCII letter or digit on either side. Pages carry random
+/// alphanumeric tokens (the CSP nonce, the CSRF token), so a plain `contains` of a short word
+/// such as "S3" now and then finds it inside one of them.
+#[cfg(test)]
+pub fn mentions(html: &str, word: &str) -> bool {
+    html.match_indices(word).any(|(index, _)| {
+        let before = html[..index].chars().next_back();
+        let after = html[index + word.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric())
+            && !after.is_some_and(|c| c.is_ascii_alphanumeric())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn words_inside_random_tokens_are_not_mentions() {
+        assert!(mentions("S3", "S3"));
+        assert!(mentions("<h2>S3 buckets</h2>", "S3"));
+        assert!(!mentions(r#"nonce="aS3b" value="S3x" csrf="yS3""#, "S3"));
+    }
 
     #[test]
     fn cookies_are_parsed_by_name() {

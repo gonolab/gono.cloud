@@ -1988,7 +1988,7 @@ async fn the_s3_part_of_the_account_page_is_there_only_while_the_s3_api_is_on() 
         "{}",
         page.text()
     );
-    assert!(!page.text().contains("S3"));
+    assert!(!web::mentions(&page.text(), "S3"), "{}", page.text());
     for (uri, fields) in [
         ("/apps/account/s3/buckets", vec![("name", "photos")]),
         (

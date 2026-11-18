@@ -1441,7 +1441,7 @@ async fn admins_see_revoke_and_remove_the_s3_keys_and_buckets_of_an_account() {
     let csrf = browser.root().await;
     let page = browser.get(&path("/users/alice")).await;
     assert_eq!(page.status, StatusCode::OK);
-    assert!(!page.body.contains("S3"), "{}", page.body);
+    assert!(!web::mentions(&page.body, "S3"), "{}", page.body);
     let off = browser
         .post(
             &path(&format!("/users/alice/s3/keys/{}/delete", key.id)),
