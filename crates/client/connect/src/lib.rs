@@ -11,7 +11,7 @@
 //! - [`ControlLookup`]: iroh's address lookup backed by the control channel (protocol 7).
 //! - [`Remote`]: the endpoint and the channel together, with the product API of plan 3.3:
 //!   connect to a device, accept connections from trusted keys
-//!   ([`Remote::accept_trusted`]), forward network changes.
+//!   ([`Remote::accept_trusted_filtered`]), forward network changes.
 //! - [`approval`]: the checks of protocol 8.5 on a received approval, and the approver's
 //!   statement.
 //!
@@ -24,7 +24,9 @@
 //! Trust stays with the product: this crate never decides whether a peer may connect or
 //! control anything, and keeps no trust list. It carries the server's messages;
 //! [`approval::check`] runs the checks of protocol 8.5 against the product's state and says
-//! what to store, and [`Remote::accept_trusted`] applies the product's own predicate.
+//! what to store, and [`Remote::accept_trusted_filtered`] applies the product's own
+//! predicates: which keys may start a handshake over the relay, and which are admitted after
+//! it.
 
 pub mod approval;
 mod channel;

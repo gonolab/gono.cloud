@@ -27,10 +27,13 @@
 //! Incoming connections: iroh 1.4.1 has no builder option for the endpoint's limit of pending
 //! connection attempts (noq's `max_incoming`, 65536 by default; `ServerConfigBuilder` only
 //! applies to `Incoming::accept_with`, after that limit was checked). Products accept with
-//! [`crate::Remote::accept_trusted`], which drains the queue at once, refuses attempts beyond a
-//! few concurrent handshakes per source and for the endpoint, and closes keys outside the trust
-//! list right after the handshake (threat model C8). iroh's `after_handshake` hook would close
-//! them at the same point, so it is not used.
+//! [`crate::Remote::accept_trusted_filtered`], which drains the queue at once, ignores relayed
+//! attempts from keys the product does not know before any handshake, refuses attempts beyond
+//! a few concurrent handshakes per source and for the endpoint, and closes keys outside the
+//! trust list right after the handshake (threat model C8). iroh's `after_handshake` hook would
+//! close them at the same point, so it is not used: in iroh 1.4.1 it runs only after the
+//! connection was registered, which already hands the peer every address of the device (threat
+//! model 5.6).
 //!
 //! Products depend on this crate, never on iroh's configuration directly, so that an iroh
 //! upgrade that adds a default changes one file. What a product may tune is limited to what

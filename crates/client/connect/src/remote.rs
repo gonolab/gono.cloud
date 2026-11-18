@@ -6,12 +6,15 @@
 //!   target) and dials the device by its key, relay first ([`crate::endpoint::dial`]).
 //!   [`Remote::connect_for_pairing`] does the same for the approver of a pending pairing
 //!   request (protocol 8.2).
-//! - [`Remote::accept_trusted`] is how a product accepts connections: it hands out only the
-//!   peers whose key the product's predicate admits (its trust list, and the key of a pending
-//!   pairing that `incoming` announced), closes every other right after the handshake, and
-//!   limits pending handshakes and their rate (threat model C8), per source first so that one
-//!   stranger cannot keep the user's own devices out. Whether an admitted peer may do anything
-//!   stays the product's decision.
+//! - [`Remote::accept_trusted_filtered`] is how a product accepts connections: it ignores
+//!   relayed attempts from keys the product does not know before any handshake, so that
+//!   strangers on the relay get no answer at all (threat model 5.6); it hands out only the
+//!   peers whose key the product admits (its trust list, and the key of a pending pairing that
+//!   `incoming` announced), closes every other right after the handshake, and limits pending
+//!   handshakes and their rate (threat model C8), per source first so that one stranger cannot
+//!   keep the user's own devices out. Whether an admitted peer may do anything stays the
+//!   product's decision. [`Remote::accept_trusted`] and [`Remote::accept_trusted_with`] do the
+//!   same without the filter before the handshake.
 //! - [`Remote::network_change`] forwards the platform's network events (plan 3.3; HarmonyOS
 //!   and Android need it).
 
@@ -193,9 +196,9 @@ impl Remote {
 
     /// The next incoming connection attempt, from any key, with no limit.
     ///
-    /// Low level: a product accepts with [`Remote::accept_trusted`] instead, which closes
-    /// unknown keys and limits handshakes (threat model C8). Do not use both: they take from
-    /// the same queue.
+    /// Low level: a product accepts with [`Remote::accept_trusted_filtered`] instead, which
+    /// ignores relayed strangers, closes unknown keys and limits handshakes (threat model C8).
+    /// Do not use both: they take from the same queue.
     pub fn accept(&self) -> Accept<'_> {
         self.endpoint.accept()
     }
@@ -208,6 +211,9 @@ impl Remote {
     ///
     /// `allow` is asked once per connection, after the handshake, so it may read a trust list
     /// that changes. Accepting stops when the endpoint closes or the receiver is dropped.
+    ///
+    /// Strangers on the relay still complete a handshake here, and with it learn the device's
+    /// addresses (threat model 5.6); [`Remote::accept_trusted_filtered`] ignores them first.
     pub fn accept_trusted<F>(&self, allow: F) -> mpsc::Receiver<Connection>
     where
         F: Fn(&EndpointId) -> bool + Send + Sync + 'static,
@@ -224,11 +230,63 @@ impl Remote {
     /// [`Remote::accept_trusted`] with the product's own close codes: `admit` says for each
     /// key whether to hand the connection out, or how to close it (for example a code that
     /// tells a revoked key apart from an unknown one).
+    ///
+    /// Strangers on the relay still complete a handshake here, and with it learn the device's
+    /// addresses (threat model 5.6); [`Remote::accept_trusted_filtered`] ignores them first.
     pub fn accept_trusted_with<F>(&self, admit: F) -> mpsc::Receiver<Connection>
     where
         F: Fn(&EndpointId) -> Admit + Send + Sync + 'static,
     {
-        accept_trusted(self.endpoint.clone(), Arc::new(admit))
+        accept_trusted(self.endpoint.clone(), None, Arc::new(admit))
+    }
+
+    /// [`Remote::accept_trusted_with`] that first ignores relayed attempts from keys `known`
+    /// refuses, before any handshake, and so before any budget (threat model 5.6).
+    ///
+    /// A relayed attempt names its sender before any cryptography: the relay labels every
+    /// frame with the key its sender proved when it connected (protocol 11.1). When `known`
+    /// refuses that key, the attempt is ignored: nothing at all goes back, no handshake, no
+    /// close and no refusal, so the stranger learns neither the device's addresses nor, with an
+    /// ordinary QUIC client, that it is online. (A crafted packet of an unknown QUIC version
+    /// still gets noq's version negotiation answer, which says only that.) iroh hands the
+    /// device's addresses to every peer that completes a handshake, and probes the addresses
+    /// the peer names, before the product can close the connection (threat model 5.6); this
+    /// keeps relayed strangers from getting that far.
+    ///
+    /// **What `known` holds.** Every key the product could admit, or wants to close with a code
+    /// of its own; nothing else, because each key in it can learn the device's addresses
+    /// (threat model G5):
+    /// - a product with a trust list passes the entries the remote endpoint admits (`remote`,
+    ///   protocol 8.1) and the key of the device's own pending pairing that `incoming`
+    ///   announced (8.2). `known` asks the product's state each time, so a pairing key it
+    ///   learns from the channel counts at the dialer's next retransmission, about a second
+    ///   later at worst;
+    /// - Input Show passes the account's devices, so that each still gets its own close code
+    ///   from `admit` (blocked, stale, remote access off).
+    ///
+    /// **Rules for `known`:**
+    /// - it is a pure predicate, cheap and without side effects: it runs on the accept loop for
+    ///   every relayed connection attempt, retransmissions included, before any limit, and
+    ///   `admit` is still asked once after the handshake for each key it lets through. A
+    ///   key-by-key budget belongs in `admit`;
+    /// - it says only whether the key may start a handshake. Whether that key may connect now
+    ///   (permissions, blocking, staleness) stays with `admit`, which gives each its close code.
+    ///
+    /// **What it does not cover:**
+    /// - direct attempts (from an IP address), which name no key before the handshake: they
+    ///   complete it and are closed by `admit` as before (threat model 5.6, plan V9);
+    /// - a relay that lies about the sender, which is a compromised server (threat model 5.1,
+    ///   5.2): the key proven in the handshake is checked by `admit` as before.
+    pub fn accept_trusted_filtered<K, F>(&self, known: K, admit: F) -> mpsc::Receiver<Connection>
+    where
+        K: Fn(&EndpointId) -> bool + Send + Sync + 'static,
+        F: Fn(&EndpointId) -> Admit + Send + Sync + 'static,
+    {
+        accept_trusted(
+            self.endpoint.clone(),
+            Some(Arc::new(known)),
+            Arc::new(admit),
+        )
     }
 
     /// Tells the endpoint that the network changed.
@@ -268,6 +326,9 @@ impl Admit {
 
 /// The product's decision over the remote key.
 type Allow = Arc<dyn Fn(&EndpointId) -> Admit + Send + Sync>;
+
+/// The keys the product knows: see [`Remote::accept_trusted_filtered`].
+type Known = Arc<dyn Fn(&EndpointId) -> bool + Send + Sync>;
 
 /// At most `limit` events per second, counted in fixed one-second windows.
 #[derive(Debug)]
@@ -376,18 +437,28 @@ impl Sources {
     }
 }
 
-/// See [`Remote::accept_trusted`].
-fn accept_trusted(endpoint: Endpoint, allow: Allow) -> mpsc::Receiver<Connection> {
+/// See [`Remote::accept_trusted`] and [`Remote::accept_trusted_filtered`].
+fn accept_trusted(
+    endpoint: Endpoint,
+    known: Option<Known>,
+    allow: Allow,
+) -> mpsc::Receiver<Connection> {
     let (accepted, receiver) = mpsc::channel(MAX_PENDING_HANDSHAKES);
-    tokio::spawn(accept_loop(endpoint, allow, accepted));
+    tokio::spawn(accept_loop(endpoint, known, allow, accepted));
     receiver
 }
 
 /// Takes every connection attempt off the endpoint at once (so noq's own queue of 65536, which
-/// iroh 1.4.1 cannot lower, never fills), refuses those beyond the budgets before any
-/// cryptography, and runs the rest. The budget of a source is checked before the endpoint's, so
-/// that one source refused does not use up the endpoint's rate.
-async fn accept_loop(endpoint: Endpoint, allow: Allow, accepted: mpsc::Sender<Connection>) {
+/// iroh 1.4.1 cannot lower, never fills), ignores relayed ones from keys `known` refuses,
+/// refuses those beyond the budgets before any cryptography, and runs the rest. The budget of a
+/// source is checked before the endpoint's, so that one source refused does not use up the
+/// endpoint's rate.
+async fn accept_loop(
+    endpoint: Endpoint,
+    known: Option<Known>,
+    allow: Allow,
+    accepted: mpsc::Sender<Connection>,
+) {
     let handshakes = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
     let sources = Arc::new(Sources::default());
     let mut rate = Rate::new(HANDSHAKES_PER_SECOND, Instant::now());
@@ -400,8 +471,19 @@ async fn accept_loop(endpoint: Endpoint, allow: Allow, accepted: mpsc::Sender<Co
             },
             () = accepted.closed() => return,
         };
+        let addr = incoming.remote_addr();
+        // Before the budgets, so that strangers use up none of them. `ignore`, not `refuse`:
+        // a refusal is an answer, and any answer tells the stranger that the device is online.
+        // A retransmitted Initial arrives as a new attempt and is asked about again.
+        if let (Some(known), IncomingAddr::Relay { endpoint_id, .. }) = (&known, &addr)
+            && !known(endpoint_id)
+        {
+            tracing::debug!(peer = %endpoint_id.fmt_short(), "ignoring a relayed attempt from a key the product does not know");
+            incoming.ignore();
+            continue;
+        }
         let now = Instant::now();
-        let source = Source::of(&incoming.remote_addr());
+        let source = Source::of(&addr);
         if let Err(reason) = sources.take(source, now) {
             tracing::debug!(?source, "refusing a connection: {reason}");
             incoming.refuse();
@@ -603,6 +685,7 @@ mod tests {
         let (server, revoked) = (bind(5).await.unwrap(), bind(6).await.unwrap());
         let _accepted = accept_trusted(
             server.clone(),
+            None,
             Arc::new(|_: &EndpointId| Admit::Close {
                 code: 4403,
                 reason: b"revoked".to_vec(),
@@ -650,6 +733,7 @@ mod tests {
         let trusted_key = trusted.id();
         let mut accepted = accept_trusted(
             server.clone(),
+            None,
             Arc::new(move |key| {
                 if *key == trusted_key {
                     Admit::Accept
@@ -692,6 +776,371 @@ mod tests {
 
         for endpoint in [server, trusted, stranger] {
             endpoint.close().await;
+        }
+    }
+
+    /// Through the relay: a relay on loopback (as in `examples/udp-paths.rs`), remote
+    /// endpoints bound as [`Remote::start`] binds them, and a tap that shows what the device
+    /// sends a stranger.
+    mod relayed {
+        use std::{
+            net::{Ipv4Addr, SocketAddr},
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        use futures_util::{SinkExt, StreamExt};
+        use iroh::{EndpointAddr, address_lookup::MemoryLookup, dns::DnsResolver};
+        use iroh_relay::{
+            client::ClientBuilder,
+            protos::relay::{ClientToRelayMsg, Datagrams, RelayToClientMsg},
+            server::{RelayConfig, Server, ServerConfig},
+        };
+        use tokio::net::UdpSocket;
+
+        use super::*;
+
+        const ALPN: &[u8] = b"test/1";
+
+        /// How long a stranger waits for an answer that must not come. The dialer's first
+        /// retransmission comes after about 1 s (noq's initial RTT of 333 ms), so the device
+        /// is asked at least twice.
+        const SILENCE: Duration = Duration::from_millis(2500);
+
+        async fn relay() -> (Server, RelayUrl) {
+            let mut config = ServerConfig::default();
+            config.relay = Some(RelayConfig::new(
+                "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            ));
+            let server = Server::spawn(config).await.unwrap();
+            let url = format!("http://{}", server.http_addr().unwrap())
+                .parse()
+                .unwrap();
+            (server, url)
+        }
+
+        /// A remote endpoint with the relay at `url`, online.
+        async fn remote(seed: u8, url: &RelayUrl) -> Endpoint {
+            let endpoint = endpoint::bind(
+                EndpointOptions {
+                    secret_key: SecretKey::from_bytes(&[seed; 32]),
+                    relay_url: Some(url.clone()),
+                    alpns: vec![ALPN.to_vec()],
+                    port: 0,
+                    bind: BindAddresses {
+                        ipv4: Ipv4Addr::LOCALHOST,
+                        ipv6: None,
+                    },
+                    dns: Dns::System,
+                    transport: TransportOptions::default(),
+                },
+                MemoryLookup::new(),
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), endpoint.online())
+                .await
+                .unwrap();
+            endpoint
+        }
+
+        /// An endpoint without relay, for dialing through a [`tap`].
+        async fn plain(key: &SecretKey) -> Endpoint {
+            Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .secret_key(key.clone())
+                .relay_mode(iroh::RelayMode::Disabled)
+                .clear_ip_transports()
+                .bind_addr("127.0.0.1:0")
+                .unwrap()
+                .bind()
+                .await
+                .unwrap()
+        }
+
+        /// A way to `target` through the relay that counts what comes back. The returned UDP
+        /// address stands for `target`: the tap passes each datagram it receives on to
+        /// `target` over the relay, as the relay client of `label` (so `target` sees an attempt
+        /// relayed from `label`), and passes `target`'s answers back. The counter is the
+        /// relay's datagram frames from `target` to `label`: every packet `target` sends back.
+        async fn tap(
+            url: &RelayUrl,
+            label: &SecretKey,
+            target: EndpointId,
+        ) -> (SocketAddr, Arc<AtomicUsize>) {
+            // A plain-HTTP relay uses no TLS, but the client wants a configuration.
+            let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+            let client = ClientBuilder::new(url.clone(), label.clone(), DnsResolver::new())
+                .tls_client_config(tls)
+                .connect()
+                .await
+                .unwrap();
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            let answers = Arc::new(AtomicUsize::new(0));
+            tokio::spawn({
+                let answers = Arc::clone(&answers);
+                async move {
+                    let (mut from_relay, mut to_relay) = client.split();
+                    let mut dialer = None;
+                    let mut buf = vec![0; 65536];
+                    loop {
+                        tokio::select! {
+                            received = socket.recv_from(&mut buf) => {
+                                let Ok((len, from)) = received else { return };
+                                dialer = Some(from);
+                                let message = ClientToRelayMsg::Datagrams {
+                                    dst_endpoint_id: target,
+                                    datagrams: Datagrams::from(&buf[..len]),
+                                };
+                                if to_relay.send(message).await.is_err() {
+                                    return;
+                                }
+                            }
+                            message = from_relay.next() => match message {
+                                Some(Ok(RelayToClientMsg::Datagrams {
+                                    remote_endpoint_id: sender,
+                                    datagrams,
+                                })) if sender == target => {
+                                    answers.fetch_add(1, Ordering::SeqCst);
+                                    let Some(dialer) = dialer else { continue };
+                                    // One frame may hold a batch of equal-sized datagrams.
+                                    let size = datagrams.segment_size.map(|size| size.get());
+                                    let size = size.map_or(datagrams.contents.len(), usize::from);
+                                    for datagram in datagrams.contents.chunks(size.max(1)) {
+                                        let _ = socket.send_to(datagram, dialer).await;
+                                    }
+                                }
+                                Some(Ok(RelayToClientMsg::Ping(data))) => {
+                                    let _ = to_relay.send(ClientToRelayMsg::Pong(data)).await;
+                                }
+                                Some(Ok(_)) => {}
+                                _ => return,
+                            },
+                        }
+                    }
+                }
+            });
+            (addr, answers)
+        }
+
+        /// The keys `known` was asked about, and a predicate that records them.
+        fn recording(
+            known: impl Fn(&EndpointId) -> bool + Send + Sync + 'static,
+        ) -> (Arc<Mutex<Vec<EndpointId>>>, Known) {
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let record = Arc::clone(&asked);
+            let known: Known = Arc::new(move |key: &EndpointId| {
+                record.lock().unwrap().push(*key);
+                known(key)
+            });
+            (asked, known)
+        }
+
+        fn admit_only(keys: Vec<EndpointId>) -> Allow {
+            Arc::new(move |key| {
+                if keys.contains(key) {
+                    Admit::Accept
+                } else {
+                    Admit::not_trusted()
+                }
+            })
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn relayed_strangers_get_no_answer_at_all() {
+            let (_relay, url) = relay().await;
+            let device = remote(1, &url).await;
+            let (stranger, liar) = (
+                SecretKey::from_bytes(&[2; 32]),
+                SecretKey::from_bytes(&[3; 32]),
+            );
+            let known_keys = vec![liar.public()];
+            let (asked, known) = recording({
+                let known_keys = known_keys.clone();
+                move |key| known_keys.contains(key)
+            });
+            let mut accepted = accept_trusted(device.clone(), Some(known), admit_only(known_keys));
+
+            // A stranger dials through the relay: no handshake, no close, no packet of any
+            // kind comes back, so no address either; and with no handshake the device never
+            // acts on the stranger's NAT-traversal frames, so it probes nothing.
+            let (through, answers) = tap(&url, &stranger, device.id()).await;
+            let dialer = plain(&stranger).await;
+            let dialed = tokio::time::timeout(
+                SILENCE,
+                dialer.connect(EndpointAddr::new(device.id()).with_ip_addr(through), ALPN),
+            )
+            .await;
+            assert!(dialed.is_err(), "the stranger got an answer: {dialed:?}");
+            assert_eq!(
+                answers.load(Ordering::SeqCst),
+                0,
+                "packets back to the stranger"
+            );
+            let asked_about_stranger = asked
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|key| **key == stranger.public())
+                .count();
+            assert!(
+                asked_about_stranger >= 2,
+                "the attempt and its retransmission reach the device and are ignored each time: {asked_about_stranger}"
+            );
+            assert!(accepted.try_recv().is_err());
+
+            // A relay that lies, labelling the stranger's packets with a key the device
+            // knows, gets the stranger through the filter but not past the check after the
+            // handshake. (The tap stands for that relay; it also shows that answers would be
+            // counted.)
+            let (through, answers) = tap(&url, &liar, device.id()).await;
+            let dialer = plain(&stranger).await;
+            let closed = tokio::time::timeout(Duration::from_secs(10), async {
+                dialer
+                    .connect(EndpointAddr::new(device.id()).with_ip_addr(through), ALPN)
+                    .await
+                    .unwrap()
+                    .closed()
+                    .await
+            })
+            .await
+            .unwrap();
+            assert!(
+                matches!(&closed, iroh::endpoint::ConnectionError::ApplicationClosed(close) if close.error_code == CLOSE_NOT_TRUSTED.into()),
+                "{closed:?}"
+            );
+            assert!(answers.load(Ordering::SeqCst) > 0);
+            assert!(accepted.try_recv().is_err());
+
+            device.close().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn known_keys_connect_through_the_relay() {
+            let (_relay, url) = relay().await;
+            let (device, own, pairing) = (
+                remote(1, &url).await,
+                remote(2, &url).await,
+                remote(3, &url).await,
+            );
+            let (own_key, pairing_key) = (own.id(), pairing.id());
+            // The pairing key becomes known only after its first attempt, as when `incoming`
+            // reaches the product a moment after the dialer's first packet.
+            let (asked, known) = recording({
+                let seen = AtomicUsize::new(0);
+                move |key| {
+                    *key == own_key
+                        || (*key == pairing_key && seen.fetch_add(1, Ordering::SeqCst) > 0)
+                }
+            });
+            let mut accepted = accept_trusted(
+                device.clone(),
+                Some(known),
+                admit_only(vec![own_key, pairing_key]),
+            );
+            let target = EndpointAddr::new(device.id()).with_relay_url(url.clone());
+
+            // A device of the account dials as gono-connect does, relay first.
+            let _connection = endpoint::dial(&own, target.clone(), ALPN).await.unwrap();
+            let incoming = tokio::time::timeout(Duration::from_secs(10), accepted.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(incoming.remote_id(), own_key);
+            assert!(
+                asked.lock().unwrap().contains(&own_key),
+                "the handshake came over the relay"
+            );
+
+            // The late key gets in with its retransmission.
+            let _connection = endpoint::dial(&pairing, target, ALPN).await.unwrap();
+            let incoming = tokio::time::timeout(Duration::from_secs(10), accepted.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(incoming.remote_id(), pairing_key);
+            let asked_about_pairing = asked
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|key| **key == pairing_key)
+                .count();
+            assert!(asked_about_pairing >= 2, "{asked_about_pairing}");
+
+            for endpoint in [device, own, pairing] {
+                endpoint.close().await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn without_known_relayed_strangers_complete_the_handshake_as_before() {
+            let (_relay, url) = relay().await;
+            let device = remote(1, &url).await;
+            let stranger = SecretKey::from_bytes(&[2; 32]);
+            let mut accepted = accept_trusted(device.clone(), None, admit_only(Vec::new()));
+
+            let (through, answers) = tap(&url, &stranger, device.id()).await;
+            let dialer = plain(&stranger).await;
+            let closed = tokio::time::timeout(Duration::from_secs(10), async {
+                dialer
+                    .connect(EndpointAddr::new(device.id()).with_ip_addr(through), ALPN)
+                    .await
+                    .unwrap()
+                    .closed()
+                    .await
+            })
+            .await
+            .unwrap();
+            assert!(
+                matches!(&closed, iroh::endpoint::ConnectionError::ApplicationClosed(close) if close.error_code == CLOSE_NOT_TRUSTED.into()),
+                "{closed:?}"
+            );
+            assert!(answers.load(Ordering::SeqCst) > 0);
+            assert!(accepted.try_recv().is_err());
+
+            device.close().await;
+        }
+
+        /// What `ignore` cannot hide: noq answers a packet of an unknown QUIC version with a
+        /// version negotiation packet itself, before any connection attempt exists. So a crafted
+        /// stranger still learns that the device is online, though nothing else (threat model
+        /// 5.6, R7). If this fails, that note can go.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn version_negotiation_still_answers_relayed_strangers() {
+            let (_relay, url) = relay().await;
+            let device = remote(1, &url).await;
+            let stranger = SecretKey::from_bytes(&[2; 32]);
+            let _accepted = accept_trusted(
+                device.clone(),
+                Some(Arc::new(|_: &EndpointId| false)),
+                admit_only(Vec::new()),
+            );
+
+            let (through, answers) = tap(&url, &stranger, device.id()).await;
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            // A long header (form and fixed bits) of the unknown version 0x1a2a3a4a, with
+            // 8-byte connection IDs, padded as an Initial must be.
+            let mut packet = vec![0; 1200];
+            packet[..6].copy_from_slice(&[0xc0, 0x1a, 0x2a, 0x3a, 0x4a, 8]);
+            packet[6..14].copy_from_slice(&[1; 8]);
+            packet[14] = 8;
+            packet[15..23].copy_from_slice(&[2; 8]);
+            socket.send_to(&packet, through).await.unwrap();
+            let mut buf = [0; 1500];
+            let (len, _) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(len > 5 && buf[0] & 0x80 != 0, "a long header");
+            assert_eq!(buf[1..5], [0; 4], "version 0: version negotiation");
+            assert!(answers.load(Ordering::SeqCst) > 0);
+
+            device.close().await;
         }
     }
 }

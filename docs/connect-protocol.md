@@ -1292,8 +1292,10 @@ the disconnect.
 
 - **No separation between accounts.** The relay forwards between any two admitted endpoints:
   iroh-relay 1.4.1 decides per connection, not per pair. So a device of one account can send
-  relayed packets to a device of another account whose endpoint ID it knows. Devices handle
-  that (C8), and the threat model weighs it (5.6).
+  relayed packets to a device of another account whose endpoint ID it knows. Devices ignore
+  relayed attempts from keys they do not know, before any handshake and without an answer, by
+  the relay's source label; they close other unknown keys right after the handshake (threat
+  model C8). The threat model weighs what remains (5.6).
 - **A relay on a host of its own** (`gono-cloud relay`) cannot read the directory, so it
   admits only `relay.allowed_endpoints`. Feeding it from the control plane over the network
   comes with hosted relays (plan 3.6).

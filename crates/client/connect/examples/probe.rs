@@ -36,10 +36,10 @@ use std::{
 };
 
 use gono_connect::{
-    ChannelEvent, ChannelOptions, Credentials, DeviceInfo, EndReason, Remote, RemoteOptions,
+    Admit, ChannelEvent, ChannelOptions, Credentials, DeviceInfo, EndReason, Remote, RemoteOptions,
     Server,
     endpoint::Dns,
-    iroh::{SecretKey, Watcher as _, endpoint::Connection},
+    iroh::{EndpointId, SecretKey, Watcher as _, endpoint::Connection},
     protocol::{
         DeviceId, Discovery, ServerMessage,
         message::{Purpose, SettingsChange},
@@ -353,12 +353,18 @@ async fn start(
     Ok((device, started.elapsed()))
 }
 
-/// Lets `device` accept connections from `peer` and echo every stream.
+/// Lets `device` accept connections from `peer` and echo every stream. Relayed attempts from
+/// other keys get no answer, as in a product.
 fn serve_echo(device: &Device, peer: DeviceId) {
     let peer = *peer.as_bytes();
-    let mut incoming = device
-        .remote
-        .accept_trusted(move |id| id.as_bytes() == &peer);
+    let is_peer = move |id: &EndpointId| id.as_bytes() == &peer;
+    let mut incoming = device.remote.accept_trusted_filtered(is_peer, move |id| {
+        if is_peer(id) {
+            Admit::Accept
+        } else {
+            Admit::not_trusted()
+        }
+    });
     tokio::spawn(async move {
         while let Some(connection) = incoming.recv().await {
             tokio::spawn(async move {

@@ -135,7 +135,9 @@ protocol 1.1).
 - end-to-end TLS (G2), and dialing by key (C2);
 - held keys are released by Input Show's switching heartbeat (500 ms, released after 2 s of
   silence), so dropped or delayed traffic cannot leave a key pressed down;
-- relay frames' source labels are used only for routing, never for identity (C2).
+- relay frames' source labels are used only for routing and to ignore strangers before the
+  handshake (C8), never for identity (C2). A false label gets a stranger past that filter, not
+  past the check of the key proven in the handshake.
 
 **Remaining:**
 - **Keystroke timing.** Packet timing on a relayed (or any observed) path reveals when keys
@@ -320,40 +322,72 @@ it.
 
 **The relay does not separate accounts** (protocol 11.3). Any admitted endpoint can address any
 other endpoint by its ID, and IDs are effectively public (5.3). So a device of another account
-on the same server can:
-- make a device run TLS handshakes, which costs CPU and could fill its handshake queue;
+on the same server can send a device relayed packets. If the device answered, the stranger
+could:
+- make it run TLS handshakes, which costs CPU and could fill its handshake queue;
+- learn its addresses, and make it send probes to addresses the stranger picks (below);
 - try to show it a pairing prompt, which C8 forbids on the remote endpoint;
-- learn whether a device is connected to the relay, from the relay's "peer gone" answers.
+- learn that it is online. Any answer says so, and once the device has answered, the relay
+  also tells the stranger when the device leaves (`EndpointGone`). The relay drops packets to
+  an absent key silently, so without an answer the relay gives no such signal.
 
 **On the control plane**, nothing crosses accounts: devices of another account get
 `not_found`, and no addresses (S8).
 
 **Mitigations:**
+- **the remote endpoint does not answer relayed strangers.** A relayed attempt names its sender
+  before any cryptography: the relay labels every frame with the key its sender proved when it
+  connected (protocol 11.1). The remote endpoint ignores attempts whose label is not a key the
+  product knows: no handshake, no close, no packet of any kind goes back (C8). This relies on
+  an honest relay. A relay that lies about the sender is a compromised server (5.1, 5.2), which
+  has the addresses anyway;
 - the remote endpoint closes unknown keys right after the handshake, with one exception: the
-  pairing connection that the server announced for a pending request (C8);
+  pairing connection that the server announced for a pending request (C8). This check still
+  covers direct attempts, which name no key before the handshake, and a relay that lies;
 - limits on pending handshakes and on the handshake rate (C8);
 - admission only of registered devices of accounts with two-step verification (S7), so the
   people on a self-hosted relay are the operator's own users. While two-step verification is
   not required (protocol 13.1, R10), any enabled account's devices are admitted.
 
-**What a stranger can still do after a handshake.** The remote endpoint accepts any client
-key in the TLS handshake and closes unknown keys right after it. iroh, however, acts on the
-peer's NAT-traversal frames itself (noq's `REACH_OUT`): a peer that completes a handshake can
-name up to 32 addresses per round, loopback and the LAN included, to which the device sends
-1200-byte probe packets. Closing the connection right after the handshake bounds this to the
-frames that arrive with the client's last flight. iroh filters no address there, and has no
-switch to hold NAT traversal until the application accepted the peer. `gono-connect` should
-refuse unknown keys as early as iroh allows, and upstream issues ask for an address filter
-and for that switch (plan V9). The addresses the control plane hands out are filtered
-(protocol 7.1).
+**What a peer gets from a handshake.** The remote endpoint accepts any client key in the TLS
+handshake, and closing the connection right after it does not stop two things that iroh 1.4.1
+does first:
+- **The device's addresses.** iroh registers the connection before the application can close
+  it, and registering sends the peer every direct address of the device (`ADD_ADDRESS`): its
+  interface addresses, global IPv6 ones included, and with QUIC address discovery on the relay
+  its public IPv4 address and port. Input Show measured that a stranger dialing through the
+  relay got them on about half of its first connections, in the 1 to 3 ms before the close.
+- **Probes to addresses the peer picks.** noq acts on the peer's NAT-traversal frames
+  (`REACH_OUT`) as soon as the handshake completes: the peer can name up to 32 addresses per
+  round, loopback and the LAN included, and the device sends each a small probe (55 bytes of
+  UDP payload: 83 bytes on the wire over IPv4, 103 over IPv6). The handshake limits of C8
+  bound how often, and nothing about a probe goes back to the peer, so this is a weak, blind
+  reflector, not an amplifier or a scanner. What it adds is reach: packets from inside the
+  device's network to its LAN and its own loopback.
+
+iroh filters no address there, and has no way to refuse a key before this happens. So:
+- **through the relay**, strangers do not get a handshake at all (the first mitigation);
+- **directly**, a stranger needs an address of the device to begin with: it shares a network
+  with the device, or learned an address before. It then learns the device's other addresses
+  and can send the probes. This remains until iroh can refuse a key inside the TLS handshake
+  (R11, plan V9).
+
+The addresses the control plane hands out are filtered (protocol 7.1).
 
 **Starving the handshake budget.** The limits of C8 are for the whole endpoint. One stranger
 who starts the allowed number of handshakes every second, or leaves them unfinished, would
 keep the user's own devices out. So the budget is kept per source first: per relay source label
 for relayed attempts (an honest relay labels frames with the sender's authenticated key) and
-per IP address (/64 for IPv6) for direct ones, before the global limit (C8).
+per IP address (/64 for IPv6) for direct ones, before the global limit (C8). Relayed strangers
+are ignored before any budget, so they use up none.
 
-**Remaining:** handshake load, and presence probing by other users of the same server (R7).
+**Remaining:**
+- **presence, for a crafted client.** noq answers a packet of an unknown QUIC version with a
+  version negotiation packet before any connection attempt exists, so a stranger that sends
+  one learns that the device is online. The answer carries nothing else. An ordinary QUIC
+  client gets no answer (R7);
+- the cost of relayed packets that the device ignores: a lookup of the label each;
+- strangers that reach the device directly (R11).
 
 ### 5.7 Network attacker
 
@@ -514,7 +548,7 @@ These are the rules the analysis depends on. V9, the security review, checks eac
 | C5 | On a revocation: add the key to the revoked set, close sessions, remove the entry (LAN pairings included), list the entries it vouched for and offer to remove them, and report `revocations.applied` | 9.3 |
 | C6 | On `4003`: stop using the credentials and never register the key again. On `503` or `1011`: never treat it as signed out | 5.1, 5.4, 9.3 |
 | C7 | Nothing is granted because of `incoming`, presence, or any claim the server makes; revocation is the only thing taken on the server's word | 7.2 |
-| C8 | On the remote endpoint, keys outside the trust list, and entries without `remote`, are closed right after the handshake. The only exception is the pairing connection that `incoming` announced for the device's own pending request. Pending handshakes and the handshake rate are limited, per source first (relay source label, or IP address and /64) and then for the endpoint. `gono-connect`'s `Remote::accept_trusted` applies the product's predicate right after the handshake and enforces the limits; iroh 1.4.1 has no endpoint-wide limit on connection attempts | 8.1, 8.2, 11.3 |
+| C8 | On the remote endpoint, relayed attempts whose relay source label is not a key the product knows are ignored before the handshake, with no answer (5.6). Keys outside the trust list, and entries without `remote`, are closed right after the handshake. The only exception is the pairing connection that `incoming` announced for the device's own pending request. Pending handshakes and the handshake rate are limited, per source first (relay source label, or IP address and /64) and then for the endpoint. `gono-connect`'s `Remote::accept_trusted_filtered` ignores relayed attempts by the product's `known` predicate, applies the product's `admit` predicate right after the handshake and enforces the limits; iroh 1.4.1 has no endpoint-wide limit on connection attempts | 8.1, 8.2, 11.3 |
 | C9 | `accept_remote` and unattended access (plan D6) are enforced on the device. The controlled device shows "being controlled by …" with one-click disconnect | 6.1 |
 | C10 | Every device added by an approval is announced on the device that accepted it, naming the approver. A setting turns acceptance of vouched devices off | 8.5 |
 | C11 | Only remote sessions are reported; LAN sessions never are | 12.2 |
@@ -536,10 +570,11 @@ These are the rules the analysis depends on. V9, the security review, checks eac
 | R4 | Devices introduced by a key that later turns out to have leaked stay trusted | The user chose not to remove vouched trust automatically. Revocation lists those devices and offers to revoke or remove them | Watch for confusion in the UI; reconsider after Phase 3 |
 | R5 | Social engineering of the remote pairing | No code stops a user from approving the attacker's own device | Prompt wording; notices; audit |
 | R6 | Denial of service by the server or the network | Availability against a compromised server is not a goal | — |
-| R7 | Other users of the same relay can cause handshakes and probe presence | iroh-relay 1.4.1 decides per connection | Per-pair policy on hosted relays |
+| R7 | Other users of the same relay can send a device packets, and a crafted client learns from noq's version negotiation answer whether the device is online | Devices ignore relayed strangers before the handshake, so an ordinary client gets no answer and nothing beyond presence leaks (5.6). iroh-relay 1.4.1 decides per connection, and noq always answers an unknown version | Per-pair policy on hosted relays |
 | R8 | A compromised server together with a malicious directly paired device from another account can introduce devices | Mitigated: only entries the local user marked as their own (`remote`, protocol 8.1) may vouch. What remains needs the user to have marked such a device as their own, and the approval is announced | — |
 | R9 | A peer that has not heard of a revocation can be reached directly by the revoked key | Bounded by C14 | Measure the delays in 2b |
 | R10 | **Temporary:** remote access needs no two-step verification (`connect.require_two_factor = false`, the default during development), so S1 and S7 are not enforced and a leaked web password alone registers devices (5.5) | Development only: test accounts need no authenticator, and devices still get no trust without the comparison code. `config check`, the log and the admin UI warn | **Release gate:** the default returns to true before remote control is released (protocol 13.1, plan R10) |
+| R11 | A stranger who can reach a device's remote endpoint directly completes a handshake. Before the endpoint closes it, the stranger learns the device's other addresses and can make it send a few dozen small probes to addresses of its choice, its LAN and loopback included; nothing comes back to the stranger (5.6) | The stranger needs a direct address of the device to begin with (a shared network, or an address learned before), and iroh 1.4.1 offers no way to refuse a key before NAT traversal starts | An authorizer in iroh's TLS handshake (plan V9) |
 
 ---
 
@@ -592,3 +627,9 @@ The findings were fixed together with the review; the main ones:
   C15, C16).
 
 This covers our own code, not iroh and noq, which V9 of the plan reviews.
+
+**Input Show's privacy test V-4 (November 2026)** found that a stranger who completes a
+handshake gets the device's addresses and its probes before the remote endpoint can close the
+connection (5.6), which broke G5 for anyone on the relay who knows a device's ID. Relayed
+attempts from keys the product does not know are now ignored before the handshake (C8). The
+direct case remains (R11), and the presence signal now needs a crafted client (R7).
