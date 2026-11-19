@@ -1290,18 +1290,23 @@ fn base32_decode(text: &str) -> Vec<u8> {
     out
 }
 
+/// The 6-digit code of `secret` at `step`.
+fn step_code(secret: &[u8], step: i64) -> String {
+    format!("{:06}", gono_server_core::two_factor::code_at(secret, step))
+}
+
 /// The 6-digit code of `secret` `steps` steps from now.
 fn code(secret: &[u8], steps: i64) -> String {
-    use gono_server_core::two_factor;
-    format!(
-        "{:06}",
-        two_factor::code_at(secret, two_factor::step_of(db::unix_now()) + steps)
+    step_code(
+        secret,
+        gono_server_core::two_factor::step_of(db::unix_now()) + steps,
     )
 }
 
-/// Turns two-step verification on for alice in `browser` (signed in); returns the secret and
-/// the recovery codes.
-async fn enrol(browser: &mut Browser, csrf: &str) -> (Vec<u8>, Vec<String>) {
+/// Turns two-step verification on for alice in `browser` (signed in); returns the secret, the
+/// recovery codes and the step whose code turned it on, which counts as used. Tests that need a
+/// used code take that step's: the step of "now" may have moved on since.
+async fn enrol(browser: &mut Browser, csrf: &str) -> (Vec<u8>, Vec<String>, i64) {
     let started = browser
         .post(
             "/apps/account/two-factor/start",
@@ -1337,10 +1342,11 @@ async fn enrol(browser: &mut Browser, csrf: &str) -> (Vec<u8>, Vec<String>) {
         )
         .await;
     assert_eq!(wrong.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let step = gono_server_core::two_factor::step_of(db::unix_now());
     let confirmed = browser
         .post(
             "/apps/account/two-factor/confirm",
-            &[("csrf", csrf), ("code", &code(&secret, 0))],
+            &[("csrf", csrf), ("code", &step_code(&secret, step))],
         )
         .await;
     assert_eq!(
@@ -1365,7 +1371,7 @@ async fn enrol(browser: &mut Browser, csrf: &str) -> (Vec<u8>, Vec<String>) {
         "/apps/account/",
         "shown once"
     );
-    (secret, codes)
+    (secret, codes, step)
 }
 
 /// Signs alice in with her password; returns the reply of the password form.
@@ -1408,7 +1414,7 @@ async fn two_step_verification_guards_every_later_sign_in() {
         )
         .await;
     assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
-    let (secret, codes) = enrol(&mut browser, &csrf).await;
+    let (secret, codes, enrolled) = enrol(&mut browser, &csrf).await;
     let page = browser
         .get("/apps/account/?done=two-factor-on")
         .await
@@ -1433,7 +1439,7 @@ async fn two_step_verification_guards_every_later_sign_in() {
         wrong.text()
     );
     // The code of the enrolment was used up; the next step's works.
-    let used = code_step(&mut other, &code(&secret, 0)).await;
+    let used = code_step(&mut other, &step_code(&secret, enrolled)).await;
     assert_eq!(used.status, StatusCode::FORBIDDEN, "a code works once");
     let signed_in = code_step(&mut other, &code(&secret, 1)).await;
     assert_eq!(signed_in.location(), "/apps/files/", "{}", signed_in.text());
@@ -1545,7 +1551,7 @@ async fn wrong_codes_lock_the_second_step() {
     let f = fixture().await;
     let mut browser = Browser::new(&f.state);
     let csrf = browser.sign_in().await;
-    let (secret, _) = enrol(&mut browser, &csrf).await;
+    let (secret, _, _) = enrol(&mut browser, &csrf).await;
 
     let mut other = Browser::new(&f.state);
     password_step(&mut other).await;
@@ -1812,7 +1818,7 @@ async fn account_page_changes_end_the_pending_sign_ins() {
     let f = fixture().await;
     let mut browser = Browser::new(&f.state);
     let csrf = browser.sign_in().await;
-    let (secret, _) = enrol(&mut browser, &csrf).await;
+    let (secret, _, _) = enrol(&mut browser, &csrf).await;
     let alice = users::get(&f.state.db, &Username::new("alice").unwrap())
         .await
         .unwrap();
