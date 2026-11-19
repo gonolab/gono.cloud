@@ -15,6 +15,14 @@
 //!   pings included, for [`SILENCE_TIMEOUT`] is taken for dead and opened again.
 //!   [`ControlChannel::last_heard`] tells when the server was last heard from (threat model
 //!   C14).
+//! - **Network changes** ([`ControlChannel::network_changed`]). A change ends the wait
+//!   between attempts at once, unless the server named the wait, and starts the backoff over;
+//!   it abandons an attempt still opening or in its handshake; and on a connection that is up,
+//!   it sends a ping and leaves the connection if nothing arrives within [`PROBE_TIMEOUT`]. So
+//!   the channel is back about as soon as the network is, not after the backoff. Attempts
+//!   still start at least [`NETWORK_RETRY_SPACING`] apart, and a change brings one forward only
+//!   while fewer than [`EARLY_ATTEMPTS_PER_MINUTE`] started in the last minute, which keeps a
+//!   flapping network below the server's limit of 20 a minute (protocol 5.2).
 //! - **Requests** ([`ControlChannel::request`] and its typed helpers) wait while the channel
 //!   reconnects, for at most [`REQUEST_TIMEOUT`].
 //! - **Events** reach the product as [`ChannelEvent::Message`]. The logged ones carry a `seq`:
@@ -31,7 +39,7 @@
 //!   never taken for "signed out" (threat model C6).
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
@@ -100,6 +108,20 @@ const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 
 /// The longest wait between reconnects.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// The least time between the starts of two attempts when a network change brings the next
+/// one forward.
+pub const NETWORK_RETRY_SPACING: Duration = Duration::from_secs(1);
+
+/// A network change brings an attempt forward only while fewer attempts than this started in
+/// the last minute; then the backoff applies. With the backoff that follows, a device stays
+/// below the server's 20 `hello`s a minute (protocol 5.2) however often its network flaps.
+pub const EARLY_ATTEMPTS_PER_MINUTE: usize = 10;
+
+/// How long a connection that is up may stay silent after a network change, once pinged: a
+/// connection on an interface that went away answers nothing, and would otherwise count as
+/// connected until [`SILENCE_TIMEOUT`].
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long to wait after `404` (remote access off) or `4004` (account disabled).
 const SLOW_RETRY: Duration = Duration::from_secs(60 * 60);
@@ -205,6 +227,8 @@ pub struct ControlChannel {
     connected: watch::Receiver<bool>,
     /// When a frame last arrived, UNIX milliseconds; 0 before the first.
     heard: Arc<AtomicI64>,
+    /// Marked changed on every network change; the background task watches it.
+    network: watch::Sender<()>,
 }
 
 /// The timings of a channel; shorter in tests.
@@ -213,6 +237,8 @@ struct Timing {
     handshake: Duration,
     silence: Duration,
     first_backoff: Duration,
+    spacing: Duration,
+    probe: Duration,
 }
 
 impl Timing {
@@ -220,6 +246,8 @@ impl Timing {
         handshake: HANDSHAKE_TIMEOUT,
         silence: SILENCE_TIMEOUT,
         first_backoff: FIRST_BACKOFF,
+        spacing: NETWORK_RETRY_SPACING,
+        probe: PROBE_TIMEOUT,
     };
 }
 
@@ -276,6 +304,7 @@ impl ControlChannel {
         let (commands, command_rx) = mpsc::channel(64);
         let (events, event_rx) = mpsc::channel(256);
         let (connected_tx, connected) = watch::channel(false);
+        let (network, network_rx) = watch::channel(());
         let cursor = Arc::new(AtomicI64::new(options.since));
         let heard = Arc::new(AtomicI64::new(0));
         let shared = Shared {
@@ -290,16 +319,36 @@ impl ControlChannel {
             websocket,
             timing,
         };
-        tokio::spawn(run(setup, command_rx, shared));
+        tokio::spawn(run(setup, command_rx, shared, network_rx));
         Ok((
             Self {
                 commands,
                 cursor,
                 connected,
                 heard,
+                network,
             },
             event_rx,
         ))
+    }
+
+    /// Tells the channel that the device's network changed: an interface came or went, the
+    /// device switched networks, or it woke from sleep. Cheap and never blocks; call it on
+    /// every change the platform reports ([`crate::Remote::network_change`] does).
+    ///
+    /// - Waiting to reconnect: the channel tries again at once and starts its backoff over,
+    ///   unless the server named the wait (`Retry-After` or `retry_after`, `4029`, `4004`, or
+    ///   `404` while remote access is off), which stands.
+    /// - Opening a connection or in its handshake: that attempt is abandoned and a new one
+    ///   starts, instead of running into its timeouts on a network that is gone.
+    /// - Connected: the channel pings the server and reconnects if nothing arrives within 10
+    ///   seconds, instead of after 75 seconds of silence.
+    ///
+    /// Attempts it brings forward start at least a second apart, and only while fewer than 10
+    /// started in the last minute, which keeps a flapping network below the server's limit of
+    /// 20 a minute.
+    pub fn network_changed(&self) {
+        self.network.send_replace(());
     }
 
     /// Whether the channel is connected now.
@@ -489,6 +538,8 @@ enum Outcome {
         /// The server closed it for a protocol violation (`4008`).
         violation: bool,
     },
+    /// The network changed before the `welcome`: start again at once.
+    NetworkChanged,
     /// Stop for good.
     End(EndReason),
     /// Every handle was dropped.
@@ -542,7 +593,8 @@ fn after_violation(outcome: Outcome, violated: &mut bool) -> Outcome {
         Outcome::Retry {
             was_connected: false,
             ..
-        } => outcome,
+        }
+        | Outcome::NetworkChanged => outcome,
         other => {
             *violated = false;
             other
@@ -550,13 +602,47 @@ fn after_violation(outcome: Outcome, violated: &mut bool) -> Outcome {
     }
 }
 
-async fn run(setup: Setup, mut commands: mpsc::Receiver<Command>, shared: Shared) {
-    let mut backoff = setup.timing.first_backoff;
+/// When the last attempts started, for [`EARLY_ATTEMPTS_PER_MINUTE`].
+#[derive(Debug, Default)]
+struct Starts(VecDeque<tokio::time::Instant>);
+
+impl Starts {
+    fn push(&mut self, at: tokio::time::Instant) {
+        self.0.push_back(at);
+        if self.0.len() > EARLY_ATTEMPTS_PER_MINUTE {
+            self.0.pop_front();
+        }
+    }
+
+    /// Whether a network change may bring the next attempt forward at `now`.
+    fn may_bring_forward(&self, now: tokio::time::Instant) -> bool {
+        self.0.len() < EARLY_ATTEMPTS_PER_MINUTE
+            || self
+                .0
+                .front()
+                .is_some_and(|first| now.duration_since(*first) >= Duration::from_secs(60))
+    }
+}
+
+async fn run(
+    setup: Setup,
+    mut commands: mpsc::Receiver<Command>,
+    shared: Shared,
+    mut network: watch::Receiver<()>,
+) {
+    let timing = setup.timing;
+    let mut backoff = timing.first_backoff;
     let mut violated = false;
+    let mut starts = Starts::default();
     loop {
-        let outcome = connection(&setup, &mut commands, &shared).await;
+        // Changes before the attempt starts are the network it runs on; only later ones count.
+        network.borrow_and_update();
+        let started = tokio::time::Instant::now();
+        starts.push(started);
+        let outcome = connection(&setup, &mut commands, &shared, &mut network).await;
         let _ = shared.connected.send(false);
-        match after_violation(outcome, &mut violated) {
+        // When to try again, and whether a network change may bring that forward.
+        let (reason, wait, mut wakeable) = match after_violation(outcome, &mut violated) {
             Outcome::Stopped => return,
             Outcome::End(reason) => {
                 tracing::info!(?reason, "control channel ended");
@@ -570,35 +656,75 @@ async fn run(setup: Setup, mut commands: mpsc::Receiver<Command>, shared: Shared
                 }
                 return;
             }
+            Outcome::NetworkChanged if starts.may_bring_forward(tokio::time::Instant::now()) => {
+                backoff = timing.first_backoff;
+                (
+                    "the network changed while connecting".to_owned(),
+                    Duration::ZERO,
+                    false,
+                )
+            }
+            Outcome::NetworkChanged => {
+                let wait = backoff + jitter(backoff);
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                (
+                    "the network changed while connecting".to_owned(),
+                    wait,
+                    true,
+                )
+            }
             Outcome::Retry {
                 reason,
                 after,
                 was_connected,
                 ..
             } => {
-                tracing::debug!(reason, "control channel disconnected");
-                if shared
-                    .events
-                    .send(ChannelEvent::Disconnected(reason))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
                 if was_connected {
-                    backoff = setup.timing.first_backoff;
+                    backoff = timing.first_backoff;
                 }
-                let jitter = rand::rng().random_range(0..=backoff.as_millis() as u64 / 2);
-                let wait = after.unwrap_or(backoff + Duration::from_millis(jitter));
+                let wait = after.unwrap_or(backoff + jitter(backoff));
                 backoff = (backoff * 2).min(MAX_BACKOFF);
-                tokio::select! {
-                    () = tokio::time::sleep(wait) => {}
-                    // Every handle dropped while waiting.
-                    () = commands_closed(&commands) => return,
+                // A wait the server named stands, network change or not.
+                (reason, wait, after.is_none())
+            }
+        };
+        tracing::debug!(reason, "control channel disconnected");
+        if shared
+            .events
+            .send(ChannelEvent::Disconnected(reason))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let mut deadline = tokio::time::Instant::now() + wait;
+        if wait.is_zero() {
+            deadline = deadline.max(started + timing.spacing);
+        }
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => break,
+                // Every handle dropped while waiting.
+                () = commands_closed(&commands) => return,
+                Ok(()) = network.changed(), if wakeable => {
+                    let now = tokio::time::Instant::now();
+                    if starts.may_bring_forward(now) {
+                        tracing::debug!("the network changed; reconnecting now");
+                        backoff = timing.first_backoff;
+                        deadline = deadline.min((started + timing.spacing).max(now));
+                        wakeable = false;
+                    } else {
+                        tracing::debug!("the network changed; too many attempts this minute to reconnect early");
+                    }
                 }
             }
         }
     }
+}
+
+/// A random part of up to half of `backoff`, so that devices do not reconnect in step.
+fn jitter(backoff: Duration) -> Duration {
+    Duration::from_millis(rand::rng().random_range(0..=backoff.as_millis() as u64 / 2))
 }
 
 /// Resolves once no handle is left.
@@ -968,11 +1094,18 @@ async fn connection(
     setup: &Setup,
     commands: &mut mpsc::Receiver<Command>,
     shared: &Shared,
+    network: &mut watch::Receiver<()>,
 ) -> Outcome {
     if commands.is_closed() && commands.is_empty() {
         return Outcome::Stopped;
     }
-    let (mut socket, welcome) = match handshake(setup, shared).await {
+    // An attempt begun on a network that is gone would only run into its timeouts (up to
+    // `OPEN_TIMEOUT` and the handshake's): start again instead.
+    let handshake = tokio::select! {
+        handshake = handshake(setup, shared) => handshake,
+        Ok(()) = network.changed() => return Outcome::NetworkChanged,
+    };
+    let (mut socket, welcome) = match handshake {
         Ok(opened) => opened,
         Err(outcome) => return outcome,
     };
@@ -994,11 +1127,14 @@ async fn connection(
     sweeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pending = Pending::new();
     let mut next_id: u64 = 1;
+    // Since a network change, waiting for any frame after the ping it sent.
+    let mut probing = false;
     let outcome = loop {
         tokio::select! {
             frame = socket.next() => {
                 if let Some(Ok(_)) = frame {
                     shared.heard();
+                    probing = false;
                     silence
                         .as_mut()
                         .reset(tokio::time::Instant::now() + silence_limit);
@@ -1046,10 +1182,29 @@ async fn connection(
                 }
             }
             () = &mut silence => {
+                if probing {
+                    break Outcome::retry("no answer to a ping after the network changed", true);
+                }
                 break Outcome::retry(
                     format!("nothing from the server for {} seconds", silence_limit.as_secs_f32()),
                     true,
                 );
+            }
+            // The connection may run on an interface that went away, where it would count as
+            // connected until the silence timeout: a ping tells sooner. Any frame answers it.
+            Ok(()) = network.changed() => {
+                let probe = setup.timing.probe;
+                let ping = tokio::time::timeout(probe, socket.send(Message::Ping(Default::default())))
+                    .await
+                    .unwrap_or_else(|_| Err(tungstenite::Error::Io(io::ErrorKind::TimedOut.into())));
+                if let Err(err) = ping {
+                    break Outcome::retry(format!("the network changed and the ping failed: {err}"), true);
+                }
+                let deadline = tokio::time::Instant::now() + probe;
+                if deadline < silence.deadline() {
+                    silence.as_mut().reset(deadline);
+                    probing = true;
+                }
             }
             _ = sweeping.tick() => sweep(&mut pending, Instant::now()),
             command = commands.recv() => match command {
@@ -1364,6 +1519,8 @@ mod tests {
         handshake: Duration::from_secs(5),
         silence: Duration::from_millis(400),
         first_backoff: Duration::from_millis(20),
+        spacing: Duration::from_millis(100),
+        probe: Duration::from_millis(300),
     };
 
     const LIMIT: Duration = Duration::from_secs(10);
@@ -1372,6 +1529,13 @@ mod tests {
 
     /// A listener and a channel that connects to it.
     async fn scripted() -> (TcpListener, ControlChannel, mpsc::Receiver<ChannelEvent>) {
+        scripted_with(FAST).await
+    }
+
+    /// [`scripted`] with other timings.
+    async fn scripted_with(
+        timing: Timing,
+    ) -> (TcpListener, ControlChannel, mpsc::Receiver<ChannelEvent>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let options = ChannelOptions::new(
@@ -1379,7 +1543,7 @@ mod tests {
             credentials(&origin, 1),
             SecretKey::from_bytes(&[1; 32]),
         );
-        let (channel, events) = ControlChannel::start_with(options, FAST).unwrap();
+        let (channel, events) = ControlChannel::start_with(options, timing).unwrap();
         (listener, channel, events)
     }
 
@@ -1673,5 +1837,140 @@ mod tests {
         let seen = publishes(&mut socket, 1, |id, _| ServerMessage::result(id, &())).await;
         assert_eq!(seen[0].0, vec![SocketAddr::from(([192, 0, 2, 1], 3))]);
         drop(latest);
+    }
+
+    /// [`FAST`] with a backoff that only a network change ends within a test.
+    const SLOW_BACKOFF: Timing = Timing {
+        first_backoff: Duration::from_secs(30),
+        ..FAST
+    };
+
+    #[tokio::test]
+    async fn a_network_change_ends_the_backoff_with_attempts_spaced_and_capped() {
+        let (listener, channel, _events) = scripted_with(SLOW_BACKOFF).await;
+        // Every attempt fails at once: the server drops the connection.
+        let attempts = tokio::spawn(async move {
+            let mut at = Vec::new();
+            while let Ok(Ok((tcp, _))) =
+                tokio::time::timeout(Duration::from_secs(3), listener.accept()).await
+            {
+                at.push(Instant::now());
+                drop(tcp);
+            }
+            at
+        });
+        // A network that keeps changing, for longer than the attempts it may bring forward.
+        for _ in 0..100 {
+            channel.network_changed();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let at = attempts.await.unwrap();
+        // The first attempt, then one per change but spaced, until the cap; then the backoff.
+        assert_eq!(at.len(), EARLY_ATTEMPTS_PER_MINUTE, "{at:?}");
+        for pair in at.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap >= FAST.spacing - Duration::from_millis(10) && gap < Duration::from_secs(1),
+                "{gap:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wait_the_server_named_stands() {
+        let (listener, channel, mut events) = scripted().await;
+        let mut socket = accept_hello(&listener).await;
+        socket.send(Message::text(welcome(&[]))).await.unwrap();
+        assert!(matches!(
+            next(&mut events).await,
+            ChannelEvent::Connected(_)
+        ));
+        // Over 20 connections a minute: the server says to come back in 60 seconds.
+        send_close(&mut socket, close::RATE_LIMITED).await;
+        assert!(matches!(
+            next(&mut events).await,
+            ChannelEvent::Disconnected(_)
+        ));
+        channel.network_changed();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), listener.accept())
+                .await
+                .is_err(),
+            "reconnected within the server's 60 seconds"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_network_change_abandons_a_stalled_attempt() {
+        let (listener, channel, mut events) = scripted_with(SLOW_BACKOFF).await;
+        // The first attempt stalls: the server takes the connection and never answers the
+        // upgrade, so only `OPEN_TIMEOUT` would end it.
+        let (_stalled, _) = listener.accept().await.unwrap();
+        let changed = Instant::now();
+        channel.network_changed();
+        assert!(matches!(
+            next(&mut events).await,
+            ChannelEvent::Disconnected(reason) if reason.contains("network changed")
+        ));
+        let mut socket = accept_hello(&listener).await;
+        socket.send(Message::text(welcome(&[]))).await.unwrap();
+        assert!(matches!(
+            next(&mut events).await,
+            ChannelEvent::Connected(_)
+        ));
+        assert!(
+            changed.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            changed.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_network_change_pings_and_leaves_only_a_dead_connection() {
+        // Only the ping can tell a dead connection from a quiet one within the test.
+        let timing = Timing {
+            silence: Duration::from_secs(30),
+            ..FAST
+        };
+        let (listener, channel, mut events) = scripted_with(timing).await;
+
+        // A connection on a network that is gone: open, but nothing answers.
+        let mut dead = accept_hello(&listener).await;
+        dead.send(Message::text(welcome(&[]))).await.unwrap();
+        assert!(matches!(
+            next(&mut events).await,
+            ChannelEvent::Connected(_)
+        ));
+        let changed = Instant::now();
+        channel.network_changed();
+        assert!(matches!(
+            next(&mut events).await,
+            ChannelEvent::Disconnected(reason) if reason.contains("ping")
+        ));
+        assert!(
+            changed.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            changed.elapsed()
+        );
+
+        // The channel connects again; a connection that answers the ping stays.
+        let mut socket = accept_hello(&listener).await;
+        socket.send(Message::text(welcome(&[]))).await.unwrap();
+        assert!(matches!(
+            next(&mut events).await,
+            ChannelEvent::Connected(_)
+        ));
+        // Reading answers the ping with a pong.
+        let answering = tokio::spawn(async move { while let Some(Ok(_)) = socket.next().await {} });
+        channel.network_changed();
+        assert!(
+            tokio::time::timeout(timing.probe * 3, events.recv())
+                .await
+                .is_err(),
+            "the answered ping keeps the connection"
+        );
+        assert!(channel.is_connected());
+        answering.abort();
+        drop(dead);
     }
 }

@@ -540,6 +540,12 @@ accounts: a device of another account gets `not_found`, exactly like one that do
 - **Reconnects.** Devices reconnect with exponential backoff from 1 to 60 seconds with
   jitter, except where the table says otherwise. A device keeps a `Retry-After` or
   `retry_after` between 1 second and 1 hour.
+- **Network changes.** A device whose network changed may reconnect at once instead of
+  waiting for its backoff, and start the backoff over; it then starts attempts at least 1 second
+  apart, and stays below the limit of 20 connections a minute (5.2). A wait the server named
+  (`Retry-After`, `retry_after`, `4004`, `4029`, a `404` on the upgrade) still stands. A device
+  that is connected when its network changes may ping the server and reconnect when nothing
+  arrives within 10 seconds, instead of waiting for the 75 seconds of silence.
 
 | Close code | Meaning | Device |
 |---|---|---|

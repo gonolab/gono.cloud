@@ -15,8 +15,8 @@
 //!   keep the user's own devices out. Whether an admitted peer may do anything stays the
 //!   product's decision. [`Remote::accept_trusted`] and [`Remote::accept_trusted_with`] do the
 //!   same without the filter before the handshake.
-//! - [`Remote::network_change`] forwards the platform's network events (plan 3.3; HarmonyOS
-//!   and Android need it).
+//! - [`Remote::network_change`] forwards the platform's network events to the endpoint and the
+//!   control channel (plan 3.3; HarmonyOS and Android need it).
 
 use std::{
     collections::HashMap,
@@ -289,8 +289,11 @@ impl Remote {
         )
     }
 
-    /// Tells the endpoint that the network changed.
+    /// Tells the endpoint and the control channel that the network changed
+    /// ([`ControlChannel::network_changed`]): the channel reconnects at once instead of after
+    /// its backoff, so the server sees the device online again as soon as its network is back.
     pub async fn network_change(&self) {
+        self.channel.network_changed();
         self.endpoint.network_change().await;
     }
 
