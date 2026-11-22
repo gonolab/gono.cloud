@@ -23,7 +23,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use gono_server_core::services::Service;
+use gono_server_core::services::{Service, Services};
 use secrecy::SecretString;
 use serde::Deserialize;
 
@@ -307,6 +307,21 @@ fn after_sign_in(next: Option<&str>) -> String {
         .to_owned()
 }
 
+/// Where a signed-in account goes from the sign-in page: `next` when it names a page of this
+/// site, otherwise the file UI, or the account page for an account without the web file
+/// service, rather than a page that only says the service is off. The sign-in form carries the
+/// file UI as its default target, which counts as no page chosen.
+fn landing(next: Option<&str>, services: Services) -> String {
+    match next
+        .and_then(local_path)
+        .filter(|path| *path != "/login" && *path != FILES_HOME)
+    {
+        Some(path) => path.to_owned(),
+        None if services.has(Service::Files) => FILES_HOME.to_owned(),
+        None => format!("{}/", crate::files::account::ACCOUNT),
+    }
+}
+
 fn sign_in_form(
     state: &AppState,
     headers: &HeaderMap,
@@ -346,8 +361,8 @@ pub async fn login_page(
     if state.files.is_none() {
         return files_off();
     }
-    if state.web.session(&headers).await.is_some() {
-        return web::see_other(&after_sign_in(query.next.as_deref()), &[]);
+    if let Some((user, _)) = state.web.session(&headers).await {
+        return web::see_other(&landing(query.next.as_deref(), user.services), &[]);
     }
     let t = Chrome::for_request(&headers).t;
     let notice = match query.done.as_deref() {
@@ -412,14 +427,7 @@ pub async fn login(
         .await
     {
         Verified::Ok(account) => {
-            // Without a page of its own to return to, an account without the web file
-            // service goes to its account page rather than to a page that says it is off.
-            let next = if local_path(&form.next).is_none() && !account.services.has(Service::Files)
-            {
-                format!("{}/", crate::files::account::ACCOUNT)
-            } else {
-                next
-            };
+            let next = landing(Some(&form.next), account.services);
             match state.web.start_session(client, &account, &next).await {
                 Started::Session(token) => web::see_other(
                     &next,
@@ -491,5 +499,24 @@ mod tests {
         assert_eq!(after_sign_in(Some("/login")), FILES_HOME);
         assert_eq!(after_sign_in(None), FILES_HOME);
         assert_eq!(after_sign_in(Some("/account/")), "/account/");
+    }
+
+    #[test]
+    fn accounts_without_the_file_ui_land_on_their_account_page() {
+        use gono_server_core::services::{Service, Services};
+        let all = Services::ALL;
+        let no_files = Services::ALL.with(Service::Files, false);
+        assert_eq!(landing(None, all), FILES_HOME);
+        assert_eq!(landing(Some(FILES_HOME), all), FILES_HOME);
+        // The form's default target counts as none chosen.
+        assert_eq!(landing(None, no_files), "/account/");
+        assert_eq!(landing(Some(FILES_HOME), no_files), "/account/");
+        assert_eq!(landing(Some("//evil"), no_files), "/account/");
+        // A page of its own is followed, whatever the services.
+        assert_eq!(landing(Some("/account/s3"), no_files), "/account/s3");
+        assert_eq!(
+            landing(Some("/apps/files/Photos/"), all),
+            "/apps/files/Photos/"
+        );
     }
 }

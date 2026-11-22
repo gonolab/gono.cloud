@@ -3131,15 +3131,19 @@ async fn the_overview_works_for_an_account_without_any_service() {
     assert_eq!(text.matches(">Off</span>").count(), 5, "{text}");
     assert!(!text.contains(">On</span>"), "{text}");
     assert!(text.contains("/account/two-factor/start"), "{text}");
-    // Signing in without a page to return to leads here rather than to the file UI.
+    // Signing in without a page to return to leads here rather than to the file UI, also with
+    // the default target the sign-in form carries.
     let mut other = Browser::new(&f.state);
     let form = other.get("/login").await;
     let login_csrf = form.field("name=\"csrf\" value=\"");
+    let default_next = form.field("name=\"next\" value=\"");
+    assert_eq!(default_next, "/apps/files/");
     let signed_in = other
         .post(
             "/login",
             &[
                 ("csrf", &login_csrf),
+                ("next", &default_next),
                 ("user", "alice"),
                 ("password", ALICE_PASSWORD),
             ],
@@ -3213,7 +3217,8 @@ async fn the_overview_works_for_an_account_without_any_service() {
             "{path}: {text}"
         );
         if *path == "/account/direct" {
-            assert!(text.contains("you can still revoke a lost one"), "{text}");
+            // No device was registered, so there is nothing to revoke either.
+            assert!(!text.contains("you can still revoke a lost one"), "{text}");
             assert!(!text.contains("/pairing"), "{text}");
         } else {
             assert!(!text.contains(own), "{path}: {text}");
@@ -3342,9 +3347,20 @@ async fn the_forms_of_a_tab_need_its_service() {
         fields.push(("csrf", &csrf));
         refused(&browser.post(uri, &fields).await, uri);
     }
-    // Revoking only removes trust, so its confirmation stays open without direct connections.
+    // Revoking only removes trust, so its confirmation stays open without direct connections,
+    // and the tab still lists the device for it, without its other actions.
     let confirm = browser.get(&format!("/account/devices/{hex}/revoke")).await;
     assert_eq!(confirm.status, StatusCode::OK, "{}", confirm.text());
+    let tab = browser.get("/account/direct").await.text();
+    assert!(tab.contains("you can still revoke a lost one"), "{tab}");
+    assert!(
+        tab.contains(&format!("/account/devices/{hex}/revoke")),
+        "{tab}"
+    );
+    assert!(
+        !tab.contains(&format!("/account/devices/{hex}/pairing")),
+        "{tab}"
+    );
     // The other device actions need direct connections, and their refusal shows the direct tab.
     for action in ["sign-out", "pairing"] {
         let reply = browser

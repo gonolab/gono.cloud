@@ -2,7 +2,7 @@
 {%- block content %}
 <div class="stack">
   {%- if let Some(off) = off %}
-  <section class="panel narrow"><div class="panel-body"><p>{{ off }}</p><p class="muted small">{{ chrome.t.direct_off_revoke_note }}</p></div></section>
+  <section class="panel narrow"><div class="panel-body"><p>{{ off }}</p>{% if !remote.is_empty() %}<p class="muted small">{{ chrome.t.direct_off_revoke_note }}</p>{% endif %}</div></section>
   {%- endif %}
   <section class="panel" aria-labelledby="remote-title">
     <div class="panel-head"><div><h2 id="remote-title">{{ chrome.t.remote_devices }}</h2><p class="muted small">{{ chrome.t.remote_devices_note }}</p><p class="muted small">{{ chrome.t.direct_relay_note }}</p></div></div>

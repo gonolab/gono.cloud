@@ -157,7 +157,7 @@ texts! {
     files: "Files", "文件";
     favorites: "Favorites", "收藏";
     admin: "Admin", "管理";
-    account: "Account", "账号";
+    account: "Account", "账户";
     sign_in: "Sign in", "登录";
     sign_out: "Sign out", "退出登录";
     search: "Search", "搜索";
@@ -222,7 +222,7 @@ texts! {
     recovery_signed_in: "Signed in with a recovery code", "已用恢复码登录";
     recovery_left_one: "That code is used up. You have 1 recovery code left.", "这个恢复码已经用掉了。你还剩 1 个恢复码。";
     recovery_left_many: "That code is used up. You have {} recovery codes left.", "这个恢复码已经用掉了。你还剩 {} 个恢复码。";
-    recovery_left_note: "Each recovery code works once. If your authenticator app is gone, make new recovery codes on your account page, or turn two-step verification off and on again with a new app.", "每个恢复码只能用一次。如果身份验证器已经无法使用，请在账号页面生成新的恢复码，或者关闭两步验证后用新的 app 重新开启。";
+    recovery_left_note: "Each recovery code works once. If your authenticator app is gone, make new recovery codes on your account page, or turn two-step verification off and on again with a new app.", "每个恢复码只能用一次。如果身份验证器已经无法使用，请在账户页生成新的恢复码，或者关闭两步验证后用新的 app 重新开启。";
     continue_on: "Continue", "继续";
 
     // Login Flow v2
@@ -409,7 +409,7 @@ texts! {
     a_notice_services: "Services saved.", "服务已保存。";
 
     // Account
-    account_title: "Account", "账号";
+    account_title: "Account", "账户";
     account_overview: "Overview", "概览";
     account_services: "Services", "服务";
     account_services_note: "What your account may use. An administrator turns services on and off.", "你的账号可以使用的服务，由管理员开通和关闭。";
@@ -563,7 +563,7 @@ texts! {
     email_none: "No email address yet.", "还没有绑定邮箱。";
     email_new: "New email address", "新邮箱";
     email_send: "Send code", "发送验证码";
-    email_waiting: "A code was sent to {}. Enter it here before {}.", "验证码已发到 {}，请在 {} 之前在这里输入。";
+    email_waiting: "A code was sent to {}. Enter it here before {}.", "验证码已发到 {}，请在{}之前在这里输入。";
     email_code: "Code from the mail", "邮件中的验证码";
     email_confirm: "Save address", "保存邮箱";
     email_remove: "Remove address", "删除邮箱";
@@ -587,7 +587,7 @@ texts! {
     wechat_show: "Show QR code", "显示二维码";
     wechat_show_again: "New QR code", "重新生成二维码";
     wechat_show_note: "The QR code binds the WeChat that scans it to this account. Your web login password is needed to show it.", "二维码会把扫描它的微信绑定到这个账号。显示二维码需要网页登录密码。";
-    wechat_scan: "Scan this code with WeChat on your phone before {}. It works once; do not share it: whoever scans it gets this account in the mini program.", "请在 {} 之前用手机微信扫描这个二维码。它只能使用一次，请勿分享：扫描它的人会在小程序中获得这个账号。";
+    wechat_scan: "Scan this code with WeChat on your phone before {}. It works once; do not share it: whoever scans it gets this account in the mini program.", "请在{}之前用手机微信扫描这个二维码。它只能使用一次，请勿分享：扫描它的人会在小程序中获得这个账号。";
     wechat_unbind: "Unbind WeChat", "解除绑定";
     wechat_unbind_note: "Unbinding needs your web login password and signs the mini program out.", "解除绑定需要网页登录密码，小程序会随之退出登录。";
     notice_wechat_ticket: "The QR code is ready. Scan it with WeChat.", "二维码已生成，请用微信扫描。";
@@ -759,13 +759,13 @@ texts! {
     a_none: "none", "无";
     a_push_detail: "Ping {} s · debounce {} s · {} per user", "心跳 {} 秒 · 合并 {} 秒 · 每用户 {} 个";
     a_push_off_detail: "Clients poll for changes", "客户端轮询变更";
-    a_relay: "Relay", "中继";
+    a_relay: "Relay", "中转";
     a_relay_detail: "{} · {} of {} devices connected · {} relayed · {} refused", "{} · 已连接 {}/{} 台设备 · 已转发 {} · 已拒绝 {} 次";
     a_relay_no_qad: " · no address discovery", " · 未开启地址发现";
     a_relay_stopped: "Stopped after an error, see the log", "出错后已停止，请查看日志";
     a_relay_off: "Turned off in [relay]", "已在 [relay] 中关闭";
-    a_relay_page_off: "The relay is off. Turn it on in the [relay] table of the configuration (\"The relay\" in docs/deployment.md).", "中继未开启。请在配置文件的 [relay] 中开启（见 docs/deployment.md 的「The relay」一节）。";
-    a_relay_note: "Devices reach each other through the relay when they cannot connect directly. Packets between devices are encrypted end to end: the relay sees which devices talk to each other, never what they send.", "设备无法直连时经中继互通。设备之间的数据包端到端加密：中继只看得到哪些设备在通信，看不到内容。";
+    a_relay_page_off: "The relay is off. Turn it on in the [relay] table of the configuration (\"The relay\" in docs/deployment.md).", "中转未开启。请在配置文件的 [relay] 中开启（见 docs/deployment.md 的「The relay」一节）。";
+    a_relay_note: "Devices reach each other through the relay when they cannot connect directly. Packets between devices are encrypted end to end: the relay sees which devices talk to each other, never what they send.", "设备无法直连时经中转互通。设备之间的数据包端到端加密：中转只看得到哪些设备在通信，看不到内容。";
     a_relay_settings: "Settings", "设置";
     a_relay_public_url: "Public URL", "公开地址";
     a_relay_listening: "Listening (HTTP, behind the proxy)", "监听地址（HTTP，在反向代理之后）";
@@ -790,8 +790,8 @@ texts! {
     a_relay_dropped_note: "packets, mostly to devices that were gone · {} held back by the rate limit", "个数据包，多数因接收方已离线 · 限速拦下 {}";
     a_relay_qad_on: "{} · {} connections since the start", "{} · 启动以来 {} 次连接";
     a_relay_devices: "Connected devices", "已连接的设备";
-    a_relay_devices_note: "Devices with a relay connection right now, and whether their control channel is open.", "此刻连着中继的设备，以及它们的控制通道是否在线。";
-    a_relay_no_devices: "No device is connected to the relay.", "没有设备连着中继。";
+    a_relay_devices_note: "Devices with a relay connection right now, and whether their control channel is open.", "此刻连着中转的设备，以及它们的控制通道是否在线。";
+    a_relay_no_devices: "No device is connected to the relay.", "没有设备连着中转。";
     a_relay_device: "Device", "设备";
     a_relay_control: "Control channel", "控制通道";
     a_relay_offline: "Not connected", "未连接";
@@ -801,20 +801,20 @@ texts! {
     a_relay_source_listed: "relay.allowed_endpoints", "relay.allowed_endpoints";
     a_relay_not_registered: "Not registered", "未注册";
     a_relay_sessions: "Recent sessions", "最近的会话";
-    a_relay_sessions_note: "Sessions devices reported (protocol 12.2). The path tells whether a session went direct or through the relay.", "设备上报的会话（协议 12.2）。路径一栏表示会话是直连还是经中继。";
+    a_relay_sessions_note: "Sessions devices reported (protocol 12.2). The path tells whether a session went direct or through the relay.", "设备上报的会话（协议 12.2）。路径一栏表示会话是直连还是经中转。";
     a_relay_no_sessions: "No session has been reported yet.", "还没有设备上报会话。";
     a_relay_when: "When", "时间";
     a_relay_peer: "Peer", "对端";
     a_relay_service: "Service", "服务";
     a_relay_path: "Path", "路径";
     a_relay_event: "Event", "事件";
-    a_relay_bytes: "Direct / relayed", "直连 / 中继";
+    a_relay_bytes: "Direct / relayed", "直连 / 中转";
     a_relay_started: "Started", "开始";
     a_relay_ended: "Ended", "结束";
     a_relay_path_direct: "Direct", "直连";
-    a_relay_path_relayed: "Relayed", "中继";
+    a_relay_path_relayed: "Relayed", "中转";
     a_relay_path_mixed: "Mixed", "混合";
-    a_relay_refusals: "Revoked devices that tried the relay", "尝试连接中继的已吊销设备";
+    a_relay_refusals: "Revoked devices that tried the relay", "尝试连接中转的已吊销设备";
     a_relay_refusals_note: "Recorded at most every 10 minutes per device. A revoked key that keeps trying is in someone else's hands.", "每台设备每 10 分钟最多记录一次。已吊销的密钥一再尝试，说明它落在了别人手里。";
     a_relay_no_refusals: "None.", "没有。";
     a_flow_waiting_one: "1 sign-in waiting", "1 个登录等待中";
@@ -914,7 +914,7 @@ texts! {
 
     // Mail (plain text; lines stay short, so that mail programs show them as written)
     mail_bind_subject: "Gono Cloud: confirm your email address", "Gono Cloud：确认你的邮箱";
-    mail_bind_text: "Your code to add this email address to an account at\n{}:\n\n    {}\n\nEnter it on the account page within 10 minutes. If you did not\nask for it, ignore this mail: without the code, nothing changes.\n", "把这个邮箱添加到\n{}\n上的账号所需的验证码：\n\n    {}\n\n请在 10 分钟内在账号页面输入。如果不是你本人操作，请忽略这封邮件：\n没有验证码，什么都不会改变。\n";
+    mail_bind_text: "Your code to add this email address to an account at\n{}:\n\n    {}\n\nEnter it on the account page within 10 minutes. If you did not\nask for it, ignore this mail: without the code, nothing changes.\n", "把这个邮箱添加到\n{}\n上的账号所需的验证码：\n\n    {}\n\n请在 10 分钟内在账户页输入。如果不是你本人操作，请忽略这封邮件：\n没有验证码，什么都不会改变。\n";
     mail_reset_subject: "Gono Cloud: reset your password", "Gono Cloud：重置密码";
     mail_reset_text: "Your code to reset the web login password of the account {}\nat {}:\n\n    {}\n\nEnter it at {}/login/reset within 10 minutes.\nTwo-step verification stays as it is. If you did not ask for it,\nignore this mail: your password stays as it is.\n", "账号 {}（{}）\n重置网页登录密码所需的验证码：\n\n    {}\n\n请在 10 分钟内到 {}/login/reset 输入。\n两步验证不受影响。如果不是你本人操作，请忽略这封邮件，你的密码不会改变。\n";
     mail_reset_done_subject: "Gono Cloud: your password was reset", "Gono Cloud：你的密码已重置";
