@@ -1043,6 +1043,67 @@ async fn the_file_ui_can_be_turned_off() {
     );
 }
 
+#[tokio::test]
+async fn the_file_ui_needs_the_files_service_but_the_account_page_does_not() {
+    use gono_server_core::{
+        services::{Service, Services},
+        users,
+    };
+    let f = fixture().await;
+    let alice = Username::new("alice").unwrap();
+    users::set_services(
+        &f.state.db,
+        &alice,
+        Services::ALL.with(Service::Files, false),
+    )
+    .await
+    .unwrap();
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+
+    let files = browser.get("/apps/files/").await;
+    assert_eq!(files.status, StatusCode::FORBIDDEN);
+    assert!(
+        files.text().contains("web file service is not enabled"),
+        "{}",
+        files.text()
+    );
+    // Under the entry of the masthead the visitor chose.
+    assert!(
+        files
+            .text()
+            .contains(r#"href="/apps/files/" aria-current="page""#)
+    );
+    let favorites = browser.get("/apps/files/?view=favorites").await;
+    assert_eq!(favorites.status, StatusCode::FORBIDDEN);
+    assert!(
+        favorites
+            .text()
+            .contains(r#"href="/apps/files/?view=favorites" aria-current="page""#)
+    );
+    let account = browser.get("/apps/account/").await;
+    assert_eq!(account.status, StatusCode::OK);
+    let root = browser.get("/").await;
+    assert_eq!(root.location(), "/apps/account/");
+    // The script's requests are refused too.
+    let csrf = account.csrf();
+    let mkcol = browser
+        .send(
+            "MKCOL",
+            "/apps/files/New",
+            &[("X-Gono-CSRF", &csrf)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(mkcol.status, StatusCode::FORBIDDEN);
+
+    users::set_services(&f.state.db, &alice, Services::ALL)
+        .await
+        .unwrap();
+    assert_eq!(browser.get("/apps/files/").await.status, StatusCode::OK);
+    assert_eq!(browser.get("/").await.location(), "/apps/files/");
+}
+
 /// Registers a device for remote access through a device flow, as the browser would grant it.
 async fn register_device(
     state: &AppState,

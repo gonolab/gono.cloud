@@ -22,6 +22,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use gono_server_core::services::Service;
 use secrecy::SecretString;
 use serde::Deserialize;
 
@@ -38,10 +39,16 @@ use crate::{
 /// Where the file UI lives.
 pub const FILES_HOME: &str = "/apps/files/";
 
-/// `GET /`.
-pub async fn root(State(state): State<AppState>) -> Response {
+/// `GET /`: the file UI, or the account page for a signed-in account without the web file
+/// service.
+pub async fn root(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if state.files.is_some() {
-        web::see_other(FILES_HOME, &[])
+        match state.web.session(&headers).await {
+            Some((user, _)) if !user.services.has(Service::Files) => {
+                web::see_other(&format!("{}/", crate::files::account::ACCOUNT), &[])
+            }
+            _ => web::see_other(FILES_HOME, &[]),
+        }
     } else if let Some(admin) = &state.admin {
         web::see_other(&format!("{}/", admin.prefix()), &[])
     } else {

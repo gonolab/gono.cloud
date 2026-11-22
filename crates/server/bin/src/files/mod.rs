@@ -54,7 +54,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
-use gono_server_core::{RelPath, path::normalize_segment, web_sessions::SessionUser};
+use gono_server_core::{
+    RelPath, path::normalize_segment, services::Service, web_sessions::SessionUser,
+};
 use gono_server_dav::{Identity, metadata::Entry};
 use tokio::sync::mpsc;
 
@@ -418,6 +420,29 @@ fn internal(visitor: &Visitor, what: &str, err: &dyn std::fmt::Display) -> Respo
     )
 }
 
+/// The answer to an account without the web file service ([`Service::Files`]): a page that
+/// says so under the masthead entry the visitor chose (files or favorites), and `403` for the
+/// script's requests.
+fn files_off(visitor: &Visitor, method: &Method, params: &Params) -> Response {
+    if method != Method::GET && method != Method::HEAD {
+        return crate::app::service_refused(Service::Files);
+    }
+    let t = visitor.t();
+    let nav = if params.view == "favorites" {
+        Nav::Favorites
+    } else {
+        Nav::Files
+    };
+    let mut page = Message::new(
+        visitor.chrome(nav),
+        t.service_off,
+        t.service_off,
+        t.service_off_files_lead,
+    );
+    page.link = Some((format!("{}/", account::ACCOUNT), t.account.to_owned()));
+    page.respond(StatusCode::FORBIDDEN)
+}
+
 /// The refusal of a request that did not come from this site's pages.
 fn blocked(visitor: &Visitor, lead: fn(&Text) -> &'static str) -> Response {
     let t = visitor.t();
@@ -444,10 +469,13 @@ async fn handle(State(state): State<AppState>, request: Request) -> Response {
         }
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    let params = Params::parse(uri.query());
+    if !visitor.user.services.has(Service::Files) {
+        return files_off(&visitor, &method, &params);
+    }
     let Some((rel, slash)) = target(&uri) else {
         return not_found(&visitor);
     };
-    let params = Params::parse(uri.query());
     match method.as_str() {
         "GET" | "HEAD" => get_page(&state, &files, &visitor, rel, slash, params, request).await,
         "POST" | "PUT" | "MKCOL" | "DELETE" => {
