@@ -23,6 +23,7 @@ async fn fixture() -> (tempfile::TempDir, Pool, i64) {
             display_name: "Alice",
             password_hash: "x",
             is_admin: false,
+            services: gono_server_core::services::Services::ALL,
         },
         |_| Ok(()),
     )

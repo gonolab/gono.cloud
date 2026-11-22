@@ -23,7 +23,7 @@ use axum::{
     http::{HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use gono_server_core::{PRODUCT_NAME, app_passwords};
+use gono_server_core::{PRODUCT_NAME, app_passwords, services::Service};
 use gono_server_dav::Identity;
 use gono_server_nextcloud::{
     notify_push,
@@ -165,6 +165,12 @@ pub async fn ocs(
             return rejection.into_response();
         }
     };
+    // A device may always give its own app password back (the apps do so when they sign out);
+    // everything else is part of the WebDAV service. Refused with 403 like the WebDAV routes,
+    // never with 997 (401), which makes the apps forget the account.
+    if endpoint != Endpoint::RevokeAppPassword && !identity.services.has(Service::Webdav) {
+        return reply(version, format, &Outcome::Forbidden, json!([]));
+    }
     match endpoint {
         Endpoint::CurrentUser => user_reply(&state, &identity, version, format).await,
         Endpoint::User(id) if id == identity.username.as_str() => {

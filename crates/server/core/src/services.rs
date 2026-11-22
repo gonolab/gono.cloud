@@ -65,6 +65,31 @@ impl Service {
     }
 }
 
+impl Service {
+    /// Its column in `users`: `service_files`, `service_webdav`, ...
+    pub const fn column(self) -> &'static str {
+        match self {
+            Self::Files => "service_files",
+            Self::Webdav => "service_webdav",
+            Self::S3 => "service_s3",
+            Self::Direct => "service_direct",
+            Self::Relay => "service_relay",
+        }
+    }
+
+    /// The service's name in English messages: "web files", "WebDAV", "S3", "direct
+    /// connections", "relay".
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Files => "web files",
+            Self::Webdav => "WebDAV",
+            Self::S3 => "S3",
+            Self::Direct => "direct connections",
+            Self::Relay => "relay",
+        }
+    }
+}
+
 impl fmt::Display for Service {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())

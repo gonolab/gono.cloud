@@ -18,7 +18,7 @@ use crate::{
     db::{self, Flag, Pool, Text, Tx},
     error::{Error, Result},
     path::RelPath,
-    services::Services,
+    services::{Service, Services},
     types::{Permission, Username},
 };
 
@@ -409,6 +409,25 @@ pub async fn is_active(pool: &Pool, id: i64, now: i64) -> Result<bool> {
     .bind(now)
     .fetch_optional(pool)
     .await?;
+    Ok(active.is_some())
+}
+
+/// Whether app password `id` can still authenticate at `now` (as [`is_active`]) and its account
+/// may use `service`: what a long-lived connection of that service checks again from time to
+/// time.
+pub async fn allows(pool: &Pool, id: i64, now: i64, service: Service) -> Result<bool> {
+    // The column name comes from a fixed list, never from input.
+    let sql = format!(
+        "SELECT 1 FROM app_passwords a JOIN users u ON u.id = a.user_id \
+         WHERE a.id = ? AND u.enabled = 1 AND u.{} = 1 \
+         AND (a.expires_at IS NULL OR a.expires_at > ?)",
+        service.column()
+    );
+    let active: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(id)
+        .bind(now)
+        .fetch_optional(pool)
+        .await?;
     Ok(active.is_some())
 }
 

@@ -38,7 +38,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use gono_server_core::{app_passwords, db};
+use gono_server_core::{app_passwords, db, services::Service};
 use gono_server_dav::Identity;
 use gono_server_nextcloud::notify_push::{
     Handshake, Hub, Outbox, SubscribeError, Subscription,
@@ -70,6 +70,8 @@ enum AuthFailure {
     RateLimited,
     /// The credentials could not be checked (the database failed).
     Unavailable,
+    /// The credentials are valid, but the account may not use WebDAV, which push belongs to.
+    ServiceOff,
 }
 
 /// `GET /push/ws`.
@@ -110,6 +112,9 @@ pub async fn pre_auth(
         Ok(identity) => identity,
         Err(rejection) => return rejection.into_response(),
     };
+    if let Some(refused) = crate::app::refusal(&identity, Service::Webdav) {
+        return refused;
+    }
     let Some(token) = hub.issue_pre_auth(identity) else {
         let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
         let wait = hub.settings().pre_auth_ttl.as_secs().max(1).to_string();
@@ -153,6 +158,7 @@ async fn serve(
                 AuthFailure::Invalid => "Invalid credentials",
                 AuthFailure::RateLimited => "Too many failed attempts, try again later",
                 AuthFailure::Unavailable => "Server temporarily unavailable",
+                AuthFailure::ServiceOff => "The WebDAV service is not enabled for this account",
             };
             let code = if failure == AuthFailure::Unavailable {
                 close_code::AGAIN
@@ -230,7 +236,10 @@ async fn authenticate_socket(
         .authenticate_credentials(client, &username, &password)
         .await
     {
-        AuthOutcome::Authenticated(identity) => Ok(identity),
+        AuthOutcome::Authenticated(identity) if identity.services.has(Service::Webdav) => {
+            Ok(identity)
+        }
+        AuthOutcome::Authenticated(_) => Err(AuthFailure::ServiceOff),
         AuthOutcome::Missing | AuthOutcome::Invalid => Err(AuthFailure::Invalid),
         AuthOutcome::RateLimited(_) => Err(AuthFailure::RateLimited),
         AuthOutcome::Unavailable => Err(AuthFailure::Unavailable),
@@ -295,15 +304,16 @@ async fn heartbeat(
         return Err("no answer to ping");
     }
     // Push connections are authenticated with app passwords only; anything else is not active.
+    // Turning WebDAV off for the account ends them like a revoked app password.
     let active = match identity.app_password_id {
-        Some(id) => app_passwords::is_active(&state.db, id, db::unix_now()).await,
+        Some(id) => app_passwords::allows(&state.db, id, db::unix_now(), Service::Webdav).await,
         None => Ok(false),
     };
     match active {
         Ok(true) => {}
         Ok(false) => {
             close(socket, close_code::POLICY, "Credentials revoked").await;
-            return Err("app password revoked, expired or account disabled");
+            return Err("app password revoked or expired, account disabled, or WebDAV turned off");
         }
         // Keep the connection; the next heartbeat checks again.
         Err(err) => tracing::warn!(error = %err, "cannot check a push connection's app password"),
@@ -447,6 +457,7 @@ mod tests {
                 display_name: "Alice",
                 password_hash: "x",
                 is_admin: false,
+                services: gono_server_core::services::Services::ALL,
             },
             |id| layout.create_user(id),
         )
@@ -675,6 +686,42 @@ mod tests {
         assert_eq!(reply.as_deref(), Some("authenticated"));
         let (_second, reply) = fixture.login("", &token).await;
         assert_eq!(reply.as_deref(), Some("err: Invalid credentials"));
+    }
+
+    #[tokio::test]
+    async fn push_belongs_to_the_webdav_service() {
+        use gono_server_core::services::{Service, Services};
+        let fixture = fixture().await;
+        let alice = Username::new("alice").unwrap();
+        let mut connected = fixture.authenticated(&fixture.full).await;
+        users::set_services(
+            &fixture.state.db,
+            &alice,
+            Services::NONE.with(Service::S3, true),
+        )
+        .await
+        .unwrap();
+        // The next heartbeat (every second here) ends the open connection.
+        assert_eq!(
+            next_text(&mut connected, Duration::from_secs(5)).await,
+            None
+        );
+        assert_eq!(
+            fixture.pre_auth(Some(&fixture.full)).await.0,
+            StatusCode::FORBIDDEN
+        );
+        let (_, reply) = fixture.login("alice", &fixture.full).await;
+        assert_eq!(
+            reply.as_deref(),
+            Some("err: The WebDAV service is not enabled for this account")
+        );
+        users::set_services(&fixture.state.db, &alice, Services::ALL)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.pre_auth(Some(&fixture.full)).await.0,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

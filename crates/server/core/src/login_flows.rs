@@ -271,12 +271,14 @@ pub async fn complete(pool: &Pool, poll_token: &str, now: i64) -> Result<Option<
         .bind(flow_id)
         .execute(&mut *tx)
         .await?;
-    let user: Option<(Text, Flag)> =
-        sqlx::query_as("SELECT username, enabled FROM users WHERE id = ?")
+    // The account may have been disabled, or lost WebDAV, since it granted the flow: the flow
+    // is used up without an app password then.
+    let user: Option<(Text, Flag, Flag)> =
+        sqlx::query_as("SELECT username, enabled, service_webdav FROM users WHERE id = ?")
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?;
-    let Some((Text(username), Flag(true))) = user else {
+    let Some((Text(username), Flag(true), Flag(true))) = user else {
         tx.commit().await?;
         return Ok(None);
     };

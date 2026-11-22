@@ -19,6 +19,11 @@ compatible within a major version: released clients keep working with newer serv
   without services can still sign in to its account page. Turn them on with
   `gono-cloud user services NAME --enable LIST` (`all`, or a comma-separated list; `--disable`
   turns them off); `user list` shows them.
+  - Without `webdav`, WebDAV, chunked uploads, OCS, notify_push and direct links answer `403`
+    with "The WebDAV service is not enabled for this account." (never `401`, after which the
+    Nextcloud apps forget the account); open push connections end at their next heartbeat, a
+    device can still give its app password back, and the Login Flow v2 consent page says so
+    instead of granting an app password the client could not use.
 - **MySQL as the database**, as an alternative to the built-in SQLite: `[db] backend =
   "mysql"` with `url` (for example `mysql://gono@127.0.0.1:3306/gono_cloud`, never with the
   password) and `password_file`. MySQL 5.7.44 or later with InnoDB and utf8mb4; MariaDB is not

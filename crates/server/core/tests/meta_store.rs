@@ -44,6 +44,7 @@ async fn add_user(pool: &Pool, name: &str) -> i64 {
             display_name: name,
             password_hash: "x",
             is_admin: false,
+            services: gono_server_core::services::Services::ALL,
         },
         |_| Ok(()),
     )

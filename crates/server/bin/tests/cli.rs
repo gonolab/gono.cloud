@@ -429,6 +429,8 @@ async fn rescan_changes_are_pushed_by_a_running_server() {
 
     let instance = Instance::new();
     assert!(instance.init().status.success());
+    let services = run(&mut instance.command(&["user", "services", "admin", "--enable", "webdav"]));
+    assert!(services.status.success(), "{}", text(&services.stderr));
     let add = run(&mut instance.command(&["app-password", "add", "admin", "--label", "push"]));
     let password = app_password_from(&add);
     let mut child = instance

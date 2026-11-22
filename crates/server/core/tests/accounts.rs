@@ -21,6 +21,7 @@ async fn add_user(pool: &Pool, name: &str) -> i64 {
             display_name: name,
             password_hash: "not-a-real-hash",
             is_admin: false,
+            services: gono_server_core::services::Services::ALL,
         },
         |_| Ok(()),
     )
@@ -44,6 +45,7 @@ async fn failed_storage_setup_rolls_the_account_back() {
             display_name: "Carol",
             password_hash: "x",
             is_admin: false,
+            services: gono_server_core::services::Services::ALL,
         },
         |_| Err(Error::InvalidScopes("simulated".into())),
     )
@@ -57,8 +59,20 @@ async fn accounts_start_without_services_and_keep_the_ones_set() {
     use gono_server_core::services::{Service, Services};
     let dir = tempfile::tempdir().unwrap();
     let pool = database(dir.path()).await;
-    let alice = add_user(&pool, "alice").await;
     let username = Username::new("alice").unwrap();
+    let alice = users::create(
+        &pool,
+        &NewUser {
+            username: &username,
+            display_name: "Alice",
+            password_hash: "not-a-real-hash",
+            is_admin: false,
+            services: Services::NONE,
+        },
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         users::get(&pool, &username).await.unwrap().services,
         Services::NONE
@@ -211,6 +225,7 @@ async fn add_admin(pool: &Pool, name: &str) -> i64 {
             display_name: name,
             password_hash: "x",
             is_admin: true,
+            services: gono_server_core::services::Services::ALL,
         },
         |_| Ok(()),
     )

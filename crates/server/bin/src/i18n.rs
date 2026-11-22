@@ -241,6 +241,8 @@ texts! {
     device_grant: "Add device", "添加设备";
     two_factor_needed: "Two-step verification needed", "需要两步验证";
     two_factor_needed_lead: "Remote access needs two-step verification on your account. Turn it on; this page follows again afterwards.", "远程访问要求账号开启两步验证。请先开启，之后会回到这个页面。";
+    service_off: "Service not enabled", "服务未开启";
+    service_off_webdav_lead: "WebDAV is not enabled for your account, so apps cannot sign in to it. Ask an administrator to turn it on.", "你的账号还没有开通 WebDAV，应用无法用它登录。请联系管理员开通。";
     too_many_devices: "Too many devices", "设备太多";
     too_many_devices_lead: "This account already has 50 devices for remote access. Revoke one on your account page, then start the sign-in on the device again.", "这个账号已有 50 台远程访问设备。请先在账户页吊销一台，再在设备上重新发起登录。";
 

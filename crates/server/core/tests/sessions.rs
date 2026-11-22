@@ -22,6 +22,7 @@ async fn fixture() -> (tempfile::TempDir, Pool, i64) {
             display_name: "Alice",
             password_hash: "x",
             is_admin: false,
+            services: gono_server_core::services::Services::ALL,
         },
         |_| Ok(()),
     )
@@ -253,6 +254,39 @@ async fn login_flows_are_bounded_and_skip_disabled_accounts() {
             .is_none()
     );
     assert!(app_passwords::list(&pool, owner).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn login_flows_of_accounts_without_webdav_mint_nothing() {
+    use gono_server_core::services::Services;
+    let (_dir, pool, owner) = fixture().await;
+    let now = 5_000;
+    let flow = login_flows::create(&pool, "c", now).await.unwrap().unwrap();
+    let id = login_flows::find(&pool, flow.login_token.expose_secret(), now)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    login_flows::grant(&pool, id, owner, None, now)
+        .await
+        .unwrap();
+    // WebDAV was turned off between the grant and the poll: the flow is used up.
+    users::set_services(&pool, &Username::new("alice").unwrap(), Services::NONE)
+        .await
+        .unwrap();
+    assert!(
+        login_flows::complete(&pool, flow.poll_token.expose_secret(), now)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(app_passwords::list(&pool, owner).await.unwrap().is_empty());
+    assert!(
+        login_flows::find(&pool, flow.login_token.expose_secret(), now)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

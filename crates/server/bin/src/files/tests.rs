@@ -54,6 +54,7 @@ async fn fixture_with(files: bool) -> Fixture {
             display_name: "Alice Example",
             password_hash: &hash,
             is_admin: false,
+            services: gono_server_core::services::Services::ALL,
         },
         |id| layout.create_user(id),
     )
@@ -1917,6 +1918,7 @@ async fn secrets_shown_once_stay_with_the_account_of_their_session() {
             display_name: "Bob",
             password_hash: &hash,
             is_admin: false,
+            services: gono_server_core::services::Services::ALL,
         },
         |id| layout.create_user(id),
     )
@@ -2673,6 +2675,7 @@ async fn s3_forms_need_the_session_csrf_token_and_the_users_own_buckets() {
             display_name: "Bob",
             password_hash: &hash,
             is_admin: false,
+            services: gono_server_core::services::Services::ALL,
         },
         |id| layout.create_user(id),
     )

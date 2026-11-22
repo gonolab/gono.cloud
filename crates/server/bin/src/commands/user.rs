@@ -45,6 +45,7 @@ pub async fn run(config_path: &Path, command: UserCommand) -> anyhow::Result<()>
                     display_name: &display_name,
                     password_hash: &hash,
                     is_admin: admin,
+                    services: gono_server_core::services::Services::NONE,
                 },
                 |id| layout.create_user(id),
             )

@@ -58,6 +58,7 @@ async fn add_user(pool: &db::Pool, layout: &DataLayout, name: &str, pw: &str, ad
             display_name: name,
             password_hash: &hash,
             is_admin: admin,
+            services: gono_server_core::services::Services::ALL,
         },
         |id| layout.create_user(id),
     )

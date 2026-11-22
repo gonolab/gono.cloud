@@ -299,6 +299,9 @@ echo "==> initializing a fresh installation in ${WORK_DIR}"
 printf '%s\n' "${WEB_PASSWORD}" | gono init --admin gono --password-stdin >/dev/null
 # An email-style name, so that the multi-user tests also cover `@` in URLs and hrefs.
 printf '%s\n' "${USER2_WEB_PASSWORD}" | gono user add alice@example.com --password-stdin >/dev/null
+# Accounts start without services; the suite exercises all of them.
+gono user services gono --enable all >/dev/null
+gono user services alice@example.com --enable all >/dev/null
 
 echo "==> minting credentials"
 PASSWORD="$(mint_app_password gono --label acceptance-full)"

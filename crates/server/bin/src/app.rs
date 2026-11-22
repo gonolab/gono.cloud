@@ -49,7 +49,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
-use gono_server_core::db;
+use gono_server_core::{db, services::Service};
 use gono_server_dav::{
     DavPrefixLayer, DavService, Identity, OcHeadersLayer, RewrittenXml, report,
     resolve::FILES_ROOT, xml_limits,
@@ -316,6 +316,28 @@ pub(crate) async fn authenticate(
     }
 }
 
+/// The refusal of a request of an account that may not use `service` (`gono_server_core::services`).
+///
+/// The answer is `403` with a line of text saying so, never `401`: the credentials are valid,
+/// and after a `401` the Nextcloud apps forget the account (see [`crate::auth`]), so turning a
+/// service off and on again would sign every device out.
+pub(crate) fn refusal(identity: &Identity, service: Service) -> Option<Response> {
+    (!identity.services.has(service)).then(|| service_refused(service))
+}
+
+/// The answer of [`refusal`]: `403` and "The <service> service is not enabled for this account."
+pub(crate) fn service_refused(service: Service) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        format!(
+            "The {} service is not enabled for this account.\n",
+            service.label()
+        ),
+    )
+        .into_response()
+}
+
 /// The (decoded) username segment after `prefix`, if the path has one.
 fn url_user(path: &str, prefix: &str) -> Option<String> {
     let segment = path.strip_prefix(prefix)?.split('/').next()?;
@@ -353,6 +375,9 @@ async fn files(
         Ok(identity) => identity,
         Err(rejection) => return rejection.into_response(),
     };
+    if let Some(refused) = refusal(&identity, Service::Webdav) {
+        return refused;
+    }
     if url_user(request.uri().path(), FILES_ROOT).as_deref() != Some(identity.username.as_str()) {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -366,7 +391,10 @@ async fn webdav(
     request: Request,
 ) -> Response {
     match authenticate(&state, peer, request.headers()).await {
-        Ok(identity) => serve_dav(&state, identity, request).await,
+        Ok(identity) => match refusal(&identity, Service::Webdav) {
+            None => serve_dav(&state, identity, request).await,
+            Some(refused) => refused,
+        },
         Err(rejection) => rejection.into_response(),
     }
 }
@@ -383,7 +411,10 @@ async fn dav_namespace(
     request: Request,
 ) -> Response {
     match authenticate(&state, peer, request.headers()).await {
-        Ok(_) => StatusCode::NOT_FOUND.into_response(),
+        Ok(identity) => match refusal(&identity, Service::Webdav) {
+            None => StatusCode::NOT_FOUND.into_response(),
+            Some(refused) => refused,
+        },
         Err(rejection) => rejection.into_response(),
     }
 }
@@ -414,6 +445,9 @@ async fn uploads(
         Ok(identity) => identity,
         Err(rejection) => return rejection.into_response(),
     };
+    if let Some(refused) = refusal(&identity, Service::Webdav) {
+        return refused;
+    }
     let own =
         url_user(request.uri().path(), UPLOADS_ROOT).as_deref() == Some(identity.username.as_str());
     if !own || !identity.can_write_somewhere() {
@@ -491,6 +525,7 @@ mod tests {
                     display_name: name,
                     password_hash: "x",
                     is_admin: false,
+                    services: gono_server_core::services::Services::ALL,
                 },
                 |id| layout.create_user(id),
             )
@@ -630,6 +665,58 @@ mod tests {
             .send("PROPFIND", "/remote.php/webdav/", Some(&f.full), &[], "")
             .await;
         assert_eq!(alias.status, StatusCode::MULTI_STATUS);
+    }
+
+    #[tokio::test]
+    async fn the_nextcloud_surface_needs_the_webdav_service() {
+        use gono_server_core::services::{Service, Services};
+        let f = fixture().await;
+        let alice = Username::new("alice").unwrap();
+        let only_files = Services::NONE.with(Service::Files, true);
+        users::set_services(&f.state.db, &alice, only_files)
+            .await
+            .unwrap();
+
+        // Every route of Nextcloud clients refuses with 403, never 401, which would make the
+        // apps forget the account.
+        for (method, uri) in [
+            ("PROPFIND", FILES),
+            ("PROPFIND", "/remote.php/webdav/"),
+            ("PROPFIND", "/remote.php/dav/"),
+            ("MKCOL", "/remote.php/dav/uploads/alice/upload-1"),
+        ] {
+            let refused = f
+                .send(method, uri, Some(&f.full), &[("Depth", "0")], "")
+                .await;
+            assert_eq!(refused.status, StatusCode::FORBIDDEN, "{method} {uri}");
+            assert!(
+                refused.body.contains("WebDAV service is not enabled"),
+                "{}",
+                refused.body
+            );
+        }
+        let ocs = f
+            .send(
+                "GET",
+                "/ocs/v2.php/cloud/user?format=json",
+                Some(&f.full),
+                &[("OCS-APIRequest", "true")],
+                "",
+            )
+            .await;
+        assert_eq!(ocs.status, StatusCode::FORBIDDEN, "{}", ocs.body);
+        // Wrong credentials still get the challenge.
+        let wrong = f.send("PROPFIND", FILES, Some("nope"), &[], "").await;
+        assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+
+        // Turned on again, the same app password works.
+        users::set_services(&f.state.db, &alice, only_files.with(Service::Webdav, true))
+            .await
+            .unwrap();
+        let ok = f
+            .send("PROPFIND", FILES, Some(&f.full), &[("Depth", "0")], "")
+            .await;
+        assert_eq!(ok.status, StatusCode::MULTI_STATUS, "{}", ok.body);
     }
 
     #[tokio::test]

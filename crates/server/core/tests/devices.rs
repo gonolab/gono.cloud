@@ -26,6 +26,7 @@ async fn user(pool: &Pool, name: &str) -> i64 {
             display_name: name,
             password_hash: "x",
             is_admin: false,
+            services: gono_server_core::services::Services::ALL,
         },
         |_| Ok(()),
     )
@@ -431,6 +432,7 @@ async fn the_name_of_a_deleted_account_that_registered_devices_is_retired() {
             display_name: "Carol",
             password_hash: "x",
             is_admin: false,
+            services: gono_server_core::services::Services::ALL,
         },
         |_| Ok(()),
     )

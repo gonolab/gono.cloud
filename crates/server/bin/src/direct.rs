@@ -25,7 +25,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use gono_server_core::{app_passwords, db, direct_downloads};
+use gono_server_core::{app_passwords, db, direct_downloads, services::Service};
 use gono_server_dav::{Identity, resolve};
 use secrecy::ExposeSecret as _;
 
@@ -146,8 +146,9 @@ pub async fn download(
         Err(err) => return unavailable(&err),
     };
     let device = match app_passwords::device(&state.db, link.app_password_id, now).await {
-        Ok(Some(device)) => device,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        // A link of an account without WebDAV is as gone as one of a revoked app password.
+        Ok(Some(device)) if device.services.has(Service::Webdav) => device,
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(err) => return unavailable(&err),
     };
     let identity = Identity::from_device(device);

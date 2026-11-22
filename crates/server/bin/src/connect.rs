@@ -422,6 +422,7 @@ mod tests {
                 display_name: "Alice",
                 password_hash: "x",
                 is_admin: false,
+                services: gono_server_core::services::Services::ALL,
             },
             |id| layout.create_user(id),
         )

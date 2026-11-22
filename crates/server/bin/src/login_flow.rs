@@ -26,7 +26,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use gono_server_core::{db, devices, login_flows, two_factor};
+use gono_server_core::{db, devices, login_flows, services::Service, two_factor};
 use gono_server_nextcloud::login_flow;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
@@ -320,6 +320,20 @@ fn consent_page(
     )
 }
 
+/// The page that refuses to grant an app password to an account without WebDAV: the app could
+/// not use it (`gono_server_core::services`).
+fn webdav_refusal(headers: &HeaderMap) -> Response {
+    let chrome = Chrome::for_request(headers);
+    let t = chrome.t;
+    Message::new(
+        chrome,
+        t.service_off,
+        t.service_off,
+        t.service_off_webdav_lead,
+    )
+    .respond(StatusCode::FORBIDDEN)
+}
+
 /// Why a device registration cannot be granted to `user_id` (`docs/connect-protocol.md`,
 /// 4.2): the account has no two-step verification while the server requires it
 /// (`connect.require_two_factor`), or holds the most devices already.
@@ -406,6 +420,10 @@ pub async fn page(
         return done_page(&headers, &flow.client_name);
     }
     match state.web.session(&headers).await {
+        // Say so before the user grants anything the app could not use.
+        Some((user, _)) if flow.device.is_none() && !user.services.has(Service::Webdav) => {
+            webdav_refusal(&headers)
+        }
         Some(session) => consent_page(&state, &headers, &flow, &session),
         None => login_page(&state, &headers, StatusCode::OK, &flow.client_name, None),
     }
@@ -488,6 +506,9 @@ pub async fn submit(
         return done_page(&headers, &flow.client_name);
     }
     let user = &session.0;
+    if form.action == "grant" && flow.device.is_none() && !user.services.has(Service::Webdav) {
+        return webdav_refusal(&headers);
+    }
     if form.action == "grant"
         && flow.device.is_some()
         && let Some(refusal) = device_refusal(&state, &headers, user.user_id, uri.path()).await

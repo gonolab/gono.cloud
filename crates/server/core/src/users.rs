@@ -103,6 +103,9 @@ pub struct NewUser<'a> {
     pub password_hash: &'a str,
     /// Grant access to the web admin UI.
     pub is_admin: bool,
+    /// The services it may use from the start. Accounts created by people (the CLI, the admin
+    /// UI, `init`) start with [`Services::NONE`]; tests set what they exercise.
+    pub services: Services,
 }
 
 /// The columns of [`User`]; the last ones are [`crate::services::COLUMNS`].
@@ -145,6 +148,7 @@ pub async fn create_initial_admin(
             display_name,
             password_hash,
             is_admin: true,
+            services: Services::NONE,
         },
     )
     .await?;
@@ -179,9 +183,11 @@ async fn insert(tx: &mut db::Tx, user: &NewUser<'_>) -> Result<i64> {
         return Err(Error::UsernameRetired(user.username.clone()));
     }
     let id = db::next_id(tx, "users").await?;
+    let services = user.services.normalized();
     sqlx::query(
         "INSERT INTO users (id, username, display_name, password_hash, enabled, is_admin, \
-         created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+         created_at, updated_at, service_files, service_webdav, service_s3, service_direct, \
+         service_relay) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(user.username.as_str())
@@ -190,6 +196,11 @@ async fn insert(tx: &mut db::Tx, user: &NewUser<'_>) -> Result<i64> {
     .bind(user.is_admin)
     .bind(now)
     .bind(now)
+    .bind(services.files)
+    .bind(services.webdav)
+    .bind(services.s3)
+    .bind(services.direct)
+    .bind(services.relay)
     .execute(&mut **tx)
     .await
     .map_err(|err| match err.as_database_error() {
