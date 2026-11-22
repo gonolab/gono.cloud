@@ -145,7 +145,7 @@ impl Files {
     }
 }
 
-/// The routes of the file UI and the account page.
+/// The routes of the file UI and the account page (see [`account`] for the latter's).
 pub fn routes() -> Router<AppState> {
     use self::account::ACCOUNT;
     let files = Router::new()
@@ -159,7 +159,11 @@ pub fn routes() -> Router<AppState> {
         .route("/index.php/apps/files", get(nextcloud_link))
         .route("/index.php/apps/files/", get(nextcloud_link))
         .route(ACCOUNT, get(account::to_page))
-        .route(&format!("{ACCOUNT}/"), get(account::show))
+        .route(&format!("{ACCOUNT}/"), get(account::overview))
+        .route(&format!("{ACCOUNT}/webdav"), get(account::webdav_tab))
+        .route(&format!("{ACCOUNT}/s3"), get(account::s3_tab))
+        .route(&format!("{ACCOUNT}/direct"), get(account::direct_tab))
+        .route(&format!("{ACCOUNT}/relay"), get(account::relay_tab))
         .route(
             &format!("{ACCOUNT}/display-name"),
             post(account::set_display_name),
@@ -439,7 +443,7 @@ fn files_off(visitor: &Visitor, method: &Method, params: &Params) -> Response {
         t.service_off,
         t.service_off_files_lead,
     );
-    page.link = Some((format!("{}/", account::ACCOUNT), t.account.to_owned()));
+    page.link = Some((account::OVERVIEW.to_owned(), t.account.to_owned()));
     page.respond(StatusCode::FORBIDDEN)
 }
 

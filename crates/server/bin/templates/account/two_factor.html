@@ -9,11 +9,11 @@
   {%- if let Some(error) = error %}
   <div class="flash bad mt-20" role="alert">{{ error }}</div>
   {%- endif %}
-  <form method="post" action="/apps/account/two-factor/confirm" class="mt-20">
+  <form method="post" action="/account/two-factor/confirm" class="mt-20">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <label class="field" for="tf-code"><span>{{ chrome.t.tf_setup_confirm }}</span>
       <input id="tf-code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" required autofocus></label>
-    <div class="actions"><button class="btn primary" type="submit">{{ chrome.t.tf_turn_on }}</button><a class="btn" href="/apps/account/">{{ chrome.t.cancel }}</a></div>
+    <div class="actions"><button class="btn primary" type="submit">{{ chrome.t.tf_turn_on }}</button><a class="btn" href="/account/">{{ chrome.t.cancel }}</a></div>
   </form>
 </div></section>
 {%- endblock %}

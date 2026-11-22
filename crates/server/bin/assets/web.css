@@ -490,6 +490,7 @@ html[data-theme=dark] .theme-switch__dark { display: block; }
   border-block-end: 1px solid var(--line);
 }
 .panel-head p { margin: 0; }
+.panel-head p + p { margin-top: 6px; }
 .panel.danger { border-color: color-mix(in srgb, var(--danger) 35%, var(--line)); }
 .card__title { margin: 0 0 10px; color: var(--text-muted); font-size: 13px; font-weight: 600; }
 .grid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: var(--gap); align-items: start; }
@@ -526,7 +527,9 @@ html[data-theme=dark] .theme-switch__dark { display: block; }
 .tabs__item[aria-current] { border-block-end-color: var(--accent); color: var(--accent); font-weight: 500; }
 .tabs__item .icon { inline-size: 13px; block-size: 13px; }
 .tabs__spacer { flex: 1; }
-.admin-tabs { margin-bottom: 18px; padding-inline: 0; }
+/* The tab bars of the admin UI and the account page, above the page heading. */
+.admin-tabs,
+.page-tabs { margin-bottom: 18px; padding-inline: 0; }
 
 /* ---------------------------------------------------------------------------------------------
    Buttons
@@ -916,6 +919,8 @@ progress::-moz-progress-bar { border-radius: var(--r-pill); background: var(--ac
   .masthead__search { flex-basis: 180px; }
 }
 @media (max-width: 860px) {
+  /* Room for the four entries of an admin's masthead next to the search box. */
+  .menu__name { display: none; }
   .layout { grid-template-columns: minmax(0, 1fr); }
   .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .grid,

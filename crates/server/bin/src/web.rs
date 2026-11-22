@@ -57,6 +57,7 @@ use axum::{
 use base64::Engine as _;
 use gono_server_core::{
     Username, db, password, secret,
+    services::{Service, Services},
     two_factor::{self, Key, Verification},
     users::{self, User},
     web_sessions::{self, SessionUser},
@@ -1212,6 +1213,9 @@ pub struct Chrome {
     pub icon: &'static str,
     /// The signed-in account, if any.
     pub user: Option<ChromeUser>,
+    /// The services of the signed-in account ([`Services::NONE`] without one): the masthead
+    /// offers the search and leads home to the files only with [`Service::Files`].
+    pub services: Services,
     /// CSRF token of the session (empty without one), for the forms in the masthead and for
     /// the script's requests.
     pub csrf: String,
@@ -1250,6 +1254,7 @@ impl Chrome {
             script: script_url(),
             icon: icon_url(),
             user: None,
+            services: Services::NONE,
             csrf: String::new(),
             nav: Nav::None,
             files: false,
@@ -1270,8 +1275,15 @@ impl Chrome {
     #[must_use]
     pub fn signed_in(mut self, user: &SessionUser, csrf: &str) -> Self {
         self.user = Some(ChromeUser::new(user));
+        self.services = user.services;
         self.csrf = csrf.to_owned();
         self
+    }
+
+    /// Whether the masthead shows the search box: it searches the web file UI, which the
+    /// account needs the files service for.
+    pub fn search(&self) -> bool {
+        self.files && self.services.has(Service::Files)
     }
 
     /// Whether masthead entry `index` is the current one (for the templates, which cannot
@@ -1287,10 +1299,16 @@ impl Chrome {
         self.nav == nav
     }
 
-    /// Where the brand links to.
+    /// Where the brand links to: the files, or the account page for a signed-in account
+    /// without the files service, which the file UI would only refuse (as `/` does,
+    /// [`crate::site::root`]).
     pub fn home(&self) -> &str {
         if self.files {
-            "/apps/files/"
+            if self.user.is_some() && !self.services.has(Service::Files) {
+                crate::files::account::OVERVIEW
+            } else {
+                "/apps/files/"
+            }
         } else if let Some(admin) = &self.admin {
             admin
         } else {

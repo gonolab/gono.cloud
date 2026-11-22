@@ -135,6 +135,12 @@ impl Connect {
         let _ = self.relay.set(relay);
     }
 
+    /// The relay this process runs, once [`Connect::set_relay`] handed it over: what the
+    /// account page shows of an account's devices on it.
+    pub fn relay(&self) -> Option<&RelayStatus> {
+        self.relay.get()
+    }
+
     /// The database.
     pub fn pool(&self) -> &Pool {
         &self.pool

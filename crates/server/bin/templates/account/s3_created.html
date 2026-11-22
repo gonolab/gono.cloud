@@ -17,6 +17,6 @@
     <dt>{{ chrome.t.s3_region }}</dt><dd class="mono">{{ region }}</dd>
     <dt>{{ chrome.t.s3_addressing }}</dt><dd>{% for line in addressing %}{% if !loop.first %}<br>{% endif %}{{ line }}{% endfor %}</dd>
   </dl>
-  <div class="actions mt-20"><a class="btn primary" href="/apps/account/#s3">{{ chrome.t.done }}</a></div>
+  <div class="actions mt-20"><a class="btn primary" href="/account/s3">{{ chrome.t.done }}</a></div>
 </div></section>
 {%- endblock %}

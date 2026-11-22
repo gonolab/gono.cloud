@@ -45,7 +45,7 @@ pub async fn root(State(state): State<AppState>, headers: HeaderMap) -> Response
     if state.files.is_some() {
         match state.web.session(&headers).await {
             Some((user, _)) if !user.services.has(Service::Files) => {
-                web::see_other(&format!("{}/", crate::files::account::ACCOUNT), &[])
+                web::see_other(crate::files::account::OVERVIEW, &[])
             }
             _ => web::see_other(FILES_HOME, &[]),
         }
@@ -403,17 +403,27 @@ pub async fn login(
         .verify_password(client, &user, SecretString::from(form.password))
         .await
     {
-        Verified::Ok(account) => match state.web.start_session(client, &account, &next).await {
-            Started::Session(token) => web::see_other(
-                &next,
-                &[
-                    state.web.session_cookie(&token),
-                    state.web.removal_cookie(CSRF_COOKIE),
-                ],
-            ),
-            Started::SecondStep(cookie) => web::see_other(web::TWO_STEP_PATH, &[cookie]),
-            Started::Unavailable => web::unavailable(Chrome::for_request(&headers)),
-        },
+        Verified::Ok(account) => {
+            // Without a page of its own to return to, an account without the web file
+            // service goes to its account page rather than to a page that says it is off.
+            let next = if local_path(&form.next).is_none() && !account.services.has(Service::Files)
+            {
+                format!("{}/", crate::files::account::ACCOUNT)
+            } else {
+                next
+            };
+            match state.web.start_session(client, &account, &next).await {
+                Started::Session(token) => web::see_other(
+                    &next,
+                    &[
+                        state.web.session_cookie(&token),
+                        state.web.removal_cookie(CSRF_COOKIE),
+                    ],
+                ),
+                Started::SecondStep(cookie) => web::see_other(web::TWO_STEP_PATH, &[cookie]),
+                Started::Unavailable => web::unavailable(Chrome::for_request(&headers)),
+            }
+        }
         Verified::Invalid => sign_in_form(
             &state,
             &headers,
@@ -472,6 +482,6 @@ mod tests {
         assert_eq!(after_sign_in(Some("//evil")), FILES_HOME);
         assert_eq!(after_sign_in(Some("/login")), FILES_HOME);
         assert_eq!(after_sign_in(None), FILES_HOME);
-        assert_eq!(after_sign_in(Some("/apps/account/")), "/apps/account/");
+        assert_eq!(after_sign_in(Some("/account/")), "/account/");
     }
 }

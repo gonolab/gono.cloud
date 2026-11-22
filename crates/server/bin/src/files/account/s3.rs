@@ -1,6 +1,7 @@
-//! The S3 part of the account page: the user's buckets and access keys, shown while the S3 API
-//! is enabled ([`S3Ui`]). The requests are listed in the table of [`super`]; while the S3 API
-//! is off they answer 404 and the page shows nothing of S3.
+//! The S3 tab of the account page: the user's buckets and access keys, while the S3 API is
+//! enabled ([`S3Ui`]) and the account has the S3 service. The requests are listed in the table
+//! of [`super`]; while the S3 API is off they answer 404 and the tab says that this server does
+//! not offer S3, and without the service they answer the tab's notice with 403.
 //!
 //! - **Buckets.** A new bucket gets the folder `<s3.bucket_folder>/<name>` of the user's files,
 //!   created here as the S3 API's `CreateBucket` creates it, and is refused when that folder
@@ -12,7 +13,7 @@
 //!   configuration are set only through the S3 API; each row sums them up, read-only
 //!   ([`BucketRow`], which the admin UI's list shares).
 //! - **Access keys.** A new key is kept in memory for its session and shown once at
-//!   `/apps/account/s3/created`, with the endpoint and region to configure; the URL carries no
+//!   `/account/s3/created`, with the endpoint and region to configure; the URL carries no
 //!   secret. Its secret key is sealed with the server's key file (`two_factor.key_file`).
 //! - **Audit.** Every change is written to the audit log with the client address:
 //!   `s3.bucket.created`, `s3.bucket.removed`, `s3.bucket.anonymous`, `s3.key.created` and
@@ -43,7 +44,10 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{ACCOUNT, CsrfForm, PageOptions, account_visitor, expiry, form_visitor, render};
+use super::{
+    ACCOUNT, CsrfForm, PageOptions, Tab, account_visitor, expiry, form_visitor, needs_service,
+    render,
+};
 use crate::{
     admin::{core_message, parse_expiry},
     app::AppState,
@@ -339,7 +343,7 @@ fn endpoint(t: &Text, ui: &S3Ui) -> (String, Vec<String>) {
     (endpoint, addressing)
 }
 
-/// What the account page shows of S3, or `None` while the S3 API is off.
+/// What the S3 tab shows, or `None` while the S3 API is off.
 pub(super) async fn view(
     state: &AppState,
     visitor: &Visitor,
@@ -403,7 +407,7 @@ pub(super) async fn view(
     }))
 }
 
-/// The notice of `?done=<done>` after an S3 change.
+/// The notice of `?done=<done>` on the S3 tab, after an S3 change.
 pub(super) fn notice(t: &'static Text, done: &str) -> Option<&'static str> {
     match done {
         "s3-bucket-created" => Some(t.s3_notice_bucket_created),
@@ -452,9 +456,10 @@ fn enabled(state: &AppState) -> Result<Arc<S3Ui>, Box<Response>> {
         .ok_or_else(|| Box::new(StatusCode::NOT_FOUND.into_response()))
 }
 
-/// Shows the account page again with `error` and the S3 forms as entered; nothing changed.
+/// Shows the S3 tab again with `error` and the S3 forms as entered; nothing changed.
 async fn refuse(state: &AppState, visitor: &Visitor, forms: S3Forms, error: String) -> Response {
     let options = PageOptions {
+        tab: Tab::S3,
         s3: forms,
         error: Some(error),
         ..PageOptions::default()
@@ -462,9 +467,22 @@ async fn refuse(state: &AppState, visitor: &Visitor, forms: S3Forms, error: Stri
     render(state, visitor, options).await
 }
 
-/// `303` to the account page with `?done=<done>`.
+/// `303` to the S3 tab with `?done=<done>`.
 fn done(done: &str) -> Response {
-    web::see_other(&format!("{ACCOUNT}/?done={done}"), &[])
+    Tab::S3.done(done)
+}
+
+/// The visitor of an S3 form: signed in, with the session's token, and with the S3 service
+/// (without it, the S3 tab's notice and `403`).
+async fn s3_visitor(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    csrf: &str,
+) -> Result<Visitor, Box<Response>> {
+    let visitor = form_visitor(state, headers, uri, csrf).await?;
+    needs_service(&visitor, Tab::S3)?;
+    Ok(visitor)
 }
 
 /// The visitor's bucket `id`, `None` if there is none (any more).
@@ -494,7 +512,7 @@ pub struct BucketForm {
     folder: String,
 }
 
-/// `POST /apps/account/s3/buckets`: a new bucket with a new folder.
+/// `POST /account/s3/buckets`: a new bucket with a new folder.
 pub async fn create_bucket(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -506,7 +524,7 @@ pub async fn create_bucket(
         Ok(ui) => ui,
         Err(response) => return *response,
     };
-    let visitor = match form_visitor(&state, &headers, &uri, &form.csrf).await {
+    let visitor = match s3_visitor(&state, &headers, &uri, &form.csrf).await {
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
@@ -574,7 +592,7 @@ pub async fn create_bucket(
     done("s3-bucket-created")
 }
 
-/// `POST /apps/account/s3/buckets/bind`: an existing folder becomes a bucket.
+/// `POST /account/s3/buckets/bind`: an existing folder becomes a bucket.
 pub async fn bind_bucket(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -585,7 +603,7 @@ pub async fn bind_bucket(
     if let Err(response) = enabled(&state) {
         return *response;
     }
-    let visitor = match form_visitor(&state, &headers, &uri, &form.csrf).await {
+    let visitor = match s3_visitor(&state, &headers, &uri, &form.csrf).await {
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
@@ -649,7 +667,7 @@ pub struct AnonymousForm {
     list: Option<String>,
 }
 
-/// `POST /apps/account/s3/buckets/<id>/anonymous`.
+/// `POST /account/s3/buckets/<id>/anonymous`.
 pub async fn set_anonymous(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -662,7 +680,7 @@ pub async fn set_anonymous(
         Ok(ui) => ui,
         Err(response) => return *response,
     };
-    let visitor = match form_visitor(&state, &headers, &uri, &form.csrf).await {
+    let visitor = match s3_visitor(&state, &headers, &uri, &form.csrf).await {
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
@@ -721,7 +739,7 @@ pub async fn set_anonymous(
     done("s3-bucket-anonymous")
 }
 
-/// `POST /apps/account/s3/buckets/<id>/delete`: unbinds the bucket; the folder stays.
+/// `POST /account/s3/buckets/<id>/delete`: unbinds the bucket; the folder stays.
 pub async fn remove_bucket(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -733,19 +751,19 @@ pub async fn remove_bucket(
     if let Err(response) = enabled(&state) {
         return *response;
     }
-    let visitor = match form_visitor(&state, &headers, &uri, &form.csrf).await {
+    let visitor = match s3_visitor(&state, &headers, &uri, &form.csrf).await {
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
     let bucket = match own_bucket(&state, &visitor, id).await {
         Ok(Some(bucket)) => bucket,
         // Removed already (for example in another tab): nothing to report.
-        Ok(None) => return web::see_other(&format!("{ACCOUNT}/"), &[]),
+        Ok(None) => return Tab::S3.back(),
         Err(response) => return *response,
     };
     match s3::delete_bucket(&state.db, visitor.user.user_id, id).await {
         Ok(true) => {}
-        Ok(false) => return web::see_other(&format!("{ACCOUNT}/"), &[]),
+        Ok(false) => return Tab::S3.back(),
         Err(err) => return internal(&visitor, "bucket", &err),
     }
     let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
@@ -784,7 +802,7 @@ fn parse_grants(t: &Text, forms: &S3Forms, buckets: &[Bucket]) -> Result<Vec<Gra
     Ok(grants)
 }
 
-/// `POST /apps/account/s3/keys`.
+/// `POST /account/s3/keys`.
 pub async fn create_key(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -800,7 +818,7 @@ pub async fn create_key(
             .get(name)
             .map_or_else(String::new, |value| value.trim().to_owned())
     };
-    let visitor = match form_visitor(&state, &headers, &uri, &field("csrf")).await {
+    let visitor = match s3_visitor(&state, &headers, &uri, &field("csrf")).await {
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
@@ -882,7 +900,7 @@ pub async fn create_key(
     web::see_other(&format!("{ACCOUNT}/s3/created"), &[])
 }
 
-/// `GET /apps/account/s3/created`: the new access key with its secret key, once.
+/// `GET /account/s3/created`: the new access key with its secret key, once.
 pub async fn created(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
     let ui = match enabled(&state) {
         Ok(ui) => ui,
@@ -896,7 +914,7 @@ pub async fn created(State(state): State<AppState>, headers: HeaderMap, uri: Uri
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(key) = files.s3_created.take(&visitor.user) else {
-        return web::see_other(&format!("{ACCOUNT}/"), &[]);
+        return Tab::S3.back();
     };
     let t = visitor.t();
     let (endpoint, addressing) = endpoint(t, &ui);
@@ -914,7 +932,7 @@ pub async fn created(State(state): State<AppState>, headers: HeaderMap, uri: Uri
     web::render(StatusCode::OK, &page)
 }
 
-/// `POST /apps/account/s3/keys/<id>/delete`.
+/// `POST /account/s3/keys/<id>/delete`.
 pub async fn revoke_key(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -926,7 +944,7 @@ pub async fn revoke_key(
     if let Err(response) = enabled(&state) {
         return *response;
     }
-    let visitor = match form_visitor(&state, &headers, &uri, &form.csrf).await {
+    let visitor = match s3_visitor(&state, &headers, &uri, &form.csrf).await {
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
@@ -937,11 +955,11 @@ pub async fn revoke_key(
     };
     let Some(key) = key else {
         // Revoked already (for example in another tab): nothing to report.
-        return web::see_other(&format!("{ACCOUNT}/"), &[]);
+        return Tab::S3.back();
     };
     match s3::delete_key(&state.db, visitor.user.user_id, id).await {
         Ok(true) => {}
-        Ok(false) => return web::see_other(&format!("{ACCOUNT}/"), &[]),
+        Ok(false) => return Tab::S3.back(),
         Err(err) => return internal(&visitor, "revoke an S3 access key", &err),
     }
     let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);

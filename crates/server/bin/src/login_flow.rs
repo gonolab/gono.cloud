@@ -382,7 +382,7 @@ async fn device_refusal(
             if state.files.is_some() && state.web.two_factor_key().is_some() {
                 let next: String = url::form_urlencoded::byte_serialize(page.as_bytes()).collect();
                 message.link = Some((
-                    format!("/apps/account/?next={next}#two-factor"),
+                    format!("{}?next={next}#two-factor", crate::files::account::OVERVIEW),
                     t.tf_turn_on.to_owned(),
                 ));
             }

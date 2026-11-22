@@ -120,9 +120,10 @@ path = "/manage"
 
 [files_ui]
 # Serve the web file UI at /apps/files/ (browse, search, preview, upload, download, organize
-# and favorites), with the sign-in page /login and the account page /apps/account/, where users
-# change their web login password and manage their own app passwords. Users sign in with their
-# web login password; app passwords cannot access it. "/" leads here. Default: true.
+# and favorites), with the sign-in page /login and the account page /account/, where users
+# see their services, change their web login password and set up what their services need
+# (app passwords, S3 buckets and keys, remote devices). Users sign in with their web login
+# password; app passwords cannot access it. "/" leads here. Default: true.
 enabled = true
 
 [relay]

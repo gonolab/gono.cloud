@@ -1,0 +1,19 @@
+{%- extends "layout.html" -%}
+{%- block title %}{{ frame.heading }}{% endblock -%}
+{%- block body -%}
+<main class="container site-main" id="main" tabindex="-1">
+<nav class="tabs page-tabs" aria-label="{{ chrome.t.account }}">
+  {%- for tab in frame.tabs %}
+  <a class="tabs__item" href="{{ tab.href }}"{% if tab.current %} aria-current="page"{% endif %}>{{ tab.label }}</a>
+  {%- endfor %}
+</nav>
+{%- if let Some(notice) = frame.notice %}
+<div class="flash ok" role="status">{{ notice }}</div>
+{%- endif %}
+{%- if let Some(error) = frame.error %}
+<div class="flash bad" role="alert">{{ error }}</div>
+{%- endif %}
+<div class="page-head"><div><h1>{{ frame.heading }}</h1><p class="sub"><span class="mono">{{ frame.username }}</span></p></div></div>
+{% block content %}{% endblock %}
+</main>
+{%- endblock -%}

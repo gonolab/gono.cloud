@@ -66,7 +66,7 @@ trusted_proxies = ["127.0.0.1", "::1"]
 - **Admin UI:** `admin.enabled` (default on) and `admin.path` (default `/manage`). The proxy
   may restrict that path further, for example to a VPN range (examples below).
 - **Web file UI:** `/apps/files/`, the sign-in page `/login` and the account page
-  `/apps/account/` (`files_ui.enabled`, default on). Uploads from the page's script send files up
+  `/account/` (`files_ui.enabled`, default on). Uploads from the page's script send files up
   to 16 MiB in one request and larger ones in 10 MiB chunks; uploads without JavaScript send the
   whole selection in one request, so a body size limit (below) also limits them.
 

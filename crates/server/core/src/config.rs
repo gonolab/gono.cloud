@@ -441,7 +441,7 @@ impl Default for AdminConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct FilesUiConfig {
     /// Serve the web file UI at `/apps/files/`, with the sign-in page at `/login` and the
-    /// account page at `/apps/account/`. Users sign in with their web login password; app
+    /// account page at `/account/`. Users sign in with their web login password; app
     /// passwords cannot access it.
     pub enabled: bool,
 }

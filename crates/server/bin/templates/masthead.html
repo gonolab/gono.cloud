@@ -7,7 +7,7 @@
         {%- if chrome.files %}
         <a href="/apps/files/"{% if chrome.on(1) %} aria-current="page"{% endif %}>{{ chrome.t.files }}</a>
         <a href="/apps/files/?view=favorites"{% if chrome.on(2) %} aria-current="page"{% endif %}>{{ chrome.t.favorites }}</a>
-        <a href="/apps/account/"{% if chrome.on(3) %} aria-current="page"{% endif %}>{{ chrome.t.account }}</a>
+        <a href="/account/"{% if chrome.on(3) %} aria-current="page"{% endif %}>{{ chrome.t.account }}</a>
         {%- endif %}
         {%- if let Some(admin) = chrome.admin %}
         <a href="{{ admin }}/"{% if chrome.on(4) %} aria-current="page"{% endif %}>{{ chrome.t.admin }}</a>
@@ -21,12 +21,13 @@
       {%- if chrome.files %}
       <a class="masthead__link" href="/apps/files/"{% if chrome.on(1) %} aria-current="page"{% endif %}>{{ chrome.t.files }}</a>
       <a class="masthead__link" href="/apps/files/?view=favorites"{% if chrome.on(2) %} aria-current="page"{% endif %}>{{ chrome.t.favorites }}</a>
+      <a class="masthead__link" href="/account/"{% if chrome.on(3) %} aria-current="page"{% endif %}>{{ chrome.t.account }}</a>
       {%- endif %}
       {%- if let Some(admin) = chrome.admin %}
       <a class="masthead__link" href="{{ admin }}/"{% if chrome.on(4) %} aria-current="page"{% endif %}>{{ chrome.t.admin }}</a>
       {%- endif %}
     </nav>
-    {%- if chrome.files %}
+    {%- if chrome.search() %}
     <form class="masthead__search" role="search" method="get" action="/apps/files/">
       <label class="sr-only" for="site-search">{{ chrome.t.search_files }}</label>
       <input class="masthead__query" id="site-search" type="search" name="q" placeholder="{{ chrome.t.search }}" maxlength="200" value="{{ chrome.query }}">
@@ -49,7 +50,7 @@
         <div class="menu__list">
           <div class="menu__head"><b>{{ user.display_name }}</b><span>{{ user.username }}</span></div>
           {%- if chrome.files %}
-          <a class="menu__item" href="/apps/account/">{{ chrome.t.account }}</a>
+          <a class="menu__item" href="/account/">{{ chrome.t.account }}</a>
           {%- endif %}
           {%- if let Some(admin) = chrome.admin %}
           <a class="menu__item" href="{{ admin }}/">{{ chrome.t.admin }}</a>

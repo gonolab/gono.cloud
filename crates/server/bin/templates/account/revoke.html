@@ -10,7 +10,7 @@
     <dt>{{ chrome.t.last_used }}</dt><dd>{{ device.status }}</dd>
   </dl>
   <p class="mt-20"><b>{{ chrome.t.revoke_consequences }}</b></p>
-  <form method="post" action="/apps/account/devices/{{ device.hex }}/revoke">
+  <form method="post" action="/account/devices/{{ device.hex }}/revoke">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     {%- if !introduced.is_empty() %}
     <fieldset class="scope"><legend>{{ chrome.t.revoke_introduced }}</legend>
@@ -20,7 +20,7 @@
       {%- endfor %}
     </fieldset>
     {%- endif %}
-    <div class="actions mt-20"><button class="btn danger" type="submit">{{ chrome.t.revoke_confirm }}</button><a class="btn" href="/apps/account/">{{ chrome.t.cancel }}</a></div>
+    <div class="actions mt-20"><button class="btn danger" type="submit">{{ chrome.t.revoke_confirm }}</button><a class="btn" href="/account/direct">{{ chrome.t.cancel }}</a></div>
   </form>
 </div></section>
 {%- endblock %}

@@ -226,10 +226,24 @@ Opening `https://cloud.example.com/` in a browser leads to the **web file UI** a
 `/apps/files/`. Every user signs in there with their web login password and can browse, search,
 preview, upload (drag and drop, folders, large files in resumable chunks), download (folders as
 `.zip`), create folders, rename, move, delete and mark favorites. The **account page**
-(`/apps/account/`) lets users change their display name and web login password and create or
-revoke their own app passwords, for example for Finder, Windows Explorer or rclone. The pages
-work without JavaScript; with it, uploads and the theme switch need no page reloads. They follow
-the browser's language (English or Chinese) and its light or dark mode.
+(`/account/`, "Account" in the masthead) has a tab for the account and one for each service a
+user sets up there:
+
+| Tab | What it shows |
+|---|---|
+| Overview (`/account/`) | The account's services, on or off, each linked to where it is used; two-step verification, the display name and the web login password. Every account has it, with or without services. |
+| WebDAV (`/account/webdav`) | The server and WebDAV addresses clients connect to, and the user's app passwords, to create or revoke, for example for Finder, Windows Explorer or rclone. |
+| S3 (`/account/s3`) | The user's buckets and access keys ([s3.md](s3.md)). |
+| Direct connections (`/account/direct`) | The devices registered for remote access ("Remote access" below). |
+| Relay (`/account/relay`) | The relay's address, whether it carries the account's devices at full speed (the relay service) or only at the limited rate (direct connections alone), the devices connected to it now and the sessions they reported. It needs direct connections, which admit the devices to the relay already. |
+
+Every tab is listed for every account. A tab whose service the account lacks says so and that
+an administrator turns it on ("Managing accounts" below), and its forms are refused; one whose
+feature this server does not offer (the S3 API, or remote access for the last two tabs) says
+that instead. Without
+the files service the masthead has no search box and its logo leads to the account page. The
+pages work without JavaScript; with it, uploads and the theme switch need no page reloads. They
+follow the browser's language (English or Chinese) and its light or dark mode.
 
 Changes made in the browser are the same WebDAV operations the clients use, so the apps see
 them at once (notify_push included). Deleting is permanent: there is no trash bin. Files are
@@ -604,8 +618,11 @@ protocol is [connect-protocol.md](connect-protocol.md), and
   [connect]
   require_two_factor = true
   ```
-- **The account page** lists the account's devices, whether they are online, and lets a device
-  ask the account's other devices to pair for an hour.
+- **The account page** lists the account's devices on its "Direct connections" tab
+  (`/account/direct`), whether they are online, and lets a device ask the account's other
+  devices to pair for an hour. Its "Relay" tab (`/account/relay`) shows the account's devices
+  connected to the relay and the sessions they reported. Both need the account's direct
+  connection service.
 - **Stopping remote access** for a device that stays in use: "Stop remote access" on the
   account page signs it out. It keeps its key and its pairings, and can sign in again.
 - **Revoking a device** (lost, stolen, retired) is final for its key: the account's other

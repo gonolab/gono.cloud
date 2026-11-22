@@ -310,8 +310,8 @@ async fn pages_need_a_web_session_and_webdav_needs_an_app_password() {
     );
     // Signed in, the sign-in page sends the browser on.
     assert_eq!(
-        browser.get("/login?next=/apps/account/").await.location(),
-        "/apps/account/"
+        browser.get("/login?next=/account/").await.location(),
+        "/account/"
     );
     assert_eq!(
         browser.get("/login?next=//evil.example/").await.location(),
@@ -886,21 +886,28 @@ async fn the_account_page_manages_password_and_app_passwords() {
     let f = fixture().await;
     let mut browser = Browser::new(&f.state);
     let csrf = browser.sign_in().await;
-    let page = browser.get("/apps/account/").await;
+    let page = browser.get("/account/webdav").await;
     assert_eq!(page.status, StatusCode::OK);
     assert!(page.text().contains("laptop"));
+    // What a client needs to connect.
+    let text = page.text();
+    assert!(text.contains("https://cloud.example.com</dd>"), "{text}");
+    assert!(
+        text.contains("https://cloud.example.com/remote.php/dav/files/alice/</dd>"),
+        "{text}"
+    );
 
     let renamed = browser
         .post(
-            "/apps/account/display-name",
+            "/account/display-name",
             &[("csrf", &csrf), ("display_name", "Alice B.")],
         )
         .await;
-    assert_eq!(renamed.location(), "/apps/account/?done=display-name");
+    assert_eq!(renamed.location(), "/account/?done=display-name");
 
     let wrong = browser
         .post(
-            "/apps/account/password",
+            "/account/password",
             &[
                 ("csrf", &csrf),
                 ("current", "nope"),
@@ -912,7 +919,7 @@ async fn the_account_page_manages_password_and_app_passwords() {
     assert_eq!(wrong.status, StatusCode::UNPROCESSABLE_ENTITY);
     let changed = browser
         .post(
-            "/apps/account/password",
+            "/account/password",
             &[
                 ("csrf", &csrf),
                 ("current", ALICE_PASSWORD),
@@ -921,28 +928,28 @@ async fn the_account_page_manages_password_and_app_passwords() {
             ],
         )
         .await;
-    assert_eq!(changed.location(), "/apps/account/?done=password");
+    assert_eq!(changed.location(), "/account/?done=password");
     assert_eq!(
-        browser.get("/apps/account/").await.status,
+        browser.get("/account/").await.status,
         StatusCode::OK,
         "still signed in"
     );
 
     let created = browser
         .post(
-            "/apps/account/app-passwords",
+            "/account/app-passwords",
             &[("csrf", &csrf), ("label", "rclone"), ("access", "view")],
         )
         .await;
-    assert_eq!(created.location(), "/apps/account/created");
-    let shown = browser.get("/apps/account/created").await;
+    assert_eq!(created.location(), "/account/created");
+    let shown = browser.get("/account/created").await;
     let text = shown.text();
     let start = text.find("<div class=\"secret\">").expect("secret") + 20;
     let token = text[start..start + text[start..].find('<').unwrap()].to_owned();
     assert!(token.len() >= 29, "{token}");
     assert_eq!(
-        browser.get("/apps/account/created").await.location(),
-        "/apps/account/",
+        browser.get("/account/created").await.location(),
+        "/account/webdav",
         "shown once"
     );
     // The new app password is read only.
@@ -955,11 +962,18 @@ async fn the_account_page_manages_password_and_app_passwords() {
     let id = list.iter().find(|p| p.label == "rclone").unwrap().id;
     let revoked = browser
         .post(
-            &format!("/apps/account/app-passwords/{id}/delete"),
+            &format!("/account/app-passwords/{id}/delete"),
             &[("csrf", &csrf)],
         )
         .await;
-    assert_eq!(revoked.location(), "/apps/account/?done=revoked");
+    assert_eq!(revoked.location(), "/account/webdav?done=revoked");
+    assert!(
+        browser
+            .get("/account/webdav?done=revoked")
+            .await
+            .text()
+            .contains("The app password was revoked.")
+    );
     assert_eq!(
         browser.dav(&token, "PROPFIND", "", "").await.status,
         StatusCode::UNAUTHORIZED
@@ -1031,10 +1045,7 @@ async fn the_file_ui_can_be_turned_off() {
         browser.get("/apps/files/").await.status,
         StatusCode::NOT_FOUND
     );
-    assert_eq!(
-        browser.get("/apps/account/").await.status,
-        StatusCode::NOT_FOUND
-    );
+    assert_eq!(browser.get("/account/").await.status, StatusCode::NOT_FOUND);
     assert_eq!(browser.get("/login").await.status, StatusCode::NOT_FOUND);
     assert_eq!(
         browser.get("/").await.status,
@@ -1081,10 +1092,10 @@ async fn the_file_ui_needs_the_files_service_but_the_account_page_does_not() {
             .text()
             .contains(r#"href="/apps/files/?view=favorites" aria-current="page""#)
     );
-    let account = browser.get("/apps/account/").await;
+    let account = browser.get("/account/").await;
     assert_eq!(account.status, StatusCode::OK);
     let root = browser.get("/").await;
-    assert_eq!(root.location(), "/apps/account/");
+    assert_eq!(root.location(), "/account/");
     // The script's requests are refused too.
     let csrf = account.csrf();
     let mkcol = browser
@@ -1185,19 +1196,18 @@ async fn remote_devices_are_revoked_after_a_second_confirmation() {
 
     let mut browser = Browser::new(&f.state);
     browser.sign_in().await;
-    let page = browser.get("/apps/account/").await;
+    let page = browser.get("/account/direct").await;
     let text = page.text();
     assert!(text.contains("Remote devices"), "{text}");
     assert!(text.contains(&phone.endpoint_id.short()), "{text}");
     assert!(text.contains("Input Show · Windows"), "{text}");
     // The device credentials are not app passwords: only the fixture's own one is listed.
-    assert_eq!(text.matches("/delete\"").count(), 1, "{text}");
+    let webdav = browser.get("/account/webdav").await.text();
+    assert_eq!(webdav.matches("/delete\"").count(), 1, "{webdav}");
     let csrf = page.csrf();
 
     let hex = phone.endpoint_id.to_hex();
-    let confirm = browser
-        .get(&format!("/apps/account/devices/{hex}/revoke"))
-        .await;
+    let confirm = browser.get(&format!("/account/devices/{hex}/revoke")).await;
     assert_eq!(confirm.status, StatusCode::OK);
     let confirm_text = confirm.text();
     assert!(
@@ -1220,11 +1230,11 @@ async fn remote_devices_are_revoked_after_a_second_confirmation() {
     let also = format!("also_{}", work.endpoint_id.to_hex());
     let revoked = browser
         .post(
-            &format!("/apps/account/devices/{hex}/revoke"),
+            &format!("/account/devices/{hex}/revoke"),
             &[("csrf", &csrf), (&also, "1")],
         )
         .await;
-    assert_eq!(revoked.location(), "/apps/account/?done=device-revoked");
+    assert_eq!(revoked.location(), "/account/direct?done=device-revoked");
     let state = |id| {
         let db = f.state.db.clone();
         async move { devices::get(&db, id).await.unwrap().unwrap().is_revoked() }
@@ -1233,7 +1243,7 @@ async fn remote_devices_are_revoked_after_a_second_confirmation() {
     assert!(state(work.id).await, "ticked, revoked along with it");
     assert!(!state(laptop.id).await, "not ticked, still trusted");
     let page = browser
-        .get("/apps/account/?done=device-revoked")
+        .get("/account/direct?done=device-revoked")
         .await
         .text();
     assert!(page.contains("Revoked."), "{page}");
@@ -1242,7 +1252,7 @@ async fn remote_devices_are_revoked_after_a_second_confirmation() {
     // A revoked device has no actions any more.
     assert_eq!(
         browser
-            .get(&format!("/apps/account/devices/{hex}/revoke"))
+            .get(&format!("/account/devices/{hex}/revoke"))
             .await
             .status,
         StatusCode::NOT_FOUND
@@ -1251,11 +1261,11 @@ async fn remote_devices_are_revoked_after_a_second_confirmation() {
     let laptop_hex = laptop.endpoint_id.to_hex();
     let pairing = browser
         .post(
-            &format!("/apps/account/devices/{laptop_hex}/pairing"),
+            &format!("/account/devices/{laptop_hex}/pairing"),
             &[("csrf", &csrf)],
         )
         .await;
-    assert_eq!(pairing.location(), "/apps/account/?done=pairing");
+    assert_eq!(pairing.location(), "/account/direct?done=pairing");
     assert!(
         devices::get(&f.state.db, laptop.id)
             .await
@@ -1265,7 +1275,7 @@ async fn remote_devices_are_revoked_after_a_second_confirmation() {
     );
     let forged = browser
         .post(
-            &format!("/apps/account/devices/{laptop_hex}/revoke"),
+            &format!("/account/devices/{laptop_hex}/revoke"),
             &[("csrf", "forged")],
         )
         .await;
@@ -1298,29 +1308,29 @@ async fn remote_access_stops_for_a_device_without_revoking_it() {
 
     let mut browser = Browser::new(&f.state);
     browser.sign_in().await;
-    let page = browser.get("/apps/account/").await;
+    let page = browser.get("/account/direct").await;
     let text = page.text();
     assert!(text.contains("Stop remote access"), "{text}");
     let csrf = page.csrf();
     let hex = work.endpoint_id.to_hex();
-    let path = format!("/apps/account/devices/{hex}/sign-out");
+    let path = format!("/account/devices/{hex}/sign-out");
 
     let forged = browser.post(&path, &[("csrf", "forged")]).await;
     assert_eq!(forged.status, StatusCode::FORBIDDEN);
     let stopped = browser.post(&path, &[("csrf", &csrf)]).await;
-    assert_eq!(stopped.location(), "/apps/account/?done=device-signed-out");
+    assert_eq!(stopped.location(), "/account/direct?done=device-signed-out");
     let entry = devices::get(&f.state.db, work.id).await.unwrap().unwrap();
     assert!(entry.is_signed_out(), "signed out");
     assert!(!entry.is_revoked(), "not revoked");
     let page = browser
-        .get("/apps/account/?done=device-signed-out")
+        .get("/account/direct?done=device-signed-out")
         .await
         .text();
     assert!(page.contains("It keeps its pairings"), "{page}");
     // A signed-out entry stays on the page and stays revocable (protocol 9.4).
     assert!(page.contains(&work.endpoint_id.short()), "{page}");
     assert!(
-        page.contains(&format!("/apps/account/devices/{hex}/revoke")),
+        page.contains(&format!("/account/devices/{hex}/revoke")),
         "{page}"
     );
 }
@@ -1362,17 +1372,17 @@ fn code(secret: &[u8], steps: i64) -> String {
 async fn enrol(browser: &mut Browser, csrf: &str) -> (Vec<u8>, Vec<String>, i64) {
     let started = browser
         .post(
-            "/apps/account/two-factor/start",
+            "/account/two-factor/start",
             &[("csrf", csrf), ("password", ALICE_PASSWORD)],
         )
         .await;
     assert_eq!(
         started.location(),
-        "/apps/account/two-factor",
+        "/account/two-factor",
         "{}",
         started.text()
     );
-    let page = browser.get("/apps/account/two-factor").await;
+    let page = browser.get("/account/two-factor").await;
     let text = page.text();
     assert!(
         text.contains("<svg ") && text.contains("class=\"qr\""),
@@ -1390,7 +1400,7 @@ async fn enrol(browser: &mut Browser, csrf: &str) -> (Vec<u8>, Vec<String>, i64)
 
     let wrong = browser
         .post(
-            "/apps/account/two-factor/confirm",
+            "/account/two-factor/confirm",
             &[("csrf", csrf), ("code", "000000")],
         )
         .await;
@@ -1398,16 +1408,13 @@ async fn enrol(browser: &mut Browser, csrf: &str) -> (Vec<u8>, Vec<String>, i64)
     let step = gono_server_core::two_factor::step_of(db::unix_now());
     let confirmed = browser
         .post(
-            "/apps/account/two-factor/confirm",
+            "/account/two-factor/confirm",
             &[("csrf", csrf), ("code", &step_code(&secret, step))],
         )
         .await;
-    assert_eq!(
-        confirmed.location(),
-        "/apps/account/two-factor/recovery-codes"
-    );
+    assert_eq!(confirmed.location(), "/account/two-factor/recovery-codes");
     let shown = browser
-        .get("/apps/account/two-factor/recovery-codes")
+        .get("/account/two-factor/recovery-codes")
         .await
         .text();
     let codes: Vec<String> = shown
@@ -1418,10 +1425,10 @@ async fn enrol(browser: &mut Browser, csrf: &str) -> (Vec<u8>, Vec<String>, i64)
     assert_eq!(codes.len(), 10, "{shown}");
     assert_eq!(
         browser
-            .get("/apps/account/two-factor/recovery-codes")
+            .get("/account/two-factor/recovery-codes")
             .await
             .location(),
-        "/apps/account/",
+        "/account/",
         "shown once"
     );
     (secret, codes, step)
@@ -1458,20 +1465,17 @@ async fn two_step_verification_guards_every_later_sign_in() {
     let f = fixture().await;
     let mut browser = Browser::new(&f.state);
     let csrf = browser.sign_in().await;
-    let page = browser.get("/apps/account/").await.text();
-    assert!(page.contains("/apps/account/two-factor/start"), "{page}");
+    let page = browser.get("/account/").await.text();
+    assert!(page.contains("/account/two-factor/start"), "{page}");
     let refused = browser
         .post(
-            "/apps/account/two-factor/start",
+            "/account/two-factor/start",
             &[("csrf", &csrf), ("password", "wrong")],
         )
         .await;
     assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
     let (secret, codes, enrolled) = enrol(&mut browser, &csrf).await;
-    let page = browser
-        .get("/apps/account/?done=two-factor-on")
-        .await
-        .text();
+    let page = browser.get("/account/?done=two-factor-on").await.text();
     assert!(page.contains("Two-step verification is on."), "{page}");
     assert!(page.contains("Recovery codes left: 10."), "{page}");
 
@@ -1520,7 +1524,7 @@ async fn two_step_verification_guards_every_later_sign_in() {
     password_step(&mut fourth).await;
     let again = code_step(&mut fourth, &codes[0]).await;
     assert_eq!(again.status, StatusCode::FORBIDDEN);
-    let page = browser.get("/apps/account/").await.text();
+    let page = browser.get("/account/").await.text();
     assert!(page.contains("Recovery codes left: 9."), "{page}");
     assert!(
         page.contains("the second step failed"),
@@ -1539,7 +1543,7 @@ async fn two_step_verification_guards_every_later_sign_in() {
     // Turning it off needs the password and a code.
     let without_code = browser
         .post(
-            "/apps/account/two-factor/disable",
+            "/account/two-factor/disable",
             &[
                 ("csrf", &csrf),
                 ("password", ALICE_PASSWORD),
@@ -1550,7 +1554,7 @@ async fn two_step_verification_guards_every_later_sign_in() {
     assert_eq!(without_code.status, StatusCode::UNPROCESSABLE_ENTITY);
     let off = browser
         .post(
-            "/apps/account/two-factor/disable",
+            "/account/two-factor/disable",
             &[
                 ("csrf", &csrf),
                 ("password", ALICE_PASSWORD),
@@ -1558,7 +1562,7 @@ async fn two_step_verification_guards_every_later_sign_in() {
             ],
         )
         .await;
-    assert_eq!(off.location(), "/apps/account/?done=two-factor-off");
+    assert_eq!(off.location(), "/account/?done=two-factor-off");
     let mut fifth = Browser::new(&f.state);
     assert_eq!(password_step(&mut fifth).await.location(), "/apps/files/");
 }
@@ -1581,10 +1585,7 @@ async fn the_account_page_says_whether_remote_access_needs_two_step_verification
         f.state.connect = Some(connect);
         let mut browser = Browser::new(&f.state);
         browser.sign_in().await;
-        let page = browser
-            .get("/apps/account/?done=two-factor-off")
-            .await
-            .text();
+        let page = browser.get("/account/?done=two-factor-off").await.text();
         assert!(page.contains("Two-step verification is off."), "{page}");
         assert_eq!(
             page.contains("Remote access for your devices needs it."),
@@ -1889,7 +1890,7 @@ async fn account_page_changes_end_the_pending_sign_ins() {
     assert_eq!(f.state.web.pending_sign_ins(alice.id), 1);
     let changed = browser
         .post(
-            "/apps/account/password",
+            "/account/password",
             &[
                 ("csrf", &csrf),
                 ("current", ALICE_PASSWORD),
@@ -1898,7 +1899,7 @@ async fn account_page_changes_end_the_pending_sign_ins() {
             ],
         )
         .await;
-    assert_eq!(changed.location(), "/apps/account/?done=password");
+    assert_eq!(changed.location(), "/account/?done=password");
     assert_eq!(f.state.web.pending_sign_ins(alice.id), 0);
     assert_eq!(
         other.get("/login/two-step").await.status,
@@ -1910,7 +1911,7 @@ async fn account_page_changes_end_the_pending_sign_ins() {
     pending_cookie(&f, &alice).await;
     let off = browser
         .post(
-            "/apps/account/two-factor/disable",
+            "/account/two-factor/disable",
             &[
                 ("csrf", &csrf),
                 ("password", "a new password"),
@@ -1918,7 +1919,7 @@ async fn account_page_changes_end_the_pending_sign_ins() {
             ],
         )
         .await;
-    assert_eq!(off.location(), "/apps/account/?done=two-factor-off");
+    assert_eq!(off.location(), "/account/?done=two-factor-off");
     assert_eq!(f.state.web.pending_sign_ins(alice.id), 0);
 }
 
@@ -1928,17 +1929,17 @@ async fn enrolment_signs_out_sessions_opened_with_the_password_alone() {
     // Someone who knows the password signs in while two-step verification is off.
     let mut earlier = Browser::new(&f.state);
     earlier.sign_in().await;
-    assert_eq!(earlier.get("/apps/account/").await.status, StatusCode::OK);
+    assert_eq!(earlier.get("/account/").await.status, StatusCode::OK);
     let mut owner = Browser::new(&f.state);
     let csrf = owner.sign_in().await;
     enrol(&mut owner, &csrf).await;
     assert_eq!(
-        earlier.get("/apps/account/").await.status,
+        earlier.get("/account/").await.status,
         StatusCode::SEE_OTHER,
         "the session from before the enrolment ended"
     );
     assert_eq!(
-        owner.get("/apps/account/").await.status,
+        owner.get("/account/").await.status,
         StatusCode::OK,
         "the enrolling session stays"
     );
@@ -1990,11 +1991,11 @@ async fn secrets_shown_once_stay_with_the_account_of_their_session() {
     let csrf = browser.sign_in().await;
     let created = browser
         .post(
-            "/apps/account/app-passwords",
+            "/account/app-passwords",
             &[("csrf", &csrf), ("label", "rclone")],
         )
         .await;
-    assert_eq!(created.location(), "/apps/account/created");
+    assert_eq!(created.location(), "/account/created");
     browser.post("/logout", &[("csrf", &csrf)]).await;
     let form = browser.get("/login").await;
     let login_csrf = form.field("name=\"csrf\" value=\"");
@@ -2010,8 +2011,8 @@ async fn secrets_shown_once_stay_with_the_account_of_their_session() {
         .await;
     assert_eq!(signed_in.status, StatusCode::SEE_OTHER);
     assert_eq!(
-        browser.get("/apps/account/created").await.location(),
-        "/apps/account/",
+        browser.get("/account/created").await.location(),
+        "/account/webdav",
         "nothing to show to bob"
     );
 }
@@ -2041,31 +2042,45 @@ async fn audit_kinds(f: &Fixture) -> Vec<(String, String)> {
     kinds
 }
 
+/// Every S3 form of the account page, with fields that would change something.
+const S3_FORMS: [(&str, &[(&str, &str)]); 6] = [
+    ("/account/s3/buckets", &[("name", "photos")]),
+    (
+        "/account/s3/buckets/bind",
+        &[("name", "photos"), ("folder", "/Photos")],
+    ),
+    (
+        "/account/s3/buckets/1/anonymous",
+        &[("anonymous", "public-read")],
+    ),
+    ("/account/s3/buckets/1/delete", &[]),
+    ("/account/s3/keys", &[("label", "rclone")]),
+    ("/account/s3/keys/1/delete", &[]),
+];
+
 #[tokio::test]
-async fn the_s3_part_of_the_account_page_is_there_only_while_the_s3_api_is_on() {
-    let f = fixture().await;
+async fn the_s3_tab_says_when_the_server_does_not_offer_s3_or_the_account_lacks_it() {
+    use gono_server_core::services::{Service, Services};
+    let mut f = fixture().await;
     let mut browser = Browser::new(&f.state);
     let csrf = browser.sign_in().await;
-    let page = browser.get("/apps/account/").await;
+
+    // The S3 API is off: the tab is still listed and says so, and its forms answer 404.
+    let page = browser.get("/account/s3").await;
     assert_eq!(page.status, StatusCode::OK);
+    let text = page.text();
     assert!(
-        !page.text().contains("/apps/account/s3/"),
-        "{}",
-        page.text()
+        text.contains("This server does not offer this service."),
+        "{text}"
     );
-    assert!(!web::mentions(&page.text(), "S3"), "{}", page.text());
-    for (uri, fields) in [
-        ("/apps/account/s3/buckets", vec![("name", "photos")]),
-        (
-            "/apps/account/s3/buckets/bind",
-            vec![("name", "photos"), ("folder", "/Photos")],
-        ),
-        ("/apps/account/s3/buckets/1/anonymous", vec![]),
-        ("/apps/account/s3/buckets/1/delete", vec![]),
-        ("/apps/account/s3/keys", vec![("label", "rclone")]),
-        ("/apps/account/s3/keys/1/delete", vec![]),
-    ] {
-        let mut fields = fields;
+    assert!(
+        text.contains(r#"href="/account/s3" aria-current="page">S3</a>"#),
+        "{text}"
+    );
+    assert!(!text.contains("/account/s3/"), "{text}");
+    assert!(!text.contains("S3 buckets"), "{text}");
+    for (uri, fields) in S3_FORMS {
+        let mut fields = fields.to_vec();
         fields.push(("csrf", &csrf));
         assert_eq!(
             browser.post(uri, &fields).await.status,
@@ -2074,11 +2089,66 @@ async fn the_s3_part_of_the_account_page_is_there_only_while_the_s3_api_is_on() 
         );
     }
     assert_eq!(
-        browser.get("/apps/account/s3/created").await.status,
+        browser.get("/account/s3/created").await.status,
         StatusCode::NOT_FOUND
+    );
+    let overview = browser.get("/account/").await.text();
+    assert!(
+        overview.contains("Not offered by this server"),
+        "{overview}"
+    );
+
+    // The API is on, but the account lacks the service: the tab shows only that, and its
+    // forms are refused with the same notice.
+    f.state.s3 = s3_on(true);
+    let alice = Username::new("alice").unwrap();
+    users::set_services(&f.state.db, &alice, Services::ALL.with(Service::S3, false))
+        .await
+        .unwrap();
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+    let page = browser.get("/account/s3").await;
+    assert_eq!(page.status, StatusCode::OK);
+    let text = page.text();
+    assert!(
+        text.contains(
+            "This service is not enabled for your account. Ask an administrator to turn it on."
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("S3 buckets"), "{text}");
+    for (uri, fields) in S3_FORMS {
+        let mut fields = fields.to_vec();
+        fields.push(("csrf", &csrf));
+        let refused = browser.post(uri, &fields).await;
+        assert_eq!(refused.status, StatusCode::FORBIDDEN, "{uri}");
+        assert!(
+            refused.text().contains("not enabled for your account"),
+            "{uri}: {}",
+            refused.text()
+        );
+    }
+    let zh = browser
+        .send(
+            "GET",
+            "/account/s3",
+            &[("Accept-Language", "zh-CN,zh;q=0.9")],
+            Body::empty(),
+        )
+        .await
+        .text();
+    assert!(
+        zh.contains("你的账号未开通此服务，请联系管理员开通。"),
+        "{zh}"
     );
     assert!(
         gono_server_core::s3::buckets_of(&f.state.db, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        gono_server_core::s3::list_keys(&f.state.db, 1)
             .await
             .unwrap()
             .is_empty()
@@ -2091,7 +2161,7 @@ async fn the_account_page_shows_virtual_hosted_style_when_enabled() {
     f.state.s3 = s3_on(true);
     let mut browser = Browser::new(&f.state);
     browser.sign_in().await;
-    let text = browser.get("/apps/account/").await.text();
+    let text = browser.get("/account/s3").await.text();
     assert!(!text.contains("Virtual-hosted style"), "{text}");
 
     let mut ui = (*s3_on(true).unwrap()).clone();
@@ -2099,7 +2169,7 @@ async fn the_account_page_shows_virtual_hosted_style_when_enabled() {
     f.state.s3 = Some(Arc::new(ui));
     let mut browser = Browser::new(&f.state);
     browser.sign_in().await;
-    let text = browser.get("/apps/account/").await.text();
+    let text = browser.get("/account/s3").await.text();
     assert!(text.contains("Path style: https://s3.example.com/&#60;bucket&#62;/&#60;key&#62;"));
     assert!(
         text.contains(
@@ -2123,12 +2193,12 @@ async fn the_account_page_shows_tags_lifecycle_rules_and_websites_set_through_s3
     let csrf = browser.sign_in().await;
     browser
         .post(
-            "/apps/account/s3/buckets",
+            "/account/s3/buckets",
             &[("csrf", &csrf), ("name", "photos")],
         )
         .await;
     let photos = s3::bucket(&f.state.db, "photos").await.unwrap().unwrap();
-    let text = browser.get("/apps/account/").await.text();
+    let text = browser.get("/account/s3").await.text();
     for absent in ["Tags:", "Lifecycle:", "Deletes", "Website"] {
         assert!(!text.contains(absent), "{absent} in {text}");
     }
@@ -2163,7 +2233,7 @@ async fn the_account_page_shows_tags_lifecycle_rules_and_websites_set_through_s3
     )
     .await
     .unwrap();
-    let text = browser.get("/apps/account/").await.text();
+    let text = browser.get("/account/s3").await.text();
     assert!(text.contains("Tags: 2 (set through the S3 API)"), "{text}");
     assert!(text.contains("Lifecycle: 6 rules (set through the S3 API)"));
     assert!(
@@ -2184,7 +2254,7 @@ async fn the_account_page_shows_tags_lifecycle_rules_and_websites_set_through_s3
     f.state.s3 = ui(None);
     let mut browser = Browser::new(&f.state);
     browser.sign_in().await;
-    let text = browser.get("/apps/account/").await.text();
+    let text = browser.get("/account/s3").await.text();
     assert!(
         text.contains("Lifecycle: 1 rule (set through the S3 API)"),
         "{text}"
@@ -2199,7 +2269,7 @@ async fn the_account_page_shows_tags_lifecycle_rules_and_websites_set_through_s3
     let text = browser
         .send(
             "GET",
-            "/apps/account/",
+            "/account/s3",
             &[("Accept-Language", "zh-CN,zh;q=0.9")],
             Body::empty(),
         )
@@ -2219,7 +2289,7 @@ async fn buckets_are_created_bound_changed_and_removed_on_the_account_page() {
     f.state.s3 = s3_on(true);
     let mut browser = Browser::new(&f.state);
     let csrf = browser.sign_in().await;
-    let page = browser.get("/apps/account/").await;
+    let page = browser.get("/account/s3").await;
     let text = page.text();
     assert!(text.contains("S3 buckets"), "{text}");
     assert!(text.contains("https://s3.example.com"));
@@ -2231,22 +2301,22 @@ async fn buckets_are_created_bound_changed_and_removed_on_the_account_page() {
     // A new bucket gets a new folder.
     let created = browser
         .post(
-            "/apps/account/s3/buckets",
+            "/account/s3/buckets",
             &[("csrf", &csrf), ("name", "photos")],
         )
         .await;
-    assert_eq!(created.location(), "/apps/account/?done=s3-bucket-created");
+    assert_eq!(created.location(), "/account/s3?done=s3-bucket-created");
     let photos = s3::bucket(&f.state.db, "photos").await.unwrap().unwrap();
     assert_eq!(photos.owner_id, 1);
     assert_eq!(photos.folder.as_str(), "Buckets/photos");
     // CORS rules come from the S3 API; the page only counts them.
-    assert!(!browser.get("/apps/account/").await.text().contains("CORS:"));
+    assert!(!browser.get("/account/s3").await.text().contains("CORS:"));
     s3::set_cors(&f.state.db, 1, photos.id, Some(r#"[{"allowed_origins":["*"],"allowed_methods":["GET"]},{"allowed_origins":["*"],"allowed_methods":["PUT"]}]"#))
         .await
         .unwrap();
     assert!(
         browser
-            .get("/apps/account/")
+            .get("/account/s3")
             .await
             .text()
             .contains("CORS: 2 rules (set through the S3 API)")
@@ -2259,7 +2329,7 @@ async fn buckets_are_created_bound_changed_and_removed_on_the_account_page() {
             .status,
         StatusCode::MULTI_STATUS
     );
-    let page = browser.get("/apps/account/?done=s3-bucket-created").await;
+    let page = browser.get("/account/s3?done=s3-bucket-created").await;
     assert!(page.text().contains("The bucket was created."));
     assert!(page.text().contains("href=\"/apps/files/Buckets/photos/\""));
     let ids = web::element_ids(&page.text());
@@ -2275,10 +2345,7 @@ async fn buckets_are_created_bound_changed_and_removed_on_the_account_page() {
         ("ab", "Bucket names have 3 to 63 characters"),
     ] {
         let refused = browser
-            .post(
-                "/apps/account/s3/buckets",
-                &[("csrf", &csrf), ("name", name)],
-            )
+            .post("/account/s3/buckets", &[("csrf", &csrf), ("name", name)])
             .await;
         assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY, "{name}");
         assert!(refused.text().contains(error), "{name}: {}", refused.text());
@@ -2296,7 +2363,7 @@ async fn buckets_are_created_bound_changed_and_removed_on_the_account_page() {
     );
     let exists = browser
         .post(
-            "/apps/account/s3/buckets",
+            "/account/s3/buckets",
             &[("csrf", &csrf), ("name", "backup")],
         )
         .await;
@@ -2335,7 +2402,7 @@ async fn buckets_are_created_bound_changed_and_removed_on_the_account_page() {
     ] {
         let refused = browser
             .post(
-                "/apps/account/s3/buckets/bind",
+                "/account/s3/buckets/bind",
                 &[("csrf", &csrf), ("name", name), ("folder", folder)],
             )
             .await;
@@ -2348,16 +2415,16 @@ async fn buckets_are_created_bound_changed_and_removed_on_the_account_page() {
     }
     let bound = browser
         .post(
-            "/apps/account/s3/buckets/bind",
+            "/account/s3/buckets/bind",
             &[("csrf", &csrf), ("name", "media"), ("folder", "/Media/")],
         )
         .await;
-    assert_eq!(bound.location(), "/apps/account/?done=s3-bucket-bound");
+    assert_eq!(bound.location(), "/account/s3?done=s3-bucket-bound");
     let media = s3::bucket(&f.state.db, "media").await.unwrap().unwrap();
     assert_eq!(media.folder.as_str(), "Media");
 
     // Anonymous access; listing goes with some anonymous access only.
-    let anonymous = format!("/apps/account/s3/buckets/{}/anonymous", photos.id);
+    let anonymous = format!("/account/s3/buckets/{}/anonymous", photos.id);
     let public = browser
         .post(
             &anonymous,
@@ -2368,13 +2435,13 @@ async fn buckets_are_created_bound_changed_and_removed_on_the_account_page() {
             ],
         )
         .await;
-    assert_eq!(public.location(), "/apps/account/?done=s3-bucket-anonymous");
+    assert_eq!(public.location(), "/account/s3?done=s3-bucket-anonymous");
     let changed = s3::bucket(&f.state.db, "photos").await.unwrap().unwrap();
     assert_eq!(
         (changed.anonymous, changed.anonymous_list),
         (Anonymous::PublicRead, true)
     );
-    let page = browser.get("/apps/account/").await;
+    let page = browser.get("/account/s3").await;
     assert!(
         page.text()
             .contains("<option value=\"public-read\" selected>"),
@@ -2420,11 +2487,11 @@ async fn buckets_are_created_bound_changed_and_removed_on_the_account_page() {
     );
     let removed = browser
         .post(
-            &format!("/apps/account/s3/buckets/{}/delete", photos.id),
+            &format!("/account/s3/buckets/{}/delete", photos.id),
             &[("csrf", &csrf)],
         )
         .await;
-    assert_eq!(removed.location(), "/apps/account/?done=s3-bucket-removed");
+    assert_eq!(removed.location(), "/account/s3?done=s3-bucket-removed");
     assert!(s3::bucket(&f.state.db, "photos").await.unwrap().is_none());
     let file = browser
         .dav(&f.device, "GET", "Buckets/photos/cat.jpg", "")
@@ -2433,11 +2500,11 @@ async fn buckets_are_created_bound_changed_and_removed_on_the_account_page() {
     assert_eq!(file.text(), "meow");
     let again = browser
         .post(
-            &format!("/apps/account/s3/buckets/{}/delete", photos.id),
+            &format!("/account/s3/buckets/{}/delete", photos.id),
             &[("csrf", &csrf)],
         )
         .await;
-    assert_eq!(again.location(), "/apps/account/", "nothing left to remove");
+    assert_eq!(again.location(), "/account/s3", "nothing left to remove");
 
     assert_eq!(
         audit_kinds(&f).await,
@@ -2462,12 +2529,12 @@ async fn anonymous_access_needs_the_server_to_allow_it() {
     let csrf = browser.sign_in().await;
     browser
         .post(
-            "/apps/account/s3/buckets",
+            "/account/s3/buckets",
             &[("csrf", &csrf), ("name", "photos")],
         )
         .await;
     let photos = s3::bucket(&f.state.db, "photos").await.unwrap().unwrap();
-    let page = browser.get("/apps/account/").await;
+    let page = browser.get("/account/s3").await;
     let text = page.text();
     assert!(
         text.contains("Anonymous access is off on this server"),
@@ -2479,7 +2546,7 @@ async fn anonymous_access_needs_the_server_to_allow_it() {
     )));
     assert!(!text.contains("Make private"), "private already");
 
-    let anonymous = format!("/apps/account/s3/buckets/{}/anonymous", photos.id);
+    let anonymous = format!("/account/s3/buckets/{}/anonymous", photos.id);
     for fields in [
         vec![("anonymous", "public-read")],
         vec![("anonymous", "acl"), ("list", "on")],
@@ -2504,7 +2571,7 @@ async fn anonymous_access_needs_the_server_to_allow_it() {
     s3::set_anonymous(&f.state.db, 1, photos.id, Anonymous::PublicRead, true)
         .await
         .unwrap();
-    let page = browser.get("/apps/account/").await;
+    let page = browser.get("/account/s3").await;
     assert!(
         page.text()
             .contains("<option value=\"public-read\" selected>")
@@ -2513,10 +2580,7 @@ async fn anonymous_access_needs_the_server_to_allow_it() {
     let private = browser
         .post(&anonymous, &[("csrf", &csrf), ("anonymous", "private")])
         .await;
-    assert_eq!(
-        private.location(),
-        "/apps/account/?done=s3-bucket-anonymous"
-    );
+    assert_eq!(private.location(), "/account/s3?done=s3-bucket-anonymous");
     let stored = s3::bucket(&f.state.db, "photos").await.unwrap().unwrap();
     assert_eq!(
         (stored.anonymous, stored.anonymous_list),
@@ -2546,7 +2610,7 @@ async fn s3_access_keys_are_created_shown_once_and_revoked() {
     let csrf = browser.sign_in().await;
     browser
         .post(
-            "/apps/account/s3/buckets",
+            "/account/s3/buckets",
             &[("csrf", &csrf), ("name", "photos")],
         )
         .await;
@@ -2555,7 +2619,7 @@ async fn s3_access_keys_are_created_shown_once_and_revoked() {
 
     let nothing = browser
         .post(
-            "/apps/account/s3/keys",
+            "/account/s3/keys",
             &[
                 ("csrf", &csrf),
                 ("label", "rclone"),
@@ -2576,7 +2640,7 @@ async fn s3_access_keys_are_created_shown_once_and_revoked() {
     ));
     let bad_expiry = browser
         .post(
-            "/apps/account/s3/keys",
+            "/account/s3/keys",
             &[
                 ("csrf", &csrf),
                 ("label", "rclone"),
@@ -2589,7 +2653,7 @@ async fn s3_access_keys_are_created_shown_once_and_revoked() {
 
     let created = browser
         .post(
-            "/apps/account/s3/keys",
+            "/account/s3/keys",
             &[
                 ("csrf", &csrf),
                 ("label", "rclone"),
@@ -2599,8 +2663,8 @@ async fn s3_access_keys_are_created_shown_once_and_revoked() {
             ],
         )
         .await;
-    assert_eq!(created.location(), "/apps/account/s3/created");
-    let shown = browser.get("/apps/account/s3/created").await;
+    assert_eq!(created.location(), "/account/s3/created");
+    let shown = browser.get("/account/s3/created").await;
     assert_eq!(shown.status, StatusCode::OK);
     assert_eq!(shown.header("cache-control"), "no-store");
     let text = shown.text();
@@ -2620,9 +2684,9 @@ async fn s3_access_keys_are_created_shown_once_and_revoked() {
         .unwrap()
         .expect("the key signs");
     assert_eq!(signing.secret.expose_secret(), secret);
-    let again = browser.get("/apps/account/s3/created").await;
-    assert_eq!(again.location(), "/apps/account/", "shown once");
-    let page = browser.get("/apps/account/").await;
+    let again = browser.get("/account/s3/created").await;
+    assert_eq!(again.location(), "/account/s3", "shown once");
+    let page = browser.get("/account/s3").await;
     assert!(page.text().contains(&access_key_id));
     assert!(page.text().contains("rclone"));
     assert!(!page.text().contains(&secret));
@@ -2647,22 +2711,22 @@ async fn s3_access_keys_are_created_shown_once_and_revoked() {
 
     let everything = browser
         .post(
-            "/apps/account/s3/keys",
+            "/account/s3/keys",
             &[("csrf", &csrf), ("label", "backup"), ("access", "all")],
         )
         .await;
-    assert_eq!(everything.location(), "/apps/account/s3/created");
+    assert_eq!(everything.location(), "/account/s3/created");
     let keys = s3::list_keys(&f.state.db, 1).await.unwrap();
     assert_eq!(keys[1].grants, [Grant::everything()]);
     assert_eq!(keys[1].expires_at, None);
 
     let revoked = browser
         .post(
-            &format!("/apps/account/s3/keys/{}/delete", keys[0].id),
+            &format!("/account/s3/keys/{}/delete", keys[0].id),
             &[("csrf", &csrf)],
         )
         .await;
-    assert_eq!(revoked.location(), "/apps/account/?done=s3-key-revoked");
+    assert_eq!(revoked.location(), "/account/s3?done=s3-key-revoked");
     assert!(
         s3::signing_key(&f.state.db, &sealing, &access_key_id, db::unix_now())
             .await
@@ -2674,7 +2738,7 @@ async fn s3_access_keys_are_created_shown_once_and_revoked() {
     assert_eq!(keys[0].label, "backup");
     assert!(
         browser
-            .get("/apps/account/?done=s3-key-revoked")
+            .get("/account/s3?done=s3-key-revoked")
             .await
             .text()
             .contains("The access key was revoked.")
@@ -2699,14 +2763,11 @@ async fn s3_forms_need_the_session_csrf_token_and_the_users_own_buckets() {
     let mut browser = Browser::new(&f.state);
     let csrf = browser.sign_in().await;
     let missing = browser
-        .post("/apps/account/s3/buckets", &[("name", "photos")])
+        .post("/account/s3/buckets", &[("name", "photos")])
         .await;
     assert_eq!(missing.status, StatusCode::FORBIDDEN);
     let wrong = browser
-        .post(
-            "/apps/account/s3/keys",
-            &[("csrf", "nope"), ("label", "rclone")],
-        )
+        .post("/account/s3/keys", &[("csrf", "nope"), ("label", "rclone")])
         .await;
     assert_eq!(wrong.status, StatusCode::FORBIDDEN);
     let body = url::form_urlencoded::Serializer::new(String::new())
@@ -2715,7 +2776,7 @@ async fn s3_forms_need_the_session_csrf_token_and_the_users_own_buckets() {
     let foreign = browser
         .send(
             "POST",
-            "/apps/account/s3/buckets",
+            "/account/s3/buckets",
             &[
                 ("Content-Type", "application/x-www-form-urlencoded"),
                 ("Origin", "https://evil.example"),
@@ -2780,26 +2841,26 @@ async fn s3_forms_need_the_session_csrf_token_and_the_users_own_buckets() {
     .unwrap();
     let anonymous = browser
         .post(
-            &format!("/apps/account/s3/buckets/{}/anonymous", shared.id),
+            &format!("/account/s3/buckets/{}/anonymous", shared.id),
             &[("csrf", &csrf), ("anonymous", "public-read")],
         )
         .await;
     assert_eq!(anonymous.status, StatusCode::NOT_FOUND);
     browser
         .post(
-            &format!("/apps/account/s3/buckets/{}/delete", shared.id),
+            &format!("/account/s3/buckets/{}/delete", shared.id),
             &[("csrf", &csrf)],
         )
         .await;
     browser
         .post(
-            &format!("/apps/account/s3/keys/{}/delete", bob_key.id),
+            &format!("/account/s3/keys/{}/delete", bob_key.id),
             &[("csrf", &csrf)],
         )
         .await;
     let taken = browser
         .post(
-            "/apps/account/s3/buckets",
+            "/account/s3/buckets",
             &[("csrf", &csrf), ("name", "shared")],
         )
         .await;
@@ -2816,7 +2877,7 @@ async fn s3_forms_need_the_session_csrf_token_and_the_users_own_buckets() {
     // A grant for another account's bucket is ignored: it is not among alice's buckets.
     let foreign_grant = browser
         .post(
-            "/apps/account/s3/keys",
+            "/account/s3/keys",
             &[
                 ("csrf", &csrf),
                 ("label", "sneaky"),
@@ -2934,4 +2995,611 @@ async fn published_files_offer_their_public_link() {
         .await;
     let photos = browser.get("/apps/files/Buckets/media/2026/").await.text();
     assert_eq!(links(photos), 0);
+}
+
+/// Turns remote connectivity on in `f`, as `serve` does with the relay enabled.
+async fn connect_on(f: &mut Fixture) -> Arc<gono_server_connect::Connect> {
+    connect_with(f, false).await
+}
+
+/// Like [`connect_on`], with `connect.require_two_factor` set to `require_two_factor`.
+async fn connect_with(
+    f: &mut Fixture,
+    require_two_factor: bool,
+) -> Arc<gono_server_connect::Connect> {
+    let connect = gono_server_connect::Connect::new(
+        f.state.db.clone(),
+        gono_server_connect::ConnectConfig {
+            base_url: ORIGIN.parse().unwrap(),
+            relay_url: "https://relay.example.com".parse().unwrap(),
+            audit_retention_secs: 3600,
+            require_two_factor,
+        },
+    )
+    .await
+    .unwrap();
+    f.state.connect = Some(connect.clone());
+    connect
+}
+
+/// The paths of the tabs of the account page, with a text only that tab shows.
+const TABS: [(&str, &str); 5] = [
+    ("/account/", "Two-step verification"),
+    ("/account/webdav", "Connecting a client"),
+    ("/account/s3", "S3 buckets"),
+    ("/account/direct", "Remote devices"),
+    ("/account/relay", "Relay address"),
+];
+
+#[tokio::test]
+async fn every_tab_of_the_account_page_renders_for_an_account_with_every_service() {
+    let mut f = fixture().await;
+    f.state.s3 = s3_on(true);
+    connect_on(&mut f).await;
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+    for (path, own) in TABS {
+        let page = browser.get(path).await;
+        assert_eq!(page.status, StatusCode::OK, "{path}");
+        let text = page.text();
+        assert!(text.contains(own), "{path}: {text}");
+        // Every tab is listed, and this one is current.
+        for (other, _) in TABS {
+            assert!(
+                text.contains(&format!("href=\"{other}\"")),
+                "{other} on {path}"
+            );
+        }
+        assert!(
+            text.contains(&format!(
+                "class=\"tabs__item\" href=\"{path}\" aria-current=\"page\""
+            )),
+            "{path}: {text}"
+        );
+        assert_eq!(text.matches("class=\"tabs__item\"").count(), 5, "{path}");
+        assert_eq!(
+            text.matches("aria-current=\"page\"").count(),
+            3,
+            "tab, nav and drawer on {path}"
+        );
+        // The masthead marks Account as current.
+        assert!(
+            text.contains(
+                r#"<a class="masthead__link" href="/account/" aria-current="page">Account</a>"#
+            ),
+            "{path}: {text}"
+        );
+        assert!(!text.contains("not enabled for your account"), "{path}");
+        assert!(!text.contains("does not offer"), "{path}");
+        let ids = web::element_ids(&text);
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(ids.len(), unique.len(), "duplicate ids on {path}: {ids:?}");
+        // Chinese too.
+        let zh = browser
+            .send("GET", path, &[("Accept-Language", "zh-CN")], Body::empty())
+            .await;
+        assert_eq!(zh.status, StatusCode::OK, "{path}");
+        assert!(zh.text().contains(">概览</a>"), "{path}");
+    }
+    // The overview lists the services, each with a link to where it is used.
+    let overview = browser.get("/account/").await.text();
+    for (href, name) in [
+        ("/apps/files/", "Web files"),
+        ("/account/webdav", "WebDAV"),
+        ("/account/s3", "S3"),
+        ("/account/direct", "Direct connections"),
+        ("/account/relay", "Relay"),
+    ] {
+        assert!(
+            overview.contains(&format!("<b><a href=\"{href}\">{name}</a></b>")),
+            "{name}: {overview}"
+        );
+    }
+    assert_eq!(overview.matches(">On</span>").count(), 5, "{overview}");
+    assert!(
+        !overview.contains("Not offered by this server"),
+        "{overview}"
+    );
+    assert!(overview.contains(r#"id="two-factor""#), "{overview}");
+    assert!(overview.contains("/account/display-name"), "{overview}");
+    assert!(overview.contains("/account/password"), "{overview}");
+    // `/account` leads to the overview.
+    assert_eq!(browser.get("/account").await.location(), "/account/");
+}
+
+#[tokio::test]
+async fn the_overview_works_for_an_account_without_any_service() {
+    use gono_server_core::services::Services;
+    let mut f = fixture().await;
+    f.state.s3 = s3_on(true);
+    connect_on(&mut f).await;
+    let alice = Username::new("alice").unwrap();
+    users::set_services(&f.state.db, &alice, Services::NONE)
+        .await
+        .unwrap();
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+    let page = browser.get("/account/").await;
+    assert_eq!(page.status, StatusCode::OK);
+    let text = page.text();
+    assert_eq!(text.matches(">Off</span>").count(), 5, "{text}");
+    assert!(!text.contains(">On</span>"), "{text}");
+    assert!(text.contains("/account/two-factor/start"), "{text}");
+    // Signing in without a page to return to leads here rather than to the file UI.
+    let mut other = Browser::new(&f.state);
+    let form = other.get("/login").await;
+    let login_csrf = form.field("name=\"csrf\" value=\"");
+    let signed_in = other
+        .post(
+            "/login",
+            &[
+                ("csrf", &login_csrf),
+                ("user", "alice"),
+                ("password", ALICE_PASSWORD),
+            ],
+        )
+        .await;
+    assert_eq!(signed_in.location(), "/account/");
+
+    // Its forms need no service.
+    let renamed = browser
+        .post(
+            "/account/display-name",
+            &[("csrf", &csrf), ("display_name", "Alice B.")],
+        )
+        .await;
+    assert_eq!(renamed.location(), "/account/?done=display-name");
+    assert!(
+        browser
+            .get("/account/?done=display-name")
+            .await
+            .text()
+            .contains("Your display name was changed.")
+    );
+    let refused = browser
+        .post(
+            "/account/password",
+            &[
+                ("csrf", &csrf),
+                ("current", "nope"),
+                ("password", "new password"),
+                ("password_repeat", "new password"),
+            ],
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        refused.text().contains("The current password is wrong."),
+        "the overview again: {}",
+        refused.text()
+    );
+    assert!(refused.text().contains(r#"id="two-factor""#));
+    let changed = browser
+        .post(
+            "/account/password",
+            &[
+                ("csrf", &csrf),
+                ("current", ALICE_PASSWORD),
+                ("password", "new password"),
+                ("password_repeat", "new password"),
+            ],
+        )
+        .await;
+    assert_eq!(changed.location(), "/account/?done=password");
+    let started = browser
+        .post(
+            "/account/two-factor/start",
+            &[("csrf", &csrf), ("password", "new password")],
+        )
+        .await;
+    assert_eq!(started.location(), "/account/two-factor");
+
+    // Every other tab is listed and says that the service is not enabled, as a page. The direct
+    // tab still lists the registered devices, which can be revoked.
+    for (path, own) in &TABS[1..] {
+        let page = browser.get(path).await;
+        assert_eq!(page.status, StatusCode::OK, "{path}");
+        let text = page.text();
+        assert!(
+            text.contains(
+                "This service is not enabled for your account. Ask an administrator to turn it on."
+            ),
+            "{path}: {text}"
+        );
+        if *path == "/account/direct" {
+            assert!(text.contains("you can still revoke a lost one"), "{text}");
+            assert!(!text.contains("/pairing"), "{text}");
+        } else {
+            assert!(!text.contains(own), "{path}: {text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_masthead_offers_search_and_files_as_home_only_with_the_files_service() {
+    use gono_server_core::services::{Service, Services};
+    let f = fixture().await;
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+    let search = r#"id="site-search""#;
+    let page = browser.get("/account/webdav").await.text();
+    assert!(page.contains(search), "{page}");
+    assert!(
+        page.contains(r#"<a class="masthead__brand" href="/apps/files/""#),
+        "{page}"
+    );
+    let files = browser.get("/apps/files/").await.text();
+    assert!(
+        files.contains(r#"<a class="masthead__link" href="/account/">Account</a>"#),
+        "not current on the files: {files}"
+    );
+    assert!(files.contains(r#"<a class="menu__item" href="/account/">Account</a>"#));
+
+    let alice = Username::new("alice").unwrap();
+    users::set_services(
+        &f.state.db,
+        &alice,
+        Services::ALL.with(Service::Files, false),
+    )
+    .await
+    .unwrap();
+    for path in ["/account/", "/apps/files/"] {
+        let page = browser.get(path).await.text();
+        assert!(!page.contains(search), "{path}: {page}");
+        assert!(
+            page.contains(r#"<a class="masthead__brand" href="/account/""#),
+            "{path}: {page}"
+        );
+        // Files and favorites stay, and say that the service is off when chosen.
+        assert!(
+            page.contains(r#"class="masthead__link" href="/apps/files/""#),
+            "{path}: {page}"
+        );
+        assert!(
+            page.contains(r#"class="masthead__link" href="/apps/files/?view=favorites""#),
+            "{path}: {page}"
+        );
+        assert!(page.contains(r#"<a href="/account/""#), "drawer on {path}");
+    }
+    // Signed out, the brand leads to the files, which ask to sign in.
+    let anonymous = Browser::new(&f.state).get("/login").await.text();
+    assert!(
+        anonymous.contains(r#"<a class="masthead__brand" href="/apps/files/""#),
+        "{anonymous}"
+    );
+}
+
+#[tokio::test]
+async fn the_forms_of_a_tab_need_its_service() {
+    use gono_server_core::{
+        devices,
+        services::{Service, Services},
+    };
+    let mut f = fixture().await;
+    f.state.s3 = s3_on(true);
+    connect_on(&mut f).await;
+    let alice = users::get(&f.state.db, &Username::new("alice").unwrap())
+        .await
+        .unwrap();
+    let work = register_device(&f.state, alice.id, 5, "Work PC").await;
+    // The pairing window of the registration is closed, so that a new one would show.
+    devices::open_pairing(&f.state.db, alice.id, work.endpoint_id, db::unix_now() - 1)
+        .await
+        .unwrap();
+    let laptop = app_passwords::list(&f.state.db, alice.id).await.unwrap()[0].id;
+    let only_files = Services::NONE.with(Service::Files, true);
+    users::set_services(&f.state.db, &alice.username, only_files)
+        .await
+        .unwrap();
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+
+    let hex = work.endpoint_id.to_hex();
+    let refused = |reply: &Reply, what: &str| {
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{what}");
+        assert!(
+            reply.text().contains("not enabled for your account"),
+            "{what}: {}",
+            reply.text()
+        );
+    };
+    // App passwords need WebDAV, and their refusal shows the WebDAV tab.
+    let created = browser
+        .post(
+            "/account/app-passwords",
+            &[("csrf", &csrf), ("label", "rclone"), ("access", "view")],
+        )
+        .await;
+    refused(&created, "create an app password");
+    assert!(
+        created
+            .text()
+            .contains(r#"href="/account/webdav" aria-current="page""#)
+    );
+    let revoked = browser
+        .post(
+            &format!("/account/app-passwords/{laptop}/delete"),
+            &[("csrf", &csrf)],
+        )
+        .await;
+    refused(&revoked, "revoke an app password");
+    assert_eq!(
+        app_passwords::list(&f.state.db, alice.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    // S3 forms need S3.
+    for (uri, fields) in S3_FORMS {
+        let mut fields = fields.to_vec();
+        fields.push(("csrf", &csrf));
+        refused(&browser.post(uri, &fields).await, uri);
+    }
+    // Revoking only removes trust, so its confirmation stays open without direct connections.
+    let confirm = browser.get(&format!("/account/devices/{hex}/revoke")).await;
+    assert_eq!(confirm.status, StatusCode::OK, "{}", confirm.text());
+    // The other device actions need direct connections, and their refusal shows the direct tab.
+    for action in ["sign-out", "pairing"] {
+        let reply = browser
+            .post(
+                &format!("/account/devices/{hex}/{action}"),
+                &[("csrf", &csrf)],
+            )
+            .await;
+        refused(&reply, action);
+        assert!(
+            reply
+                .text()
+                .contains(r#"href="/account/direct" aria-current="page""#),
+            "{action}"
+        );
+    }
+    let entry = devices::get(&f.state.db, work.id).await.unwrap().unwrap();
+    assert!(entry.is_active(), "neither revoked nor signed out");
+    assert!(!entry.pairing_open(db::unix_now()), "no pairing window");
+
+    // With the services, the same forms go through.
+    users::set_services(&f.state.db, &alice.username, Services::ALL)
+        .await
+        .unwrap();
+    let pairing = browser
+        .post(
+            &format!("/account/devices/{hex}/pairing"),
+            &[("csrf", &csrf)],
+        )
+        .await;
+    assert_eq!(pairing.location(), "/account/direct?done=pairing");
+    let bucket = browser
+        .post(
+            "/account/s3/buckets",
+            &[("csrf", &csrf), ("name", "photos")],
+        )
+        .await;
+    assert_eq!(bucket.location(), "/account/s3?done=s3-bucket-created");
+}
+
+#[tokio::test]
+async fn the_relay_tab_shows_the_rate_the_connected_devices_and_the_sessions() {
+    use gono_server_core::{
+        audit::{self, Actor, Record},
+        config::RelayConfig,
+        devices::EndpointId,
+        services::{Service, Services},
+    };
+    let mut f = fixture().await;
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+    let off = browser.get("/account/relay").await;
+    assert_eq!(off.status, StatusCode::OK);
+    assert!(
+        off.text()
+            .contains("This server does not offer this service."),
+        "{}",
+        off.text()
+    );
+
+    let connect = connect_on(&mut f).await;
+    let alice = users::get(&f.state.db, &Username::new("alice").unwrap())
+        .await
+        .unwrap();
+    let work = register_device(&f.state, alice.id, 6, "Work PC").await;
+    let phone = register_device(&f.state, alice.id, 7, "Phone").await;
+    let layout = DataLayout::new(f._dir.path().join("data"));
+    let hash = password::hash(&SecretString::from("bob password".to_owned())).unwrap();
+    let bob = users::create(
+        &f.state.db,
+        &NewUser {
+            username: &Username::new("bob").unwrap(),
+            display_name: "Bob",
+            password_hash: &hash,
+            is_admin: false,
+            services: Services::ALL,
+        },
+        |id| layout.create_user(id),
+    )
+    .await
+    .unwrap();
+    // Sessions as the control channel records them, and one of another account.
+    let now = db::unix_now();
+    for (user_id, kind, details) in [
+        (
+            alice.id,
+            "session.started",
+            serde_json::json!({ "service": "inputshow/1", "path": "relayed" }),
+        ),
+        (
+            alice.id,
+            "session.ended",
+            serde_json::json!({
+                "service": "inputshow/1",
+                "path": "direct",
+                "bytes_direct": 1_048_576,
+                "bytes_relayed": 2048,
+            }),
+        ),
+        (
+            bob,
+            "session.started",
+            serde_json::json!({ "service": "elsewhere/1", "path": "direct" }),
+        ),
+    ] {
+        audit::record(
+            &f.state.db,
+            &Record::new(user_id, kind, Actor::Device)
+                .device(work.endpoint_id)
+                .peer(phone.endpoint_id)
+                .details(details),
+            now,
+        )
+        .await
+        .unwrap();
+    }
+    // Without a relay in this process, the tab has no connections to show.
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+    let text = browser.get("/account/relay").await.text();
+    assert!(text.contains("https://relay.example.com/</dd>"), "{text}");
+    assert!(text.contains("Full speed"), "{text}");
+    assert!(!text.contains("Connected now"), "{text}");
+
+    let relay = gono_server_relay::Relay::spawn(
+        &RelayConfig {
+            enabled: true,
+            public_url: Some("https://relay.example.com".parse().unwrap()),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            allowed_endpoints: vec![EndpointId([9; 32]).to_hex()],
+            ..RelayConfig::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    connect.set_relay(relay.status());
+    let page = browser.get("/account/relay").await;
+    assert_eq!(page.status, StatusCode::OK);
+    let text = page.text();
+    assert!(text.contains("Connected now"), "{text}");
+    assert!(
+        text.contains("None of your devices is connected to the relay."),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("Work PC ({})", work.endpoint_id.short())),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("Phone ({})", phone.endpoint_id.short())),
+        "{text}"
+    );
+    assert!(
+        text.contains(r#"<span class="badge warn">Relayed</span>"#),
+        "{text}"
+    );
+    assert!(
+        text.contains(r#"<span class="badge ok">Direct</span>"#),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "{} / {}",
+            crate::admin::format_bytes(1_048_576),
+            crate::admin::format_bytes(2048)
+        )),
+        "{text}"
+    );
+    assert!(text.contains("inputshow/1"), "{text}");
+    assert!(!text.contains("elsewhere/1"), "another account's: {text}");
+    let zh = browser
+        .send(
+            "GET",
+            "/account/relay",
+            &[("Accept-Language", "zh-CN")],
+            Body::empty(),
+        )
+        .await
+        .text();
+    assert!(zh.contains("中转地址") && zh.contains("全速"), "{zh}");
+
+    // Direct connections alone: the relay only helps set them up.
+    users::set_services(
+        &f.state.db,
+        &alice.username,
+        Services::ALL.with(Service::Relay, false),
+    )
+    .await
+    .unwrap();
+    let text = browser.get("/account/relay").await.text();
+    assert!(
+        text.contains("Limited: your account has direct connections only"),
+        "{text}"
+    );
+    assert!(!text.contains("Full speed"), "{text}");
+    assert!(
+        browser
+            .get("/account/direct")
+            .await
+            .text()
+            .contains("the relay only helps them set up the connection"),
+    );
+    // Without direct connections, the account's devices do not use the relay at all.
+    users::set_services(
+        &f.state.db,
+        &alice.username,
+        Services::ALL.with(Service::Direct, false),
+    )
+    .await
+    .unwrap();
+    let text = browser.get("/account/relay").await.text();
+    assert!(text.contains("not enabled for your account"), "{text}");
+    assert!(!text.contains("inputshow/1"), "{text}");
+    relay.run_until(async {}).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_device_that_needs_two_step_verification_is_sent_to_the_overview_and_back() {
+    use gono_server_core::{
+        devices::{EndpointId, NewDevice},
+        login_flows,
+    };
+    let mut f = fixture().await;
+    connect_with(&mut f, true).await;
+    let new = NewDevice {
+        endpoint_id: EndpointId([8; 32]),
+        product: "input-show".to_owned(),
+        platform: "windows".to_owned(),
+        name: "Work PC".to_owned(),
+        version: String::new(),
+    };
+    let (flow, _) = login_flows::create_device(&f.state.db, &new, db::unix_now())
+        .await
+        .unwrap()
+        .unwrap();
+    let page = format!("/login/v2/flow/{}", flow.login_token.expose_secret());
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+    let consent = browser.get(&page).await;
+    assert_eq!(consent.status, StatusCode::OK, "{}", consent.text());
+    let csrf = consent.field("name=\"csrf\" value=\"");
+    let refused = browser
+        .post(&page, &[("csrf", &csrf), ("action", "grant")])
+        .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    let link = format!(
+        "/account/?next={}#two-factor",
+        super::view::encode_query(&page)
+    );
+    assert!(
+        refused.text().contains(&format!("href=\"{link}\"")),
+        "{link} in {}",
+        refused.text()
+    );
+    // The overview's form starts the enrolment with the flow's page to come back to.
+    let overview = browser.get(&link).await.text();
+    assert!(
+        overview.contains(&format!("name=\"next\" value=\"{page}\"")),
+        "{overview}"
+    );
 }

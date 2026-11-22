@@ -721,6 +721,65 @@ async fn admins_switch_the_services_of_accounts_and_their_own() {
 }
 
 #[tokio::test]
+async fn the_masthead_of_the_admin_ui_follows_the_admins_own_services() {
+    use gono_server_core::services::{Service, Services};
+    let mut f = fixture().await;
+    // Without the web file UI the masthead has only the admin UI.
+    let mut browser = Browser::new(&f.state);
+    browser.root().await;
+    let page = browser.get(&path("/")).await.body;
+    assert!(!page.contains(r#"href="/account/""#), "{page}");
+    assert!(!page.contains(r#"id="site-search""#), "{page}");
+    assert!(
+        page.contains(&format!(r#"<a class="masthead__brand" href="{PREFIX}""#)),
+        "{page}"
+    );
+
+    f.state.files = Some(Arc::new(crate::files::Files::new()));
+    let mut browser = Browser::new(&f.state);
+    browser.root().await;
+    let page = browser.get(&path("/")).await.body;
+    for link in [
+        r#"<a class="masthead__link" href="/apps/files/">Files</a>"#,
+        r#"<a class="masthead__link" href="/account/">Account</a>"#,
+        r#"<a class="menu__item" href="/account/">Account</a>"#,
+    ] {
+        assert!(page.contains(link), "{link} in {page}");
+    }
+    assert!(
+        page.contains(&format!(
+            r#"<a class="masthead__link" href="{PREFIX}/" aria-current="page">Admin</a>"#
+        )),
+        "{page}"
+    );
+    assert!(page.contains(r#"id="site-search""#), "{page}");
+    assert!(
+        page.contains(r#"<a class="masthead__brand" href="/apps/files/""#),
+        "{page}"
+    );
+
+    // An admin without the files service: no search, and the brand leads to the account page.
+    let root = Username::new("root").unwrap();
+    users::set_services(
+        &f.state.db,
+        &root,
+        Services::ALL.with(Service::Files, false),
+    )
+    .await
+    .unwrap();
+    let page = browser.get(&path("/users")).await.body;
+    assert!(!page.contains(r#"id="site-search""#), "{page}");
+    assert!(
+        page.contains(r#"<a class="masthead__brand" href="/account/""#),
+        "{page}"
+    );
+    assert!(
+        page.contains(r#"<a class="masthead__link" href="/account/">Account</a>"#),
+        "{page}"
+    );
+}
+
+#[tokio::test]
 async fn admins_are_promoted_and_demoted_but_not_themselves() {
     let f = fixture().await;
     let mut browser = Browser::new(&f.state);
@@ -1504,7 +1563,11 @@ async fn admins_see_revoke_and_remove_the_s3_keys_and_buckets_of_an_account() {
     let page = browser.get(&path("/users/alice")).await;
     assert_eq!(page.status, StatusCode::OK);
     assert!(!page.body.contains(r#"id="s3""#), "{}", page.body);
-    assert!(page.body.contains("Not offered by this server"), "{}", page.body);
+    assert!(
+        page.body.contains("Not offered by this server"),
+        "{}",
+        page.body
+    );
     let off = browser
         .post(
             &path(&format!("/users/alice/s3/keys/{}/delete", key.id)),

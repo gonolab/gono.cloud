@@ -1,43 +1,62 @@
-//! The account page of the signed-in user, part of the web file UI.
+//! The account page of the signed-in user, part of the web file UI. It has a tab for the
+//! account itself and one for each service a user sets up here:
 //!
 //! | Request | Page or action |
 //! |---|---|
-//! | `GET /apps/account/` | Profile, web login password and the user's app passwords. |
-//! | `POST /apps/account/display-name` | Change the display name. |
-//! | `POST /apps/account/password` | Change the web login password (needs the current one). The other browser sessions end; this one stays. |
-//! | `POST /apps/account/app-passwords` | Create an app password, then show it once at `/apps/account/created`. |
-//! | `POST /apps/account/app-passwords/<id>/delete` | Revoke one of the user's app passwords. |
-//! | `GET /apps/account/devices/<endpoint id>/revoke` | The second confirmation of revoking a device for remote access. |
-//! | `POST /apps/account/devices/<endpoint id>/revoke` | Revoke it, and the devices it introduced that are ticked. |
-//! | `POST /apps/account/devices/<endpoint id>/sign-out` | Stop remote access for a device that stays in use: sign it out (protocol 9.4). |
-//! | `POST /apps/account/devices/<endpoint id>/pairing` | Let the device send pairing requests for an hour. |
-//! | `POST /apps/account/two-factor/start` | Start enrolling two-step verification (needs the password). |
-//! | `GET /apps/account/two-factor` | The QR code and key of the enrolment, and the form for its first code. |
-//! | `POST /apps/account/two-factor/confirm` | Turn it on with the first code; the recovery codes follow once. The other browser sessions end; this one stays. |
-//! | `GET /apps/account/two-factor/recovery-codes` | New recovery codes, shown once. |
-//! | `POST /apps/account/two-factor/renew` | New recovery codes (password and a code). |
-//! | `POST /apps/account/two-factor/disable` | Turn it off (password and a code). |
-//! | `POST /apps/account/s3/buckets` | Create an S3 bucket with a new folder `<s3.bucket_folder>/<name>`. |
-//! | `POST /apps/account/s3/buckets/bind` | Make an existing folder an S3 bucket. |
-//! | `POST /apps/account/s3/buckets/<id>/anonymous` | Change what anonymous requests may read and list in a bucket. |
-//! | `POST /apps/account/s3/buckets/<id>/delete` | Remove a bucket: only the binding goes, the folder and its files stay. |
-//! | `POST /apps/account/s3/keys` | Create an S3 access key, then show it once at `/apps/account/s3/created`. |
-//! | `GET /apps/account/s3/created` | The new access key with its secret key, once. |
-//! | `POST /apps/account/s3/keys/<id>/delete` | Revoke one of the user's S3 access keys. |
+//! | `GET /account/` | Overview: the account's services, two-step verification, display name and web login password. |
+//! | `GET /account/webdav` | WebDAV: the addresses clients connect to, and the user's app passwords. |
+//! | `GET /account/s3` | S3: the user's buckets and access keys (see [`s3`]). |
+//! | `GET /account/direct` | Direct connections: the devices registered for remote access. |
+//! | `GET /account/relay` | Relay: its address, the rate it reads the account's devices at, those connected to it now and the sessions they reported (see [`relay`]). |
+//! | `POST /account/display-name` | Change the display name. |
+//! | `POST /account/password` | Change the web login password (needs the current one). The other browser sessions end; this one stays. |
+//! | `POST /account/app-passwords` | Create an app password, then show it once at `/account/created`. |
+//! | `POST /account/app-passwords/<id>/delete` | Revoke one of the user's app passwords. |
+//! | `GET /account/devices/<endpoint id>/revoke` | The second confirmation of revoking a device for remote access. |
+//! | `POST /account/devices/<endpoint id>/revoke` | Revoke it, and the devices it introduced that are ticked. |
+//! | `POST /account/devices/<endpoint id>/sign-out` | Stop remote access for a device that stays in use: sign it out (protocol 9.4). |
+//! | `POST /account/devices/<endpoint id>/pairing` | Let the device send pairing requests for an hour. |
+//! | `POST /account/two-factor/start` | Start enrolling two-step verification (needs the password). |
+//! | `GET /account/two-factor` | The QR code and key of the enrolment, and the form for its first code. |
+//! | `POST /account/two-factor/confirm` | Turn it on with the first code; the recovery codes follow once. The other browser sessions end; this one stays. |
+//! | `GET /account/two-factor/recovery-codes` | New recovery codes, shown once. |
+//! | `POST /account/two-factor/renew` | New recovery codes (password and a code). |
+//! | `POST /account/two-factor/disable` | Turn it off (password and a code). |
+//! | `POST /account/s3/buckets` | Create an S3 bucket with a new folder `<s3.bucket_folder>/<name>`. |
+//! | `POST /account/s3/buckets/bind` | Make an existing folder an S3 bucket. |
+//! | `POST /account/s3/buckets/<id>/anonymous` | Change what anonymous requests may read and list in a bucket. |
+//! | `POST /account/s3/buckets/<id>/delete` | Remove a bucket: only the binding goes, the folder and its files stay. |
+//! | `POST /account/s3/keys` | Create an S3 access key, then show it once at `/account/s3/created`. |
+//! | `GET /account/s3/created` | The new access key with its secret key, once. |
+//! | `POST /account/s3/keys/<id>/delete` | Revoke one of the user's S3 access keys. |
 //!
-//! The S3 part (see [`s3`]) is there only while the S3 API is enabled (`s3.enabled`); its
-//! requests answer 404 otherwise.
+//! # Tabs and services
 //!
-//! Devices registered for remote access (`docs/connect-protocol.md`, sections 6 and 9) are
-//! listed only when remote connectivity is on. Their credentials are not app passwords and do
-//! not appear among them. Revoking one is final for its key, so it is never one click: the
-//! revoke button opens a confirmation page.
+//! Every tab is listed for every account, so that its user sees what exists. The overview
+//! belongs to the account itself and works without any service
+//! (`gono_server_core::services`). Each other tab belongs to a service: while the account
+//! lacks it, the tab shows only a notice that an administrator turns it on, and while this
+//! server does not offer it at all ([`service_view::offered`]: the S3 API or remote
+//! connectivity is off) a notice that says so. Both are pages, answered with `200`. The relay
+//! tab belongs to direct connections, which admit the account's devices to the relay already,
+//! at the limited rate; the tab says whether the relay service raises that to the full rate.
 //!
-//! Every change is a POST with the session's CSRF token from this origin, answered with a
-//! redirect. A new app password or S3 access key is kept in memory for its session only and
-//! shown once; the URL carries no secret. Changing the password checks the current one through
-//! the failed-attempt limiter of the sign-in pages.
+//! The forms of a tab need its service as well: without it they answer the tab's notice with
+//! `403`, and so does the confirmation page of a device's revocation. While the server does
+//! not offer the feature, the S3 and device forms answer `404`, as they did before accounts
+//! had services.
+//!
+//! Devices registered for remote access (`docs/connect-protocol.md`, sections 6 and 9) are not
+//! app passwords and do not appear among them. Revoking one is final for its key, so it is
+//! never one click: the revoke button opens a confirmation page.
+//!
+//! Every change is a POST with the session's CSRF token from this origin, answered with `303`
+//! to the tab of its form with `?done=<what>`, which that tab shows as a notice; a form that is
+//! refused shows its tab again with the error (`422`). A new app password or S3 access key is
+//! kept in memory for its session only and shown once; the URL carries no secret. Changing the
+//! password checks the current one through the failed-attempt limiter of the sign-in pages.
 
+pub(crate) mod relay;
 pub(crate) mod s3;
 
 use std::{
@@ -60,6 +79,7 @@ use gono_server_core::{
     db,
     devices::{self, Device, EndpointId, RevokedBy},
     password,
+    services::Service,
     two_factor::{self, TurnedOff},
     users, web_sessions,
 };
@@ -72,11 +92,98 @@ use crate::{
     app::AppState,
     client_ip::client_ip,
     i18n::{Text, fill},
+    service_view,
+    site::FILES_HOME,
     web::{self, Chrome, CodeCheck, Nav, Verified, page},
 };
 
 /// Where the account page lives.
-pub const ACCOUNT: &str = "/apps/account";
+pub const ACCOUNT: &str = "/account";
+
+/// Its overview tab, where the masthead's entry leads.
+pub const OVERVIEW: &str = "/account/";
+
+/// A tab of the account page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tab {
+    /// The account itself: its services, two-step verification, display name and password.
+    #[default]
+    Overview,
+    /// WebDAV clients and their app passwords.
+    Webdav,
+    /// S3 buckets and access keys.
+    S3,
+    /// The devices registered for remote access.
+    Direct,
+    /// The relay, as the account's devices use it.
+    Relay,
+}
+
+impl Tab {
+    /// Every tab, in the order of the tab bar.
+    const ALL: [Self; 5] = [
+        Self::Overview,
+        Self::Webdav,
+        Self::S3,
+        Self::Direct,
+        Self::Relay,
+    ];
+
+    /// Where the tab lives: [`OVERVIEW`], `/account/webdav`, ...
+    pub fn path(self) -> String {
+        match self {
+            Self::Overview => OVERVIEW.to_owned(),
+            Self::Webdav => format!("{ACCOUNT}/webdav"),
+            Self::S3 => format!("{ACCOUNT}/s3"),
+            Self::Direct => format!("{ACCOUNT}/direct"),
+            Self::Relay => format!("{ACCOUNT}/relay"),
+        }
+    }
+
+    /// `303` to the tab.
+    fn back(self) -> Response {
+        web::see_other(&self.path(), &[])
+    }
+
+    /// `303` to the tab with `?done=<done>`, which it shows as a notice ([`notice`]).
+    fn done(self, done: &str) -> Response {
+        web::see_other(&format!("{}?done={done}", self.path()), &[])
+    }
+
+    /// The service the tab needs, `None` for the overview. The relay tab needs direct
+    /// connections: they admit the account's devices to the relay already, at the limited
+    /// rate, and the tab says whether the relay service raises it.
+    fn service(self) -> Option<Service> {
+        match self {
+            Self::Overview => None,
+            Self::Webdav => Some(Service::Webdav),
+            Self::S3 => Some(Service::S3),
+            Self::Direct | Self::Relay => Some(Service::Direct),
+        }
+    }
+
+    /// Its name in the tab bar.
+    fn label(self, t: &Text) -> &'static str {
+        match self {
+            Self::Overview => t.account_overview,
+            Self::Webdav => t.svc_webdav,
+            Self::S3 => t.svc_s3,
+            Self::Direct => t.svc_direct,
+            Self::Relay => t.svc_relay,
+        }
+    }
+
+    /// Where the overview links `service` to: its tab, or the file UI for the web files.
+    fn href(service: Service) -> String {
+        match service {
+            Service::Files => FILES_HOME.to_owned(),
+            Service::Webdav => Self::Webdav.path(),
+            Service::S3 => Self::S3.path(),
+            Service::Direct => Self::Direct.path(),
+            Service::Relay => Self::Relay.path(),
+        }
+    }
+}
 
 /// How long a new app password or S3 access key waits to be shown.
 const CREATED_TTL: Duration = Duration::from_secs(10 * 60);
@@ -200,22 +307,123 @@ pub struct TwoFactorView {
     pub note: &'static str,
 }
 
-/// `account/page.html`.
-#[derive(Template)]
-#[template(path = "account/page.html")]
-struct AccountPage {
-    chrome: Chrome,
+/// One link of the tab bar.
+struct TabLink {
+    href: String,
+    label: &'static str,
+    current: bool,
+}
+
+/// What every tab shows around its content (`account/frame.html`): the tab bar, the heading
+/// and the flash messages.
+struct AccountFrame {
+    tabs: Vec<TabLink>,
+    /// "Account" on the overview, the tab's name on the others.
+    heading: &'static str,
     username: String,
-    display_name: String,
-    two_factor: TwoFactorView,
-    /// `None` when remote connectivity is off.
-    remote: Option<Vec<RemoteRow>>,
-    devices: Vec<DeviceRow>,
-    form: AppPasswordForm,
-    /// `None` when the S3 API is off.
-    s3: Option<s3::S3View>,
     notice: Option<String>,
     error: Option<String>,
+}
+
+impl AccountFrame {
+    fn new(visitor: &Visitor, tab: Tab, notice: Option<String>, error: Option<String>) -> Self {
+        let t = visitor.t();
+        Self {
+            tabs: Tab::ALL
+                .into_iter()
+                .map(|each| TabLink {
+                    href: each.path(),
+                    label: each.label(t),
+                    current: each == tab,
+                })
+                .collect(),
+            heading: if tab == Tab::Overview {
+                t.account_title
+            } else {
+                tab.label(t)
+            },
+            username: visitor.user.username.to_string(),
+            notice,
+            error,
+        }
+    }
+}
+
+/// One service of the account on the overview.
+struct ServiceLine {
+    name: &'static str,
+    note: &'static str,
+    /// The account has it.
+    on: bool,
+    /// This server offers it ([`service_view::offered`]).
+    offered: bool,
+    /// Its tab, or the file UI ([`Tab::href`]).
+    href: String,
+}
+
+/// `account/overview.html`.
+#[derive(Template)]
+#[template(path = "account/overview.html")]
+struct OverviewPage {
+    chrome: Chrome,
+    frame: AccountFrame,
+    services: Vec<ServiceLine>,
+    display_name: String,
+    two_factor: TwoFactorView,
+}
+
+/// `account/webdav.html`.
+#[derive(Template)]
+#[template(path = "account/webdav.html")]
+struct WebdavPage {
+    chrome: Chrome,
+    frame: AccountFrame,
+    /// The server address, for the Nextcloud apps.
+    server: String,
+    /// The user's WebDAV address, for other clients.
+    webdav: String,
+    devices: Vec<DeviceRow>,
+    form: AppPasswordForm,
+}
+
+/// `account/s3.html`.
+#[derive(Template)]
+#[template(path = "account/s3.html")]
+struct S3Page {
+    chrome: Chrome,
+    frame: AccountFrame,
+    s3: s3::S3View,
+}
+
+/// `account/direct.html`.
+#[derive(Template)]
+#[template(path = "account/direct.html")]
+struct DirectPage {
+    chrome: Chrome,
+    frame: AccountFrame,
+    remote: Vec<RemoteRow>,
+    /// Set while the account lacks direct connections: the notice that says so. The devices it
+    /// registered before stay listed, and can still be revoked (revoking only removes trust),
+    /// but nothing else.
+    off: Option<&'static str>,
+}
+
+/// `account/relay.html`.
+#[derive(Template)]
+#[template(path = "account/relay.html")]
+struct RelayPage {
+    chrome: Chrome,
+    frame: AccountFrame,
+    relay: relay::RelayView,
+}
+
+/// `account/off.html`: a tab the visitor cannot use, with the notice that says why.
+#[derive(Template)]
+#[template(path = "account/off.html")]
+struct OffPage {
+    chrome: Chrome,
+    frame: AccountFrame,
+    lead: &'static str,
 }
 
 /// `account/created.html`.
@@ -263,7 +471,12 @@ struct RecoveryCodesPage {
 }
 
 page!(
-    AccountPage,
+    OverviewPage,
+    WebdavPage,
+    S3Page,
+    DirectPage,
+    RelayPage,
+    OffPage,
     CreatedPage,
     RevokePage,
     EnrolPage,
@@ -282,10 +495,7 @@ async fn account_visitor(
     match visitor(state, headers, uri).await {
         Some(visitor) => Ok(visitor),
         None => Err(Box::new(web::see_other(
-            &format!(
-                "/login?next={}",
-                super::view::encode_query(&format!("{ACCOUNT}/"))
-            ),
+            &format!("/login?next={}", super::view::encode_query(OVERVIEW)),
             &[],
         ))),
     }
@@ -316,9 +526,57 @@ fn expiry(t: &Text, visitor: &Visitor, now: i64, expires_at: Option<i64>) -> Str
     }
 }
 
-/// What the account page shows besides the account itself.
+/// The notice a tab shows in place of its content, if the visitor cannot use it: this server
+/// does not offer its service, or the account lacks it.
+fn unavailable(state: &AppState, visitor: &Visitor, tab: Tab) -> Option<&'static str> {
+    let service = tab.service()?;
+    let t = visitor.t();
+    if !service_view::offered(state, service) {
+        Some(t.account_not_offered)
+    } else if !visitor.user.services.has(service) {
+        Some(t.account_not_enabled)
+    } else {
+        None
+    }
+}
+
+/// `frame` with `lead` in place of the tab's content.
+fn off_page(
+    visitor: &Visitor,
+    frame: AccountFrame,
+    lead: &'static str,
+    status: StatusCode,
+) -> Response {
+    let page = OffPage {
+        chrome: visitor.chrome(Nav::Account),
+        frame,
+        lead,
+    };
+    web::render(status, &page)
+}
+
+/// For the forms of `tab`: `Err` with the tab's notice and `403` while the account lacks the
+/// tab's service. While this server does not offer it, the handlers answer `404` themselves.
+fn needs_service(visitor: &Visitor, tab: Tab) -> Result<(), Box<Response>> {
+    match tab.service() {
+        Some(service) if !visitor.user.services.has(service) => {
+            let frame = AccountFrame::new(visitor, tab, None, None);
+            let lead = visitor.t().account_not_enabled;
+            Err(Box::new(off_page(
+                visitor,
+                frame,
+                lead,
+                StatusCode::FORBIDDEN,
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// What a tab shows besides its own content.
 #[derive(Default)]
 struct PageOptions {
+    tab: Tab,
     /// The new app password form, as entered.
     form: AppPasswordForm,
     /// The S3 forms, as entered.
@@ -330,37 +588,130 @@ struct PageOptions {
     next: Option<String>,
 }
 
-async fn render_page(
-    state: &AppState,
-    visitor: &Visitor,
-    form: AppPasswordForm,
-    notice: Option<String>,
-    error: Option<String>,
-) -> Response {
+/// Shows `tab` again with `error`: the form was refused and nothing changed.
+async fn show_error(state: &AppState, visitor: &Visitor, tab: Tab, error: String) -> Response {
     let options = PageOptions {
-        form,
-        notice,
-        error,
+        tab,
+        error: Some(error),
         ..PageOptions::default()
     };
     render(state, visitor, options).await
 }
 
+/// The tab of `options`, reading only what that tab shows.
 async fn render(state: &AppState, visitor: &Visitor, options: PageOptions) -> Response {
     let PageOptions {
+        tab,
         form,
         s3: s3_forms,
         notice,
         error,
         next,
     } = options;
-    let t = visitor.t();
-    let passwords = match app_passwords::list(&state.db, visitor.user.user_id).await {
-        Ok(passwords) => passwords,
-        Err(err) => return internal(visitor, "app password list", &err),
+    let status = if error.is_some() {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::OK
     };
+    let chrome = visitor.chrome(Nav::Account);
+    let frame = AccountFrame::new(visitor, tab, notice, error);
+    // Without direct connections, the tab still lists the registered devices so that a lost
+    // one can be revoked; every other tab of a service that is off shows only the notice.
+    let off = unavailable(state, visitor, tab);
+    let direct_off = tab == Tab::Direct && state.connect.is_some() && off.is_some();
+    if let Some(lead) = off.filter(|_| !direct_off) {
+        return off_page(visitor, frame, lead, StatusCode::OK);
+    }
+    let not_offered = visitor.t().account_not_offered;
     let now = db::unix_now();
-    let devices = passwords
+    match tab {
+        Tab::Overview => {
+            let two_factor = match two_factor_view(state, visitor, now, next).await {
+                Ok(view) => view,
+                Err(err) => return internal(visitor, "two-step verification", &err),
+            };
+            let page = OverviewPage {
+                chrome,
+                frame,
+                services: service_lines(state, visitor),
+                display_name: visitor.user.display_name.clone(),
+                two_factor,
+            };
+            web::render(status, &page)
+        }
+        Tab::Webdav => {
+            let devices = match app_password_rows(state, visitor, now).await {
+                Ok(devices) => devices,
+                Err(err) => return internal(visitor, "app password list", &err),
+            };
+            let (server, webdav) = addresses(state, visitor);
+            let page = WebdavPage {
+                chrome,
+                frame,
+                server,
+                webdav,
+                devices,
+                form,
+            };
+            web::render(status, &page)
+        }
+        Tab::S3 => match s3::view(state, visitor, now, s3_forms).await {
+            Ok(Some(s3)) => web::render(status, &S3Page { chrome, frame, s3 }),
+            Ok(None) => off_page(visitor, frame, not_offered, StatusCode::OK),
+            Err(err) => internal(visitor, "S3 buckets and keys", &err),
+        },
+        Tab::Direct => match remote_rows(state, visitor, now).await {
+            Ok(Some(remote)) => web::render(
+                status,
+                &DirectPage {
+                    chrome,
+                    frame,
+                    remote,
+                    off: off.filter(|_| direct_off),
+                },
+            ),
+            Ok(None) => off_page(visitor, frame, not_offered, StatusCode::OK),
+            Err(err) => internal(visitor, "device list", &err),
+        },
+        Tab::Relay => match relay::view(state, visitor, now).await {
+            Ok(Some(relay)) => web::render(
+                status,
+                &RelayPage {
+                    chrome,
+                    frame,
+                    relay,
+                },
+            ),
+            Ok(None) => off_page(visitor, frame, not_offered, StatusCode::OK),
+            Err(err) => internal(visitor, "relay", &err),
+        },
+    }
+}
+
+/// The services of the visitor's account, for the overview.
+fn service_lines(state: &AppState, visitor: &Visitor) -> Vec<ServiceLine> {
+    let t = visitor.t();
+    Service::ALL
+        .into_iter()
+        .map(|service| ServiceLine {
+            name: service_view::name(t, service),
+            note: service_view::note(t, service),
+            on: visitor.user.services.has(service),
+            offered: service_view::offered(state, service),
+            href: Tab::href(service),
+        })
+        .collect()
+}
+
+/// The visitor's app passwords.
+async fn app_password_rows(
+    state: &AppState,
+    visitor: &Visitor,
+    now: i64,
+) -> gono_server_core::Result<Vec<DeviceRow>> {
+    let t = visitor.t();
+    let passwords = app_passwords::list(&state.db, visitor.user.user_id).await?;
+    Ok(passwords
         .into_iter()
         .map(|password| DeviceRow {
             id: password.id,
@@ -376,37 +727,18 @@ async fn render(state: &AppState, visitor: &Visitor, options: PageOptions) -> Re
             ),
             expiry: expiry(t, visitor, now, password.expires_at),
         })
-        .collect();
-    let remote = match remote_rows(state, visitor, now).await {
-        Ok(remote) => remote,
-        Err(err) => return internal(visitor, "device list", &err),
-    };
-    let two_factor = match two_factor_view(state, visitor, now, next).await {
-        Ok(view) => view,
-        Err(err) => return internal(visitor, "two-step verification", &err),
-    };
-    let s3 = match s3::view(state, visitor, now, s3_forms).await {
-        Ok(view) => view,
-        Err(err) => return internal(visitor, "S3 buckets and keys", &err),
-    };
-    let status = if error.is_some() {
-        StatusCode::UNPROCESSABLE_ENTITY
-    } else {
-        StatusCode::OK
-    };
-    let page = AccountPage {
-        chrome: visitor.chrome(Nav::Account),
-        username: visitor.user.username.to_string(),
-        display_name: visitor.user.display_name.clone(),
-        two_factor,
-        remote,
-        devices,
-        form,
-        s3,
-        notice,
-        error,
-    };
-    web::render(status, &page)
+        .collect())
+}
+
+/// The server address the Nextcloud apps are set up with, and the visitor's WebDAV address for
+/// other clients.
+fn addresses(state: &AppState, visitor: &Visitor) -> (String, String) {
+    let origin = state.base_url.as_str().trim_end_matches('/').to_owned();
+    let webdav = format!(
+        "{origin}/remote.php/dav/files/{}/",
+        super::view::encode_segment(visitor.user.username.as_str())
+    );
+    (origin, webdav)
 }
 
 /// The two-step verification of the visitor's account.
@@ -485,12 +817,11 @@ async fn check_password(
     {
         Verified::Ok(user) if user.id == visitor.user.user_id => Ok(()),
         Verified::Ok(_) | Verified::Invalid => Err(Box::new(
-            render_page(
+            show_error(
                 state,
                 visitor,
-                AppPasswordForm::default(),
-                None,
-                Some(visitor.t().err_current_password.to_owned()),
+                Tab::Overview,
+                visitor.t().err_current_password.to_owned(),
             )
             .await,
         )),
@@ -511,16 +842,7 @@ async fn check_code(
     code: &str,
 ) -> Result<(), Box<Response>> {
     let fail = |message: &'static str| async move {
-        Box::new(
-            render_page(
-                state,
-                visitor,
-                AppPasswordForm::default(),
-                None,
-                Some(message.to_owned()),
-            )
-            .await,
-        )
+        Box::new(show_error(state, visitor, Tab::Overview, message.to_owned()).await)
     };
     match state
         .web
@@ -530,7 +852,7 @@ async fn check_code(
         CodeCheck::Right { .. } => Ok(()),
         CodeCheck::Wrong => Err(fail(visitor.t().two_step_wrong).await),
         CodeCheck::Locked => Err(fail(visitor.t().two_step_locked).await),
-        CodeCheck::NotEnrolled => Err(Box::new(web::see_other(&format!("{ACCOUNT}/"), &[]))),
+        CodeCheck::NotEnrolled => Err(Box::new(Tab::Overview.back())),
         CodeCheck::RateLimited(wait) => Err(Box::new(web::too_many_attempts(
             visitor.chrome(Nav::Account),
             wait,
@@ -549,7 +871,7 @@ pub struct PasswordOnlyForm {
     next: String,
 }
 
-/// `POST /apps/account/two-factor/start`.
+/// `POST /account/two-factor/start`.
 pub async fn two_factor_start(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -581,8 +903,8 @@ async fn enrol_page(
     error: Option<&'static str>,
 ) -> Response {
     let Some(enrolment) = state.web.enrolment(&visitor.user) else {
-        let message = Some(visitor.t().tf_setup_expired.to_owned());
-        return render_page(state, visitor, AppPasswordForm::default(), None, message).await;
+        let message = visitor.t().tf_setup_expired.to_owned();
+        return show_error(state, visitor, Tab::Overview, message).await;
     };
     let uri = two_factor::otpauth_uri(visitor.user.username.as_str(), &enrolment.secret);
     let Some(qr) = crate::qr::svg(&uri) else {
@@ -601,7 +923,7 @@ async fn enrol_page(
     web::render(status, &page)
 }
 
-/// `GET /apps/account/two-factor`.
+/// `GET /account/two-factor`.
 pub async fn two_factor_page(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -624,7 +946,7 @@ pub struct CodeForm {
     password: String,
 }
 
-/// `POST /apps/account/two-factor/confirm`.
+/// `POST /account/two-factor/confirm`.
 pub async fn two_factor_confirm(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -673,7 +995,7 @@ pub async fn two_factor_confirm(
         Ok(codes) => codes,
         Err(gono_server_core::Error::TwoFactorEnrolled) => {
             state.web.end_enrolment(&visitor.user);
-            return web::see_other(&format!("{ACCOUNT}/"), &[]);
+            return Tab::Overview.back();
         }
         Err(err) => return internal(&visitor, "two-step verification", &err),
     };
@@ -687,7 +1009,7 @@ pub async fn two_factor_confirm(
     web::see_other(&format!("{ACCOUNT}/two-factor/recovery-codes"), &[])
 }
 
-/// `GET /apps/account/two-factor/recovery-codes`.
+/// `GET /account/two-factor/recovery-codes`.
 pub async fn recovery_codes(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -698,19 +1020,19 @@ pub async fn recovery_codes(
         Err(response) => return *response,
     };
     let Some(shown) = state.web.take_shown(&visitor.user) else {
-        return web::see_other(&format!("{ACCOUNT}/"), &[]);
+        return Tab::Overview.back();
     };
     let page = RecoveryCodesPage {
         chrome: visitor.chrome(Nav::Account),
         codes: shown.codes,
         next: shown
             .next
-            .unwrap_or_else(|| format!("{ACCOUNT}/?done=two-factor-on")),
+            .unwrap_or_else(|| format!("{OVERVIEW}?done=two-factor-on")),
     };
     web::render(StatusCode::OK, &page)
 }
 
-/// `POST /apps/account/two-factor/renew`.
+/// `POST /account/two-factor/renew`.
 pub async fn two_factor_renew(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -745,7 +1067,7 @@ pub async fn two_factor_renew(
     }
 }
 
-/// `POST /apps/account/two-factor/disable`.
+/// `POST /account/two-factor/disable`.
 pub async fn two_factor_disable(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -779,7 +1101,7 @@ pub async fn two_factor_disable(
             if let Some(connect) = &state.connect {
                 connect.poke();
             }
-            web::see_other(&format!("{ACCOUNT}/?done=two-factor-off"), &[])
+            Tab::Overview.done("two-factor-off")
         }
         Err(err) => internal(&visitor, "two-step verification", &err),
     }
@@ -877,14 +1199,29 @@ fn remote_row(
     }
 }
 
-/// The unrevoked remote device `hex` of the visitor, or the page that says there is none.
+/// The unrevoked remote device `hex` of the visitor, or the page that says there is none, or
+/// that the account lacks direct connections, which every action on a device needs.
+/// What a request does with one of the visitor's devices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceAction {
+    /// Revoking it: only removes trust, so it needs no service, and an account whose direct
+    /// connections were turned off can still revoke a lost device.
+    Revoke,
+    /// Stopping its remote access or opening pairing: needs direct connections.
+    Manage,
+}
+
 async fn own_device(
     state: &AppState,
     visitor: &Visitor,
     hex: &str,
+    action: DeviceAction,
 ) -> Result<Device, Box<Response>> {
     if state.connect.is_none() {
         return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
+    }
+    if action == DeviceAction::Manage {
+        needs_service(visitor, Tab::Direct)?;
     }
     let not_found = || Box::new(super::not_found(visitor));
     let key = EndpointId::parse(hex).ok_or_else(not_found)?;
@@ -897,7 +1234,7 @@ async fn own_device(
     }
 }
 
-/// `GET /apps/account/devices/<endpoint id>/revoke`.
+/// `GET /account/devices/<endpoint id>/revoke`.
 pub async fn revoke_page(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -908,7 +1245,7 @@ pub async fn revoke_page(
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
-    let device = match own_device(&state, &visitor, &hex).await {
+    let device = match own_device(&state, &visitor, &hex, DeviceAction::Revoke).await {
         Ok(device) => device,
         Err(response) => return *response,
     };
@@ -937,7 +1274,7 @@ pub async fn revoke_page(
     web::render(StatusCode::OK, &page)
 }
 
-/// `POST /apps/account/devices/<endpoint id>/revoke`: the device, and every introduced device
+/// `POST /account/devices/<endpoint id>/revoke`: the device, and every introduced device
 /// ticked as `also_<endpoint id>`.
 pub async fn revoke_device(
     State(state): State<AppState>,
@@ -952,7 +1289,7 @@ pub async fn revoke_device(
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
-    let device = match own_device(&state, &visitor, &hex).await {
+    let device = match own_device(&state, &visitor, &hex, DeviceAction::Revoke).await {
         Ok(device) => device,
         Err(response) => return *response,
     };
@@ -985,13 +1322,13 @@ pub async fn revoke_device(
             if let Some(connect) = &state.connect {
                 connect.poke();
             }
-            web::see_other(&format!("{ACCOUNT}/?done=device-revoked"), &[])
+            Tab::Direct.done("device-revoked")
         }
         Err(err) => internal(&visitor, "revoke a device", &err),
     }
 }
 
-/// `POST /apps/account/devices/<endpoint id>/sign-out`: stops remote access for a device that
+/// `POST /account/devices/<endpoint id>/sign-out`: stops remote access for a device that
 /// is not lost, without revoking it (protocol 9.4). The device keeps its key, its pairings and
 /// its place in the account, and can register again; the entry stays revocable.
 pub async fn stop_remote_access(
@@ -1005,7 +1342,7 @@ pub async fn stop_remote_access(
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
-    let device = match own_device(&state, &visitor, &hex).await {
+    let device = match own_device(&state, &visitor, &hex, DeviceAction::Manage).await {
         Ok(device) => device,
         Err(response) => return *response,
     };
@@ -1023,13 +1360,13 @@ pub async fn stop_remote_access(
                 device = %device.endpoint_id.short(),
                 "user stopped remote access for a device"
             );
-            web::see_other(&format!("{ACCOUNT}/?done=device-signed-out"), &[])
+            Tab::Direct.done("device-signed-out")
         }
         Err(err) => internal(&visitor, "stop remote access", &err),
     }
 }
 
-/// `POST /apps/account/devices/<endpoint id>/pairing`.
+/// `POST /account/devices/<endpoint id>/pairing`.
 pub async fn allow_pairing(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1041,13 +1378,13 @@ pub async fn allow_pairing(
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
-    let device = match own_device(&state, &visitor, &hex).await {
+    let device = match own_device(&state, &visitor, &hex, DeviceAction::Manage).await {
         Ok(device) => device,
         Err(response) => return *response,
     };
     let until = db::unix_now() + devices::PAIRING_WINDOW_SECS;
     match devices::open_pairing(&state.db, visitor.user.user_id, device.endpoint_id, until).await {
-        Ok(_) => web::see_other(&format!("{ACCOUNT}/?done=pairing"), &[]),
+        Ok(_) => Tab::Direct.done("pairing"),
         Err(err) => internal(&visitor, "allow pairing", &err),
     }
 }
@@ -1058,44 +1395,105 @@ pub struct DoneQuery {
     next: Option<String>,
 }
 
-/// `GET /apps/account/`.
-pub async fn show(
+/// The notice of `?done=<done>` on `tab`, after a change made with one of its forms.
+fn notice(state: &AppState, t: &'static Text, tab: Tab, done: &str) -> Option<String> {
+    let text = match (tab, done) {
+        (Tab::Overview, "display-name") => t.notice_display_name,
+        (Tab::Overview, "password") => t.notice_password_changed,
+        (Tab::Overview, "two-factor-on") => t.notice_tf_on,
+        (Tab::Overview, "two-factor-off") if state.remote_access_needs_two_factor() => {
+            t.notice_tf_off
+        }
+        (Tab::Overview, "two-factor-off") => t.notice_tf_off_optional,
+        (Tab::Webdav, "revoked") => t.notice_revoked,
+        (Tab::S3, done) => s3::notice(t, done)?,
+        (Tab::Direct, "device-revoked") => t.notice_device_revoked,
+        (Tab::Direct, "device-signed-out") => t.notice_device_signed_out,
+        (Tab::Direct, "pairing") => t.notice_pairing_open,
+        _ => return None,
+    };
+    Some(text.to_owned())
+}
+
+/// `GET` of `tab`, with the notice of its `?done=` and, on the overview, the `?next=` page
+/// that turning on two-step verification continues to.
+async fn show(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    query: DoneQuery,
+    tab: Tab,
+) -> Response {
+    let visitor = match account_visitor(state, headers, uri).await {
+        Ok(visitor) => visitor,
+        Err(response) => return *response,
+    };
+    let notice = query
+        .done
+        .as_deref()
+        .and_then(|done| notice(state, visitor.t(), tab, done));
+    let options = PageOptions {
+        tab,
+        notice,
+        next: next_path(query.next.as_deref()),
+        ..PageOptions::default()
+    };
+    render(state, &visitor, options).await
+}
+
+/// `GET /account/`.
+pub async fn overview(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: Uri,
     Query(query): Query<DoneQuery>,
 ) -> Response {
-    let visitor = match account_visitor(&state, &headers, &uri).await {
-        Ok(visitor) => visitor,
-        Err(response) => return *response,
-    };
-    let t = visitor.t();
-    let notice = match query.done.as_deref() {
-        Some(done) if done.starts_with("s3-") => s3::notice(t, done).map(str::to_owned),
-        Some("display-name") => Some(t.notice_display_name.to_owned()),
-        Some("password") => Some(t.notice_password_changed.to_owned()),
-        Some("revoked") => Some(t.notice_revoked.to_owned()),
-        Some("device-revoked") => Some(t.notice_device_revoked.to_owned()),
-        Some("device-signed-out") => Some(t.notice_device_signed_out.to_owned()),
-        Some("pairing") => Some(t.notice_pairing_open.to_owned()),
-        Some("two-factor-on") => Some(t.notice_tf_on.to_owned()),
-        Some("two-factor-off") if state.remote_access_needs_two_factor() => {
-            Some(t.notice_tf_off.to_owned())
-        }
-        Some("two-factor-off") => Some(t.notice_tf_off_optional.to_owned()),
-        _ => None,
-    };
-    let options = PageOptions {
-        notice,
-        next: next_path(query.next.as_deref()),
-        ..PageOptions::default()
-    };
-    render(&state, &visitor, options).await
+    show(&state, &headers, &uri, query, Tab::Overview).await
 }
 
-/// `GET /apps/account`.
+/// `GET /account/webdav`.
+pub async fn webdav_tab(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(query): Query<DoneQuery>,
+) -> Response {
+    show(&state, &headers, &uri, query, Tab::Webdav).await
+}
+
+/// `GET /account/s3`.
+pub async fn s3_tab(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(query): Query<DoneQuery>,
+) -> Response {
+    show(&state, &headers, &uri, query, Tab::S3).await
+}
+
+/// `GET /account/direct`.
+pub async fn direct_tab(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(query): Query<DoneQuery>,
+) -> Response {
+    show(&state, &headers, &uri, query, Tab::Direct).await
+}
+
+/// `GET /account/relay`.
+pub async fn relay_tab(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Query(query): Query<DoneQuery>,
+) -> Response {
+    show(&state, &headers, &uri, query, Tab::Relay).await
+}
+
+/// `GET /account`.
 pub async fn to_page() -> Response {
-    web::see_other(&format!("{ACCOUNT}/"), &[])
+    Tab::Overview.back()
 }
 
 #[derive(Deserialize)]
@@ -1106,7 +1504,7 @@ pub struct DisplayNameForm {
     display_name: String,
 }
 
-/// `POST /apps/account/display-name`.
+/// `POST /account/display-name`.
 pub async fn set_display_name(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1119,11 +1517,11 @@ pub async fn set_display_name(
     };
     let t = visitor.t();
     if users::validate_display_name(&form.display_name).is_err() {
-        let error = Some(t.err_display_name.to_owned());
-        return render_page(&state, &visitor, AppPasswordForm::default(), None, error).await;
+        let error = t.err_display_name.to_owned();
+        return show_error(&state, &visitor, Tab::Overview, error).await;
     }
     match users::set_display_name(&state.db, &visitor.user.username, &form.display_name).await {
-        Ok(_) => web::see_other(&format!("{ACCOUNT}/?done=display-name"), &[]),
+        Ok(_) => Tab::Overview.done("display-name"),
         Err(err) => internal(&visitor, "display name", &err),
     }
 }
@@ -1140,7 +1538,7 @@ pub struct PasswordForm {
     password_repeat: String,
 }
 
-/// `POST /apps/account/password`.
+/// `POST /account/password`.
 pub async fn set_password(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1156,16 +1554,7 @@ pub async fn set_password(
     let fail = |message: String| {
         let state = state.clone();
         let visitor = &visitor;
-        async move {
-            render_page(
-                &state,
-                visitor,
-                AppPasswordForm::default(),
-                None,
-                Some(message),
-            )
-            .await
-        }
+        async move { show_error(&state, visitor, Tab::Overview, message).await }
     };
     if form.password != form.password_repeat {
         return fail(t.err_passwords_differ.to_owned()).await;
@@ -1214,10 +1603,10 @@ pub async fn set_password(
         tracing::warn!(error = %err, "cannot end the browser sessions after a password change");
     }
     tracing::info!(user = %visitor.user.username, "web login password changed by its user");
-    web::see_other(&format!("{ACCOUNT}/?done=password"), &[])
+    Tab::Overview.done("password")
 }
 
-/// `POST /apps/account/app-passwords`.
+/// `POST /account/app-passwords`.
 pub async fn create_app_password(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1229,13 +1618,24 @@ pub async fn create_app_password(
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
+    if let Err(response) = needs_service(&visitor, Tab::Webdav) {
+        return *response;
+    }
     let Some(files) = state.files.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let form = fields.form();
     let (label, scopes, expires_at) = match parse_app_password(visitor.t(), &form, db::unix_now()) {
         Ok(parsed) => parsed,
-        Err(error) => return render_page(&state, &visitor, form, None, Some(error)).await,
+        Err(error) => {
+            let options = PageOptions {
+                tab: Tab::Webdav,
+                form,
+                error: Some(error),
+                ..PageOptions::default()
+            };
+            return render(&state, &visitor, options).await;
+        }
     };
     let (id, token) = match app_passwords::create(
         &state.db,
@@ -1262,7 +1662,7 @@ pub async fn create_app_password(
     web::see_other(&format!("{ACCOUNT}/created"), &[])
 }
 
-/// `GET /apps/account/created`: the new app password, once.
+/// `GET /account/created`: the new app password, once.
 pub async fn created(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
     let visitor = match account_visitor(&state, &headers, &uri).await {
         Ok(visitor) => visitor,
@@ -1272,10 +1672,10 @@ pub async fn created(State(state): State<AppState>, headers: HeaderMap, uri: Uri
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(created) = files.created.take(&visitor.user) else {
-        return web::see_other(&format!("{ACCOUNT}/"), &[]);
+        return Tab::Webdav.back();
     };
     let t = visitor.t();
-    let origin = state.base_url.as_str().trim_end_matches('/').to_owned();
+    let (server, webdav) = addresses(&state, &visitor);
     let page = CreatedPage {
         chrome: visitor.chrome(Nav::Account),
         username: visitor.user.username.to_string(),
@@ -1283,11 +1683,8 @@ pub async fn created(State(state): State<AppState>, headers: HeaderMap, uri: Uri
         token: created.token.expose_secret().to_owned(),
         scopes: created.scopes.iter().map(ScopeChip::new).collect(),
         expiry: expiry(t, &visitor, db::unix_now(), created.expires_at),
-        webdav: format!(
-            "{origin}/remote.php/dav/files/{}/",
-            super::view::encode_segment(visitor.user.username.as_str())
-        ),
-        server: origin,
+        server,
+        webdav,
     };
     web::render(StatusCode::OK, &page)
 }
@@ -1298,7 +1695,7 @@ pub struct CsrfForm {
     csrf: String,
 }
 
-/// `POST /apps/account/app-passwords/<id>/delete`.
+/// `POST /account/app-passwords/<id>/delete`.
 pub async fn revoke_app_password(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1310,11 +1707,14 @@ pub async fn revoke_app_password(
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
+    if let Err(response) = needs_service(&visitor, Tab::Webdav) {
+        return *response;
+    }
     // Only the user's own: the query names the owner.
     match app_passwords::delete(&state.db, visitor.user.user_id, id).await {
         Ok(_) => {
             tracing::info!(user = %visitor.user.username, app_password = id, "user revoked an app password");
-            web::see_other(&format!("{ACCOUNT}/?done=revoked"), &[])
+            Tab::Webdav.done("revoked")
         }
         Err(err) => internal(&visitor, "revoke", &err),
     }

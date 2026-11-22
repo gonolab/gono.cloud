@@ -50,6 +50,15 @@ compatible within a major version: released clients keep working with newer serv
 
 ### Changed
 
+- **The account page moved to `/account/`** and has tabs: an overview with the account's
+  services, two-step verification, display name and password, which every account has, and
+  WebDAV (app passwords), S3, direct connections (remote devices) and relay (the rate, the
+  devices connected and their sessions). A tab whose service the account lacks, or which the
+  server does not offer, says so, and its forms answer `403` without the service, except that
+  registered devices can always be revoked: without direct connections the tab still lists
+  them for that. "Account" is in the masthead's navigation; without the files service the
+  masthead has no search box, its logo and a sign-in without a page to return to lead to the
+  account page. `/apps/account/` is gone.
 - **The admin UI moved to `/manage/`** (`admin.path`; `/apps/manage` is refused now, like every
   path below `/apps`, which holds the pages of every account). Its user page has the
   account's services as switches, an admin's own included, and the list of users shows them.

@@ -1,0 +1,102 @@
+{%- extends "account/frame.html" -%}
+{%- block content %}
+<div class="stack">
+  <section class="panel" aria-labelledby="s3-title">
+    <div class="panel-head"><div><h2 id="s3-title">{{ chrome.t.s3_title }}</h2><p class="muted small">{{ chrome.t.s3_note }} {{ chrome.t.s3_remove_note }}</p></div></div>
+    <div class="panel-body">
+      <dl class="facts"><dt>{{ chrome.t.s3_endpoint }}</dt><dd class="mono">{{ s3.endpoint }}</dd><dt>{{ chrome.t.s3_region }}</dt><dd class="mono">{{ s3.region }}</dd><dt>{{ chrome.t.s3_addressing }}</dt><dd>{% for line in s3.addressing %}{% if !loop.first %}<br>{% endif %}{{ line }}{% endfor %}</dd></dl>
+      {%- if !s3.allow_anonymous %}
+      <div class="flash warn mt-18" role="status">{{ chrome.t.s3_anonymous_off }}</div>
+      {%- endif %}
+    </div>
+    {%- if s3.buckets.is_empty() %}
+    <div class="empty">{{ chrome.t.s3_no_buckets }}</div>
+    {%- else %}
+    <div class="table-wrap"><table>
+      <thead><tr><th>{{ chrome.t.s3_bucket }}</th><th>{{ chrome.t.s3_anonymous }}</th><th class="end"></th></tr></thead>
+      <tbody>
+      {%- for bucket in s3.buckets %}
+        <tr><td><b class="mono">{{ bucket.name }}</b><div class="small nowrap"><a href="{{ bucket.folder_href }}">{{ bucket.folder }}</a></div><div class="muted small nowrap">{{ bucket.created }}</div>{% if let Some(cors) = bucket.cors %}<div class="muted small nowrap">{{ cors }}</div>{% endif %}{% if let Some(tags) = bucket.tags %}<div class="muted small nowrap">{{ tags }}</div>{% endif %}{% if let Some(lifecycle) = bucket.lifecycle %}<div class="muted small nowrap">{{ lifecycle }}</div>{% endif %}{% if let Some(expiry) = bucket.expiry %}<div class="muted small">{{ expiry }}</div>{% endif %}{% if let Some(website) = bucket.website %}<div class="muted small">{{ website }}{% if let Some(url) = bucket.website_url %} <a href="{{ url }}">{{ url }}</a>{% endif %}</div>{% endif %}</td>
+          <td><form method="post" action="/account/s3/buckets/{{ bucket.id }}/anonymous" class="anon-form">
+            <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+            <select id="s3-anon-{{ bucket.id }}" name="anonymous" aria-label="{{ chrome.t.s3_anonymous }} {{ bucket.name }}"{% if !s3.allow_anonymous %} disabled{% endif %}><option value="private"{% if bucket.anonymous == "private" %} selected{% endif %}>{{ chrome.t.s3_anon_private }}</option><option value="acl"{% if bucket.anonymous == "acl" %} selected{% endif %}>{{ chrome.t.s3_anon_acl }}</option><option value="public-read"{% if bucket.anonymous == "public-read" %} selected{% endif %}>{{ chrome.t.s3_anon_public }}</option></select>
+            <label class="check small" for="s3-list-{{ bucket.id }}"><input id="s3-list-{{ bucket.id }}" type="checkbox" name="list" value="on"{% if bucket.list %} checked{% endif %}{% if !s3.allow_anonymous %} disabled{% endif %}><span>{{ chrome.t.s3_anon_list }}</span></label>
+            <button class="btn sm" type="submit"{% if !s3.allow_anonymous %} disabled{% endif %}>{{ chrome.t.save }}</button>
+          </form>
+          {%- if !s3.allow_anonymous && bucket.is_public() %}
+          <form method="post" action="/account/s3/buckets/{{ bucket.id }}/anonymous" class="mt-6"><input type="hidden" name="csrf" value="{{ chrome.csrf }}"><input type="hidden" name="anonymous" value="private"><button class="btn sm" type="submit">{{ chrome.t.s3_make_private }}</button></form>
+          {%- endif %}</td>
+          <td class="end"><form method="post" action="/account/s3/buckets/{{ bucket.id }}/delete"><input type="hidden" name="csrf" value="{{ chrome.csrf }}"><button class="btn danger sm" type="submit">{{ chrome.t.s3_remove_bucket }}</button></form></td></tr>
+      {%- endfor %}
+      </tbody>
+    </table></div>
+    {%- endif %}
+    <div class="panel-body sep">
+      <form method="post" action="/account/s3/buckets">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <h3>{{ chrome.t.s3_new_bucket }}</h3>
+        <p class="muted small">{{ s3.new_bucket_note }}</p>
+        <label class="field" for="s3-bucket-name"><span>{{ chrome.t.s3_bucket_name }}</span><input id="s3-bucket-name" class="mono-input" type="text" name="name" value="{{ s3.forms.bucket_name }}" required minlength="3" maxlength="63" placeholder="photos"><small>{{ chrome.t.s3_bucket_name_hint }}</small></label>
+        <button class="btn primary" type="submit">{{ chrome.t.s3_create_bucket }}</button>
+      </form>
+      <form method="post" action="/account/s3/buckets/bind" class="mt-20">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <h3>{{ chrome.t.s3_bind_title }}</h3>
+        <p class="muted small">{{ chrome.t.s3_bind_note }}</p>
+        <div class="row">
+          <label class="field" for="s3-bind-name"><span>{{ chrome.t.s3_bucket_name }}</span><input id="s3-bind-name" class="mono-input" type="text" name="name" value="{{ s3.forms.bind_name }}" required minlength="3" maxlength="63" placeholder="media"></label>
+          <label class="field" for="s3-bind-folder"><span>{{ chrome.t.folder }}</span><input id="s3-bind-folder" class="mono-input" type="text" name="folder" value="{{ s3.forms.bind_folder }}" required placeholder="/Media"></label>
+        </div>
+        <button class="btn" type="submit">{{ chrome.t.s3_bind }}</button>
+      </form>
+    </div>
+  </section>
+  <section class="panel" aria-labelledby="s3-keys-title">
+    <div class="panel-head"><div><h2 id="s3-keys-title">{{ chrome.t.s3_keys }}</h2><p class="muted small">{{ chrome.t.s3_keys_note }}</p></div></div>
+    {%- if s3.keys.is_empty() %}
+    <div class="empty">{{ chrome.t.s3_no_keys }}</div>
+    {%- else %}
+    <div class="table-wrap"><table>
+      <thead><tr><th>{{ chrome.t.label }}</th><th>{{ chrome.t.access }}</th><th>{{ chrome.t.last_used }}</th><th class="end"></th></tr></thead>
+      <tbody>
+      {%- for key in s3.keys %}
+        <tr><td><b>{{ key.label }}</b><div class="small nowrap"><code>{{ key.access_key_id }}</code></div><div class="muted small nowrap">{{ key.created }}</div></td>
+          <td>{% if key.grants.is_empty() %}<span class="muted small">{{ chrome.t.s3_key_no_access }}</span>{% else %}<div class="chips">{% for grant in key.grants %}<span class="chip">{{ grant.bucket }} <span class="perm">{{ grant.permission }}</span></span>{% endfor %}</div>{% endif %}</td>
+          <td class="num">{{ key.last_used }}<div class="muted small">{{ key.expiry }}</div></td>
+          <td class="end"><form method="post" action="/account/s3/keys/{{ key.id }}/delete"><input type="hidden" name="csrf" value="{{ chrome.csrf }}"><button class="btn danger sm" type="submit">{{ chrome.t.revoke }}</button></form></td></tr>
+      {%- endfor %}
+      </tbody>
+    </table></div>
+    {%- endif %}
+  </section>
+  <section class="panel" aria-labelledby="s3-new-key-title">
+    <div class="panel-head"><div><h2 id="s3-new-key-title">{{ chrome.t.s3_new_key }}</h2><p class="muted small">{{ chrome.t.s3_new_key_note }}</p></div></div>
+    <div class="panel-body">
+      <form method="post" action="/account/s3/keys">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <div class="row">
+          <label class="field" for="s3-key-label"><span>{{ chrome.t.label }}</span><input id="s3-key-label" type="text" name="label" value="{{ s3.forms.key_label }}" required maxlength="100" placeholder="rclone"></label>
+          <label class="field" for="s3-key-expires"><span>{{ chrome.t.expires_after }}</span><input id="s3-key-expires" type="number" name="expires_in_days" value="{{ s3.forms.key_expires_in_days }}" min="1" max="3650" placeholder="{{ chrome.t.never }}"></label>
+        </div>
+        <fieldset class="scope"><legend>{{ chrome.t.access }}</legend>
+          <div class="choices">
+            <label class="choice" for="s3-access-all"><input id="s3-access-all" type="radio" name="access" value="all"{% if s3.forms.key_access != "buckets" %} checked{% endif %}><span><b>{{ chrome.t.s3_access_everything }}</b><span>{{ chrome.t.s3_access_everything_note }}</span></span></label>
+            {%- if !s3.grants.is_empty() %}
+            <label class="choice" for="s3-access-buckets"><input id="s3-access-buckets" type="radio" name="access" value="buckets"{% if s3.forms.key_access == "buckets" %} checked{% endif %}><span><b>{{ chrome.t.s3_access_chosen }}</b><span>{{ chrome.t.s3_access_chosen_note }}</span></span></label>
+            {%- endif %}
+          </div>
+          {%- if !s3.grants.is_empty() %}
+          <div class="mounts">
+            <div class="grant-row mount-head"><span>{{ chrome.t.s3_bucket }}</span><span>{{ chrome.t.access }}</span></div>
+            {%- for grant in s3.grants %}
+            <div class="grant-row"><label class="mono" for="s3-grant-{{ grant.id }}">{{ grant.name }}</label><select id="s3-grant-{{ grant.id }}" name="bucket_{{ grant.id }}"><option value=""{% if grant.permission != "view" && grant.permission != "full" %} selected{% endif %}>{{ chrome.t.s3_grant_none }}</option><option value="view"{% if grant.permission == "view" %} selected{% endif %}>view</option><option value="full"{% if grant.permission == "full" %} selected{% endif %}>full</option></select></div>
+            {%- endfor %}
+          </div>
+          {%- endif %}
+        </fieldset>
+        <button class="btn primary" type="submit">{{ chrome.t.s3_create_key }}</button>
+      </form>
+    </div>
+  </section>
+</div>
+{%- endblock %}
