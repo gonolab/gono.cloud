@@ -3,7 +3,7 @@
 //!
 //! | Request | Page or action |
 //! |---|---|
-//! | `GET /account/` | Overview: the account's services, its email address, two-step verification, display name and web login password. |
+//! | `GET /account/` | Overview: the account's services, its email address, its WeChat, two-step verification, display name and web login password. |
 //! | `GET /account/webdav` | WebDAV: the addresses clients connect to, and the user's app passwords. |
 //! | `GET /account/s3` | S3: the user's buckets and access keys (see [`s3`]). |
 //! | `GET /account/direct` | Direct connections: the devices registered for remote access. |
@@ -11,6 +11,7 @@
 //! | `POST /account/display-name` | Change the display name. |
 //! | `POST /account/password` | Change the web login password (needs the current one). The other browser sessions end; this one stays. |
 //! | `POST /account/email`, `POST /account/email/confirm`, `POST /account/email/remove` | Add, replace or remove the email address with a mailed code (see [`email`]). |
+//! | `POST /account/wechat`, `POST /account/wechat/unbind` | Show a QR code that binds WeChat for the mini program, or unbind it (see [`wechat`]). |
 //! | `POST /account/app-passwords` | Create an app password, then show it once at `/account/created`. |
 //! | `POST /account/app-passwords/<id>/delete` | Revoke one of the user's app passwords. |
 //! | `GET /account/devices/<endpoint id>/revoke` | The second confirmation of revoking a device for remote access. |
@@ -60,6 +61,7 @@
 pub(crate) mod email;
 pub(crate) mod relay;
 pub(crate) mod s3;
+pub(crate) mod wechat;
 
 use std::{
     collections::HashMap,
@@ -371,6 +373,7 @@ struct OverviewPage {
     frame: AccountFrame,
     services: Vec<ServiceLine>,
     email: email::EmailView,
+    wechat: wechat::WeChatView,
     display_name: String,
     two_factor: TwoFactorView,
 }
@@ -637,11 +640,16 @@ async fn render(state: &AppState, visitor: &Visitor, options: PageOptions) -> Re
                 Ok(view) => view,
                 Err(err) => return internal(visitor, "email address", &err),
             };
+            let wechat = match wechat::view(state, visitor, now).await {
+                Ok(view) => view,
+                Err(err) => return internal(visitor, "WeChat", &err),
+            };
             let page = OverviewPage {
                 chrome,
                 frame,
                 services: service_lines(state, visitor),
                 email,
+                wechat,
                 display_name: visitor.user.display_name.clone(),
                 two_factor,
             };
@@ -1414,6 +1422,7 @@ fn notice(state: &AppState, t: &'static Text, tab: Tab, done: &str) -> Option<St
         }
         (Tab::Overview, "two-factor-off") => t.notice_tf_off_optional,
         (Tab::Overview, done) if done.starts_with("email-") => email::notice(t, done)?,
+        (Tab::Overview, done) if done.starts_with("wechat-") => wechat::notice(t, done)?,
         (Tab::Webdav, "revoked") => t.notice_revoked,
         (Tab::S3, done) => s3::notice(t, done)?,
         (Tab::Direct, "device-revoked") => t.notice_device_revoked,

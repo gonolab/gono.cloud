@@ -28,6 +28,9 @@
 //!   sign-in page `/login`, `/logout`, the theme switch and the assets of every HTML page:
 //!   see [`crate::site`]; resetting a forgotten password by mail under `/login/forgot` and
 //!   `/login/reset`, when `smtp.enabled` as well: see [`crate::recovery`].
+//! - The WeChat mini program's API under `/gono/v1/wechat/`, the page of its QR links below
+//!   `/q/` and its verification file, when `wechat.enabled`: see [`crate::wechat`]. Without
+//!   it, every path below `/gono/v1/wechat/` answers `404 {"error":"not_found"}`.
 //!
 //! Every response to a WebDAV request passes [`OcHeadersLayer`], which adds the `OC-ETag`,
 //! `OC-FileId` and `X-NC-Permissions` headers, and [`DavPrefixLayer`], which writes the `DAV:`
@@ -75,6 +78,7 @@ use crate::{
     s3::S3Ui,
     site,
     web::{self, Web},
+    wechat,
 };
 
 /// State shared by all request handlers.
@@ -110,6 +114,9 @@ pub struct AppState {
     /// Outgoing mail, when `smtp.enabled`: the codes that bind email addresses and reset
     /// passwords ([`crate::mail`]). Without it, the pages offer neither.
     pub mailer: Option<Arc<dyn crate::mail::Mailer>>,
+    /// The WeChat mini program, when `wechat.enabled` ([`crate::wechat`]). Without it, the
+    /// account page offers no binding and the mini program's API answers `not_found`.
+    pub wechat: Option<Arc<wechat::WeChat>>,
 }
 
 impl AppState {
@@ -226,6 +233,7 @@ pub fn router(state: AppState) -> Router {
     if let Some(admin) = &state.admin {
         router = router.merge(admin::routes(admin.prefix()));
     }
+    router = router.merge(wechat::routes(state.wechat.as_deref()));
     // The pages every browser UI shares; `/login` and `/logout` answer 404 without the file UI.
     router = router
         .route("/", get(site::root))
@@ -587,6 +595,7 @@ mod tests {
             connect: None,
             s3: None,
             mailer: None,
+            wechat: None,
         };
         Fixture {
             dir,

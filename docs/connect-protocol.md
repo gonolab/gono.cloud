@@ -1364,6 +1364,7 @@ clipboard, no screen, no file names, and no addresses published by devices.
 | `recovery_code.used`, `recovery_codes.renewed` | 13.4 | user | client IP |
 | `email.bound`, `email.removed` | The account's email address is added or replaced, or removed, on the account page (`docs/deployment.md`, "Email") | user | client IP (never the address) |
 | `password.reset` | The web login password is reset with a code mailed to the account's address | user | client IP |
+| `wechat.bound`, `wechat.unbound` | The account's WeChat is bound by the mini program with a ticket of the account page, or unbound on the account page (`docs/wechat-miniprogram.md`) | user | AppID, client IP (never the openid) |
 | `s3.key.created`, `s3.key.revoked` | An S3 access key is created or revoked (`docs/s3.md`) | user, admin, CLI | access key id, label, grants and expiry; client IP; the admin |
 | `s3.bucket.created`, `s3.bucket.removed` | An S3 bucket is created (a new folder) or bound (an existing one), or removed | user, admin, CLI | bucket name, whether the folder is new; client IP, or the access key id through the S3 API; the admin |
 | `s3.bucket.anonymous` | The anonymous access of an S3 bucket changes | user, admin, CLI | bucket name, anonymous access, listing; client IP, or the access key id through the S3 API; the admin |

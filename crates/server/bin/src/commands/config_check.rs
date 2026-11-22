@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use gono_server_core::{
-    config::{DbConfig, RelayConfig, S3Config, SmtpConfig},
+    config::{DbConfig, RelayConfig, S3Config, SmtpConfig, WeChatConfig},
     db::Backend,
 };
 
@@ -85,6 +85,10 @@ pub fn run(config_path: &Path) -> anyhow::Result<()> {
     if config.smtp.enabled {
         settings.extend(smtp_settings(&config.smtp));
     }
+    settings.push(("wechat.enabled", config.wechat.enabled.to_string()));
+    if config.wechat.enabled {
+        settings.extend(wechat_settings(&config.wechat));
+    }
     for (key, value) in settings {
         println!("  {key:<31} {value}");
     }
@@ -158,6 +162,46 @@ fn smtp_settings(smtp: &SmtpConfig) -> Vec<(&'static str, String)> {
             }),
         ),
         ("smtp.from", smtp.from.clone().unwrap_or_else(none)),
+    ]
+}
+
+/// A file of the configuration, and whether it is missing.
+fn file_setting(file: Option<&Path>, none: &str) -> String {
+    file.map_or_else(
+        || none.to_owned(),
+        |file| {
+            format!(
+                "{}{}",
+                file.display(),
+                if file.exists() { "" } else { " (missing)" }
+            )
+        },
+    )
+}
+
+/// The effective settings of the enabled mini program. The AppSecret's file is named, never
+/// read here.
+fn wechat_settings(wechat: &WeChatConfig) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "wechat.app_id",
+            wechat.app_id.clone().unwrap_or_else(|| "(none)".to_owned()),
+        ),
+        (
+            "wechat.secret_file",
+            file_setting(wechat.secret_file.as_deref(), "(none)"),
+        ),
+        (
+            "wechat.qr_url_prefix",
+            wechat
+                .qr_url_prefix
+                .as_ref()
+                .map_or_else(|| "(none)".to_owned(), ToString::to_string),
+        ),
+        (
+            "wechat.verify_file",
+            file_setting(wechat.verify_file.as_deref(), "(none)"),
+        ),
     ]
 }
 

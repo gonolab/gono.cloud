@@ -86,6 +86,9 @@ pub struct Config {
     /// `[smtp]`: the mail server that sends the codes of email addresses and password resets.
     #[serde(default)]
     pub smtp: SmtpConfig,
+    /// `[wechat]`: the WeChat mini program whose users bind and sign in to their accounts.
+    #[serde(default)]
+    pub wechat: WeChatConfig,
 }
 
 /// `[server]` table.
@@ -707,6 +710,91 @@ impl Default for SmtpConfig {
     }
 }
 
+/// `[wechat]` table: the WeChat mini program whose users bind their WeChat to their accounts
+/// on the account page and then sign in with it (`docs/wechat-miniprogram.md`). Off by
+/// default: the account page says that the server does not offer it, and the mini program's
+/// API under `/gono/v1/wechat/` answers `not_found`.
+///
+/// The AppSecret never goes into the configuration: it is the first line of `secret_file`, read
+/// when `serve` starts.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WeChatConfig {
+    /// Serve the mini program's API, the WeChat panel of the account page and the pages of the
+    /// QR links.
+    pub enabled: bool,
+    /// The mini program's AppID: `wx` and 16 letters or digits. Required when enabled.
+    pub app_id: Option<String>,
+    /// A file holding the mini program's AppSecret: its first line, without the line break.
+    /// Relative paths are resolved against the configuration file's directory. Required when
+    /// enabled.
+    pub secret_file: Option<PathBuf>,
+    /// The prefix of the QR links that open the mini program, as configured in its admin
+    /// console under "扫普通链接二维码打开小程序" (scan ordinary QR codes to open the mini
+    /// program): an `https://` URL ending in `/`, for example `https://cloud.example.com/q/`.
+    /// Binding links are `<prefix>bind/<ticket>`. Its host may differ from `server.base_url`'s:
+    /// mini programs need a domain with an ICP filing, which another host may front. Required
+    /// when enabled.
+    pub qr_url_prefix: Option<Url>,
+    /// The verification file WeChat gives for the QR link rule, served at `/<its file name>`
+    /// with its exact content while enabled. Relative paths are resolved against the
+    /// configuration file's directory. Optional.
+    pub verify_file: Option<PathBuf>,
+}
+
+/// The longest `wechat.qr_url_prefix` accepted, in bytes: the QR codes of its links stay easy
+/// to scan.
+pub const MAX_QR_URL_PREFIX_BYTES: usize = 200;
+
+/// Checks `wechat.qr_url_prefix`: `https`, a host, no credentials, query or fragment, a path
+/// that ends with `/`, at most [`MAX_QR_URL_PREFIX_BYTES`].
+fn check_qr_url_prefix(url: &Url) -> Result<(), String> {
+    if url.scheme() != "https" {
+        return Err(format!(
+            "must be an https URL (mini programs open https links only), got {:?}",
+            url.scheme()
+        ));
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err("must include a host".to_owned());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("must not contain credentials".to_owned());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("must not contain a query string or fragment".to_owned());
+    }
+    if !url.path().ends_with('/') {
+        return Err(format!(
+            "must end with '/', as the rule in the mini program's console does, for example \
+             \"https://cloud.example.com/q/\" (got {:?})",
+            url.path()
+        ));
+    }
+    if url.as_str().len() > MAX_QR_URL_PREFIX_BYTES {
+        return Err(format!(
+            "must be at most {MAX_QR_URL_PREFIX_BYTES} bytes long, so that its QR codes stay \
+             easy to scan"
+        ));
+    }
+    Ok(())
+}
+
+/// The name under which `wechat.verify_file` is served, `/<name>`: the file name, if it is
+/// letters, digits, `-`, `_` and `.`, ends with `.txt` and does not start with `.` (WeChat's
+/// are `<random>.txt`), so that it can never name another page of the server.
+pub fn verify_file_name(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    (name.len() > 4
+        && name.len() <= 128
+        && name.ends_with(".txt")
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')))
+    .then_some(name)
+}
+
 /// Whether `host` names this host: a loopback address or `localhost`.
 fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
@@ -894,6 +982,8 @@ impl Config {
             self.relay.tls_cert.as_mut(),
             self.relay.tls_key.as_mut(),
             self.smtp.password_file.as_mut(),
+            self.wechat.secret_file.as_mut(),
+            self.wechat.verify_file.as_mut(),
         ]
         .into_iter()
         .flatten()
@@ -995,6 +1085,9 @@ impl Config {
 
         // [smtp]
         self.validate_smtp(&mut reject);
+
+        // [wechat]
+        self.validate_wechat(&mut reject);
 
         if issues.is_empty() {
             Ok(())
@@ -1312,6 +1405,65 @@ impl Config {
         }
     }
 
+    /// Checks the `[wechat]` table. Values that are set are always checked; what the mini
+    /// program needs is only required once it is enabled.
+    fn validate_wechat(&self, reject: &mut impl FnMut(&'static str, String)) {
+        let wechat = &self.wechat;
+        match &wechat.app_id {
+            Some(app_id) if !crate::wechat::is_app_id(app_id) => reject(
+                "wechat.app_id",
+                format!(
+                    "{app_id:?} is not the AppID of a mini program: \"wx\" and 16 letters or \
+                     digits, as its admin console shows it"
+                ),
+            ),
+            None if wechat.enabled => {
+                reject(
+                    "wechat.app_id",
+                    "is required when wechat.enabled".to_owned(),
+                );
+            }
+            _ => {}
+        }
+        match &wechat.secret_file {
+            Some(file) if file.as_os_str().is_empty() => {
+                reject("wechat.secret_file", "must not be empty".to_owned());
+            }
+            None if wechat.enabled => reject(
+                "wechat.secret_file",
+                "is required when wechat.enabled: the file that holds the mini program's \
+                 AppSecret"
+                    .to_owned(),
+            ),
+            _ => {}
+        }
+        match &wechat.qr_url_prefix {
+            Some(url) => {
+                if let Err(message) = check_qr_url_prefix(url) {
+                    reject("wechat.qr_url_prefix", message);
+                }
+            }
+            None if wechat.enabled => reject(
+                "wechat.qr_url_prefix",
+                "is required when wechat.enabled, for example \"https://cloud.example.com/q/\""
+                    .to_owned(),
+            ),
+            None => {}
+        }
+        if let Some(file) = &wechat.verify_file
+            && verify_file_name(file).is_none()
+        {
+            reject(
+                "wechat.verify_file",
+                format!(
+                    "{} is not a verification file of WeChat: its name must be letters, digits, \
+                     '-', '_' and '.' ending in .txt, as WeChat names it",
+                    file.display()
+                ),
+            );
+        }
+    }
+
     /// Checks `s3.website_domain`: a DNS name of its own, below which no other host of this
     /// server lies and which is neither the virtual-hosted domain nor below or above it.
     fn validate_website_domain(&self, domain: &str, reject: &mut impl FnMut(&'static str, String)) {
@@ -1527,6 +1679,27 @@ impl Config {
                         .to_owned(),
                 ),
                 _ => {}
+            }
+        }
+
+        let wechat = &self.wechat;
+        if wechat.enabled {
+            if !self.files_ui.enabled {
+                warnings.push(
+                    "wechat.enabled is true, but nothing binds WeChat to an account: the WeChat \
+                     panel is on the account page, part of the web file UI that \
+                     files_ui.enabled turns off"
+                        .to_owned(),
+                );
+            }
+            if let Some(url) = wechat.qr_url_prefix.as_ref().filter(|url| {
+                url.host_str() == self.server.base_url.host_str() && !url.path().starts_with("/q/")
+            }) {
+                warnings.push(format!(
+                    "wechat.qr_url_prefix {url} is on server.base_url's host but outside /q/: a \
+                     browser that opens one of its links gets 404 instead of the page that says \
+                     to scan the code with WeChat"
+                ));
             }
         }
         warnings
@@ -2629,6 +2802,142 @@ mod tests {
         );
         // Off, nothing is warned about.
         let mut off = with_smtp("port = 587");
+        off.files_ui.enabled = false;
+        assert!(off.warnings().is_empty());
+    }
+
+    /// Parses `MINIMAL` with a `[wechat]` table holding `body`.
+    fn with_wechat(body: &str) -> Config {
+        parse(&format!("{MINIMAL}\n[wechat]\n{body}\n"))
+    }
+
+    const WECHAT: &str = "enabled = true\napp_id = \"wxd930ea5d5a258f4f\"\n\
+                          secret_file = \"wechat-secret\"\n\
+                          qr_url_prefix = \"https://cloud.example.com/q/\"";
+
+    #[test]
+    fn wechat_is_off_by_default() {
+        let wechat = parse(MINIMAL).wechat;
+        assert!(!wechat.enabled);
+        assert_eq!(wechat.app_id, None);
+        assert_eq!(wechat.secret_file, None);
+        assert_eq!(wechat.qr_url_prefix, None);
+        assert_eq!(wechat.verify_file, None);
+        assert!(issue_keys(&with_wechat("")).is_empty());
+    }
+
+    #[test]
+    fn enabled_wechat_needs_an_app_id_a_secret_and_a_prefix() {
+        let mut keys = issue_keys(&with_wechat("enabled = true"));
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "wechat.app_id",
+                "wechat.qr_url_prefix",
+                "wechat.secret_file"
+            ]
+        );
+        let config = with_wechat(WECHAT);
+        assert!(issue_keys(&config).is_empty());
+        assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+        // Unknown keys are refused, the secret itself among them.
+        assert!(
+            Config::from_toml(&format!("{MINIMAL}\n[wechat]\n{WECHAT}\nsecret = \"x\"\n")).is_err()
+        );
+    }
+
+    #[test]
+    fn wechat_values_are_checked() {
+        let app_id =
+            |value: &str| issue_keys(&with_wechat(&WECHAT.replace("wxd930ea5d5a258f4f", value)));
+        assert!(app_id("wx0123456789ABCDEF").is_empty());
+        for invalid in ["", "wx123", "wxd930ea5d5a258f4f0", "gh_d930ea5d5a25"] {
+            assert_eq!(app_id(invalid), ["wechat.app_id"], "{invalid}");
+        }
+        let prefix = |value: &str| {
+            issue_keys(&with_wechat(
+                &WECHAT.replace("https://cloud.example.com/q/", value),
+            ))
+        };
+        for valid in [
+            "https://mp.example.cn/q/",
+            "https://cloud.example.com/",
+            "https://cloud.example.com:8443/q/open/",
+        ] {
+            assert!(prefix(valid).is_empty(), "{valid}");
+        }
+        let long = format!("https://cloud.example.com/{}/", "a".repeat(200));
+        for invalid in [
+            "http://cloud.example.com/q/",
+            "https://cloud.example.com/q",
+            "https://user@cloud.example.com/q/",
+            "https://cloud.example.com/q/?a=b",
+            "https://cloud.example.com/q/#x",
+            &long,
+        ] {
+            assert_eq!(prefix(invalid), ["wechat.qr_url_prefix"], "{invalid}");
+        }
+        let verify =
+            |value: &str| issue_keys(&with_wechat(&format!("{WECHAT}\nverify_file = {value:?}")));
+        for valid in ["AbC123.txt", "/etc/gono-cloud/x_y-z.1.txt"] {
+            assert!(verify(valid).is_empty(), "{valid}");
+        }
+        for invalid in [
+            "",
+            "verify.html",
+            ".txt",
+            ".hidden.txt",
+            "a b.txt",
+            "a%2F.txt",
+        ] {
+            assert_eq!(verify(invalid), ["wechat.verify_file"], "{invalid}");
+        }
+        assert_eq!(
+            verify_file_name(Path::new("/etc/gono-cloud/MP_verify_abc.txt")),
+            Some("MP_verify_abc.txt")
+        );
+        // Values are checked also while the mini program is off.
+        assert_eq!(
+            issue_keys(&with_wechat("app_id = \"wx1\"")),
+            ["wechat.app_id"]
+        );
+    }
+
+    #[test]
+    fn wechat_files_resolve_against_the_config_directory() {
+        let mut config = with_wechat(&format!("{WECHAT}\nverify_file = \"abc.txt\""));
+        config.resolve_relative_paths(Path::new("/etc/gono-cloud"));
+        assert_eq!(
+            config.wechat.secret_file.as_deref(),
+            Some(Path::new("/etc/gono-cloud/wechat-secret"))
+        );
+        assert_eq!(
+            config.wechat.verify_file.as_deref(),
+            Some(Path::new("/etc/gono-cloud/abc.txt"))
+        );
+    }
+
+    #[test]
+    fn wechat_warns_about_a_missing_file_ui_and_links_outside_q() {
+        let mut config = with_wechat(WECHAT);
+        config.files_ui.enabled = false;
+        let warnings = config.warnings();
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("files_ui.enabled"),
+            "{warnings:?}"
+        );
+        let outside = with_wechat(&WECHAT.replace("/q/", "/open/"));
+        let warnings = outside.warnings();
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("/q/"),
+            "{warnings:?}"
+        );
+        // Another host serves its own pages.
+        let fronted = with_wechat(&WECHAT.replace("cloud.example.com/q/", "mp.example.cn/open/"));
+        assert!(fronted.warnings().is_empty(), "{:?}", fronted.warnings());
+        // Off, nothing is warned about.
+        let mut off = with_wechat(&WECHAT.replace("enabled = true", "enabled = false"));
         off.files_ui.enabled = false;
         assert!(off.warnings().is_empty());
     }

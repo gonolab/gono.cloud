@@ -28,6 +28,27 @@ compatible within a major version: released clients keep working with newer serv
   `smtp.password_file`; unencrypted SMTP only to a mail server on this host. `config check`
   shows the settings without the password, and the admin UI shows each account's address. See
   "Email" in `docs/deployment.md`.
+- **WeChat mini program sign-in** (`[wechat]`, off by default): users bind their WeChat to their
+  account and then sign in to the mini program of `wechat.app_id` with it. On the account
+  page's overview ("WeChat") the user enters the web login password and gets a QR code of
+  `<qr_url_prefix>bind/<ticket>`, valid for 10 minutes and once (a new one ends the previous
+  one); the mini program that scans it exchanges its `wx.login()` code with WeChat
+  (`jscode2session`) through `POST /gono/v1/wechat/session`, which answers a session for a
+  bound WeChat and a signup token otherwise, and binds with `POST /gono/v1/wechat/bind`. An
+  account has one WeChat of the AppID, and a WeChat one account. `session` and `bind` take only
+  the scenes of scanning (1011, 1047) on a phone (`ios`, `android`, `ohos`) and refuse others
+  with `wrong_scene` or `desktop_client`, a safeguard against forwarded codes. A session
+  (`Authorization: Bearer`, 30 days after its last use, at most 5 per WeChat) reads the
+  account's name and services through `GET /gono/v1/wechat/account` and nothing else, and ends
+  with `POST /gono/v1/wechat/logout`, unbinding (with the password, on the same page), and
+  disabling or deleting the account. Failures are limited per client address like sign-ins.
+  Tickets and tokens are stored only as digests; codes, tokens, openids and the AppSecret
+  (read from `wechat.secret_file`) are never logged, WeChat's `session_key` is never kept. Any
+  path below `/q/` answers a page that says to scan the code with WeChat, and
+  `wechat.verify_file` serves the console's verification file at `/<its name>`. The audit log
+  records `wechat.bound` and `wechat.unbound` (the AppID, never the openid); `config check`
+  shows the settings without the secret, and the admin UI shows whether each account's WeChat
+  is bound. See `docs/wechat-miniprogram.md` and "WeChat" in `docs/deployment.md`.
 - **Services per account**: every account has five switches, all off for new accounts, the
   first admin included: `files` (the web file UI), `webdav` (WebDAV and the other endpoints of
   Nextcloud clients), `s3` (the S3 API), `direct` (remote access for devices, with the relay at

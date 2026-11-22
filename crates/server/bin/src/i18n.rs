@@ -579,6 +579,20 @@ texts! {
     err_email_too_soon: "A code was sent less than a minute ago. Try again in {} seconds.", "一分钟内已经发送过验证码，请 {} 秒后再试。";
     err_email_daily: "Too many codes were sent today. Try again tomorrow.", "今天发送的验证码太多了，请明天再试。";
     err_email_send: "The mail could not be sent. Try again later.", "邮件发送失败，请稍后再试。";
+    wechat_title: "WeChat", "微信";
+    wechat_note: "Bind your WeChat to use this account in this server's WeChat mini program. The mini program sees your name and services, never your files.", "绑定微信后，可以在本服务器的微信小程序中使用这个账号。小程序只能看到你的名称和服务，看不到你的文件。";
+    wechat_unavailable: "This server does not offer a WeChat mini program.", "本服务器没有提供微信小程序。";
+    wechat_none: "No WeChat bound yet.", "还没有绑定微信。";
+    wechat_bound: "Bound since {}.", "已绑定，绑定时间：{}。";
+    wechat_show: "Show QR code", "显示二维码";
+    wechat_show_again: "New QR code", "重新生成二维码";
+    wechat_show_note: "The QR code binds the WeChat that scans it to this account. Your web login password is needed to show it.", "二维码会把扫描它的微信绑定到这个账号。显示二维码需要网页登录密码。";
+    wechat_scan: "Scan this code with WeChat on your phone before {}. It works once; do not share it: whoever scans it gets this account in the mini program.", "请在 {} 之前用手机微信扫描这个二维码。它只能使用一次，请勿分享：扫描它的人会在小程序中获得这个账号。";
+    wechat_unbind: "Unbind WeChat", "解除绑定";
+    wechat_unbind_note: "Unbinding needs your web login password and signs the mini program out.", "解除绑定需要网页登录密码，小程序会随之退出登录。";
+    notice_wechat_ticket: "The QR code is ready. Scan it with WeChat.", "二维码已生成，请用微信扫描。";
+    notice_wechat_unbound: "WeChat was unbound, and the mini program is signed out.", "已解除微信绑定，小程序已退出登录。";
+    err_wechat_bound: "This account has WeChat bound already.", "这个账号已经绑定了微信。";
 
     // Account: S3
     s3_title: "S3 buckets", "S3 存储桶";
@@ -856,6 +870,8 @@ texts! {
     a_user_id: "User id", "用户 id";
     a_changed: "Changed", "修改时间";
     a_email_none: "None", "无";
+    a_wechat_bound: "Bound since {} ({})", "已绑定：{}（{}）";
+    a_wechat_none: "Not bound", "未绑定";
     a_display_name_note: "The name clients show for this account.", "客户端为这个账号显示的名称。";
     a_change_display_name: "Change display name", "修改显示名称";
     a_password_note: "Used for the web pages, Login Flow and this admin UI. Setting it signs the user out of open browser sessions.", "用于网页、Login Flow 和管理界面。设置后该用户已打开的浏览器会话都会退出。";
@@ -891,6 +907,10 @@ texts! {
     a_new_app_password_crumb: "New app password", "新建 app password";
     a_nothing_to_show: "Nothing to show", "没有可显示的内容";
     a_nothing_to_show_lead: "A new app password is shown only once, right after it was created. Create another one if it was not written down.", "新的 app password 只在创建后显示一次。如果没有记下，请再创建一个。";
+
+    // The page of the WeChat mini program's QR links, opened in a browser
+    scan_title: "Scan this code with WeChat", "请用微信扫描这个二维码";
+    scan_lead: "This link belongs to a QR code of a WeChat mini program. Open WeChat on your phone, tap Scan and point it at the code: a browser cannot open it, and nothing happened here.", "这个链接属于一个微信小程序的二维码。请在手机上打开微信，点击“扫一扫”扫描二维码：浏览器无法打开它，这里也没有进行任何操作。";
 
     // Mail (plain text; lines stay short, so that mail programs show them as written)
     mail_bind_subject: "Gono Cloud: confirm your email address", "Gono Cloud：确认你的邮箱";

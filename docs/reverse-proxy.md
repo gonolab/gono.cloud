@@ -5,7 +5,8 @@ to terminate HTTPS. This guide shows working configurations for **nginx** and **
 explains which Gono Cloud settings have to match the proxy. It covers only the proxy; installing
 the server as a service, upgrades and backups are in [deployment.md](deployment.md). The relay
 (`[relay]`), when enabled, needs a host name and a server block of its own:
-[The relay](#the-relay).
+[The relay](#the-relay). The WeChat mini program (`[wechat]`) may have one too:
+[The WeChat mini program](#the-wechat-mini-program).
 
 ## What the proxy has to do
 
@@ -502,3 +503,89 @@ curl -i https://s3.example.com/
 aws --endpoint-url https://s3.example.com s3 ls
 ```
 
+
+## The WeChat mini program
+
+With `wechat.enabled`, Gono Cloud serves the API of a WeChat mini program
+([deployment.md](deployment.md#wechat), [wechat-miniprogram.md](wechat-miniprogram.md)) on the
+same `server.bind` as everything else. These paths have to reach it:
+
+| Path | What it is |
+|---|---|
+| `/gono/v1/wechat/` and below | The mini program's API, on the host it sends its requests to (a request domain of its console). |
+| `/q/` and below | The QR links of `wechat.qr_url_prefix`: a browser that opens one gets a page that says to scan the code with WeChat. |
+| `/<file name>` of `wechat.verify_file` | WeChat's verification file of the QR link rule, at the root of `qr_url_prefix`'s host. |
+| `/apps/assets/` and below | The stylesheet, script and icon of that page, which every page of the server loads. |
+
+On `base_url`'s host the configurations above already forward all of it: `location /` and
+`reverse_proxy` pass every path. Restricting paths there (an allow list of locations, a WAF)
+must leave these open.
+
+WeChat accepts only host names with an ICP filing, so the mini program's host may be another
+one than `base_url`'s, for example `mp.example.cn`. Forward only these paths on it, unchanged,
+and keep `/q/` as the prefix's path (`qr_url_prefix = "https://mp.example.cn/q/"`). The host
+needs a certificate of its own; `base_url` stays the origin of the pages, so the account page,
+the sign-in and everything else remain on `base_url`'s host.
+
+### nginx
+
+```nginx
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name mp.example.cn;
+
+    ssl_certificate     /etc/letsencrypt/live/mp.example.cn/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/mp.example.cn/privkey.pem;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # The mini program's API, the page of its QR links with its assets, and the verification
+    # file (its name as WeChat gave it, the file name of wechat.verify_file).
+    location ~ ^/(gono/v1/wechat/|q/|apps/assets/|AbCdEf1234\.txt$) {
+        proxy_pass http://gono_cloud;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    location / {
+        return 404;
+    }
+}
+```
+
+The requests carry at most 4 KiB, so this block needs none of the main block's settings for
+large bodies and long transfers. The `gono_cloud` upstream is the main configuration's.
+
+### Caddy
+
+```caddyfile
+mp.example.cn {
+	header Strict-Transport-Security "max-age=31536000"
+
+	@wechat path /gono/v1/wechat/* /q/* /apps/assets/* /AbCdEf1234.txt
+	handle @wechat {
+		reverse_proxy 127.0.0.1:16102
+	}
+	handle {
+		respond 404
+	}
+}
+```
+
+### Checking the mini program
+
+```sh
+# The API answers: expect 401 and {"error":"not_signed_in"}. 404 {"error":"not_found"} means
+# [wechat] is off; a 404 page of the proxy means the path is not forwarded.
+curl -si https://mp.example.cn/gono/v1/wechat/account
+
+# The page of the QR links: expect 200.
+curl -s -o /dev/null -w '%{http_code}\n' https://mp.example.cn/q/
+
+# The verification file, exactly as WeChat gave it.
+curl -s https://mp.example.cn/AbCdEf1234.txt | cmp - /etc/gono-cloud/AbCdEf1234.txt && echo same
+```

@@ -331,8 +331,9 @@ pub async fn set_password_hash(
     Ok(())
 }
 
-/// Enables or disables an account. A disabled account cannot sign in with any credential. The
-/// last enabled admin cannot be disabled.
+/// Enables or disables an account. A disabled account cannot sign in with any credential, and
+/// disabling it ends its WeChat mini program sessions ([`crate::wechat`]), which enabling it
+/// again does not bring back. The last enabled admin cannot be disabled.
 pub async fn set_enabled(pool: &Pool, username: &Username, enabled: bool) -> Result<()> {
     let mut tx = db::begin_immediate(pool).await?;
     if !enabled {
@@ -346,6 +347,14 @@ pub async fn set_enabled(pool: &Pool, username: &Username, enabled: bool) -> Res
         .await?;
     if result.rows_affected() == 0 {
         return Err(Error::UserNotFound(username.clone()));
+    }
+    if !enabled {
+        sqlx::query(
+            "DELETE FROM mp_sessions WHERE user_id IN (SELECT id FROM users WHERE username = ?)",
+        )
+        .bind(username.as_str())
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
     Ok(())

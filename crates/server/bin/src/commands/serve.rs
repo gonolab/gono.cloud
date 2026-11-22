@@ -36,6 +36,7 @@ use crate::{
     s3::S3Ui,
     shutdown,
     web::Web,
+    wechat::WeChat,
 };
 
 /// How long the relay may take to stop once the HTTP server has.
@@ -114,6 +115,23 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
             "mail enabled: email addresses and password resets"
         );
         Some(Arc::new(mailer) as Arc<dyn Mailer>)
+    } else {
+        None
+    };
+    // The WeChat mini program: the AppSecret and the verification file are read now as well.
+    let wechat = if config.wechat.enabled {
+        let wechat = WeChat::from_config(&config.wechat)
+            .context("set up the WeChat mini program of [wechat]")?;
+        if let Some(file) = &config.wechat.secret_file {
+            warn_if_readable_by_others(file, "wechat.secret_file");
+        }
+        tracing::info!(
+            app_id = wechat.app_id(),
+            qr_url_prefix = %wechat.qr_url_prefix(),
+            verify_file = wechat.verify_file_name(),
+            "WeChat mini program enabled"
+        );
+        Some(Arc::new(wechat))
     } else {
         None
     };
@@ -332,6 +350,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         connect: connect.clone(),
         s3: S3Ui::from_config(&config.s3).map(Arc::new),
         mailer,
+        wechat,
     };
     let connect_task = connect.clone().map(|connect| tokio::spawn(connect.run()));
     let on_signal = {

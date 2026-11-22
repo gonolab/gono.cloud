@@ -285,6 +285,79 @@ fn config_check_shows_the_mail_server_but_not_its_password() {
     );
 }
 
+/// `config check` shows the mini program and names the file of its AppSecret, never the
+/// secret, and `serve` does not start without that file or with an empty one.
+#[test]
+fn config_check_shows_the_mini_program_but_not_its_secret() {
+    let instance = Instance::new();
+    let mut config = std::fs::read_to_string(instance.config()).unwrap();
+    config.push_str(
+        r#"
+        [wechat]
+        enabled = true
+        app_id = "wxd930ea5d5a258f4f"
+        secret_file = "wechat-secret"
+        qr_url_prefix = "https://cloud.example.com/q/"
+        "#,
+    );
+    std::fs::write(instance.config(), config).unwrap();
+    let secret_file = instance.dir.path().join("wechat-secret");
+
+    let check = run(&mut instance.command(&["config", "check"]));
+    assert!(check.status.success(), "{}", text(&check.stderr));
+    let shown = text(&check.stdout);
+    for expected in [
+        "wechat.enabled                  true",
+        "wechat.app_id                   wxd930ea5d5a258f4f",
+        "wechat.qr_url_prefix            https://cloud.example.com/q/",
+        "wechat.verify_file              (none)",
+    ] {
+        assert!(shown.contains(expected), "{expected} in {shown}");
+    }
+    assert!(
+        shown.contains(&format!("{} (missing)", secret_file.display())),
+        "{shown}"
+    );
+
+    assert!(instance.init().status.success());
+    let serve = run(&mut instance.command(&["serve"]));
+    assert!(!serve.status.success());
+    assert!(
+        text(&serve.stderr).contains("wechat.secret_file"),
+        "{}",
+        text(&serve.stderr)
+    );
+    std::fs::write(&secret_file, "\n").unwrap();
+    let serve = run(&mut instance.command(&["serve"]));
+    assert!(!serve.status.success());
+    assert!(
+        text(&serve.stderr).contains("is empty"),
+        "{}",
+        text(&serve.stderr)
+    );
+
+    std::fs::write(&secret_file, "0123456789abcdef0123456789abcdef\n").unwrap();
+    let shown = text(&run(&mut instance.command(&["config", "check"])).stdout);
+    assert!(!shown.contains("(missing)"), "{shown}");
+    assert!(
+        !shown.contains("0123456789abcdef"),
+        "the secret is never shown: {shown}"
+    );
+
+    // A link prefix the console would not take is refused.
+    let config = std::fs::read_to_string(instance.config())
+        .unwrap()
+        .replace("https://cloud.example.com/q/", "http://cloud.example.com/q");
+    std::fs::write(instance.config(), config).unwrap();
+    let refused = run(&mut instance.command(&["config", "check"]));
+    assert!(!refused.status.success());
+    assert!(
+        text(&refused.stderr).contains("wechat.qr_url_prefix"),
+        "{}",
+        text(&refused.stderr)
+    );
+}
+
 #[test]
 fn missing_config_files_get_a_hint() {
     let output = run(gono_cloud().args(["config", "check", "--config", "/nonexistent.toml"]));

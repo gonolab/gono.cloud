@@ -1,5 +1,6 @@
-//! QR codes as inline SVG, for the enrolment of two-step verification. The pages need no
-//! script, and the SVG has no style attributes, so the Content Security Policy stays strict.
+//! QR codes as inline SVG, for the enrolment of two-step verification and the WeChat bind
+//! tickets of the account page. The pages need no script, and the SVG has no style attributes,
+//! so the Content Security Policy stays strict.
 
 use std::fmt::Write as _;
 

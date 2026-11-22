@@ -273,3 +273,31 @@ key_file = "two-factor.key"
 
 # The sender of every mail: an address, optionally with a name. Required when enabled.
 # from = "Gono Cloud <cloud@example.com>"
+
+[wechat]
+# The WeChat mini program whose users bind their WeChat to their accounts on the account page
+# (Overview, "WeChat": a QR code to scan with WeChat) and then sign in to the mini program with
+# it. A mini program session reads the account's name and services, never its files. Off by
+# default: then the account page says that the server does not offer it. See "WeChat" in
+# docs/deployment.md and docs/wechat-miniprogram.md.
+# enabled = true
+
+# The mini program's AppID, as its admin console (mp.weixin.qq.com) shows it. Required when
+# enabled.
+# app_id = "wxd930ea5d5a258f4f"
+
+# The file that holds the mini program's AppSecret (its first line; relative paths start in this
+# file's directory). The AppSecret never goes into this file. Required when enabled.
+# secret_file = "wechat-secret"
+
+# The prefix of the QR links that open the mini program, exactly as configured in its admin
+# console under "扫普通链接二维码打开小程序": an https URL ending in "/". Binding links are
+# <prefix>bind/<ticket>. Its host may differ from base_url's (mini programs need a domain with an
+# ICP filing); on base_url's host, use /q/, where the server answers browsers that open a link.
+# Required when enabled.
+# qr_url_prefix = "https://cloud.example.com/q/"
+
+# The verification file the admin console gives for that rule, kept under the name WeChat gave
+# it (<random>.txt) and served at /<that name> with its exact content (relative paths start in
+# this file's directory). Default: unset (serve it some other way).
+# verify_file = "AbCdEf1234.txt"

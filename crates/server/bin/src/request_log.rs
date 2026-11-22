@@ -18,11 +18,13 @@ use axum::{
 
 use crate::{app::AppState, client_ip::client_ip};
 
-/// Path prefixes followed by a secret token.
+/// Path prefixes followed by a secret token. Every path below `/q/` may carry a ticket of the
+/// WeChat mini program (`/q/bind/<ticket>`).
 const TOKEN_PATHS: &[&str] = &[
     "/login/v2/flow/",
     "/index.php/login/v2/flow/",
     crate::direct::DIRECT_PATH,
+    crate::wechat::QR_PATH,
 ];
 
 /// Query parameters whose values may be logged. The web file UI's names, search texts and
@@ -112,6 +114,8 @@ mod tests {
             "/index.php/login/v2/poll?token=<redacted>&format=json"
         );
         assert_eq!(redacted("/x?flag"), "/x?flag");
+        assert_eq!(redacted("/q/bind/AbCdEfGhIjKlMnOpQrStUv"), "/q/<redacted>");
+        assert_eq!(redacted("/q/AbCdEfGhIjKlMnOpQrStUv"), "/q/<redacted>");
     }
 
     #[test]

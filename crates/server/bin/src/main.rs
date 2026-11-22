@@ -26,6 +26,7 @@ mod service_view;
 mod shutdown;
 mod site;
 mod web;
+mod wechat;
 
 use std::process::ExitCode;
 

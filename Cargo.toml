@@ -102,6 +102,10 @@ pin-project-lite = "0.2.17"
 # The QR code of two-step verification enrolment, rendered as SVG on the server.
 qrcodegen = "1.8.0"
 rand = "0.10.3"
+# The one outgoing HTTPS request of the server: WeChat's `jscode2session` (`[wechat]`). The
+# configuration iroh-relay already builds: rustls without a provider of its own, given a
+# configuration on ring with the webpki roots; no HTTP/2, no system proxy, no native-tls.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
 # HMAC-SHA-1 of TOTP and the AEAD of stored TOTP secrets; the version rustls already uses.
 ring = "0.17.14"
 rpassword = "7.5.0"
@@ -148,6 +152,8 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 ] }
 url = { version = "2.5.8", features = ["serde"] }
 uuid = { version = "1.29.2", features = ["v4"] }
+# The CA list of outgoing TLS (Mozilla's), the one every TLS client of the workspace uses.
+webpki-roots = "1.0.12"
 xml = "1.4.0"
 xmltree = "0.12.0"
 

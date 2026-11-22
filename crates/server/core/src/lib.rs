@@ -21,6 +21,8 @@
 //! - [`web_sessions`]: browser sessions of the server's HTML pages.
 //! - [`direct_downloads`]: links that let media players stream a file without credentials.
 //! - [`email`]: email addresses of accounts and the one-time codes that prove them.
+//! - [`wechat`]: WeChat mini program identities of accounts, the tickets that bind them and the
+//!   mini program's sessions.
 //! - [`s3`]: S3 buckets (names bound to folders) and S3 access keys.
 //! - [`services`]: the services an account may use, which admins turn on.
 //! - [`rescan`]: walking a user's tree on disk for `gono-cloud rescan`.
@@ -55,6 +57,7 @@ pub mod types;
 pub mod uploads;
 pub mod users;
 pub mod web_sessions;
+pub mod wechat;
 
 pub use config::Config;
 pub use error::{ConfigError, Error, Result};

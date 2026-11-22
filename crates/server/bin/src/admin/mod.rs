@@ -1330,6 +1330,10 @@ async fn user_page_response(
         Ok(email) => email,
         Err(err) => return internal_error(&session.chrome, &err),
     };
+    let wechat = match gono_server_core::wechat::identities(&state.db, user.id).await {
+        Ok(identities) => identities,
+        Err(err) => return internal_error(&session.chrome, &err),
+    };
     let t = session.chrome.t;
     let now = pages::now();
     let app_passwords = passwords
@@ -1386,6 +1390,22 @@ async fn user_page_response(
             },
             two_factor_on: two_factor_status.is_some(),
             email: email.unwrap_or_else(|| t.a_email_none.to_owned()),
+            // Every AppID the account has an identity of, also of a mini program configured
+            // before: an admin sees what a change of `wechat.app_id` left behind.
+            wechat: if wechat.is_empty() {
+                t.a_wechat_none.to_owned()
+            } else {
+                wechat
+                    .iter()
+                    .map(|identity| {
+                        fill(
+                            t.a_wechat_bound,
+                            &[&pages::date(identity.created_at), &identity.app_id],
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            },
             services: service_view::rows(t, state, user.services),
         },
         is_self: user.id == session.user.user_id,

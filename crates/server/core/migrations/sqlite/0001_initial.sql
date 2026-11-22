@@ -60,9 +60,13 @@ INSERT INTO id_sequences (name, last_id) VALUES
     ('email_codes', 0),
     ('files', 0),
     ('login_flows', 0),
+    ('mp_sessions', 0),
     ('s3_buckets', 0),
     ('users', 0),
-    ('web_sessions', 0);
+    ('web_sessions', 0),
+    ('wechat_bind_tickets', 0),
+    ('wechat_identities', 0),
+    ('wechat_signup_tokens', 0);
 
 -- Server-wide settings that are generated once and must stay stable for the lifetime of the
 -- installation.
@@ -635,3 +639,76 @@ CREATE TABLE email_codes (
 
 CREATE INDEX email_codes_user ON email_codes (user_id, purpose, created_at);
 CREATE INDEX email_codes_created_at ON email_codes (created_at);
+
+-- WeChat mini program identities (`gono_server_core::wechat`): an account bound to the user a
+-- mini program knows by its AppID and the openid WeChat gives that user for it. Bound on the
+-- account page with a ticket that the mini program scans; one binding per account and AppID,
+-- and an openid of an AppID belongs to one account at most. `unionid` is what WeChat reports
+-- across the AppIDs of one developer account, when it reports one. Ids from `id_sequences`.
+CREATE TABLE wechat_identities (
+    id           INTEGER PRIMARY KEY,
+    user_id      INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    -- `wx` and 16 letters or digits.
+    app_id       TEXT    NOT NULL COLLATE BINARY CHECK (length(app_id) BETWEEN 1 AND 32),
+    -- Opaque identifiers of WeChat: letters, digits, '-' and '_'.
+    openid       TEXT    NOT NULL COLLATE BINARY CHECK (length(openid) BETWEEN 1 AND 128),
+    unionid      TEXT    COLLATE BINARY
+                         CHECK (unionid IS NULL OR length(unionid) BETWEEN 1 AND 128),
+    created_at   INTEGER NOT NULL,
+    -- The last sign-in of the mini program with this identity.
+    last_seen_at INTEGER NOT NULL,
+    UNIQUE (app_id, openid),
+    UNIQUE (user_id, app_id)
+) STRICT;
+
+-- Tickets that bind a WeChat identity to an account: made on the account page (with the web
+-- login password), shown there as a QR code, used up by the mini program that scans it. Valid
+-- for 10 minutes; a new one ends the account's earlier ones.
+CREATE TABLE wechat_bind_tickets (
+    id          INTEGER PRIMARY KEY,
+    -- SHA-256 of the ticket (128 random bits). The ticket itself is never stored.
+    ticket_hash BLOB    NOT NULL UNIQUE CHECK (length(ticket_hash) = 32),
+    user_id     INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX wechat_bind_tickets_user_id ON wechat_bind_tickets (user_id);
+CREATE INDEX wechat_bind_tickets_expires_at ON wechat_bind_tickets (expires_at);
+
+-- What the mini program holds for a WeChat user that is bound to no account yet: the openid
+-- that signing in found unbound, for 10 minutes, so that binding it needs no second sign-in
+-- with WeChat. A new one for the same openid ends the earlier ones.
+CREATE TABLE wechat_signup_tokens (
+    id         INTEGER PRIMARY KEY,
+    -- SHA-256 of the token (256 random bits).
+    token_hash BLOB    NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+    app_id     TEXT    NOT NULL COLLATE BINARY CHECK (length(app_id) BETWEEN 1 AND 32),
+    openid     TEXT    NOT NULL COLLATE BINARY CHECK (length(openid) BETWEEN 1 AND 128),
+    unionid    TEXT    COLLATE BINARY
+                       CHECK (unionid IS NULL OR length(unionid) BETWEEN 1 AND 128),
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX wechat_signup_tokens_openid ON wechat_signup_tokens (app_id, openid);
+CREATE INDEX wechat_signup_tokens_expires_at ON wechat_signup_tokens (expires_at);
+
+-- Sessions of the mini program with a bound WeChat identity. They read the account's name and
+-- services and nothing else: no files, no WebDAV, no S3. A session ends 30 days after its last
+-- use, when the identity is unbound, and when the account is disabled or deleted.
+CREATE TABLE mp_sessions (
+    id           INTEGER PRIMARY KEY,
+    -- SHA-256 of the bearer token (256 random bits).
+    token_hash   BLOB    NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+    user_id      INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    -- The identity the session was opened with.
+    app_id       TEXT    NOT NULL COLLATE BINARY CHECK (length(app_id) BETWEEN 1 AND 32),
+    openid       TEXT    NOT NULL COLLATE BINARY CHECK (length(openid) BETWEEN 1 AND 128),
+    created_at   INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX mp_sessions_user_app ON mp_sessions (user_id, app_id);
+CREATE INDEX mp_sessions_expires_at ON mp_sessions (expires_at);

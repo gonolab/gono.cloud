@@ -26,11 +26,11 @@ use sqlx::Row as _;
 /// the edit and add a new migration instead.
 const SQLITE_MIGRATIONS: &[(i64, &str)] = &[(
     1,
-    "41d9c69fbcde028d26db97270502076a58af4c92749e4cda98fe26bdbfd7c53fcb8c4d94fe4f01121d5d917a46064a2e",
+    "ff5bfb6340a35474653681126fd690763051c83130e65d3e5bdb60a501aa1bbd72ed64baa7b472c58cadedf68ba502ea",
 )];
 const MYSQL_MIGRATIONS: &[(i64, &str)] = &[(
     1,
-    "bc6d1ef814818eceaf5386651093c98e520973e045fa47357a3936a1823726f5fc34668853d739aa860933a4aebc8ce2",
+    "36748a131a477199b26fea7c9626b718a791843a9169fe48b2c672d6c078928ff0fd4d9790dde45d5a955c8de5f0265c",
 )];
 
 /// The tables of the schema on both backends.
@@ -49,6 +49,7 @@ const TABLES: &[&str] = &[
     "id_sequences",
     "locks",
     "login_flows",
+    "mp_sessions",
     "object_meta",
     "object_parts",
     "recovery_codes",
@@ -64,6 +65,9 @@ const TABLES: &[&str] = &[
     "upload_sessions",
     "users",
     "web_sessions",
+    "wechat_bind_tickets",
+    "wechat_identities",
+    "wechat_signup_tokens",
 ];
 
 fn sqlite_config(dir: &Path) -> DbConfig {

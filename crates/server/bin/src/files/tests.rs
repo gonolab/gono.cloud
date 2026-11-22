@@ -94,6 +94,7 @@ async fn fixture_with(files: bool) -> Fixture {
         connect: None,
         s3: None,
         mailer: None,
+        wechat: None,
     };
     Fixture {
         _dir: dir,
@@ -3037,6 +3038,8 @@ async fn every_tab_of_the_account_page_renders_for_an_account_with_every_service
     let mut f = fixture().await;
     f.state.s3 = s3_on(true);
     connect_on(&mut f).await;
+    // The WeChat panel of the overview too, which says so without `[wechat]`.
+    wechat::wechat_on(&mut f, None);
     let mut browser = Browser::new(&f.state);
     browser.sign_in().await;
     for (path, own) in TABS {
@@ -3606,3 +3609,4 @@ async fn a_device_that_needs_two_step_verification_is_sent_to_the_overview_and_b
 }
 
 mod email;
+mod wechat;

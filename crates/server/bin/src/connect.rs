@@ -476,6 +476,7 @@ mod tests {
             connect: Some(connect),
             s3: None,
             mailer: None,
+            wechat: None,
         };
         let app = crate::app::router(state.clone());
         tokio::spawn(async move {

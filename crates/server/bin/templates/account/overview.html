@@ -48,6 +48,38 @@
       <p class="muted">{{ chrome.t.email_unavailable }}</p>
       {%- endif %}
     </div></section>
+    <section class="panel" id="wechat" aria-labelledby="wechat-title"><div class="panel-body">
+      <h2 id="wechat-title">{{ chrome.t.wechat_title }}</h2>
+      <p class="muted small">{{ chrome.t.wechat_note }}</p>
+      {%- if wechat.available %}
+      {%- if let Some(bound) = wechat.bound %}
+      <p>{{ bound }}</p>
+      <form method="post" action="/account/wechat/unbind" class="mt-20">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <input type="text" name="username" value="{{ frame.username }}" autocomplete="username" hidden>
+        <label class="field" for="wechat-unbind-password"><span>{{ chrome.t.tf_password }}</span><input id="wechat-unbind-password" type="password" name="password" autocomplete="current-password" required></label>
+        <button class="btn danger block" type="submit">{{ chrome.t.wechat_unbind }}</button>
+      </form>
+      <p class="muted small mt-6">{{ chrome.t.wechat_unbind_note }}</p>
+      {%- else %}
+      {%- if let Some(qr) = wechat.qr %}
+      <p class="small mt-18">{{ wechat.scan }}</p>
+      {{ qr|safe }}
+      {%- else %}
+      <p>{{ chrome.t.wechat_none }}</p>
+      {%- endif %}
+      <form method="post" action="/account/wechat" class="mt-20">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <input type="text" name="username" value="{{ frame.username }}" autocomplete="username" hidden>
+        <label class="field" for="wechat-password"><span>{{ chrome.t.tf_password }}</span><input id="wechat-password" type="password" name="password" autocomplete="current-password" required></label>
+        <button class="btn{% if wechat.qr.is_none() %} primary{% endif %} block" type="submit">{% if wechat.qr.is_some() %}{{ chrome.t.wechat_show_again }}{% else %}{{ chrome.t.wechat_show }}{% endif %}</button>
+      </form>
+      <p class="muted small mt-6">{{ chrome.t.wechat_show_note }}</p>
+      {%- endif %}
+      {%- else %}
+      <p class="muted">{{ chrome.t.wechat_unavailable }}</p>
+      {%- endif %}
+    </div></section>
   </div>
   <div class="stack">
     <section class="panel" id="two-factor"><div class="panel-body">

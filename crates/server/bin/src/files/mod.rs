@@ -178,6 +178,11 @@ pub fn routes() -> Router<AppState> {
             &format!("{ACCOUNT}/email/remove"),
             post(account::email::remove),
         )
+        .route(&format!("{ACCOUNT}/wechat"), post(account::wechat::start))
+        .route(
+            &format!("{ACCOUNT}/wechat/unbind"),
+            post(account::wechat::unbind),
+        )
         .route(
             &format!("{ACCOUNT}/app-passwords"),
             post(account::create_app_password),

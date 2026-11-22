@@ -122,6 +122,7 @@ async fn fixture() -> Fixture {
         connect: None,
         s3: None,
         mailer: None,
+        wechat: None,
     };
     Fixture {
         _dir: dir,
@@ -1749,4 +1750,58 @@ async fn the_page_of_an_account_shows_its_email_address() {
     assert!(matches!(bound, Bind::Bound { .. }), "{bound:?}");
     let page = browser.get(&path("/users/alice")).await;
     assert_eq!(fact(&page.body), "alice@example.com");
+}
+
+#[tokio::test]
+async fn the_page_of_an_account_shows_whether_it_has_wechat_bound() {
+    use gono_server_core::wechat::{self, Bind, NewTicket, SignIn};
+    use secrecy::ExposeSecret as _;
+
+    let f = fixture().await;
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in("root", ROOT_PASSWORD).await;
+    let fact = |body: &str| {
+        let start = body.find("<dt>WeChat</dt><dd>").expect("the WeChat fact") + 19;
+        body[start..start + body[start..].find("</dd>").unwrap()].to_owned()
+    };
+    let page = browser.get(&path("/users/alice")).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_eq!(fact(&page.body), "Not bound");
+
+    // Bound on 2027-01-15, whether or not this server has `[wechat]` now.
+    let at = 1_800_000_000;
+    let NewTicket::Ticket(ticket) =
+        wechat::create_ticket(&f.state.db, f.alice, "wxd930ea5d5a258f4f", at)
+            .await
+            .unwrap()
+    else {
+        panic!("bound");
+    };
+    let SignIn::Unbound { token, .. } =
+        wechat::sign_in(&f.state.db, "wxd930ea5d5a258f4f", "oAlice", None, at)
+            .await
+            .unwrap()
+    else {
+        panic!("bound");
+    };
+    let bound = wechat::bind(
+        &f.state.db,
+        "wxd930ea5d5a258f4f",
+        token.expose_secret(),
+        ticket.ticket.expose_secret(),
+        None,
+        at,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(bound, Bind::Bound { .. }), "{bound:?}");
+    let page = browser.get(&path("/users/alice")).await;
+    assert_eq!(
+        fact(&page.body),
+        format!(
+            "Bound since {} (wxd930ea5d5a258f4f)",
+            super::pages::date(at)
+        )
+    );
+    assert!(!page.body.contains("oAlice"), "the openid is not shown");
 }

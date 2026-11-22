@@ -480,6 +480,81 @@ What users see:
   day after they were made. Mail is plain text in the language of the page (English or
   Chinese), and the only secret it carries is its code.
 
+## WeChat
+
+With `[wechat]`, the users of a WeChat mini program bind their WeChat to their account and then
+sign in to the mini program with it. The server serves one mini program, the one whose AppID
+and AppSecret it is given; a mini program session reads the account's name and services, never
+its files. Off by default: the account page then says that the server does not offer a mini
+program, and the mini program's API answers `404`. The API, its errors and what the mini
+program's developers set up are in [wechat-miniprogram.md](wechat-miniprogram.md).
+
+What the mini program needs from WeChat, in its admin console (mp.weixin.qq.com):
+
+- **A host name with an ICP filing (备案)** for the requests of the mini program (a "request合法域名")
+  and for its QR links: WeChat accepts no other. It can be `base_url`'s host, or another host
+  name that the reverse proxy forwards to Gono Cloud
+  ([reverse-proxy.md](reverse-proxy.md#the-wechat-mini-program)). HTTPS with a valid
+  certificate, as everywhere.
+- **The rule "扫普通链接二维码打开小程序"** (scan ordinary QR codes to open the mini program),
+  whose prefix becomes `qr_url_prefix`, for example `https://cloud.example.com/q/`. On
+  `base_url`'s host use `/q/`: every path below it answers a page that tells a browser to scan
+  the code with WeChat instead. The console asks for its verification file at the root of the
+  prefix's host; `verify_file` serves it.
+
+Put the AppSecret into a file of its own, readable by the service, keep the verification file
+under the name WeChat gave it, and turn the mini program on in `/etc/gono-cloud/config.toml`;
+then restart the service:
+
+```sh
+sudo install -m 0640 -o root -g gono-cloud /dev/null /etc/gono-cloud/wechat-secret
+sudoedit /etc/gono-cloud/wechat-secret    # the AppSecret on the first line
+sudo install -m 0644 ~/AbCdEf1234.txt /etc/gono-cloud/AbCdEf1234.txt
+```
+
+```toml
+[wechat]
+enabled = true
+app_id = "wxd930ea5d5a258f4f"
+secret_file = "/etc/gono-cloud/wechat-secret"
+qr_url_prefix = "https://cloud.example.com/q/"
+verify_file = "/etc/gono-cloud/AbCdEf1234.txt"
+```
+
+| Key | What it sets |
+|---|---|
+| `app_id` | The mini program's AppID, `wx` and 16 letters or digits, as its console shows it. Changing it later starts over: the bindings and sessions of the previous AppID no longer count, although the admin UI still lists those bindings on each account's page. |
+| `secret_file` | The file that holds the AppSecret (the first line; relative paths start in the directory of `config.toml`). The AppSecret never goes into `config.toml`; `config check` names the file and whether it exists, never the secret, and `serve` reads it when it starts and refuses to start without it or with an empty one. It warns when others can read the file. |
+| `qr_url_prefix` | The prefix of the QR links, exactly as the console's rule has it: an `https://` URL ending in `/`, without credentials, query or fragment, at most 200 bytes. Binding links are `<prefix>bind/<ticket>`. Its host may differ from `base_url`'s. |
+| `verify_file` | Optional. WeChat's verification file for the rule, served at `/<its file name>` with its exact content as `text/plain`, and nowhere else. Its name must be letters, digits, `-`, `_` and `.`, ending in `.txt`, as WeChat names it; it is read when `serve` starts (at most 4 KiB). Leave it unset to serve the file another way. |
+
+`config check` validates the table and warns when `files_ui` is off (the panel that binds is on
+the account page, part of the web file UI) and when `qr_url_prefix` is on `base_url`'s host but
+outside `/q/` (a browser that opens a link would get `404`). The server connects to
+`https://api.weixin.qq.com` (port 443) to exchange the mini program's sign-in codes, through
+rustls with the CA list built into the binary, so outgoing HTTPS to that host must be allowed.
+It never logs the AppSecret, sign-in codes, tickets, session tokens or openids.
+
+What users see:
+
+- **Binding.** On the account page (Overview, "WeChat") a user enters the web login password,
+  and the page shows a QR code with the time it expires. Scanned with WeChat on the phone, it
+  opens the mini program, which binds the user's WeChat to the account. A QR code is valid for
+  10 minutes and once, a new one ends the previous one, and it binds only when the mini program
+  reports that it was opened by scanning it on a phone, not on a desktop and not from an image,
+  the album or a chat (a safeguard against forwarded codes; the mini program reports this
+  itself). Whoever scans the code gets the account in the mini program, so the page says not to
+  share it. An account has one WeChat of the mini program at most, and a WeChat belongs to one
+  account.
+- **Unbinding** on the same page needs the password too, and signs the mini program out on
+  every phone. Disabling or deleting an account ends its mini program sessions as well;
+  otherwise a session ends 30 days after its last use.
+- Neither changes the web login: browser sessions, app passwords and two-step verification stay.
+  The audit log records `wechat.bound` and `wechat.unbound` with the AppID, never the openid.
+  The admin UI shows on each account's page whether its WeChat is bound, and since when.
+- **Limits.** `session` and `bind` of the mini program are limited per client address like the
+  sign-in pages: failures count, successful sign-ins do not.
+
 ## The S3 API
 
 S3 clients and applications can upload files to Gono Cloud and publish them for anonymous
@@ -729,7 +804,7 @@ journalctl -u gono-cloud --since today
 
 Every request is logged at level `info` with its method, path, status, duration and client
 address. Credentials never are: headers are not logged, query values are dropped and Login Flow
-tokens in paths are replaced by `<redacted>`.
+tokens and the tickets of WeChat's QR links (`/q/...`) in paths are replaced by `<redacted>`.
 `logging.level` sets the level of Gono Cloud's own messages (`warn` drops the request lines);
 dependencies log only warnings and errors. For debugging, the `GONO_CLOUD_LOG` environment
 variable replaces the whole filter, for example `GONO_CLOUD_LOG=info,sqlx=debug` (set it in a
