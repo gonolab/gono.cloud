@@ -238,21 +238,22 @@ multipart_ttl_secs = 604800
 # website_domain = "web.example.com"
 
 [two_factor]
-# The key the TOTP secrets of two-step verification are encrypted with: 32 random bytes (or 64
-# hex digits), readable by the service. Keep it outside the data directory and back it up with
-# this file, apart from the database: without it, accounts with two-step verification cannot
-# sign in, and `serve` refuses to start while any account uses it. Relative paths are resolved
-# against this file's directory. `init` and the install script create it. Default:
-# "two-factor.key".
+# The key the TOTP secrets of two-step verification are encrypted with, and the digests of the
+# codes sent by mail ([smtp]) are keyed with: 32 random bytes (or 64 hex digits), readable by
+# the service. Keep it outside the data directory and back it up with this file, apart from the
+# database: without it, accounts with two-step verification cannot sign in, and `serve` refuses
+# to start while any account uses it. Relative paths are resolved against this file's
+# directory. `init` and the install script create it. Default: "two-factor.key".
 key_file = "two-factor.key"
 
 [smtp]
 # The mail server through which `serve` sends one-time codes: users add an email address on the
 # account page with a code sent to it, and reset a forgotten web login password from the sign-in
 # page ("Forgot your password?") with a code sent to that address. Codes are 6 digits, valid for
-# 10 minutes. Two-step verification is not affected: the next sign-in still asks for its code.
-# Off by default: then accounts have no email addresses, and passwords cannot be reset by mail.
-# See "Email" in docs/deployment.md.
+# 10 minutes; a reset code works only in the browser that asked for it. Two-step verification
+# is not affected: the next sign-in still asks for its code. The codes are stored as digests
+# keyed with two_factor.key_file, which mail therefore needs. Off by default: then accounts have
+# no email addresses, and passwords cannot be reset by mail. See "Email" in docs/deployment.md.
 # enabled = true
 
 # The mail server's host name or IP address. Required when enabled.

@@ -335,7 +335,7 @@ require_two_factor` is true; during development it defaults to false ("Remote ac
 
 - **The server's clock must be right** (NTP): codes change every 30 seconds.
 - **The key file.** The TOTP secrets are encrypted with the key in `two_factor.key_file`,
-  `/etc/gono-cloud/two-factor.key`. The
+  `/etc/gono-cloud/two-factor.key`, and the codes sent by mail are keyed with it ("Email"). The
   install script creates it at the path the configuration names (32 random bytes,
   `root:gono-cloud`, mode 0640) and never replaces it, nor a symbolic link put there;
   `config check` shows whether it exists. Keep it out of the data directory and the database's
@@ -421,6 +421,13 @@ login password with a code mailed to it. Without one (the default) neither exist
 page says that the server cannot send mail, and the sign-in page has no "Forgot your
 password?" link. Mail is sent only for this; the server sends no newsletters or other notices.
 
+The codes are stored only as digests keyed with the key file of two-step verification,
+`two_factor.key_file` ("Two-step verification" above; `serve` creates it when it is missing).
+A code has only 6 digits, so an unkeyed digest could be reversed by trying them all; keyed, a
+copy of the database or of a backup alone does not reveal a code that is still waiting, as
+long as the key file is kept apart from it. Without the key file the email features are off as
+without a mail server, and `serve` logs a warning saying so.
+
 Put the password of the mail account into a file of its own, readable by the service, and turn
 mail on in `/etc/gono-cloud/config.toml`; then restart the service:
 
@@ -471,14 +478,29 @@ What users see:
   browser session of the account and its sign-ins waiting for their second step, is recorded in
   the audit log (`password.reset`) and is mailed to the address. App passwords stay valid, so
   devices and Nextcloud apps keep working. Disabled accounts cannot reset.
+- **A reset code works only in the browser that asked for it.** `/login/forgot` sets a cookie
+  (`gono_reset`, `__Host-gono_reset` on HTTPS; a random value of 256 bits, `HttpOnly`,
+  `SameSite=Strict`, for 11 minutes) and binds the code to a keyed digest of it. Anyone who
+  knows a username can have codes sent to the account's address, but cannot try the code the
+  owner got (a try from another browser does not even count against it), and a request of
+  theirs does not end the owner's code: a new code ends only the earlier one of the same
+  browser. The reset page says when the browser has not asked for a code recently, and the
+  mail says to enter the code in the browser window where it was asked for (a code read on a
+  phone is typed into the computer that asked for it). A reset removes the cookie.
 - **Two-step verification is not affected.** A reset changes the password only: an account
   with two-step verification is still asked for its code at the next sign-in. A lost phone still
   needs a recovery code or an admin ("Two-step verification" above).
-- **Limits.** Per account, one code a minute and ten a day for adding addresses, and the same
-  for resets; requests for reset codes are also limited per client address, and wrong reset
-  codes count as failed sign-ins of the client. Codes are stored only as digests and removed a
-  day after they were made. Mail is plain text in the language of the page (English or
-  Chinese), and the only secret it carries is its code.
+- **Limits.** Adding addresses: one code a minute and ten a day per account. Resets: one code
+  a minute and three a day per account and client network (the /24 of an IPv4 address, the /64
+  of an IPv6 one, as `trusted_proxies` decides the client's address), and twenty a day per
+  account in all, so an address gets at most twenty reset mails a day. A stranger on another
+  network therefore cannot keep the owner from getting a code, short of asking from enough
+  networks to use up the twenty; one on the owner's network (the same office or home router)
+  shares that network's three. Requests for reset codes are also limited per client address,
+  and wrong reset codes count as failed sign-ins of the client. Each code takes 5 tries, and a
+  reset code only from its browser. Codes, with the digest of the browser and the network that
+  asked, are removed a day after they were made. Mail is plain text in the language of the
+  page (English or Chinese), and the only secret it carries is its code.
 
 ## WeChat
 

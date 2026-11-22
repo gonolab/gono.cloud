@@ -22,8 +22,16 @@ compatible within a major version: released clients keep working with newer serv
   recorded in the audit log (`password.reset`; adding and removing addresses as `email.bound`
   and `email.removed`) and mailed to the address; it leaves two-step verification alone, so the
   next sign-in still asks for the code. Replacing or removing the address needs the password and
-  notifies the previous address. Codes are limited to one a minute and ten a day per account,
-  stored only as digests, and mailed in plain text in the language of the page. Mail goes out
+  notifies the previous address. Codes are stored only as HMAC-SHA256 digests keyed with
+  `two_factor.key_file` (without the file there are no email features, as without a mail
+  server), so a copy of the database alone does not reveal a code still waiting. A reset code
+  works only in the browser that asked for it: `/login/forgot` sets a random `gono_reset`
+  cookie (`__Host-` on HTTPS) whose keyed digest the code is bound to, so a stranger who knows
+  the username can neither try the owner's code nor end it with requests of their own; the
+  reset page says when the browser has not asked for a code. Codes for adding addresses are
+  limited to one a minute and ten a day per account; reset codes to one a minute and three a
+  day per account and client network (/24 or /64) and twenty a day per account. Codes are
+  mailed in plain text in the language of the page. Mail goes out
   over TLS (`security = "tls"`, port 465, the default) or STARTTLS, with the password read from
   `smtp.password_file`; unencrypted SMTP only to a mail server on this host. `config check`
   shows the settings without the password, and the admin UI shows each account's address. See

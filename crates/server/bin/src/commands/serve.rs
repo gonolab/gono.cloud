@@ -110,11 +110,11 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         if let Some(file) = &config.smtp.password_file {
             warn_if_readable_by_others(file, "smtp.password_file");
         }
-        tracing::info!(
-            server = mailer.server(),
-            "mail enabled: email addresses and password resets"
-        );
-        Some(Arc::new(mailer) as Arc<dyn Mailer>)
+        // Whether the email features exist is logged once the key file is known (below).
+        Some((
+            mailer.server().to_owned(),
+            Arc::new(mailer) as Arc<dyn Mailer>,
+        ))
     } else {
         None
     };
@@ -295,6 +295,24 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         Arc::new(RateLimiter::new()),
         &config.server.base_url,
     );
+    // The codes of the email features are keyed with two_factor.key_file: without it, mail is
+    // as good as off (`AppState::email`).
+    let mailer = match (mailer, &sealing_key) {
+        (Some((server, mailer)), Some(_)) => {
+            tracing::info!(%server, "mail enabled: email addresses and password resets");
+            Some(mailer)
+        }
+        (Some((server, _)), None) => {
+            tracing::warn!(
+                %server,
+                "email addresses and password resets are unavailable although [smtp] is \
+                 enabled: their codes are keyed with two_factor.key_file, which is missing \
+                 (see the warning above)"
+            );
+            None
+        }
+        (None, _) => None,
+    };
     if let Some(key) = sealing_key {
         web = web.with_two_factor_key(key);
     }

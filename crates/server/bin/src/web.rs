@@ -29,16 +29,17 @@
 //!   address; only an account with a code waiting also counts the try, and such a code exists
 //!   only once someone asked for it to be mailed to the account's address. Requests for codes
 //!   have a per-client limiter of their own ([`Web::allow_reset_request`]), since asking is not a
-//!   failure.
+//!   failure. A code is bound to the browser that asked for it by the [`RESET_COOKIE`]
+//!   ([`Web::reset_cookie`]): only a form that brings the same cookie reaches the code.
 //! - **Sessions**: a successful sign-in creates a `web_sessions` row
 //!   ([`gono_server_core::web_sessions`]) and sets the [`SESSION_COOKIE`] (`HttpOnly`,
 //!   `SameSite=Lax`, `Secure` when the public origin is HTTPS). App passwords never create a
 //!   session, and sessions never authenticate WebDAV requests.
-//! - **Cookie names**: on an HTTPS origin the cookies of sessions, sign-ins and CSRF tokens are
-//!   named with the [`HOST_PREFIX`], which browsers accept only from this host itself. Other
-//!   hosts of the same site (the S3 API's serves pages its users uploaded) can set cookies for
-//!   the whole site, but none of these; a request that carries a cookie more than once is taken
-//!   to carry it not at all ([`cookie`]).
+//! - **Cookie names**: on an HTTPS origin the cookies of sessions, sign-ins, CSRF tokens and
+//!   password resets are named with the [`HOST_PREFIX`], which browsers accept only from this
+//!   host itself. Other hosts of the same site (the S3 API's serves pages its users uploaded)
+//!   can set cookies for the whole site, but none of these; a request that carries a cookie
+//!   more than once is taken to carry it not at all ([`cookie`]).
 //! - **CSRF**: every form carries a token. Before sign-in it is a double-submit token: a random
 //!   value in the [`CSRF_COOKIE`] (`SameSite=Strict`) repeated in the form. After sign-in it
 //!   is derived from the session token, which the page cannot read; the script sends it in a
@@ -84,9 +85,9 @@ use crate::{
 /// Cookie holding the session token.
 pub const SESSION_COOKIE: &str = "gono_session";
 
-/// Prefix of the names of [`SESSION_COOKIE`], [`CSRF_COOKIE`] and [`TWO_STEP_COOKIE`] on an
-/// HTTPS origin. Browsers accept a cookie named so only from the host itself, with `Secure`,
-/// `Path=/` and no `Domain`, so no other host of the site can plant one.
+/// Prefix of the names of [`SESSION_COOKIE`], [`CSRF_COOKIE`], [`TWO_STEP_COOKIE`] and
+/// [`RESET_COOKIE`] on an HTTPS origin. Browsers accept a cookie named so only from the host
+/// itself, with `Secure`, `Path=/` and no `Domain`, so no other host of the site can plant one.
 pub const HOST_PREFIX: &str = "__Host-";
 
 /// Cookie holding the double-submit CSRF token of forms shown before sign-in.
@@ -97,6 +98,20 @@ pub const TWO_STEP_COOKIE: &str = "gono_two_step";
 
 /// Where the second step of a sign-in is entered.
 pub const TWO_STEP_PATH: &str = "/login/two-step";
+
+/// Cookie binding password reset codes to the browser that asked for them
+/// (`gono_server_core::email::Binding`): a random value of [`RESET_CHARS`] characters, set by
+/// `POST /login/forgot`, whose keyed digest the code's row holds. `HttpOnly`,
+/// `SameSite=Strict`, and `Path=/` like the other cookies: the [`HOST_PREFIX`] it carries on
+/// HTTPS requires that path, and keeps other hosts of the site from planting a value they know.
+pub const RESET_COOKIE: &str = "gono_reset";
+
+/// Length of the value of the [`RESET_COOKIE`]: 43 characters of `[A-Za-z0-9]`, 256 bits.
+const RESET_CHARS: usize = 43;
+
+/// How long the [`RESET_COOKIE`] lives, in seconds: a minute longer than a code, so that it
+/// outlives the code made right after it is set.
+const RESET_COOKIE_SECS: u32 = email::CODE_TTL_SECS as u32 + 60;
 
 /// How long a sign-in waits for its second step, in seconds.
 const TWO_STEP_TTL_SECS: i64 = 5 * 60;
@@ -848,10 +863,13 @@ impl Web {
     }
 
     /// The name of cookie `base` on this origin: with the [`HOST_PREFIX`] for the cookies of
-    /// sessions, sign-ins and CSRF tokens on an HTTPS origin (whose `Set-Cookie` values carry
-    /// `Secure` and `Path=/` and no `Domain`, as the prefix asks), as it is otherwise.
+    /// sessions, sign-ins, CSRF tokens and password resets on an HTTPS origin (whose
+    /// `Set-Cookie` values carry `Secure` and `Path=/` and no `Domain`, as the prefix asks), as
+    /// it is otherwise.
     pub fn cookie_name(&self, base: &str) -> String {
-        if self.secure && [SESSION_COOKIE, CSRF_COOKIE, TWO_STEP_COOKIE].contains(&base) {
+        if self.secure
+            && [SESSION_COOKIE, CSRF_COOKIE, TWO_STEP_COOKIE, RESET_COOKIE].contains(&base)
+        {
             format!("{HOST_PREFIX}{base}")
         } else {
             base.to_owned()
@@ -886,9 +904,34 @@ impl Web {
         self.cookie_header(
             name,
             "",
-            if name == CSRF_COOKIE { "Strict" } else { "Lax" },
+            if [CSRF_COOKIE, RESET_COOKIE].contains(&name) {
+                "Strict"
+            } else {
+                "Lax"
+            },
             Some(0),
         )
+    }
+
+    /// The value of the request's [`RESET_COOKIE`], if it carries a well-formed one: then this
+    /// browser asked for a reset code less than [`RESET_COOKIE_SECS`] ago.
+    pub fn reset_cookie_value(&self, headers: &HeaderMap) -> Option<String> {
+        cookie(headers, &self.cookie_name(RESET_COOKIE)).filter(|value| {
+            value.len() == RESET_CHARS && value.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+    }
+
+    /// The value to bind a new reset code to, and the `Set-Cookie` value to send with the
+    /// answer to `POST /login/forgot`. A browser that has one keeps its value (with a new
+    /// lifetime), so that a second request from it ends its own earlier code and one refused as
+    /// too soon leaves that code usable; others get a fresh random one. A value is never
+    /// chosen by the client: the server made it, and on HTTPS only this host can have set it.
+    pub fn reset_cookie(&self, headers: &HeaderMap) -> (String, HeaderValue) {
+        let value = self
+            .reset_cookie_value(headers)
+            .unwrap_or_else(|| secret::random_token(RESET_CHARS).expose_secret().to_owned());
+        let cookie = self.cookie_header(RESET_COOKIE, &value, "Strict", Some(RESET_COOKIE_SECS));
+        (value, cookie)
     }
 
     /// The `Set-Cookie` value that stores `theme` for a year (or forgets the choice).
@@ -969,22 +1012,30 @@ impl Web {
 
     /// Resets the web login password of the account `login` names (its username or email
     /// address) to `password` (already checked against the policy), if `code` is the code last
-    /// mailed to the account's address (see the module documentation).
+    /// mailed to the account's address for the browser whose [`RESET_COOKIE`] value is
+    /// `cookie` (see the module documentation).
     ///
     /// The form's answer must not tell whether the account exists or has an address: every
     /// case does the same expensive work, the hash of the new password included (as
     /// [`Web::verify_password`] hashes a dummy for unknown accounts), and every failure is the
-    /// same [`PasswordReset::Wrong`], counted by the failed-attempt limiter.
+    /// same [`PasswordReset::Wrong`], counted by the failed-attempt limiter. A form without the
+    /// cookie fails the same way; whether the browser has the cookie is its own to know.
     pub async fn reset_password(
         &self,
         client: IpAddr,
         login: &str,
         code: &str,
         password: SecretString,
+        cookie: Option<&str>,
     ) -> PasswordReset {
         if let Some(wait) = self.limiter.check(client) {
             return PasswordReset::RateLimited(wait);
         }
+        // The pages exist only with the key (`crate::recovery`); this keeps it so.
+        let Some(key) = self.two_factor_key.as_ref() else {
+            tracing::error!("a password reset without two_factor.key_file");
+            return PasswordReset::Unavailable;
+        };
         let account = match email::find_account(&self.pool, login).await {
             Ok(account) => account,
             Err(err) => {
@@ -1007,9 +1058,12 @@ impl Web {
         // A code that is not six digits matches no account's: the transaction runs as for an
         // unknown one.
         let code = email::parse_code(code);
+        let binding = cookie.map(|value| email::Binding::new(key, value));
         let outcome = email::reset_password(
             &self.pool,
+            key,
             user_id.filter(|_| code.is_some()),
+            binding.as_ref(),
             code.as_deref().unwrap_or_default(),
             &hash,
             Some(client),

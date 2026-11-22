@@ -16,6 +16,12 @@
 //! The associated data of [`Purpose::Totp`] is the one described in
 //! `docs/connect-protocol.md` section 13.6; it must not change, or existing enrolments stop
 //! opening.
+//!
+//! The same key file also keys digests that must not be computable from the database alone
+//! ([`Key::mac`]): the 6-digit codes sent by mail ([`crate::email`]) have so few values that
+//! an unkeyed digest of them could be reversed by trying them all. The MAC key is derived from
+//! the file's 32 bytes with HKDF-SHA256 and a label of its own, so the cipher and the MAC
+//! never use the same key material.
 
 use std::{
     fs,
@@ -24,7 +30,7 @@ use std::{
 };
 
 use rand::RngExt as _;
-use ring::aead;
+use ring::{aead, hkdf, hmac};
 
 use crate::error::{Error, Result};
 
@@ -53,10 +59,21 @@ impl Purpose {
     }
 }
 
+/// The HKDF-SHA256 `info` of the MAC key ([`Key::mac`]). Never change it: digests made with
+/// the key before would no longer match.
+const MAC_KEY_INFO: &[u8] = b"gono-cloud mac key v1";
+
 /// The key secrets are sealed with: 32 bytes from a file of the configuration directory (raw
 /// bytes, or 64 hex digits).
 #[derive(Clone)]
-pub struct Key(aead::LessSafeKey);
+pub struct Key {
+    /// ChaCha20-Poly1305 with the file's 32 bytes as they are: the TOTP secrets of section
+    /// 13.6 were sealed so, and must keep opening.
+    aead: aead::LessSafeKey,
+    /// HMAC-SHA256 with a key derived from the file's bytes ([`MAC_KEY_INFO`]); never the raw
+    /// bytes themselves.
+    mac: hmac::Key,
+}
 
 impl std::fmt::Debug for Key {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -70,7 +87,16 @@ impl Key {
         // CHACHA20_POLY1305 takes exactly 32 bytes, so this cannot fail.
         let unbound = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, bytes)
             .unwrap_or_else(|_| unreachable!("a 32-byte ChaCha20-Poly1305 key"));
-        Self(aead::LessSafeKey::new(unbound))
+        // HKDF-Expand fails only for more than 255 blocks of output; this is one.
+        let mac = hkdf::Salt::new(hkdf::HKDF_SHA256, &[])
+            .extract(bytes)
+            .expand(&[MAC_KEY_INFO], hmac::HMAC_SHA256)
+            .map(hmac::Key::from)
+            .unwrap_or_else(|_| unreachable!("one block of HKDF-SHA256 output"));
+        Self {
+            aead: aead::LessSafeKey::new(unbound),
+            mac,
+        }
     }
 
     /// Reads the key file at `path`. `None` if it does not exist.
@@ -144,13 +170,27 @@ impl Key {
         }
     }
 
+    /// HMAC-SHA256 of `message` for `label`, which names what the digest is for: the input is
+    /// the label's length (8 bytes, big endian), the label and the message, so that two labels
+    /// never produce the same input. Whoever lacks the key file cannot compute or check such a
+    /// digest, however few values the message may take.
+    pub fn mac(&self, label: &[u8], message: &[u8]) -> [u8; 32] {
+        let mut context = hmac::Context::with_key(&self.mac);
+        context.update(&(label.len() as u64).to_be_bytes());
+        context.update(label);
+        context.update(message);
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(context.sign().as_ref());
+        digest
+    }
+
     /// Encrypts `secret` for `purpose` and the row `id`: nonce ‖ ciphertext ‖ tag.
     pub fn seal(&self, purpose: Purpose, id: i64, secret: &[u8]) -> Vec<u8> {
         let nonce: [u8; aead::NONCE_LEN] = rand::rng().random();
         let mut sealed = secret.to_vec();
         // Sealing in place only fails for input of gigabytes, which no secret is.
         if self
-            .0
+            .aead
             .seal_in_place_append_tag(
                 aead::Nonce::assume_unique_for_key(nonce),
                 purpose.aad(id),
@@ -175,7 +215,7 @@ impl Key {
         let nonce = aead::Nonce::try_assume_unique_for_key(nonce).ok()?;
         let mut buffer = ciphertext.to_vec();
         let plain = self
-            .0
+            .aead
             .open_in_place(nonce, purpose.aad(id), &mut buffer)
             .ok()?;
         Some(plain.to_vec())
@@ -251,7 +291,7 @@ mod tests {
         let mut aad = b"gono-cloud totp v1".to_vec();
         aad.extend_from_slice(&42i64.to_be_bytes());
         let mut sealed = b"totp".to_vec();
-        key.0
+        key.aead
             .seal_in_place_append_tag(
                 aead::Nonce::assume_unique_for_key(nonce),
                 aead::Aad::from(aad),
@@ -264,6 +304,24 @@ mod tests {
             key.open(Purpose::Totp, 42, &stored).as_deref(),
             Some(&b"totp"[..])
         );
+    }
+
+    #[test]
+    fn macs_depend_on_the_key_the_label_and_the_message() {
+        let key = Key::from_bytes(&[5; 32]);
+        let digest = key.mac(b"label", b"message");
+        assert_eq!(digest, key.mac(b"label", b"message"));
+        assert_ne!(digest, Key::from_bytes(&[6; 32]).mac(b"label", b"message"));
+        assert_ne!(digest, key.mac(b"other", b"message"));
+        assert_ne!(digest, key.mac(b"label", b"messagf"));
+        // The label's length keeps where it ends from moving into the message.
+        assert_ne!(key.mac(b"ab", b"c"), key.mac(b"a", b"bc"));
+        // The MAC key is derived: it is not the file's bytes used directly.
+        let raw = hmac::Key::new(hmac::HMAC_SHA256, &[5; 32]);
+        let mut input = 5u64.to_be_bytes().to_vec();
+        input.extend_from_slice(b"label");
+        input.extend_from_slice(b"message");
+        assert_ne!(&digest[..], hmac::sign(&raw, &input).as_ref());
     }
 
     #[test]

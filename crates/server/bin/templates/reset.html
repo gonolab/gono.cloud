@@ -9,6 +9,9 @@
 {%- if let Some(error) = error %}
 <div class="flash bad" role="alert">{{ error }}</div>
 {%- endif %}
+{%- if no_request %}
+<div class="flash warn" role="status">{{ chrome.t.reset_no_request }} <a href="/login/forgot">{{ chrome.t.reset_ask_again }}</a></div>
+{%- endif %}
 <form method="post" action="/login/reset">
   <input type="hidden" name="csrf" value="{{ csrf }}">
   <label class="field" for="reset-login"><span>{{ chrome.t.forgot_login }}</span>

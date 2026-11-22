@@ -13,27 +13,44 @@
 //!   account at most (a unique key).
 //! - **Codes** are 6 random digits ([`CODE_DIGITS`]) for one [`Purpose`] and the address they
 //!   were sent to, valid for [`CODE_TTL_SECS`] and for at most [`MAX_ATTEMPTS`] tries, each
-//!   counted before the code is compared. A new code ends the account's earlier ones of the same
-//!   purpose; a used one ends at once. Codes are never stored in plain text: a row holds the
-//!   SHA-256 of the code together with the row's id. That keeps them out of sight of whoever
-//!   reads the database or a backup, but 6 digits are only 20 bits: whoever can read the
-//!   database while a code waits could find it by trying them all. Codes therefore live for
-//!   minutes, bind only the address they were sent to, and resetting a password with one does
-//!   not touch two-step verification.
-//! - **Sending** is limited per account and purpose: one code per [`SEND_INTERVAL_SECS`] and
-//!   [`SENDS_PER_DAY`] in a day ([`send_code`]), which also bounds the guesses at codes to
-//!   `SENDS_PER_DAY * MAX_ATTEMPTS` a day. Used and expired codes stay a day to be counted;
+//!   counted before the code is compared; a used one ends at once. Codes are never stored in
+//!   plain text: a row holds an HMAC-SHA256 over a label, the row's id, the purpose and the
+//!   code, keyed with the server's key file (`two_factor.key_file`, see [`Key::mac`]). 6 digits
+//!   are only 20 bits, so an unkeyed digest could be reversed by trying them all; keyed, a copy
+//!   of the database or of a backup alone reveals no code, and the key file lives apart from it.
+//!   Codes still live for minutes, bind only the address they were sent to, and resetting a
+//!   password with one does not touch two-step verification. The functions that make or check
+//!   codes therefore take the [`Key`]: without the key file there are no codes.
+//! - **Bind codes** ([`CodeFor::Bind`]) are asked for on the account page, behind a signed-in
+//!   session. A new one ends the account's earlier ones.
+//! - **Reset codes** ([`CodeFor::Reset`]) are asked for by anyone who knows a username, so they
+//!   are bound to the browser that asked ([`ResetClient`]): the row holds a keyed digest of the
+//!   random value of that browser's reset cookie ([`Binding`]), and a try reaches only the code
+//!   of the binding it brings. A stranger's requests and guesses therefore never reach the code
+//!   the owner was sent: a new reset code ends only the earlier live ones of the same binding,
+//!   and a try with another binding (or none) finds no code and counts no attempt.
+//! - **Sending** is limited ([`send_code`]). Bind codes: one per [`SEND_INTERVAL_SECS`] and
+//!   [`BIND_SENDS_PER_DAY`] in a day per account. Reset codes: one per [`SEND_INTERVAL_SECS`]
+//!   and [`RESET_SENDS_PER_NET_PER_DAY`] in a day per account and client network
+//!   ([`client_net`]: the /24 of an IPv4 address, the /64 of an IPv6 one), and
+//!   [`RESET_SENDS_PER_DAY`] in a day per account in all, which bounds the mails one address
+//!   gets. A stranger on another network thus cannot keep the owner from getting a code short
+//!   of the per-account total, which takes requests from several networks. The guesses at an
+//!   account's codes stay bounded: `BIND_SENDS_PER_DAY * MAX_ATTEMPTS` a day by the signed-in
+//!   account itself, and `RESET_SENDS_PER_DAY * MAX_ATTEMPTS` a day at reset codes, each try
+//!   only by the browser its code is bound to (a stranger's only at the codes it asked for
+//!   itself, which were mailed to the owner). Used and expired codes stay a day to be counted;
 //!   [`purge`] removes them after that.
 //!
 //! Every write is one write transaction, so the limits, the attempt counts and the uniqueness of
 //! addresses hold under concurrent requests, also from other processes.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use rand::RngExt as _;
-use sha2::{Digest as _, Sha256};
 use sqlx::FromRow;
 
+pub use crate::sealing::Key;
 use crate::{
     audit::{self, Actor, Record},
     db::{self, Flag, Pool, Text},
@@ -61,14 +78,32 @@ pub const CODE_TTL_SECS: i64 = 10 * 60;
 /// Tries a code takes; the last wrong one ends it.
 pub const MAX_ATTEMPTS: i64 = 5;
 
-/// Codes per account and purpose are at least this far apart, in seconds.
+/// Codes are at least this far apart, in seconds: bind codes per account, reset codes per
+/// account and client network.
 pub const SEND_INTERVAL_SECS: i64 = 60;
 
-/// Codes per account and purpose within [`DAY_SECS`].
-pub const SENDS_PER_DAY: i64 = 10;
+/// Bind codes per account within [`DAY_SECS`]: they are asked for by the signed-in account
+/// itself, so its own limit is the only one.
+pub const BIND_SENDS_PER_DAY: i64 = 10;
 
-/// The window of [`SENDS_PER_DAY`], and how long the rows of codes are kept for it.
+/// Reset codes per account and client network ([`client_net`]) within [`DAY_SECS`]: enough for
+/// an owner who mistyped or lost a mail, few enough that one network cannot use up
+/// [`RESET_SENDS_PER_DAY`] alone.
+pub const RESET_SENDS_PER_NET_PER_DAY: i64 = 3;
+
+/// Reset codes per account within [`DAY_SECS`], from every network together: the most reset
+/// mails an address gets in a day, and with [`MAX_ATTEMPTS`] the most tries at an account's
+/// reset codes.
+pub const RESET_SENDS_PER_DAY: i64 = 20;
+
+/// The window of the daily limits, and how long the rows of codes are kept for it.
 pub const DAY_SECS: i64 = 24 * 60 * 60;
+
+/// The label of the digests of codes ([`Key::mac`]).
+const CODE_LABEL: &[u8] = b"gono-cloud email code v1";
+
+/// The label of the digests of reset cookies ([`Binding`]).
+const BINDING_LABEL: &[u8] = b"gono-cloud email reset binding v1";
 
 /// What a code is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,14 +219,95 @@ pub fn parse_code(input: &str) -> Option<String> {
     (digits.len() == CODE_DIGITS && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
 }
 
-/// The stored digest of `code` in row `id`: SHA-256 over a label, the id and the code, so that
-/// equal codes of two rows have different digests.
-fn code_digest(id: i64, code: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"gono-email-code-v1\0");
-    hasher.update(id.to_be_bytes());
-    hasher.update(code.as_bytes());
-    hasher.finalize().into()
+/// The stored digest of `code` of `purpose` in row `id`: HMAC-SHA256 keyed with `key` over a
+/// label, the id (8 bytes, big endian), the purpose and a NUL, and the code. Without the key
+/// file it cannot be computed, so trying all codes against a copy of the database finds none;
+/// the id and the purpose make equal codes of two rows, or of two purposes, differ.
+fn code_digest(key: &Key, id: i64, purpose: Purpose, code: &str) -> [u8; 32] {
+    let mut message = id.to_be_bytes().to_vec();
+    // Purposes contain no NUL, so it ends the purpose unambiguously.
+    message.extend_from_slice(purpose.as_str().as_bytes());
+    message.push(0);
+    message.extend_from_slice(code.as_bytes());
+    key.mac(CODE_LABEL, &message)
+}
+
+/// The browser a reset code is bound to: the keyed digest ([`Key::mac`]) of the random value of
+/// its reset cookie. The database holds only the digest, so it gives the cookie away no more
+/// than the code; a try at a reset code must bring the cookie whose digest the row holds.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Binding([u8; 32]);
+
+impl Binding {
+    /// The binding of the reset cookie value `value`.
+    pub fn new(key: &Key, value: &str) -> Self {
+        Self(key.mac(BINDING_LABEL, value.as_bytes()))
+    }
+}
+
+impl std::fmt::Debug for Binding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Binding(..)")
+    }
+}
+
+/// The client network that reset codes from `ip` are counted against, as stored: the /24 of an
+/// IPv4 address (`192.0.2.0/24`), the /64 of an IPv6 one (`2001:db8:1:2::/64`); an
+/// IPv4-mapped IPv6 address counts as its IPv4 address. A /64 is the smallest block an IPv6
+/// network is usually given, so a host can change addresses within it at will; a /24 keeps a
+/// client from spreading its requests over the neighbouring addresses it may have.
+pub fn client_net(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            format!("{}/24", Ipv4Addr::new(a, b, c, 0))
+        }
+        IpAddr::V6(v6) => {
+            let [a, b, c, d, ..] = v6.segments();
+            format!("{}/64", Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+        }
+    }
+}
+
+/// The browser that asks for a reset code: the code is bound to it and counted against its
+/// network.
+#[derive(Debug, Clone)]
+pub struct ResetClient {
+    /// The binding of the browser's reset cookie.
+    pub binding: Binding,
+    /// Its network, see [`client_net`].
+    pub net: String,
+}
+
+impl ResetClient {
+    /// The browser with reset cookie value `cookie`, at address `ip`.
+    pub fn new(key: &Key, cookie: &str, ip: IpAddr) -> Self {
+        Self {
+            binding: Binding::new(key, cookie),
+            net: client_net(ip),
+        }
+    }
+}
+
+/// What a new code is for, which decides its limits and what it is bound to (see the module
+/// documentation).
+#[derive(Debug, Clone, Copy)]
+pub enum CodeFor<'a> {
+    /// Binding an address to the signed-in account: limited per account, bound to no browser.
+    Bind,
+    /// Resetting the password, asked for by this browser: bound to it, limited per account and
+    /// its network and per account.
+    Reset(&'a ResetClient),
+}
+
+impl CodeFor<'_> {
+    /// The purpose of the code.
+    pub const fn purpose(self) -> Purpose {
+        match self {
+            Self::Bind => Purpose::Bind,
+            Self::Reset(_) => Purpose::Reset,
+        }
+    }
 }
 
 /// A new code: the one value to put into the mail that carries it.
@@ -221,10 +337,12 @@ impl std::fmt::Debug for Code {
 pub enum NewCode {
     /// A new code to mail.
     Code(Code),
-    /// A code of this purpose was made less than [`SEND_INTERVAL_SECS`] ago; this many seconds
-    /// are left.
+    /// A code of this purpose (for a reset code: from this network) was made less than
+    /// [`SEND_INTERVAL_SECS`] ago; this many seconds are left.
     TooSoon(i64),
-    /// [`SENDS_PER_DAY`] codes of this purpose were made within a day.
+    /// A daily limit is reached: [`BIND_SENDS_PER_DAY`] bind codes of the account, or
+    /// [`RESET_SENDS_PER_NET_PER_DAY`] reset codes of the account from this network or
+    /// [`RESET_SENDS_PER_DAY`] from all.
     DailyLimit,
 }
 
@@ -271,7 +389,8 @@ pub async fn find_account(pool: &Pool, login: &str) -> Result<Option<(User, Opti
     Ok(row.map(|row| (row.user, row.email.map(String::from))))
 }
 
-/// The address the live code of `purpose` of `user_id` was sent to, and when it ends.
+/// The address the live code of `purpose` of `user_id` was sent to, and when it ends. For reset
+/// codes this is the latest of any browser's: only the account page asks, for bind codes.
 pub async fn pending(
     pool: &Pool,
     user_id: i64,
@@ -314,52 +433,115 @@ async fn end_codes(
     Ok(())
 }
 
-/// Makes a new code of `purpose` for `email` (normalized, see [`normalize_address`]) of
-/// account `user_id`, within the limits of the module documentation, and ends the account's
-/// earlier codes of that purpose. The caller mails it, and calls [`discard`] if that fails.
+/// Ends the live reset codes of `user_id` that are bound to `binding` inside `tx`, as
+/// [`end_codes`] does; those of other browsers stay.
+async fn end_bound_codes(tx: &mut db::Tx, user_id: i64, binding: &Binding, now: i64) -> Result<()> {
+    sqlx::query(
+        "UPDATE email_codes SET expires_at = ? \
+         WHERE user_id = ? AND purpose = ? AND client_binding = ? AND expires_at > ?",
+    )
+    .bind(now)
+    .bind(user_id)
+    .bind(Purpose::Reset.as_str())
+    .bind(&binding.0[..])
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// The codes of `purpose` of `user_id` made after `since` (only those from client network
+/// `net`, if given) inside `tx`: how many, and when the last was made (0 for none).
+async fn made_since(
+    tx: &mut db::Tx,
+    user_id: i64,
+    purpose: Purpose,
+    net: Option<&str>,
+    since: i64,
+) -> Result<(i64, i64)> {
+    Ok(sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(MAX(created_at), 0) FROM email_codes \
+         WHERE user_id = ? AND purpose = ? AND created_at > ? \
+         AND (? IS NULL OR client_net = ?)",
+    )
+    .bind(user_id)
+    .bind(purpose.as_str())
+    .bind(since)
+    .bind(net)
+    .bind(net)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+/// The refusal, if any, of a new code after `count` codes within a day, the last made at
+/// `last`, when `per_day` are allowed.
+fn over_limit(count: i64, last: i64, per_day: i64, now: i64) -> Option<NewCode> {
+    if count > 0 && last > now - SEND_INTERVAL_SECS {
+        // A clock that went back must not make the wait longer than the interval.
+        return Some(NewCode::TooSoon(
+            (last + SEND_INTERVAL_SECS - now).clamp(1, SEND_INTERVAL_SECS),
+        ));
+    }
+    (count >= per_day).then_some(NewCode::DailyLimit)
+}
+
+/// Makes a new code for `request` to `email` (normalized, see [`normalize_address`]) of account
+/// `user_id`, within the limits of the module documentation, and ends the earlier codes it
+/// replaces: a bind code the account's earlier bind codes, a reset code the earlier ones of the
+/// same browser only. The digest is keyed with `key`. The caller mails the code, and calls
+/// [`discard`] if that fails.
 ///
 /// A bind code is made also for an address that another account has: that is found out only
 /// when the code is entered ([`bind`]), so that only the owner of an address can learn that it
 /// is taken.
 pub async fn send_code(
     pool: &Pool,
+    key: &Key,
     user_id: i64,
-    purpose: Purpose,
+    request: CodeFor<'_>,
     email: &str,
     now: i64,
 ) -> Result<NewCode> {
+    let purpose = request.purpose();
+    let since = now - DAY_SECS;
     let mut tx = db::begin_immediate(pool).await?;
-    let (count, last): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COALESCE(MAX(created_at), 0) FROM email_codes \
-         WHERE user_id = ? AND purpose = ? AND created_at > ?",
-    )
-    .bind(user_id)
-    .bind(purpose.as_str())
-    .bind(now - DAY_SECS)
-    .fetch_one(&mut *tx)
-    .await?;
-    if count > 0 && last > now - SEND_INTERVAL_SECS {
-        // A clock that went back must not make the wait longer than the interval.
-        return Ok(NewCode::TooSoon(
-            (last + SEND_INTERVAL_SECS - now).clamp(1, SEND_INTERVAL_SECS),
-        ));
+    let (count, last) = made_since(&mut tx, user_id, purpose, None, since).await?;
+    let refused = match request {
+        CodeFor::Bind => over_limit(count, last, BIND_SENDS_PER_DAY, now),
+        CodeFor::Reset(client) => {
+            let (net_count, net_last) =
+                made_since(&mut tx, user_id, purpose, Some(&client.net), since).await?;
+            over_limit(net_count, net_last, RESET_SENDS_PER_NET_PER_DAY, now)
+                .or_else(|| (count >= RESET_SENDS_PER_DAY).then_some(NewCode::DailyLimit))
+        }
+    };
+    if let Some(refused) = refused {
+        return Ok(refused);
     }
-    if count >= SENDS_PER_DAY {
-        return Ok(NewCode::DailyLimit);
-    }
-    end_codes(&mut tx, user_id, Some(purpose), now).await?;
+    let (binding, net) = match request {
+        CodeFor::Bind => {
+            end_codes(&mut tx, user_id, Some(Purpose::Bind), now).await?;
+            (None, None)
+        }
+        CodeFor::Reset(client) => {
+            end_bound_codes(&mut tx, user_id, &client.binding, now).await?;
+            (Some(&client.binding.0[..]), Some(client.net.as_str()))
+        }
+    };
     let id = db::next_id(&mut tx, "email_codes").await?;
     let code = format!("{:06}", rand::rng().random_range(0..CODE_SPACE));
     let expires_at = now + CODE_TTL_SECS;
     sqlx::query(
-        "INSERT INTO email_codes (id, user_id, purpose, email, code_hash, created_at, \
-         expires_at, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+        "INSERT INTO email_codes (id, user_id, purpose, email, code_hash, client_binding, \
+         client_net, created_at, expires_at, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
     )
     .bind(id)
     .bind(user_id)
     .bind(purpose.as_str())
     .bind(email)
-    .bind(&code_digest(id, &code)[..])
+    .bind(&code_digest(key, id, purpose, &code)[..])
+    .bind(binding)
+    .bind(net)
     .bind(now)
     .bind(expires_at)
     .execute(&mut *tx)
@@ -405,24 +587,32 @@ enum Tried {
     None,
 }
 
-/// Takes one try at the live code of `purpose` of `user_id` inside `tx`. The try is counted
-/// before the code is compared, and the digests are compared in constant time.
+/// Takes one try at the live code of `purpose` of `user_id` inside `tx`: of `binding` for a
+/// reset code, of no binding for a bind code. A code of another binding is not found, so it
+/// counts no try. The try is counted before the code is compared, and the digests are compared
+/// in constant time.
 async fn try_code(
     tx: &mut db::Tx,
+    key: &Key,
     user_id: i64,
     purpose: Purpose,
+    binding: Option<&Binding>,
     code: &str,
     now: i64,
 ) -> Result<Tried> {
+    let binding = binding.map(|binding| &binding.0[..]);
     let row: Option<CodeRow> = sqlx::query_as(
         "SELECT id, email, code_hash, attempts FROM email_codes \
          WHERE user_id = ? AND purpose = ? AND expires_at > ? AND attempts < ? \
+         AND (client_binding = ? OR (? IS NULL AND client_binding IS NULL)) \
          ORDER BY id DESC LIMIT 1",
     )
     .bind(user_id)
     .bind(purpose.as_str())
     .bind(now)
     .bind(MAX_ATTEMPTS)
+    .bind(binding)
+    .bind(binding)
     .fetch_optional(&mut **tx)
     .await?;
     let Some(row) = row else {
@@ -432,7 +622,7 @@ async fn try_code(
         .bind(row.id)
         .execute(&mut **tx)
         .await?;
-    if secret::constant_time_eq(&code_digest(row.id, code), &row.code_hash) {
+    if secret::constant_time_eq(&code_digest(key, row.id, purpose, code), &row.code_hash) {
         Ok(Tried::Right(row))
     } else {
         Ok(Tried::Wrong(MAX_ATTEMPTS - row.attempts - 1))
@@ -458,17 +648,19 @@ pub enum Bind {
 }
 
 /// Binds the address of the live bind code of `user_id` to the account, if `code` is that
-/// code (see `try_code`). Ends every live code of the account, also those for password
-/// resets, which were sent to the address it had, and bumps `updated_at`.
+/// code (see `try_code`; its digest is keyed with `key`). Ends every live code of the account,
+/// also those for password resets, which were sent to the address it had, and bumps
+/// `updated_at`.
 pub async fn bind(
     pool: &Pool,
+    key: &Key,
     user_id: i64,
     code: &str,
     client_ip: Option<IpAddr>,
     now: i64,
 ) -> Result<Bind> {
     let mut tx = db::begin_immediate(pool).await?;
-    let row = match try_code(&mut tx, user_id, Purpose::Bind, code, now).await? {
+    let row = match try_code(&mut tx, key, user_id, Purpose::Bind, None, code, now).await? {
         Tried::Right(row) => row,
         Tried::None => return Ok(Bind::Expired),
         Tried::Wrong(left) => {
@@ -575,25 +767,29 @@ pub enum Reset {
 }
 
 /// Resets the web login password of account `user_id` to `password_hash` (an Argon2 PHC
-/// string) if `code` is its live reset code, sent to the address the account still has (see
-/// `try_code`). Disabled accounts cannot reset.
+/// string) if `code` is its live reset code bound to `binding` (the browser that asked for it),
+/// sent to the address the account still has (see `try_code`; digests are keyed with `key`).
+/// Disabled accounts cannot reset.
 ///
-/// A reset ends every browser session of the account and every live code, bumps `updated_at`
-/// (so sign-ins waiting for their second step end) and is recorded as `password.reset`, all in
-/// one transaction. Two-step verification stays as it is.
+/// A reset ends every browser session of the account and every live code (those of other
+/// browsers too), bumps `updated_at` (so sign-ins waiting for their second step end) and is
+/// recorded as `password.reset`, all in one transaction. Two-step verification stays as it is.
 ///
-/// `user_id` is `None` when the form named no account: the write transaction runs all the same,
-/// as it does for an account without a code.
+/// `user_id` is `None` when the form named no account, `binding` when the browser has no reset
+/// cookie: the write transaction runs all the same, as it does for an account without a code.
+#[allow(clippy::too_many_arguments)]
 pub async fn reset_password(
     pool: &Pool,
+    key: &Key,
     user_id: Option<i64>,
+    binding: Option<&Binding>,
     code: &str,
     password_hash: &str,
     client_ip: Option<IpAddr>,
     now: i64,
 ) -> Result<Reset> {
     let mut tx = db::begin_immediate(pool).await?;
-    let Some(user_id) = user_id else {
+    let (Some(user_id), Some(binding)) = (user_id, binding) else {
         tx.commit().await?;
         return Ok(Reset::Refused);
     };
@@ -606,7 +802,17 @@ pub async fn reset_password(
         tx.commit().await?;
         return Ok(Reset::Refused);
     };
-    let row = match try_code(&mut tx, user_id, Purpose::Reset, code, now).await? {
+    let row = match try_code(
+        &mut tx,
+        key,
+        user_id,
+        Purpose::Reset,
+        Some(binding),
+        code,
+        now,
+    )
+    .await?
+    {
         // A code sent to an address the account no longer has does not count (changing the
         // address ends codes already; this keeps it so).
         Tried::Right(row) if row.email.0 == email.0 => row,
@@ -741,8 +947,16 @@ mod tests {
         for invalid in ["", "12345", "1234567", "12345a", "١٢٣٤٥٦"] {
             assert_eq!(parse_code(invalid), None, "{invalid}");
         }
-        assert_ne!(code_digest(1, "123456"), code_digest(2, "123456"));
-        assert_ne!(code_digest(1, "123456"), code_digest(1, "123457"));
+        let key = Key::from_bytes(&[3; 32]);
+        let digest = code_digest(&key, 1, Purpose::Bind, "123456");
+        assert_ne!(digest, code_digest(&key, 2, Purpose::Bind, "123456"));
+        assert_ne!(digest, code_digest(&key, 1, Purpose::Bind, "123457"));
+        assert_ne!(digest, code_digest(&key, 1, Purpose::Reset, "123456"));
+        assert_ne!(
+            digest,
+            code_digest(&Key::from_bytes(&[4; 32]), 1, Purpose::Bind, "123456"),
+            "keyed"
+        );
         let code = Code {
             id: 1,
             code: "987654".to_owned(),
@@ -750,5 +964,32 @@ mod tests {
             expires_at: 0,
         };
         assert!(!format!("{code:?}").contains("987654"));
+    }
+
+    #[test]
+    fn reset_codes_count_against_the_network_of_the_client() {
+        for (ip, net) in [
+            ("192.0.2.7", "192.0.2.0/24"),
+            ("192.0.2.255", "192.0.2.0/24"),
+            ("198.51.100.1", "198.51.100.0/24"),
+            ("::ffff:192.0.2.9", "192.0.2.0/24"),
+            ("2001:db8:1:2:3:4:5:6", "2001:db8:1:2::/64"),
+            ("2001:db8:1:2::ffff", "2001:db8:1:2::/64"),
+            ("2001:db8::1", "2001:db8::/64"),
+            ("::1", "::/64"),
+        ] {
+            assert_eq!(client_net(ip.parse().unwrap()), net, "{ip}");
+        }
+    }
+
+    #[test]
+    fn bindings_are_keyed_digests_of_the_cookie() {
+        let key = Key::from_bytes(&[3; 32]);
+        let binding = Binding::new(&key, "cookie");
+        assert_eq!(binding, Binding::new(&key, "cookie"));
+        assert_ne!(binding, Binding::new(&key, "cookif"));
+        assert_ne!(binding, Binding::new(&Key::from_bytes(&[4; 32]), "cookie"));
+        assert_ne!(binding.0, secret::digest("cookie"), "not a plain digest");
+        assert_eq!(format!("{binding:?}"), "Binding(..)");
     }
 }

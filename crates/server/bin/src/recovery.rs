@@ -1,11 +1,12 @@
 //! Resetting a forgotten web login password with a code mailed to the account's email address
-//! (`gono_server_core::email`). The pages exist while the web file UI is on and mail can be sent
-//! (`[smtp]`); otherwise they answer `404` and the sign-in page has no link to them.
+//! (`gono_server_core::email`). The pages exist while the web file UI is on, mail can be sent
+//! (`[smtp]`) and the key the codes are keyed with exists (`two_factor.key_file`, see
+//! [`AppState::email`]); otherwise they answer `404` and the sign-in page has no link to them.
 //!
 //! | Request | Answer |
 //! |---|---|
 //! | `GET /login/forgot` | The form: username or email address. |
-//! | `POST /login/forgot` | Sends a reset code to the account's address, if it has one, and answers with the reset form. |
+//! | `POST /login/forgot` | Sends a reset code to the account's address, if it has one, bound to this browser, and answers with the reset form. |
 //! | `GET /login/reset` | The reset form: username or email address, the code and the new password twice. |
 //! | `POST /login/reset` | Resets the password and leads to `/login`, or shows the form again. |
 //!
@@ -16,7 +17,18 @@
 //! for the day. The answer does not wait for anything account-dependent either: the lookup, the
 //! code and the mail happen on a task of their own after the page is answered. Requests are
 //! limited per client ([`Web::allow_reset_request`](crate::web::Web::allow_reset_request)) and,
-//! through the limits of codes, per account.
+//! through the limits of codes, per account and client network and per account.
+//!
+//! # Bound to the browser that asked
+//!
+//! `POST /login/forgot` sets the [`RESET_COOKIE`] (a random value, see
+//! [`Web::reset_cookie`](crate::web::Web::reset_cookie)) and the code is bound to its keyed
+//! digest: only a reset form sent with the same cookie reaches the code. Whoever knows a
+//! username can therefore ask for codes for it, which go to the owner's address, but can
+//! neither try the code the owner got nor end it, and a request of theirs does not end the
+//! owner's. The reset form says when this browser has no such cookie (it never asked, or too
+//! long ago), which tells nothing about any account; the mail says to enter the code in the
+//! browser window that asked. A reset removes the cookie.
 //!
 //! A reset is checked by [`Web::reset_password`](crate::web::Web::reset_password): the
 //! failed-attempt limiter of the sign-in pages, the same work and the same answer for every
@@ -39,7 +51,7 @@ use axum::{
 };
 use gono_server_core::{
     db,
-    email::{self, NewCode, Purpose},
+    email::{self, CodeFor, NewCode, ResetClient},
     password,
 };
 use secrecy::SecretString;
@@ -52,7 +64,7 @@ use crate::{
     i18n::{Lang, fill},
     mail::{self, Mailer},
     site::blocked,
-    web::{self, Chrome, Message, PasswordReset, page},
+    web::{self, Chrome, Message, PasswordReset, RESET_COOKIE, page},
 };
 
 /// `forgot.html`.
@@ -74,14 +86,17 @@ struct ResetPage {
     login: String,
     notice: Option<&'static str>,
     error: Option<String>,
+    /// This browser has no reset cookie: the page says that a code works only in the browser
+    /// that asked for it, and links to `/login/forgot`.
+    no_request: bool,
 }
 
 page!(ForgotPage, ResetPage);
 
-/// The mailer, while the pages exist.
-fn mailer(state: &AppState) -> Option<Arc<dyn Mailer>> {
+/// The mailer and the key of the codes, while the pages exist.
+fn mail(state: &AppState) -> Option<(Arc<dyn Mailer>, email::Key)> {
     state.files.as_ref()?;
-    state.mailer.clone()
+    state.email()
 }
 
 fn forgot_form(
@@ -103,12 +118,14 @@ fn forgot_form(
     response
 }
 
+/// The reset form; `no_request` when the browser has no reset cookie (see [`ResetPage`]).
 fn reset_form(
     state: &AppState,
     headers: &HeaderMap,
     status: StatusCode,
     login: &str,
     message: (Option<&'static str>, Option<String>),
+    no_request: bool,
 ) -> Response {
     let (csrf, cookie) = state.web.login_csrf(headers);
     let page = ResetPage {
@@ -117,6 +134,7 @@ fn reset_form(
         login: login.to_owned(),
         notice: message.0,
         error: message.1,
+        no_request,
     };
     let mut response = web::render(status, &page);
     response.headers_mut().append(header::SET_COOKIE, cookie);
@@ -125,7 +143,7 @@ fn reset_form(
 
 /// `GET /login/forgot`.
 pub async fn forgot_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if mailer(&state).is_none() {
+    if mail(&state).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
     forgot_form(&state, &headers, StatusCode::OK, "", None)
@@ -146,7 +164,7 @@ pub async fn forgot(
     headers: HeaderMap,
     Form(form): Form<ForgotForm>,
 ) -> Response {
-    let Some(mailer) = mailer(&state) else {
+    let Some((mailer, key)) = mail(&state) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if !state.web.same_origin(&headers) {
@@ -173,31 +191,46 @@ pub async fn forgot(
     if let Err(wait) = state.web.allow_reset_request(client) {
         return too_many_requests(chrome, wait);
     }
+    // The code is bound to this browser: the cookie goes out with the answer whether or not a
+    // code is made, as nothing may tell.
+    let (value, cookie) = state.web.reset_cookie(&headers);
+    let requester = ResetClient::new(&key, &value, client);
     // Everything that depends on the account happens on a task the answer does not wait for.
     let base_url = state.base_url.clone();
     let pool = state.db.clone();
     let lang = chrome.lang;
     let named = login.clone();
     tokio::spawn(async move {
-        send_reset_code(&pool, &mailer, &base_url, lang, client, &named).await;
+        send_reset_code(
+            &pool, &key, &mailer, &base_url, lang, client, &requester, &named,
+        )
+        .await;
     });
-    reset_form(
+    // The cookie is set by this very answer, so the form needs no notice about it.
+    let mut response = reset_form(
         &state,
         &headers,
         StatusCode::OK,
         &login,
         (Some(t.forgot_sent), None),
-    )
+        false,
+    );
+    response.headers_mut().append(header::SET_COOKIE, cookie);
+    response
 }
 
-/// Mails a reset code to the address of the account `login` names, if it has one and may still
-/// get a code today. Nothing of it reaches the page.
+/// Mails a reset code, bound to `requester` (the browser that asked from `client`), to the
+/// address of the account `login` names, if it has one and may still get a code. Nothing of it
+/// reaches the page.
+#[allow(clippy::too_many_arguments)]
 async fn send_reset_code(
     pool: &db::Pool,
+    key: &email::Key,
     mailer: &Arc<dyn Mailer>,
     base_url: &url::Url,
     lang: Lang,
     client: std::net::IpAddr,
+    requester: &ResetClient,
     login: &str,
 ) {
     let account = match email::find_account(pool, login).await {
@@ -212,10 +245,11 @@ async fn send_reset_code(
         return;
     };
     let now = db::unix_now();
-    let code = match email::send_code(pool, user.id, Purpose::Reset, &address, now).await {
+    let request = CodeFor::Reset(requester);
+    let code = match email::send_code(pool, key, user.id, request, &address, now).await {
         Ok(NewCode::Code(code)) => code,
         Ok(NewCode::TooSoon(_) | NewCode::DailyLimit) => {
-            tracing::info!(%client, user = %user.username, "no password reset code sent: the account's limit is reached");
+            tracing::info!(%client, user = %user.username, "no password reset code sent: a limit of the account or of the client network is reached");
             return;
         }
         Err(err) => {
@@ -256,10 +290,18 @@ fn too_many_requests(chrome: Chrome, wait: std::time::Duration) -> Response {
 
 /// `GET /login/reset`.
 pub async fn reset_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if mailer(&state).is_none() {
+    if mail(&state).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    reset_form(&state, &headers, StatusCode::OK, "", (None, None))
+    let no_request = state.web.reset_cookie_value(&headers).is_none();
+    reset_form(
+        &state,
+        &headers,
+        StatusCode::OK,
+        "",
+        (None, None),
+        no_request,
+    )
 }
 
 #[derive(Deserialize)]
@@ -283,7 +325,7 @@ pub async fn reset(
     headers: HeaderMap,
     Form(form): Form<ResetForm>,
 ) -> Response {
-    let Some(mailer) = mailer(&state) else {
+    let Some((mailer, _)) = mail(&state) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if !state.web.same_origin(&headers) {
@@ -292,8 +334,17 @@ pub async fn reset(
     let chrome = Chrome::for_request(&headers);
     let t = chrome.t;
     let login = form.login.trim().to_owned();
+    let cookie = state.web.reset_cookie_value(&headers);
     let refuse = |status: StatusCode, error: String| {
-        reset_form(&state, &headers, status, &login, (None, Some(error)))
+        let no_request = cookie.is_none();
+        reset_form(
+            &state,
+            &headers,
+            status,
+            &login,
+            (None, Some(error)),
+            no_request,
+        )
     };
     if !state.web.check_login_csrf(&headers, &form.csrf) {
         return refuse(StatusCode::FORBIDDEN, t.form_expired_sign_in.to_owned());
@@ -312,13 +363,15 @@ pub async fn reset(
     let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
     match state
         .web
-        .reset_password(client, &login, &form.code, new)
+        .reset_password(client, &login, &form.code, new, cookie.as_deref())
         .await
     {
         PasswordReset::Done { username, email } => {
             let message = mail::password_reset(chrome.lang, &state.base_url, &username);
             mail::send_later(&mailer, email, message, "a password reset");
-            web::see_other("/login?done=password-reset", &[])
+            // The codes of the account ended with the reset; the cookie has nothing left to do.
+            let removal = state.web.removal_cookie(RESET_COOKIE);
+            web::see_other("/login?done=password-reset", &[removal])
         }
         PasswordReset::Wrong => refuse(StatusCode::FORBIDDEN, t.reset_wrong.to_owned()),
         PasswordReset::RateLimited(wait) => web::too_many_attempts(chrome, wait),

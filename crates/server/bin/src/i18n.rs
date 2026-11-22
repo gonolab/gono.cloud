@@ -183,13 +183,14 @@ texts! {
     forgot_lead: "Enter your username or the email address of your account. If the account has an email address, a code to reset the password is sent to it.", "请输入用户名或账号绑定的邮箱。如果账号绑定了邮箱，重置密码的验证码会发到这个邮箱。";
     forgot_login: "Username or email address", "用户名或邮箱";
     forgot_send: "Send code", "发送验证码";
-    forgot_sent: "If this account has an email address, a code was sent to it. It is valid for 10 minutes.", "如果这个账号绑定了邮箱，验证码已发到该邮箱，10 分钟内有效。";
+    forgot_sent: "If this account has an email address, a code was sent to it. Enter it here, in this browser window, within 10 minutes.", "如果这个账号绑定了邮箱，验证码已发到该邮箱。请在 10 分钟内在这个浏览器窗口中输入。";
     err_forgot_login: "Enter your username or email address.", "请输入用户名或邮箱。";
     reset_title: "Reset your password", "重置密码";
     reset_lead: "Enter the code from the mail and choose a new web login password. Two-step verification stays as it is: if your account has it, the next sign-in still asks for its code.", "请输入邮件中的验证码，并设置新的网页登录密码。两步验证保持不变：如果你的账号开启了它，下次登录仍需要输入验证码。";
     reset_code: "Code from the mail", "邮件中的验证码";
     reset_submit: "Reset password", "重置密码";
-    reset_wrong: "That code is not right or has expired. Ask for a new one if you need it.", "验证码不正确或已过期，如有需要请重新获取。";
+    reset_wrong: "That code is not right, has expired, or was asked for in another browser. Ask for a new one if you need it.", "验证码不正确、已过期，或是在另一个浏览器中获取的。如有需要请重新获取。";
+    reset_no_request: "This browser has not asked for a code in the last few minutes. A code works only in the browser window where it was asked for.", "这个浏览器最近没有获取过验证码。验证码只能在获取它的那个浏览器窗口中使用。";
     reset_ask_again: "Ask for a code", "获取验证码";
     back_to_sign_in: "Back to sign-in", "返回登录";
     too_many_requests_lead: "There were too many requests from your network. Try again in {} seconds.", "你的网络请求次数过多，请 {} 秒后再试。";
@@ -916,7 +917,7 @@ texts! {
     mail_bind_subject: "Gono Cloud: confirm your email address", "Gono Cloud：确认你的邮箱";
     mail_bind_text: "Your code to add this email address to an account at\n{}:\n\n    {}\n\nEnter it on the account page within 10 minutes. If you did not\nask for it, ignore this mail: without the code, nothing changes.\n", "把这个邮箱添加到\n{}\n上的账号所需的验证码：\n\n    {}\n\n请在 10 分钟内在账户页输入。如果不是你本人操作，请忽略这封邮件：\n没有验证码，什么都不会改变。\n";
     mail_reset_subject: "Gono Cloud: reset your password", "Gono Cloud：重置密码";
-    mail_reset_text: "Your code to reset the web login password of the account {}\nat {}:\n\n    {}\n\nEnter it at {}/login/reset within 10 minutes.\nTwo-step verification stays as it is. If you did not ask for it,\nignore this mail: your password stays as it is.\n", "账号 {}（{}）\n重置网页登录密码所需的验证码：\n\n    {}\n\n请在 10 分钟内到 {}/login/reset 输入。\n两步验证不受影响。如果不是你本人操作，请忽略这封邮件，你的密码不会改变。\n";
+    mail_reset_text: "Your code to reset the web login password of the account {}\nat {}:\n\n    {}\n\nEnter it within 10 minutes in the browser window where you asked\nfor it ({}/login/reset): it works in no other browser.\nTwo-step verification stays as it is. If you did not ask for it,\nignore this mail: your password stays as it is.\n", "账号 {}（{}）\n重置网页登录密码所需的验证码：\n\n    {}\n\n请在 10 分钟内，在获取验证码的那个浏览器窗口中输入（{}/login/reset），\n在其他浏览器中无效。\n两步验证不受影响。如果不是你本人操作，请忽略这封邮件，你的密码不会改变。\n";
     mail_reset_done_subject: "Gono Cloud: your password was reset", "Gono Cloud：你的密码已重置";
     mail_reset_done_text: "The web login password of the account {} at\n{} was reset with a code sent to this address,\nand every browser was signed out. If you did not do this, contact\nyour administrator at once.\n", "账号 {}（{}）\n的网页登录密码已经用发到这个邮箱的验证码重置，所有浏览器都已退出登录。\n如果不是你本人操作，请立即联系管理员。\n";
     mail_replaced_subject: "Gono Cloud: your email address was changed", "Gono Cloud：你的邮箱已更换";

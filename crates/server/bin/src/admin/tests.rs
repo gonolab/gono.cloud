@@ -1719,7 +1719,7 @@ async fn admins_see_revoke_and_remove_the_s3_keys_and_buckets_of_an_account() {
 
 #[tokio::test]
 async fn the_page_of_an_account_shows_its_email_address() {
-    use gono_server_core::email::{self, Bind, NewCode, Purpose};
+    use gono_server_core::email::{self, Bind, CodeFor, Key, NewCode};
 
     let f = fixture().await;
     let mut browser = Browser::new(&f.state);
@@ -1733,10 +1733,12 @@ async fn the_page_of_an_account_shows_its_email_address() {
     assert_eq!(fact(&page.body), "None");
 
     let now = db::unix_now();
+    let key = Key::from_bytes(&[1; 32]);
     let NewCode::Code(code) = email::send_code(
         &f.state.db,
+        &key,
         f.alice,
-        Purpose::Bind,
+        CodeFor::Bind,
         "alice@example.com",
         now,
     )
@@ -1744,7 +1746,7 @@ async fn the_page_of_an_account_shows_its_email_address() {
     .unwrap() else {
         panic!("no code");
     };
-    let bound = email::bind(&f.state.db, f.alice, &code.code, None, now)
+    let bound = email::bind(&f.state.db, &key, f.alice, &code.code, None, now)
         .await
         .unwrap();
     assert!(matches!(bound, Bind::Bound { .. }), "{bound:?}");

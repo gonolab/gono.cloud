@@ -341,7 +341,7 @@ fn sign_in_form(
         next: next.to_owned(),
         notice: message.0,
         error: message.1,
-        forgot: state.mailer.is_some(),
+        forgot: state.email().is_some(),
     };
     let mut response = web::render(status, &page);
     response.headers_mut().append(header::SET_COOKIE, cookie);

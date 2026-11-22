@@ -16,7 +16,8 @@
 //!
 //! Whether another account has the address is found out only when the code is entered, so that
 //! only the owner of an address can learn it; the error does not say which account. Without a
-//! mailer (`[smtp]` off) the panel says so and offers no form, and the forms answer `404`.
+//! mailer (`[smtp]` off), or without the key the codes are keyed with (`two_factor.key_file`,
+//! see [`AppState::email`]), the panel says so and offers no form, and the forms answer `404`.
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -28,7 +29,7 @@ use axum::{
 };
 use gono_server_core::{
     db,
-    email::{self, Bind, NewCode, Purpose},
+    email::{self, Bind, CodeFor, Key, NewCode, Purpose},
 };
 use serde::Deserialize;
 
@@ -60,7 +61,7 @@ pub(super) async fn view(
 ) -> gono_server_core::Result<EmailView> {
     let user_id = visitor.user.user_id;
     let address = email::address(&state.db, user_id).await?;
-    let available = state.mailer.is_some();
+    let available = state.email().is_some();
     let waiting = if available {
         email::pending(&state.db, user_id, Purpose::Bind, now)
             .await?
@@ -90,17 +91,17 @@ pub(super) fn notice(t: &'static Text, done: &str) -> Option<&'static str> {
     })
 }
 
-/// The visitor of a form of the panel and the mailer, or the page to answer with: `404` while
-/// this server cannot send mail.
+/// The visitor of a form of the panel, the mailer and the key of the codes, or the page to
+/// answer with: `404` while this server cannot send codes ([`AppState::email`]).
 async fn panel_visitor(
     state: &AppState,
     headers: &HeaderMap,
     uri: &Uri,
     csrf: &str,
-) -> Result<(Visitor, Arc<dyn Mailer>), Box<Response>> {
+) -> Result<(Visitor, Arc<dyn Mailer>, Key), Box<Response>> {
     let visitor = form_visitor(state, headers, uri, csrf).await?;
-    match state.mailer.clone() {
-        Some(mailer) => Ok((visitor, mailer)),
+    match state.email() {
+        Some((mailer, key)) => Ok((visitor, mailer, key)),
         None => Err(Box::new(StatusCode::NOT_FOUND.into_response())),
     }
 }
@@ -123,7 +124,7 @@ pub async fn start(
     uri: Uri,
     Form(form): Form<StartForm>,
 ) -> Response {
-    let (visitor, mailer) = match panel_visitor(&state, &headers, &uri, &form.csrf).await {
+    let (visitor, mailer, key) = match panel_visitor(&state, &headers, &uri, &form.csrf).await {
         Ok(found) => found,
         Err(response) => return *response,
     };
@@ -145,7 +146,8 @@ pub async fn start(
         Err(err) => return internal(&visitor, "email address", &err),
     }
     let now = db::unix_now();
-    let code = match email::send_code(&state.db, user_id, Purpose::Bind, &address, now).await {
+    let code = match email::send_code(&state.db, &key, user_id, CodeFor::Bind, &address, now).await
+    {
         Ok(NewCode::Code(code)) => code,
         Ok(NewCode::TooSoon(wait)) => {
             return fail(fill(t.err_email_too_soon, &[&wait.to_string()])).await;
@@ -182,7 +184,7 @@ pub async fn confirm(
     uri: Uri,
     Form(form): Form<ConfirmForm>,
 ) -> Response {
-    let (visitor, mailer) = match panel_visitor(&state, &headers, &uri, &form.csrf).await {
+    let (visitor, mailer, key) = match panel_visitor(&state, &headers, &uri, &form.csrf).await {
         Ok(found) => found,
         Err(response) => return *response,
     };
@@ -195,7 +197,16 @@ pub async fn confirm(
     let Some(code) = email::parse_code(&form.code) else {
         return fail(t.err_email_code).await;
     };
-    match email::bind(&state.db, user_id, &code, Some(client), db::unix_now()).await {
+    match email::bind(
+        &state.db,
+        &key,
+        user_id,
+        &code,
+        Some(client),
+        db::unix_now(),
+    )
+    .await
+    {
         Ok(Bind::Bound { email, previous }) => {
             // A recovery credential changed.
             state.web.end_pending_sign_ins(user_id);
@@ -233,7 +244,7 @@ pub async fn remove(
     uri: Uri,
     Form(form): Form<RemoveForm>,
 ) -> Response {
-    let (visitor, mailer) = match panel_visitor(&state, &headers, &uri, &form.csrf).await {
+    let (visitor, mailer, _) = match panel_visitor(&state, &headers, &uri, &form.csrf).await {
         Ok(found) => found,
         Err(response) => return *response,
     };

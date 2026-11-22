@@ -622,19 +622,29 @@ CREATE TABLE recovery_codes (
 -- becomes the account's, 'reset' resets the web login password through the account's address.
 -- Ids from `id_sequences`. A code is valid until `expires_at` and for 5 tries (`attempts`,
 -- counted before each comparison); a used or replaced code gets `expires_at` set to the time it
--- ended. Rows stay a day after they were created, so that the limit of codes per day can count
+-- ended. Rows stay a day after they were created, so that the limits of codes per day can count
 -- them, and are removed by the janitor after that.
 CREATE TABLE email_codes (
-    id         INTEGER PRIMARY KEY,
-    user_id    INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    purpose    TEXT    NOT NULL CHECK (purpose IN ('bind', 'reset')),
+    id             INTEGER PRIMARY KEY,
+    user_id        INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    purpose        TEXT    NOT NULL CHECK (purpose IN ('bind', 'reset')),
     -- The address the code was sent to, lower-cased like `users.email`.
-    email      TEXT    NOT NULL COLLATE BINARY CHECK (length(email) BETWEEN 3 AND 254),
-    -- SHA-256 of the code and the row's id. The code itself (6 digits) is never stored.
-    code_hash  BLOB    NOT NULL CHECK (length(code_hash) = 32),
-    created_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
-    attempts   INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0)
+    email          TEXT    NOT NULL COLLATE BINARY CHECK (length(email) BETWEEN 3 AND 254),
+    -- HMAC-SHA256 of the row's id, the purpose and the code, keyed with a key derived from
+    -- `two_factor.key_file`: without that file the 6 digits cannot be found by trying them
+    -- all. The code itself is never stored.
+    code_hash      BLOB    NOT NULL CHECK (length(code_hash) = 32),
+    -- Reset codes only: the keyed digest of the reset cookie of the browser that asked for the
+    -- code, the only browser that may try it, and the network it asked from (the /24 of an
+    -- IPv4 address or the /64 of an IPv6 one, `192.0.2.0/24`), for the limits per network.
+    client_binding BLOB    CHECK (client_binding IS NULL OR length(client_binding) = 32),
+    client_net     TEXT    COLLATE BINARY
+                           CHECK (client_net IS NULL OR length(client_net) BETWEEN 1 AND 64),
+    created_at     INTEGER NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    attempts       INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    CHECK ((purpose = 'reset') = (client_binding IS NOT NULL AND client_net IS NOT NULL)),
+    CHECK ((client_binding IS NULL) = (client_net IS NULL))
 ) STRICT;
 
 CREATE INDEX email_codes_user ON email_codes (user_id, purpose, created_at);

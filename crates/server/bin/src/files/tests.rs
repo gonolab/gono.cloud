@@ -150,13 +150,22 @@ impl Reply {
 struct Browser {
     router: Router,
     cookies: HashMap<String, String>,
+    /// The address its requests come from.
+    peer: SocketAddr,
 }
 
 impl Browser {
+    /// A browser at 192.0.2.7.
     fn new(state: &AppState) -> Self {
+        Self::at(state, [192, 0, 2, 7].into())
+    }
+
+    /// A browser at `ip`.
+    fn at(state: &AppState, ip: std::net::IpAddr) -> Self {
         Self {
             router: app::router(state.clone()),
             cookies: HashMap::new(),
+            peer: SocketAddr::new(ip, 4000),
         }
     }
 
@@ -174,9 +183,7 @@ impl Browser {
             request = request.header(*name, *value);
         }
         let mut request = request.body(body).unwrap();
-        request
-            .extensions_mut()
-            .insert(ConnectInfo(SocketAddr::from(([192, 0, 2, 7], 4000))));
+        request.extensions_mut().insert(ConnectInfo(self.peer));
         let response = self.router.clone().oneshot(request).await.unwrap();
         for value in response.headers().get_all("set-cookie") {
             let value = value.to_str().unwrap();
@@ -245,6 +252,7 @@ impl Browser {
         let mut router = Browser {
             router: self.router.clone(),
             cookies: HashMap::new(),
+            peer: self.peer,
         };
         router
             .send(

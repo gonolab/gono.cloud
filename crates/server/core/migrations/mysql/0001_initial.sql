@@ -482,18 +482,26 @@ CREATE TABLE recovery_codes (
     FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC;
 
+-- See the SQLite schema: `code_hash` and `client_binding` are keyed digests, and only reset
+-- codes have a `client_binding` and a `client_net`.
 CREATE TABLE email_codes (
-    id         BIGINT       NOT NULL PRIMARY KEY,
-    user_id    BIGINT       NOT NULL,
-    purpose    VARCHAR(8)   NOT NULL,
-    email      VARCHAR(254) NOT NULL,
-    code_hash  BINARY(32)   NOT NULL,
-    created_at BIGINT       NOT NULL,
-    expires_at BIGINT       NOT NULL,
-    attempts   BIGINT       NOT NULL DEFAULT 0,
+    id             BIGINT       NOT NULL PRIMARY KEY,
+    user_id        BIGINT       NOT NULL,
+    purpose        VARCHAR(8)   NOT NULL,
+    email          VARCHAR(254) NOT NULL,
+    code_hash      BINARY(32)   NOT NULL,
+    client_binding BINARY(32),
+    client_net     VARCHAR(64),
+    created_at     BIGINT       NOT NULL,
+    expires_at     BIGINT       NOT NULL,
+    attempts       BIGINT       NOT NULL DEFAULT 0,
     CHECK (purpose IN ('bind', 'reset')),
     CHECK (LENGTH(email) BETWEEN 3 AND 254),
     CHECK (LENGTH(code_hash) = 32),
+    CHECK (client_binding IS NULL OR LENGTH(client_binding) = 32),
+    CHECK (client_net IS NULL OR LENGTH(client_net) BETWEEN 1 AND 64),
+    CHECK ((purpose = 'reset') = (client_binding IS NOT NULL AND client_net IS NOT NULL)),
+    CHECK ((client_binding IS NULL) = (client_net IS NULL)),
     CHECK (attempts >= 0),
     INDEX email_codes_user (user_id, purpose, created_at),
     INDEX email_codes_created_at (created_at),

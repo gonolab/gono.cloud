@@ -1,12 +1,12 @@
 //! Email addresses on the account page and password resets by mail, through the router, with
 //! the in-memory mailer.
 
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 use axum::{body::Body, http::StatusCode};
 use gono_server_core::{
     Username, audit, db,
-    email::{self, Bind, NewCode, Purpose},
+    email::{self, Bind, CodeFor, Key, NewCode, Purpose, RESET_SENDS_PER_DAY},
     password,
     users::{self, NewUser},
 };
@@ -18,7 +18,12 @@ use super::{
 use crate::{
     i18n::{Lang, Text},
     mail::{Mailer, MemoryMailer, Sent},
+    ratelimit::RateLimiter,
+    web::Web,
 };
+
+/// The name of the reset cookie on the fixture's HTTPS origin.
+const RESET_COOKIE: &str = "__Host-gono_reset";
 
 fn t() -> &'static Text {
     Lang::En.t()
@@ -60,17 +65,31 @@ async fn add_user(f: &Fixture, name: &str, password: &str) -> i64 {
 /// Binds `address` to account `user_id` without the pages, with a code of an hour ago (so that
 /// the codes of the test itself are not held back by the limit of one a minute).
 async fn bind_directly(f: &Fixture, user_id: i64, address: &str) {
+    // The fixture's key; the code is used at once, so any key would do.
+    let key = Key::from_bytes(&[9; 32]);
     let then = db::unix_now() - 3600;
-    let NewCode::Code(code) = email::send_code(&f.state.db, user_id, Purpose::Bind, address, then)
-        .await
-        .unwrap()
+    let NewCode::Code(code) =
+        email::send_code(&f.state.db, &key, user_id, CodeFor::Bind, address, then)
+            .await
+            .unwrap()
     else {
         panic!("no code");
     };
-    let bound = email::bind(&f.state.db, user_id, &code.code, None, then + 1)
+    let bound = email::bind(&f.state.db, &key, user_id, &code.code, None, then + 1)
         .await
         .unwrap();
     assert!(matches!(bound, Bind::Bound { .. }), "{bound:?}");
+}
+
+/// The `Set-Cookie` value of the reset cookie in `reply`.
+fn reset_cookie(reply: &Reply) -> String {
+    reply
+        .headers
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| value.to_str().unwrap().to_owned())
+        .find(|value| value.starts_with(&format!("{RESET_COOKIE}=")))
+        .unwrap_or_else(|| panic!("no reset cookie in {:?}", reply.headers))
 }
 
 /// Posts `fields` to `uri` from this origin in the language `accept_language`.
@@ -474,14 +493,33 @@ async fn pending_cookie_after_enrolment(f: &Fixture, browser: &mut Browser, csrf
 #[tokio::test]
 async fn without_a_mailer_there_is_neither_a_form_nor_a_reset() {
     let f = fixture().await;
-    let alice = user(&f, "alice").await;
+    no_email_features(&f).await;
+}
+
+#[tokio::test]
+async fn without_the_key_file_there_is_neither_a_form_nor_a_reset() {
+    // A mailer, but no key to key the codes with: as without a mailer.
+    let (mut f, mailer) = with_mail().await;
+    f.state.web = Arc::new(Web::new(
+        f.state.db.clone(),
+        Arc::new(RateLimiter::new()),
+        &f.state.base_url,
+    ));
+    assert!(f.state.email().is_none());
+    no_email_features(&f).await;
+    assert!(settled(&mailer).await.is_empty());
+}
+
+/// Checks that `f` offers no email address on the account page and no password reset.
+async fn no_email_features(f: &Fixture) {
+    let alice = user(f, "alice").await;
     let mut browser = Browser::new(&f.state);
     let csrf = browser.sign_in().await;
     let page = browser.get("/account/").await.text();
     assert!(page.contains(t().email_unavailable), "{page}");
     assert!(!page.contains("action=\"/account/email"), "{page}");
     // An address bound while mail was on is still shown.
-    bind_directly(&f, alice.id, "alice@example.com").await;
+    bind_directly(f, alice.id, "alice@example.com").await;
     let page = browser.get("/account/").await.text();
     assert!(page.contains("alice@example.com"), "{page}");
     assert!(!page.contains("action=\"/account/email"), "{page}");
@@ -834,4 +872,135 @@ async fn a_code_that_cannot_be_mailed_is_reported_and_ended() {
         None
     );
     assert!(!failed.text().contains("action=\"/account/email/confirm\""));
+}
+
+#[tokio::test]
+async fn a_reset_code_works_only_in_the_browser_that_asked_for_it() {
+    let (f, mailer) = with_mail().await;
+    let alice = user(&f, "alice").await;
+    bind_directly(&f, alice.id, "alice@example.com").await;
+    let mut owner = Browser::new(&f.state);
+
+    // A browser that asked for no code is told so, with a way to ask.
+    let blank = owner.get("/login/reset").await.text();
+    assert!(blank.contains(t().reset_no_request), "{blank}");
+    assert!(blank.contains("href=\"/login/forgot\""), "{blank}");
+
+    let answer = forgot(&mut owner, "alice").await;
+    assert_eq!(answer.status, StatusCode::OK);
+    let set = reset_cookie(&answer);
+    for attribute in [
+        "; Path=/;",
+        "; HttpOnly",
+        "; SameSite=Strict",
+        "; Secure",
+        &format!("; Max-Age={}", email::CODE_TTL_SECS + 60),
+    ] {
+        assert!(set.contains(attribute), "{attribute} in {set}");
+    }
+    let value = owner.cookies[RESET_COOKIE].clone();
+    assert!(
+        value.len() >= 22 && value.bytes().all(|b| b.is_ascii_alphanumeric()),
+        "{value}"
+    );
+    assert!(!answer.text().contains(t().reset_no_request));
+    let form = owner.get("/login/reset").await.text();
+    assert!(!form.contains(t().reset_no_request), "{form}");
+    let mail = mailer.wait_for(1).await.remove(0);
+    assert!(mail.text.contains("browser window"), "{}", mail.text);
+    let code = mail.code();
+
+    // Asking again within a minute keeps the browser's value, and so its code.
+    let again = forgot(&mut owner, "alice").await;
+    assert_eq!(owner.cookies[RESET_COOKIE], value);
+    assert!(reset_cookie(&again).starts_with(&format!("{RESET_COOKIE}={value};")));
+
+    // The code in another browser without a reset cookie: refused, and told why it may be.
+    let mut elsewhere = Browser::at(&f.state, IpAddr::from([198, 51, 100, 9]));
+    let refused = reset(&mut elsewhere, "alice", &code, "a new password").await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    let text = refused.text();
+    assert!(text.contains(t().reset_wrong), "{text}");
+    assert!(text.contains(t().reset_no_request), "{text}");
+    // A stranger with a reset cookie of its own, who asked for the account's code too: refused
+    // (the refusal names another browser as a cause), and the owner's code lives on.
+    forgot(&mut elsewhere, "alice").await;
+    assert_ne!(elsewhere.cookies[RESET_COOKIE], value);
+    let theirs = mailer.wait_for(2).await.remove(1).code();
+    if theirs != code {
+        for _ in 0..email::MAX_ATTEMPTS {
+            let refused = reset(&mut elsewhere, "alice", &code, "a new password").await;
+            assert_eq!(refused.status, StatusCode::FORBIDDEN);
+            let text = refused.text();
+            assert!(text.contains(t().reset_wrong), "{text}");
+            assert!(!text.contains(t().reset_no_request), "{text}");
+        }
+    }
+    // A browser with a forged value has no code either.
+    let mut forged = Browser::at(&f.state, IpAddr::from([203, 0, 113, 5]));
+    forged
+        .cookies
+        .insert(RESET_COOKIE.to_owned(), "A".repeat(value.len()));
+    assert_eq!(
+        reset(&mut forged, "alice", &code, "a new password")
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // In the browser that asked, the code works, and the cookie goes with the reset.
+    let done = reset(&mut owner, "alice", &code, "a new password").await;
+    assert_eq!(
+        done.location(),
+        "/login?done=password-reset",
+        "{}",
+        done.text()
+    );
+    let removal = reset_cookie(&done);
+    assert!(
+        removal.starts_with(&format!("{RESET_COOKIE}=;")) && removal.contains("Max-Age=0"),
+        "{removal}"
+    );
+    assert!(!owner.cookies.contains_key(RESET_COOKIE));
+    let after = owner.get("/login/reset").await.text();
+    assert!(after.contains(t().reset_no_request), "{after}");
+    // The stranger's code ended with the reset as well.
+    let ended = reset(&mut elsewhere, "alice", &theirs, "a third password").await;
+    assert_eq!(ended.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_stranger_neither_ends_the_owners_code_nor_keeps_one_from_coming() {
+    let (f, mailer) = with_mail().await;
+    let alice = user(&f, "alice").await;
+    bind_directly(&f, alice.id, "alice@example.com").await;
+    // A stranger who knows the username asks for codes from networks of its own (one a
+    // minute each), until the account's daily total is nearly used up.
+    let stranger = |index: u8| Browser::at(&f.state, IpAddr::from([10, 0, index, 1]));
+    let total = usize::try_from(RESET_SENDS_PER_DAY).unwrap();
+    for index in 0..total - 2 {
+        let mut browser = stranger(u8::try_from(index).unwrap());
+        forgot(&mut browser, "alice").await;
+        mailer.wait_for(index + 1).await;
+    }
+    // The owner still gets a code.
+    let mut owner = Browser::new(&f.state);
+    forgot(&mut owner, "alice").await;
+    let code = mailer.wait_for(total - 1).await.remove(total - 2).code();
+    // A stranger's request after it does not end it.
+    forgot(&mut stranger(200), "alice").await;
+    mailer.wait_for(total).await;
+    // Beyond the account's total nobody gets a code, which bounds the mails of the address.
+    forgot(&mut stranger(201), "alice").await;
+    let mut neighbour = Browser::at(&f.state, IpAddr::from([198, 51, 100, 1]));
+    forgot(&mut neighbour, "alice").await;
+    assert_eq!(settled(&mailer).await.len(), total);
+
+    let done = reset(&mut owner, "alice", &code, "a new password").await;
+    assert_eq!(
+        done.location(),
+        "/login?done=password-reset",
+        "{}",
+        done.text()
+    );
 }

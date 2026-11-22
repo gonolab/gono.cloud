@@ -112,7 +112,8 @@ pub struct AppState {
     /// What the account page and the admin UI show of the S3 API, when `s3.enabled`.
     pub s3: Option<Arc<S3Ui>>,
     /// Outgoing mail, when `smtp.enabled`: the codes that bind email addresses and reset
-    /// passwords ([`crate::mail`]). Without it, the pages offer neither.
+    /// passwords ([`crate::mail`]). Without it, or without the key of [`Web::two_factor_key`],
+    /// the pages offer neither ([`AppState::email`]).
     pub mailer: Option<Arc<dyn crate::mail::Mailer>>,
     /// The WeChat mini program, when `wechat.enabled` ([`crate::wechat`]). Without it, the
     /// account page offers no binding and the mini program's API answers `not_found`.
@@ -120,6 +121,16 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The mailer and the key of the codes, while the email features exist (binding an address
+    /// on the account page, `/login/forgot` and `/login/reset`): both are needed, since the
+    /// codes and the browsers they are bound to are stored as digests keyed with
+    /// `two_factor.key_file` (`gono_server_core::email`). Without the key it is as without a
+    /// mailer.
+    pub fn email(&self) -> Option<(Arc<dyn crate::mail::Mailer>, gono_server_core::email::Key)> {
+        let key = self.web.two_factor_key()?.clone();
+        Some((self.mailer.clone()?, key))
+    }
+
     /// Whether remote access needs two-step verification on the account
     /// (`connect.require_two_factor`). True while remote connectivity is off, so that the pages
     /// describe two-step verification as they will once it is required again.
