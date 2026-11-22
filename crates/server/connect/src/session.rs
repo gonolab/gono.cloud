@@ -377,18 +377,10 @@ impl Session {
         let pool = &self.connect.pool;
         let access =
             devices::account_access(pool, self.user_id, self.connect.requires_two_factor()).await?;
-        let remote_access = access.refusal.is_none();
-        let relay = relay_access(remote_access, access.full_relay);
-        if self
-            .connect
-            .hub
-            .set_remote_access(self.user_id, remote_access, relay)
-        {
+        let state = announced(&access);
+        if self.connect.hub.set_remote_access(self.user_id, state) {
             // Noticed here before the background task: the other devices hear of it now.
-            let message = ServerMessage::Account {
-                remote_access,
-                relay,
-            };
+            let message = account_message(state);
             self.connect
                 .hub
                 .broadcast(self.user_id, &message.to_text(), Some(self.key));
@@ -436,8 +428,9 @@ impl Session {
             account: AccountInfo {
                 username: login.username.clone(),
                 display_name: login.display_name.clone(),
-                remote_access,
-                relay,
+                remote_access: state.remote_access,
+                relay: state.relay,
+                two_factor: Some(state.two_factor),
             },
             device: entry(&self.device, true).ok_or(Error::InvalidDevice {
                 field: "endpoint_id",
@@ -1448,11 +1441,35 @@ impl Connect {
     }
 }
 
-/// The relay access announced with remote access (protocol 11.1): none without remote access.
-pub(crate) fn relay_access(remote_access: bool, full_relay: bool) -> Option<RelayAccess> {
-    remote_access.then_some(if full_relay {
-        RelayAccess::Full
-    } else {
-        RelayAccess::Limited
-    })
+/// What the devices of an account are told about it (`welcome.account` and the `account`
+/// event, protocol 5.2 and 13.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Announced {
+    pub(crate) remote_access: bool,
+    /// None without remote access (protocol 11.1).
+    pub(crate) relay: Option<RelayAccess>,
+    pub(crate) two_factor: bool,
+}
+
+/// The announcement of `access`.
+pub(crate) fn announced(access: &devices::AccountAccess) -> Announced {
+    let remote_access = access.refusal.is_none();
+    Announced {
+        remote_access,
+        relay: remote_access.then_some(if access.full_relay {
+            RelayAccess::Full
+        } else {
+            RelayAccess::Limited
+        }),
+        two_factor: access.two_factor,
+    }
+}
+
+/// The `account` event of `state`.
+pub(crate) fn account_message(state: Announced) -> ServerMessage {
+    ServerMessage::Account {
+        remote_access: state.remote_access,
+        relay: state.relay,
+        two_factor: Some(state.two_factor),
+    }
 }

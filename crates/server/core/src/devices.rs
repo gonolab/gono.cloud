@@ -1134,6 +1134,8 @@ pub struct AccountAccess {
     pub refusal: Option<RemoteAccessRefusal>,
     /// The account has the relay service: its devices relay at the full rate.
     pub full_relay: bool,
+    /// The account has two-step verification enrolled, whether or not the server requires it.
+    pub two_factor: bool,
 }
 
 /// Why remote access is not available on an account (protocol 10).
@@ -1173,7 +1175,42 @@ pub async fn account_access(
     Ok(AccountAccess {
         refusal,
         full_relay: row.is_some_and(|(_, _, Flag(relay), _)| relay),
+        two_factor: row.is_some_and(|(.., Flag(two_factor))| two_factor),
     })
+}
+
+/// [`account_access`] of every enabled account, for the background task that tells connected
+/// devices about changes.
+pub async fn enabled_account_access(
+    pool: &Pool,
+    require_two_factor: bool,
+) -> Result<Vec<(i64, AccountAccess)>> {
+    let rows: Vec<(i64, Flag, Flag, Flag)> = sqlx::query_as(
+        "SELECT u.id, u.service_direct, u.service_relay, t.user_id IS NOT NULL \
+         FROM users u LEFT JOIN two_factor t ON t.user_id = u.id WHERE u.enabled = 1",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, Flag(direct), Flag(relay), Flag(two_factor))| {
+            let refusal = if !direct {
+                Some(RemoteAccessRefusal::ServiceOff)
+            } else if require_two_factor && !two_factor {
+                Some(RemoteAccessRefusal::TwoFactorRequired)
+            } else {
+                None
+            };
+            (
+                id,
+                AccountAccess {
+                    refusal,
+                    full_relay: relay,
+                    two_factor,
+                },
+            )
+        })
+        .collect())
 }
 
 /// The keys the relay admits from the directory (protocol 11.1): registered devices (neither

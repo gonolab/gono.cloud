@@ -749,6 +749,45 @@ async fn remote_access_follows_the_direct_and_relay_services() {
 }
 
 #[tokio::test]
+async fn devices_hear_whether_their_account_has_two_step_verification() {
+    // Not required by the server, so that remote access does not depend on it.
+    let f = fixture_with(false).await;
+    let carol = f.user("carol", false).await;
+    let mut phone = f.device(carol, "carol", &key(1), "a").await;
+    let ServerMessage::Welcome(welcome) = phone.open(&f.connect, None).await else {
+        panic!("welcome");
+    };
+    assert!(welcome.account.remote_access);
+    assert_eq!(welcome.account.two_factor, Some(false));
+
+    // Enrolled while the device is connected: the background task tells it.
+    sqlx::query("INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?, x'00', 0)")
+        .bind(carol)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    f.connect.poke();
+    let event = phone
+        .expect(|message| matches!(message, ServerMessage::Account { .. }))
+        .await;
+    assert!(
+        matches!(
+            event,
+            ServerMessage::Account {
+                remote_access: true,
+                two_factor: Some(true),
+                ..
+            }
+        ),
+        "{event:?}"
+    );
+    let ServerMessage::Welcome(welcome) = phone.open(&f.connect, None).await else {
+        panic!("welcome");
+    };
+    assert_eq!(welcome.account.two_factor, Some(true));
+}
+
+#[tokio::test]
 async fn a_refused_registration_tells_the_device_why() {
     let f = fixture().await;
     let now = db::unix_now();

@@ -474,7 +474,8 @@ seconds, it decides by the `error` code: `bad_signature`, `bad_request`, `not_fo
 {
   "type": "welcome",
   "server_time": 1763200001,
-  "account": { "username": "kim", "display_name": "Kim", "remote_access": true, "relay": "full" },
+  "account": { "username": "kim", "display_name": "Kim", "remote_access": true, "relay": "full",
+               "two_factor": true },
   "device": { "…": "own directory entry" },
   "relay_url": "https://relay.example.com/",
   "devices": [ { "…": "every directory entry of the account, revoked ones included" } ],
@@ -497,8 +498,14 @@ seconds, it decides by the `error` code: `bad_signature`, `bad_request`, `not_fo
   devices may use while `remote_access` is true (11.1): `"full"` with the relay service,
   `"limited"` with direct connections alone, enough for handshakes and for setting up a
   direct connection but not for a session. It is absent while `remote_access` is false, and
-  from older servers, which relay every device at the full rate. The `account` event carries
-  the same two fields when either changes.
+  from older servers, which relay every device at the full rate.
+- **`two_factor`** (added with services per account) says whether the account has two-step
+  verification enrolled, whatever the server requires (`two_factor_required` of the discovery
+  document, 13.1). Products may allow more to accounts that have it, for example control rather
+  than viewing only. Servers that send it always send it; older servers do not, and devices
+  treat its absence as unknown, never as off.
+- The `account` event carries the same three fields (`remote_access`, `relay`, `two_factor`)
+  whenever any of them changes.
 - **`devices`** is the full state of the directory. A device always acts on it, even when
   `events_truncated` is true (5.6).
 
@@ -1492,7 +1499,7 @@ true again, and this paragraph removed, before remote control is released (plan 
 - **Effects of either**, while the server requires it (13.1):
   - remote access becomes unavailable;
   - the account's devices are disconnected from the relay (11.2);
-  - they get `account {"remote_access": false}`;
+  - they get `account {"remote_access": false, "two_factor": false}`;
   - `connect`, `lookup` and the pairing requests are refused until verification is enrolled
     again.
 - **What stays.** The devices stay registered, and their trust lists are untouched.

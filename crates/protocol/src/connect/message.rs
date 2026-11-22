@@ -312,6 +312,12 @@ pub struct AccountInfo {
     /// device at the full rate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<RelayAccess>,
+    /// Whether the account has two-step verification enrolled, whatever the server requires
+    /// (`connect.require_two_factor`, which `two_factor_required` of the discovery document
+    /// gives). Products may allow more to accounts that have it. Absent from older servers:
+    /// `None` means unknown, never "off".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub two_factor: Option<bool>,
 }
 
 /// How much of the relay the devices of an account may use (protocol 11.1).
@@ -560,7 +566,8 @@ pub enum ServerMessage {
         /// `approved`, `declined`, `withdrawn` or `expired`.
         outcome: String,
     },
-    /// Remote access on the account changed (protocol 13.5), or its relay access.
+    /// Remote access on the account changed (protocol 13.5), its relay access, or whether it has
+    /// two-step verification.
     #[serde(rename = "account")]
     Account {
         /// Remote access is available.
@@ -569,6 +576,10 @@ pub enum ServerMessage {
         /// available (as in [`AccountInfo::relay`]).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         relay: Option<RelayAccess>,
+        /// Whether the account has two-step verification enrolled (as in
+        /// [`AccountInfo::two_factor`]); `None` from older servers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        two_factor: Option<bool>,
     },
     /// A type a newer server sent (protocol 2.4: version 1 may add message types). Receivers
     /// ignore it (protocol 5.3); servers never send it.

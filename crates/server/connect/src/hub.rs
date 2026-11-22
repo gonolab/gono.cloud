@@ -19,11 +19,10 @@ use std::{
     },
 };
 
-use gono_protocol::connect::{
-    DeviceEntry, Signed,
-    message::{Purpose, RelayAccess},
-};
+use gono_protocol::connect::{DeviceEntry, Signed, message::Purpose};
 use gono_server_core::devices::EndpointId;
+
+use crate::session::Announced;
 use tokio::sync::{Notify, mpsc};
 
 use crate::limit::{DeviceLimits, Limit};
@@ -149,8 +148,9 @@ struct Account {
     requests: HashMap<String, PendingPair>,
     /// When the account's pairing requests were made, for the hourly limit.
     request_times: VecDeque<i64>,
-    /// Remote access and relay access as last announced, to send `account` only on changes.
-    remote_access: Option<(bool, Option<RelayAccess>)>,
+    /// Remote access, relay access and two-step verification as last announced, to send
+    /// `account` only on changes.
+    remote_access: Option<Announced>,
     /// Recent replacements per device, with the address of the new connection.
     replacements: HashMap<EndpointId, VecDeque<(i64, IpAddr)>>,
     /// The address of each device's last connection.
@@ -606,17 +606,11 @@ impl Hub {
 
     /// Records `available` as the account's remote access. Returns `true` if it changed from
     /// what was recorded before (and something was recorded before).
-    pub fn set_remote_access(
-        &self,
-        user_id: i64,
-        available: bool,
-        relay: Option<RelayAccess>,
-    ) -> bool {
+    pub fn set_remote_access(&self, user_id: i64, now: Announced) -> bool {
         let mut accounts = self.lock();
         let Some(account) = accounts.get_mut(&user_id) else {
             return false;
         };
-        let now = (available, relay);
         let before = account.remote_access.replace(now);
         before.is_some_and(|before| before != now)
     }

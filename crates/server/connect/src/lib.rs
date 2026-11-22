@@ -535,8 +535,8 @@ impl Connect {
                 );
             }
         }
-        let available: HashMap<i64, bool> =
-            match devices::remote_access_accounts(&self.pool, self.config.require_two_factor).await
+        let access: HashMap<i64, devices::AccountAccess> =
+            match devices::enabled_account_access(&self.pool, self.config.require_two_factor).await
             {
                 Ok(accounts) => accounts.into_iter().collect(),
                 Err(err) => {
@@ -545,15 +545,14 @@ impl Connect {
                 }
             };
         for user_id in self.hub.accounts() {
-            let full_relay = available.get(&user_id).copied();
-            let remote_access = full_relay.is_some();
-            let relay = session::relay_access(remote_access, full_relay.unwrap_or(false));
-            if self.hub.set_remote_access(user_id, remote_access, relay) {
-                let message = ServerMessage::Account {
-                    remote_access,
-                    relay,
-                };
-                self.hub.broadcast(user_id, &message.to_text(), None);
+            // Accounts that are no longer enabled were closed above.
+            let Some(access) = access.get(&user_id) else {
+                continue;
+            };
+            let state = session::announced(access);
+            if self.hub.set_remote_access(user_id, state) {
+                self.hub
+                    .broadcast(user_id, &session::account_message(state).to_text(), None);
             }
         }
     }

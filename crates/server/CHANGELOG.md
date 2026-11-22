@@ -52,6 +52,9 @@ compatible within a major version: released clients keep working with newer serv
     With `direct` but without `relay`, the relay reads the devices at
     `relay.limited_bytes_per_sec` instead of the full rate; `welcome.account` and the
     `account` event say which (`"relay": "full"` or `"limited"`).
+- **Devices learn whether their account has two-step verification**: `welcome.account` and the
+  `account` event carry `two_factor`, whatever `connect.require_two_factor` says, and the event
+  is sent again when it changes. Older servers omit it; devices treat that as unknown.
 - **MySQL as the database**, as an alternative to the built-in SQLite: `[db] backend =
   "mysql"` with `url` (for example `mysql://gono@127.0.0.1:3306/gono_cloud`, never with the
   password) and `password_file`. MySQL 5.7.44 or later with InnoDB and utf8mb4; MariaDB is not

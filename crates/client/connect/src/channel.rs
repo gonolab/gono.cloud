@@ -1576,6 +1576,7 @@ mod tests {
                 display_name: "Kim".to_owned(),
                 remote_access: true,
                 relay: Some(gono_protocol::connect::message::RelayAccess::Full),
+                two_factor: Some(true),
             },
             device: entry(1),
             relay_url: "https://relay.example.com/".to_owned(),
@@ -1635,6 +1636,7 @@ mod tests {
                 ServerMessage::Account {
                     remote_access: false,
                     relay: None,
+                    two_factor: Some(false),
                 }
                 .to_text(),
             ] {
