@@ -251,6 +251,8 @@ pub struct UserView {
     /// "On since …" or "Off".
     pub two_factor: String,
     pub two_factor_on: bool,
+    /// The email address its user bound, or "None".
+    pub email: String,
     /// The five services, with the switch of each.
     pub services: Vec<crate::service_view::ServiceRow>,
 }

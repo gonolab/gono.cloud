@@ -1326,6 +1326,10 @@ async fn user_page_response(
         Ok(status) => status,
         Err(err) => return internal_error(&session.chrome, &err),
     };
+    let email = match gono_server_core::email::address(&state.db, user.id).await {
+        Ok(email) => email,
+        Err(err) => return internal_error(&session.chrome, &err),
+    };
     let t = session.chrome.t;
     let now = pages::now();
     let app_passwords = passwords
@@ -1381,6 +1385,7 @@ async fn user_page_response(
                 None => t.a_tf_off.to_owned(),
             },
             two_factor_on: two_factor_status.is_some(),
+            email: email.unwrap_or_else(|| t.a_email_none.to_owned()),
             services: service_view::rows(t, state, user.services),
         },
         is_self: user.id == session.user.user_id,

@@ -109,7 +109,7 @@ pub struct NewUser<'a> {
 }
 
 /// The columns of [`User`]; the last ones are [`crate::services::COLUMNS`].
-const USER_COLUMNS: &str = "id, username, display_name, enabled, is_admin, created_at, updated_at, \
+pub(crate) const USER_COLUMNS: &str = "id, username, display_name, enabled, is_admin, created_at, updated_at, \
                             service_files, service_webdav, service_s3, service_direct, service_relay";
 
 /// Returns the number of user accounts.

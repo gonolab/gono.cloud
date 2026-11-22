@@ -12,6 +12,22 @@ compatible within a major version: released clients keep working with newer serv
 
 ### Added
 
+- **Email addresses and password reset by mail** (`[smtp]`, off by default). With a mail server
+  configured, users add an email address on the account page's overview with a 6-digit code
+  sent to it (valid for 10 minutes and 5 tries; an address belongs to one account, stored in
+  lower case), and reset a forgotten web login password from the sign-in page ("Forgot your
+  password?", `/login/forgot` and `/login/reset`) with a code sent to that address. The page
+  that sends the code answers the same whether or not the account exists or has an address. A
+  reset ends the account's browser sessions and its sign-ins waiting for their second step, is
+  recorded in the audit log (`password.reset`; adding and removing addresses as `email.bound`
+  and `email.removed`) and mailed to the address; it leaves two-step verification alone, so the
+  next sign-in still asks for the code. Replacing or removing the address needs the password and
+  notifies the previous address. Codes are limited to one a minute and ten a day per account,
+  stored only as digests, and mailed in plain text in the language of the page. Mail goes out
+  over TLS (`security = "tls"`, port 465, the default) or STARTTLS, with the password read from
+  `smtp.password_file`; unencrypted SMTP only to a mail server on this host. `config check`
+  shows the settings without the password, and the admin UI shows each account's address. See
+  "Email" in `docs/deployment.md`.
 - **Services per account**: every account has five switches, all off for new accounts, the
   first admin included: `files` (the web file UI), `webdav` (WebDAV and the other endpoints of
   Nextcloud clients), `s3` (the S3 API), `direct` (remote access for devices, with the relay at

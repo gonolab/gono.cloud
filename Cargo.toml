@@ -77,6 +77,17 @@ http-body = "1.1.0"
 http-body-util = "0.1.5"
 httpdate = "1.0.3"
 ipnet = "2.12.0"
+# Mail of email addresses and password resets (`[smtp]`): SMTP with implicit TLS or STARTTLS
+# through rustls with ring and the webpki roots, as everywhere else. The default features would
+# add native-tls (OpenSSL), a connection pool and the host name lookup; none of them is needed.
+lettre = { version = "0.11.23", default-features = false, features = [
+  "builder",
+  "ring",
+  "smtp-transport",
+  "tokio1",
+  "tokio1-rustls",
+  "webpki-roots",
+] }
 libc = "0.2.191"
 # MD5 of file contents (S3 ETags, Nextcloud checksums); the version s3s already uses.
 md-5 = "0.11.0"

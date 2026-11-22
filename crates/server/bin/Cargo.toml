@@ -30,6 +30,7 @@ gono-server-relay.workspace = true
 gono-server-s3.workspace = true
 tower-service.workspace = true
 ipnet.workspace = true
+lettre.workspace = true
 qrcodegen.workspace = true
 rpassword.workspace = true
 rustix.workspace = true

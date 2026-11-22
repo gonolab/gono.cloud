@@ -31,6 +31,7 @@ use crate::{
     files::Files,
     janitor::Janitor,
     logging::{self, Destination},
+    mail::{Mailer, SmtpMailer},
     ratelimit::RateLimiter,
     s3::S3Ui,
     shutdown,
@@ -100,6 +101,22 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         tracing::debug!(purged, "removed expired WebDAV locks");
     }
 
+    // Mail: the password file is read now, before anything listens, so that a missing one
+    // stops the start.
+    let mailer = if config.smtp.enabled {
+        let mailer = SmtpMailer::new(&config.smtp, &config.server.base_url)
+            .context("set up the mail server of [smtp]")?;
+        if let Some(file) = &config.smtp.password_file {
+            warn_if_readable_by_others(file, "smtp.password_file");
+        }
+        tracing::info!(
+            server = mailer.server(),
+            "mail enabled: email addresses and password resets"
+        );
+        Some(Arc::new(mailer) as Arc<dyn Mailer>)
+    } else {
+        None
+    };
     let bind = config.server.bind;
     let listener = TcpListener::bind(bind)
         .await
@@ -314,6 +331,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         files,
         connect: connect.clone(),
         s3: S3Ui::from_config(&config.s3).map(Arc::new),
+        mailer,
     };
     let connect_task = connect.clone().map(|connect| tokio::spawn(connect.run()));
     let on_signal = {
@@ -381,7 +399,7 @@ async fn two_factor_key(
             .with_context(|| format!("read two_factor.key_file {}", path.display()))
     };
     if let Some(key) = read(path)? {
-        warn_if_readable_by_others(path);
+        warn_if_readable_by_others(path, "two_factor.key_file");
         return Ok(Some(key));
     }
     if two_factor::any_enrolled(pool).await? {
@@ -421,8 +439,8 @@ async fn two_factor_key(
     }
 }
 
-/// Warns when the key file is readable by everyone.
-fn warn_if_readable_by_others(path: &Path) {
+/// Warns when the secret file of configuration key `key` is readable by everyone.
+fn warn_if_readable_by_others(path: &Path, key: &str) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -431,12 +449,12 @@ fn warn_if_readable_by_others(path: &Path) {
         {
             tracing::warn!(
                 path = %path.display(),
-                "two_factor.key_file is readable by every user of this host; make it 0640"
+                "{key} is readable by every user of this host; make it 0640"
             );
         }
     }
     #[cfg(not(unix))]
-    let _ = path;
+    let _ = (path, key);
 }
 
 /// Builds the one `DavHandler` of the process and the service around it. Every metadata

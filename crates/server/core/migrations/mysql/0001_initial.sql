@@ -42,6 +42,7 @@ INSERT INTO id_sequences (name, last_id) VALUES
     ('change_log', 0),
     ('device_events', 0),
     ('devices', 0),
+    ('email_codes', 0),
     ('files', 0),
     ('login_flows', 0),
     ('s3_buckets', 0),
@@ -74,7 +75,10 @@ CREATE TABLE users (
     is_admin      INT           NOT NULL DEFAULT 0,
     created_at    BIGINT        NOT NULL,
     updated_at    BIGINT        NOT NULL,
-    -- The services the account may use; see the SQLite schema.
+    -- See the SQLite schema. VARCHAR rather than VARBINARY: addresses are lower-cased ASCII
+    -- without spaces, so `utf8mb4_bin`, which ignores trailing spaces, compares them byte for
+    -- byte.
+    email         VARCHAR(254)  UNIQUE,
     service_files  INT NOT NULL DEFAULT 0,
     service_webdav INT NOT NULL DEFAULT 0,
     service_s3     INT NOT NULL DEFAULT 0,
@@ -82,6 +86,7 @@ CREATE TABLE users (
     service_relay  INT NOT NULL DEFAULT 0,
     CHECK (enabled IN (0, 1)),
     CHECK (is_admin IN (0, 1)),
+    CHECK (email IS NULL OR (LENGTH(email) BETWEEN 3 AND 254 AND email = LOWER(email))),
     CHECK (service_files IN (0, 1)),
     CHECK (service_webdav IN (0, 1)),
     CHECK (service_s3 IN (0, 1)),
@@ -470,5 +475,23 @@ CREATE TABLE recovery_codes (
     used_at   BIGINT,
     CHECK (LENGTH(code_hash) = 32),
     PRIMARY KEY (user_id, code_hash),
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC;
+
+CREATE TABLE email_codes (
+    id         BIGINT       NOT NULL PRIMARY KEY,
+    user_id    BIGINT       NOT NULL,
+    purpose    VARCHAR(8)   NOT NULL,
+    email      VARCHAR(254) NOT NULL,
+    code_hash  BINARY(32)   NOT NULL,
+    created_at BIGINT       NOT NULL,
+    expires_at BIGINT       NOT NULL,
+    attempts   BIGINT       NOT NULL DEFAULT 0,
+    CHECK (purpose IN ('bind', 'reset')),
+    CHECK (LENGTH(email) BETWEEN 3 AND 254),
+    CHECK (LENGTH(code_hash) = 32),
+    CHECK (attempts >= 0),
+    INDEX email_codes_user (user_id, purpose, created_at),
+    INDEX email_codes_created_at (created_at),
     FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC;

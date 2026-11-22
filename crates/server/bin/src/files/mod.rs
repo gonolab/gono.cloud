@@ -169,6 +169,15 @@ pub fn routes() -> Router<AppState> {
             post(account::set_display_name),
         )
         .route(&format!("{ACCOUNT}/password"), post(account::set_password))
+        .route(&format!("{ACCOUNT}/email"), post(account::email::start))
+        .route(
+            &format!("{ACCOUNT}/email/confirm"),
+            post(account::email::confirm),
+        )
+        .route(
+            &format!("{ACCOUNT}/email/remove"),
+            post(account::email::remove),
+        )
         .route(
             &format!("{ACCOUNT}/app-passwords"),
             post(account::create_app_password),

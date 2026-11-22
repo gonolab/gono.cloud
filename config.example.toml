@@ -245,3 +245,31 @@ multipart_ttl_secs = 604800
 # against this file's directory. `init` and the install script create it. Default:
 # "two-factor.key".
 key_file = "two-factor.key"
+
+[smtp]
+# The mail server through which `serve` sends one-time codes: users add an email address on the
+# account page with a code sent to it, and reset a forgotten web login password from the sign-in
+# page ("Forgot your password?") with a code sent to that address. Codes are 6 digits, valid for
+# 10 minutes. Two-step verification is not affected: the next sign-in still asks for its code.
+# Off by default: then accounts have no email addresses, and passwords cannot be reset by mail.
+# See "Email" in docs/deployment.md.
+# enabled = true
+
+# The mail server's host name or IP address. Required when enabled.
+# host = "smtp.example.com"
+
+# The port, and how the connection is protected: "tls" (TLS from the first byte, usually port
+# 465), "starttls" (plain SMTP upgraded with STARTTLS, usually port 587; refused if the server
+# does not offer it) or "none" (unencrypted, accepted only for a mail server on this host, such
+# as a local Postfix on 127.0.0.1:25). Default: 465 and "tls".
+# port = 465
+# security = "tls"
+
+# The account to sign in to the mail server with, and the file that holds its password (its
+# first line; relative paths start in this file's directory). Both or neither; the password
+# never goes into this file. Default: no authentication.
+# username = "cloud@example.com"
+# password_file = "smtp-password"
+
+# The sender of every mail: an address, optionally with a name. Required when enabled.
+# from = "Gono Cloud <cloud@example.com>"

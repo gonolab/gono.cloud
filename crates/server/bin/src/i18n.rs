@@ -175,6 +175,24 @@ texts! {
     form_expired_sign_in: "The form has expired. Please sign in again.", "表单已过期，请重新登录。";
     session_ended: "Your session has ended. Please sign in again.", "会话已结束，请重新登录。";
     signed_out: "You are signed out.", "已退出登录。";
+    forgot_link: "Forgot your password?", "忘记密码？";
+    notice_password_reset: "Your password was reset and every browser was signed out. Sign in with the new password.", "密码已重置，所有浏览器都已退出登录。请用新密码登录。";
+
+    // Password reset by mail
+    forgot_title: "Forgot your password?", "忘记密码";
+    forgot_lead: "Enter your username or the email address of your account. If the account has an email address, a code to reset the password is sent to it.", "请输入用户名或账号绑定的邮箱。如果账号绑定了邮箱，重置密码的验证码会发到这个邮箱。";
+    forgot_login: "Username or email address", "用户名或邮箱";
+    forgot_send: "Send code", "发送验证码";
+    forgot_sent: "If this account has an email address, a code was sent to it. It is valid for 10 minutes.", "如果这个账号绑定了邮箱，验证码已发到该邮箱，10 分钟内有效。";
+    err_forgot_login: "Enter your username or email address.", "请输入用户名或邮箱。";
+    reset_title: "Reset your password", "重置密码";
+    reset_lead: "Enter the code from the mail and choose a new web login password. Two-step verification stays as it is: if your account has it, the next sign-in still asks for its code.", "请输入邮件中的验证码，并设置新的网页登录密码。两步验证保持不变：如果你的账号开启了它，下次登录仍需要输入验证码。";
+    reset_code: "Code from the mail", "邮件中的验证码";
+    reset_submit: "Reset password", "重置密码";
+    reset_wrong: "That code is not right or has expired. Ask for a new one if you need it.", "验证码不正确或已过期，如有需要请重新获取。";
+    reset_ask_again: "Ask for a code", "获取验证码";
+    back_to_sign_in: "Back to sign-in", "返回登录";
+    too_many_requests_lead: "There were too many requests from your network. Try again in {} seconds.", "你的网络请求次数过多，请 {} 秒后再试。";
 
     // Messages
     request_blocked: "Request blocked", "请求被拦截";
@@ -537,6 +555,31 @@ texts! {
     err_invalid_path: "Invalid path {}.", "路径 {} 无效。";
     err_scopes: "The mounts do not fit together: {}.", "挂载之间有冲突：{}。";
 
+    // Account: email
+    email_title: "Email", "邮箱";
+    email_note: "With an email address, a forgotten web login password can be reset with a code sent to it. Nobody else sees it.", "绑定邮箱后，忘记网页登录密码时可以用发到这个邮箱的验证码重置密码。其他人看不到它。";
+    email_unavailable: "This server cannot send mail, so no email address can be added. Ask the operator.", "本服务器无法发送邮件，因此不能添加邮箱，请联系管理员。";
+    email_current: "Your address", "你的邮箱";
+    email_none: "No email address yet.", "还没有绑定邮箱。";
+    email_new: "New email address", "新邮箱";
+    email_send: "Send code", "发送验证码";
+    email_waiting: "A code was sent to {}. Enter it here before {}.", "验证码已发到 {}，请在 {} 之前在这里输入。";
+    email_code: "Code from the mail", "邮件中的验证码";
+    email_confirm: "Save address", "保存邮箱";
+    email_remove: "Remove address", "删除邮箱";
+    email_password_note: "Changing or removing the address needs your web login password; the old address gets a notice.", "更换或删除邮箱需要网页登录密码，原邮箱会收到通知。";
+    notice_email_sent: "A code is on its way. Enter it below.", "验证码已发送，请在下面输入。";
+    notice_email_bound: "Your email address was saved.", "邮箱已保存。";
+    notice_email_removed: "Your email address was removed.", "邮箱已删除。";
+    err_email_invalid: "That is not an email address this server accepts.", "这不是本服务器接受的邮箱地址。";
+    err_email_same: "That is your address already.", "这已经是你的邮箱。";
+    err_email_taken: "This address belongs to another account. Use another one.", "这个邮箱已被其他账号使用，请换一个。";
+    err_email_code: "That code is not right.", "验证码不正确。";
+    err_email_expired: "The code has expired or was entered wrong too often. Ask for a new one.", "验证码已过期或输错次数太多，请重新获取。";
+    err_email_too_soon: "A code was sent less than a minute ago. Try again in {} seconds.", "一分钟内已经发送过验证码，请 {} 秒后再试。";
+    err_email_daily: "Too many codes were sent today. Try again tomorrow.", "今天发送的验证码太多了，请明天再试。";
+    err_email_send: "The mail could not be sent. Try again later.", "邮件发送失败，请稍后再试。";
+
     // Account: S3
     s3_title: "S3 buckets", "S3 存储桶";
     s3_note: "Buckets are folders of your files that S3 clients such as rclone, restic or the AWS CLI reach with an access key. What they upload are ordinary files here and in the apps.", "存储桶是你文件中的文件夹，rclone、restic、AWS CLI 等 S3 客户端用访问密钥访问它们。它们上传的内容在这里和各个 app 里都是普通文件。";
@@ -812,6 +855,7 @@ texts! {
     a_account: "Account", "账号";
     a_user_id: "User id", "用户 id";
     a_changed: "Changed", "修改时间";
+    a_email_none: "None", "无";
     a_display_name_note: "The name clients show for this account.", "客户端为这个账号显示的名称。";
     a_change_display_name: "Change display name", "修改显示名称";
     a_password_note: "Used for the web pages, Login Flow and this admin UI. Setting it signs the user out of open browser sessions.", "用于网页、Login Flow 和管理界面。设置后该用户已打开的浏览器会话都会退出。";
@@ -847,6 +891,18 @@ texts! {
     a_new_app_password_crumb: "New app password", "新建 app password";
     a_nothing_to_show: "Nothing to show", "没有可显示的内容";
     a_nothing_to_show_lead: "A new app password is shown only once, right after it was created. Create another one if it was not written down.", "新的 app password 只在创建后显示一次。如果没有记下，请再创建一个。";
+
+    // Mail (plain text; lines stay short, so that mail programs show them as written)
+    mail_bind_subject: "Gono Cloud: confirm your email address", "Gono Cloud：确认你的邮箱";
+    mail_bind_text: "Your code to add this email address to an account at\n{}:\n\n    {}\n\nEnter it on the account page within 10 minutes. If you did not\nask for it, ignore this mail: without the code, nothing changes.\n", "把这个邮箱添加到\n{}\n上的账号所需的验证码：\n\n    {}\n\n请在 10 分钟内在账号页面输入。如果不是你本人操作，请忽略这封邮件：\n没有验证码，什么都不会改变。\n";
+    mail_reset_subject: "Gono Cloud: reset your password", "Gono Cloud：重置密码";
+    mail_reset_text: "Your code to reset the web login password of the account {}\nat {}:\n\n    {}\n\nEnter it at {}/login/reset within 10 minutes.\nTwo-step verification stays as it is. If you did not ask for it,\nignore this mail: your password stays as it is.\n", "账号 {}（{}）\n重置网页登录密码所需的验证码：\n\n    {}\n\n请在 10 分钟内到 {}/login/reset 输入。\n两步验证不受影响。如果不是你本人操作，请忽略这封邮件，你的密码不会改变。\n";
+    mail_reset_done_subject: "Gono Cloud: your password was reset", "Gono Cloud：你的密码已重置";
+    mail_reset_done_text: "The web login password of the account {} at\n{} was reset with a code sent to this address,\nand every browser was signed out. If you did not do this, contact\nyour administrator at once.\n", "账号 {}（{}）\n的网页登录密码已经用发到这个邮箱的验证码重置，所有浏览器都已退出登录。\n如果不是你本人操作，请立即联系管理员。\n";
+    mail_replaced_subject: "Gono Cloud: your email address was changed", "Gono Cloud：你的邮箱已更换";
+    mail_replaced_text: "The email address of the account {} at\n{} was changed: this address no longer receives\nits password reset codes. If you did not do this, contact your\nadministrator at once.\n", "账号 {}（{}）\n的邮箱已更换：这个邮箱以后不会再收到它的密码重置验证码。\n如果不是你本人操作，请立即联系管理员。\n";
+    mail_removed_subject: "Gono Cloud: your email address was removed", "Gono Cloud：你的邮箱已删除";
+    mail_removed_text: "This address was removed from the account {} at\n{}: it no longer receives its password reset\ncodes. If you did not do this, contact your administrator at once.\n", "这个邮箱已从账号 {}（{}）\n中删除，以后不会再收到它的密码重置验证码。\n如果不是你本人操作，请立即联系管理员。\n";
 }
 
 #[cfg(test)]

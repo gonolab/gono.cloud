@@ -20,6 +20,7 @@
 //! - [`login_flows`]: pending Login Flow v2 sign-ins.
 //! - [`web_sessions`]: browser sessions of the server's HTML pages.
 //! - [`direct_downloads`]: links that let media players stream a file without credentials.
+//! - [`email`]: email addresses of accounts and the one-time codes that prove them.
 //! - [`s3`]: S3 buckets (names bound to folders) and S3 access keys.
 //! - [`services`]: the services an account may use, which admins turn on.
 //! - [`rescan`]: walking a user's tree on disk for `gono-cloud rescan`.
@@ -34,6 +35,7 @@ pub mod config;
 pub mod db;
 pub mod devices;
 pub mod direct_downloads;
+pub mod email;
 pub mod error;
 pub mod locks;
 pub mod login_flows;

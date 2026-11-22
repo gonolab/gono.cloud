@@ -18,4 +18,7 @@
     <input id="login-password" type="password" name="password" autocomplete="current-password" required></label>
   <button class="btn primary block" type="submit">{{ chrome.t.sign_in }}</button>
 </form>
+{%- if forgot %}
+<p class="muted small mt-20"><a href="/login/forgot">{{ chrome.t.forgot_link }}</a></p>
+{%- endif %}
 {%- endblock %}

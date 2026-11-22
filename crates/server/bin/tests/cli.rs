@@ -214,6 +214,77 @@ fn config_check_rejects_unknown_keys() {
     assert!(text(&output.stderr).contains("max_conections"));
 }
 
+/// `config check` shows the mail server and names its password file, never the password, and
+/// `serve` does not start without that file.
+#[test]
+fn config_check_shows_the_mail_server_but_not_its_password() {
+    let instance = Instance::new();
+    let mut config = std::fs::read_to_string(instance.config()).unwrap();
+    config.push_str(
+        r#"
+        [smtp]
+        enabled = true
+        host = "smtp.example.com"
+        port = 587
+        security = "starttls"
+        username = "cloud@example.com"
+        password_file = "smtp-password"
+        from = "Gono Cloud <cloud@example.com>"
+        "#,
+    );
+    std::fs::write(instance.config(), config).unwrap();
+    let password_file = instance.dir.path().join("smtp-password");
+
+    let check = run(&mut instance.command(&["config", "check"]));
+    assert!(check.status.success(), "{}", text(&check.stderr));
+    let shown = text(&check.stdout);
+    for expected in [
+        "smtp.enabled                    true",
+        "smtp.host                       smtp.example.com",
+        "smtp.port                       587",
+        "smtp.security                   starttls",
+        "smtp.username                   cloud@example.com",
+        "smtp.from                       Gono Cloud <cloud@example.com>",
+    ] {
+        assert!(shown.contains(expected), "{expected} in {shown}");
+    }
+    assert!(
+        shown.contains(&format!("{} (missing)", password_file.display())),
+        "{shown}"
+    );
+    assert!(!shown.contains("warning"), "{shown}");
+
+    assert!(instance.init().status.success());
+    let serve = run(&mut instance.command(&["serve"]));
+    assert!(!serve.status.success());
+    assert!(
+        text(&serve.stderr).contains("smtp.password_file"),
+        "{}",
+        text(&serve.stderr)
+    );
+
+    std::fs::write(&password_file, "very secret\n").unwrap();
+    let shown = text(&run(&mut instance.command(&["config", "check"])).stdout);
+    assert!(!shown.contains("(missing)"), "{shown}");
+    assert!(
+        !shown.contains("very secret"),
+        "the password is never shown: {shown}"
+    );
+
+    // Plain SMTP is for a mail server on this host only.
+    let config = std::fs::read_to_string(instance.config())
+        .unwrap()
+        .replace("security = \"starttls\"", "security = \"none\"");
+    std::fs::write(instance.config(), config).unwrap();
+    let refused = run(&mut instance.command(&["config", "check"]));
+    assert!(!refused.status.success());
+    assert!(
+        text(&refused.stderr).contains("smtp.security"),
+        "{}",
+        text(&refused.stderr)
+    );
+}
+
 #[test]
 fn missing_config_files_get_a_hint() {
     let output = run(gono_cloud().args(["config", "check", "--config", "/nonexistent.toml"]));

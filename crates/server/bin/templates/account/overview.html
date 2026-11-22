@@ -11,6 +11,43 @@
         {%- endfor %}
       </ul>
     </div></section>
+    <section class="panel" id="email" aria-labelledby="email-title"><div class="panel-body">
+      <h2 id="email-title">{{ chrome.t.email_title }}</h2>
+      <p class="muted small">{{ chrome.t.email_note }}</p>
+      {%- if let Some(address) = email.address %}
+      <dl class="facts mt-18"><dt>{{ chrome.t.email_current }}</dt><dd class="mono">{{ address }}</dd></dl>
+      {%- else %}
+      <p>{{ chrome.t.email_none }}</p>
+      {%- endif %}
+      {%- if email.available %}
+      {%- if let Some(waiting) = email.waiting %}
+      <form method="post" action="/account/email/confirm" class="mt-18">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <p class="small">{{ waiting }}</p>
+        <label class="field" for="email-code"><span>{{ chrome.t.email_code }}</span><input id="email-code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" spellcheck="false" maxlength="16" required></label>
+        <button class="btn primary block" type="submit">{{ chrome.t.email_confirm }}</button>
+      </form>
+      {%- endif %}
+      <form method="post" action="/account/email" class="mt-20">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <input type="text" name="username" value="{{ frame.username }}" autocomplete="username" hidden>
+        <label class="field" for="email-new"><span>{{ chrome.t.email_new }}</span><input id="email-new" type="email" name="email" autocomplete="email" spellcheck="false" maxlength="254" required></label>
+        <label class="field" for="email-password"><span>{{ chrome.t.tf_password }}</span><input id="email-password" type="password" name="password" autocomplete="current-password" required></label>
+        <button class="btn block" type="submit">{{ chrome.t.email_send }}</button>
+      </form>
+      {%- if email.address.is_some() %}
+      <form method="post" action="/account/email/remove" class="mt-20">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <input type="text" name="username" value="{{ frame.username }}" autocomplete="username" hidden>
+        <label class="field" for="email-remove-password"><span>{{ chrome.t.tf_password }}</span><input id="email-remove-password" type="password" name="password" autocomplete="current-password" required></label>
+        <button class="btn danger block" type="submit">{{ chrome.t.email_remove }}</button>
+      </form>
+      <p class="muted small mt-6">{{ chrome.t.email_password_note }}</p>
+      {%- endif %}
+      {%- else %}
+      <p class="muted">{{ chrome.t.email_unavailable }}</p>
+      {%- endif %}
+    </div></section>
   </div>
   <div class="stack">
     <section class="panel" id="two-factor"><div class="panel-body">

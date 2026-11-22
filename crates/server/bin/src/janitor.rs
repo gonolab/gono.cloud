@@ -8,6 +8,9 @@
 //! - expired Login Flow v2 sign-ins ([`login_flows::purge_expired`]);
 //! - expired browser sessions ([`web_sessions::purge_expired`]);
 //! - expired direct download links ([`direct_downloads::purge_expired`]);
+//! - one-time codes of email addresses that ended (expired, used, replaced or tried too often)
+//!   a day after they were made: until then the limit of codes per day counts them
+//!   ([`email::purge`]);
 //! - expired S3 multipart uploads with their parts, and part directories that belong to no
 //!   upload ([`gono_server_s3::multipart::purge`]), when the S3 API is on;
 //! - the lifecycle rules of S3 buckets ([`gono_server_s3::lifecycle::apply`]), when the S3 API
@@ -17,7 +20,7 @@
 
 use std::time::Duration;
 
-use gono_server_core::{db, direct_downloads, login_flows, web_sessions};
+use gono_server_core::{db, direct_downloads, email, login_flows, web_sessions};
 use gono_server_nextcloud::chunking::ChunkedUploads;
 use gono_server_s3::S3State;
 use tokio::task::JoinHandle;
@@ -59,6 +62,11 @@ impl Janitor {
             Ok(0) => {}
             Ok(removed) => tracing::debug!(removed, "removed expired direct download links"),
             Err(err) => tracing::warn!(error = %err, "cannot clean up direct download links"),
+        }
+        match email::purge(&self.db, now).await {
+            Ok(0) => {}
+            Ok(removed) => tracing::debug!(removed, "removed old email codes"),
+            Err(err) => tracing::warn!(error = %err, "cannot clean up email codes"),
         }
         if let Some(s3) = &self.s3 {
             match gono_server_s3::multipart::purge(s3).await {

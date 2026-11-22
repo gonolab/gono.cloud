@@ -3,13 +3,14 @@
 //!
 //! | Request | Page or action |
 //! |---|---|
-//! | `GET /account/` | Overview: the account's services, two-step verification, display name and web login password. |
+//! | `GET /account/` | Overview: the account's services, its email address, two-step verification, display name and web login password. |
 //! | `GET /account/webdav` | WebDAV: the addresses clients connect to, and the user's app passwords. |
 //! | `GET /account/s3` | S3: the user's buckets and access keys (see [`s3`]). |
 //! | `GET /account/direct` | Direct connections: the devices registered for remote access. |
 //! | `GET /account/relay` | Relay: its address, the rate it reads the account's devices at, those connected to it now and the sessions they reported (see [`relay`]). |
 //! | `POST /account/display-name` | Change the display name. |
 //! | `POST /account/password` | Change the web login password (needs the current one). The other browser sessions end; this one stays. |
+//! | `POST /account/email`, `POST /account/email/confirm`, `POST /account/email/remove` | Add, replace or remove the email address with a mailed code (see [`email`]). |
 //! | `POST /account/app-passwords` | Create an app password, then show it once at `/account/created`. |
 //! | `POST /account/app-passwords/<id>/delete` | Revoke one of the user's app passwords. |
 //! | `GET /account/devices/<endpoint id>/revoke` | The second confirmation of revoking a device for remote access. |
@@ -56,6 +57,7 @@
 //! kept in memory for its session only and shown once; the URL carries no secret. Changing the
 //! password checks the current one through the failed-attempt limiter of the sign-in pages.
 
+pub(crate) mod email;
 pub(crate) mod relay;
 pub(crate) mod s3;
 
@@ -368,6 +370,7 @@ struct OverviewPage {
     chrome: Chrome,
     frame: AccountFrame,
     services: Vec<ServiceLine>,
+    email: email::EmailView,
     display_name: String,
     two_factor: TwoFactorView,
 }
@@ -630,10 +633,15 @@ async fn render(state: &AppState, visitor: &Visitor, options: PageOptions) -> Re
                 Ok(view) => view,
                 Err(err) => return internal(visitor, "two-step verification", &err),
             };
+            let email = match email::view(state, visitor, now).await {
+                Ok(view) => view,
+                Err(err) => return internal(visitor, "email address", &err),
+            };
             let page = OverviewPage {
                 chrome,
                 frame,
                 services: service_lines(state, visitor),
+                email,
                 display_name: visitor.user.display_name.clone(),
                 two_factor,
             };
@@ -1405,6 +1413,7 @@ fn notice(state: &AppState, t: &'static Text, tab: Tab, done: &str) -> Option<St
             t.notice_tf_off
         }
         (Tab::Overview, "two-factor-off") => t.notice_tf_off_optional,
+        (Tab::Overview, done) if done.starts_with("email-") => email::notice(t, done)?,
         (Tab::Webdav, "revoked") => t.notice_revoked,
         (Tab::S3, done) => s3::notice(t, done)?,
         (Tab::Direct, "device-revoked") => t.notice_device_revoked,

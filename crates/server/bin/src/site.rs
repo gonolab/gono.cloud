@@ -6,6 +6,7 @@
 //! | `GET /login`, `POST /login` | Sign in with the web login password (file UI only). `?next=` names a local page to return to. |
 //! | `POST /logout` | Sign out (file UI only). |
 //! | `GET /login/two-step`, `POST /login/two-step` | The second step of every web sign-in of an account with two-step verification: a TOTP code or a recovery code. A recovery code is followed by a page that says how many are left. |
+//! | `GET /login/forgot`, `POST /login/forgot`, `GET /login/reset`, `POST /login/reset` | Resetting a forgotten password with a code mailed to the account's address (file UI and `[smtp]` only): see [`crate::recovery`]. |
 //! | `POST /apps/theme` | Switches the theme (system, light, dark) and returns to the page; a script asking for JSON gets the new theme instead. |
 //! | `GET /apps/assets/<name>` | The stylesheet and the script, under content-hashed names, cached for a year. |
 //!
@@ -149,6 +150,8 @@ struct SignInPage {
     next: String,
     notice: Option<&'static str>,
     error: Option<&'static str>,
+    /// Link to `/login/forgot`: only while mail can be sent.
+    forgot: bool,
 }
 
 /// `two_step.html`: the second step of a sign-in.
@@ -323,6 +326,7 @@ fn sign_in_form(
         next: next.to_owned(),
         notice: message.0,
         error: message.1,
+        forgot: state.mailer.is_some(),
     };
     let mut response = web::render(status, &page);
     response.headers_mut().append(header::SET_COOKIE, cookie);
@@ -346,7 +350,11 @@ pub async fn login_page(
         return web::see_other(&after_sign_in(query.next.as_deref()), &[]);
     }
     let t = Chrome::for_request(&headers).t;
-    let notice = (query.done.as_deref() == Some("signed-out")).then_some(t.signed_out);
+    let notice = match query.done.as_deref() {
+        Some("signed-out") => Some(t.signed_out),
+        Some("password-reset") => Some(t.notice_password_reset),
+        _ => None,
+    };
     let next = after_sign_in(query.next.as_deref());
     sign_in_form(&state, &headers, StatusCode::OK, "", &next, (notice, None))
 }

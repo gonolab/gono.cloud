@@ -121,6 +121,7 @@ async fn fixture() -> Fixture {
         files: None,
         connect: None,
         s3: None,
+        mailer: None,
     };
     Fixture {
         _dir: dir,
@@ -1713,4 +1714,39 @@ async fn admins_see_revoke_and_remove_the_s3_keys_and_buckets_of_an_account() {
         ]
         .map(|(kind, actor)| (kind.to_owned(), actor.to_owned()))
     );
+}
+
+#[tokio::test]
+async fn the_page_of_an_account_shows_its_email_address() {
+    use gono_server_core::email::{self, Bind, NewCode, Purpose};
+
+    let f = fixture().await;
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in("root", ROOT_PASSWORD).await;
+    let fact = |body: &str| {
+        let start = body.find("<dt>Email</dt><dd>").expect("the email fact") + 18;
+        body[start..start + body[start..].find("</dd>").unwrap()].to_owned()
+    };
+    let page = browser.get(&path("/users/alice")).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_eq!(fact(&page.body), "None");
+
+    let now = db::unix_now();
+    let NewCode::Code(code) = email::send_code(
+        &f.state.db,
+        f.alice,
+        Purpose::Bind,
+        "alice@example.com",
+        now,
+    )
+    .await
+    .unwrap() else {
+        panic!("no code");
+    };
+    let bound = email::bind(&f.state.db, f.alice, &code.code, None, now)
+        .await
+        .unwrap();
+    assert!(matches!(bound, Bind::Bound { .. }), "{bound:?}");
+    let page = browser.get(&path("/users/alice")).await;
+    assert_eq!(fact(&page.body), "alice@example.com");
 }

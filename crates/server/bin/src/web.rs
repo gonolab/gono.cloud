@@ -21,6 +21,15 @@
 //!   sign-in and the client's limiter token are taken before a code is verified, and a failure
 //!   that cannot be recorded makes the answer "unavailable". A pending sign-in ends when the
 //!   account's password changes, it is disabled or deleted, or its verification is turned off.
+//! - **Password reset** by mail ([`Web::reset_password`], the pages are in [`crate::recovery`]):
+//!   a code sent to the account's email address sets a new password. It is checked behind the
+//!   same limiter as passwords, and every failure gets the same answer. As with sign-ins, every
+//!   form does the expensive work, one lookup of the account, one Argon2 hash of the new password
+//!   and one write transaction, whether or not it names an account that exists or has an
+//!   address; only an account with a code waiting also counts the try, and such a code exists
+//!   only once someone asked for it to be mailed to the account's address. Requests for codes
+//!   have a per-client limiter of their own ([`Web::allow_reset_request`]), since asking is not a
+//!   failure.
 //! - **Sessions**: a successful sign-in creates a `web_sessions` row
 //!   ([`gono_server_core::web_sessions`]) and sets the [`SESSION_COOKIE`] (`HttpOnly`,
 //!   `SameSite=Lax`, `Secure` when the public origin is HTTPS). App passwords never create a
@@ -56,7 +65,7 @@ use axum::{
 };
 use base64::Engine as _;
 use gono_server_core::{
-    Username, db, password, secret,
+    Username, db, email, password, secret,
     services::{Service, Services},
     two_factor::{self, Key, Verification},
     users::{self, User},
@@ -284,6 +293,25 @@ pub enum Verified {
     Unavailable,
 }
 
+/// Outcome of [`Web::reset_password`].
+#[derive(Debug)]
+pub enum PasswordReset {
+    /// The password is reset: every browser session of the account ended, and so did its
+    /// sign-ins waiting for their second step.
+    Done {
+        /// The account's name.
+        username: String,
+        /// Its email address, which should hear of the reset.
+        email: String,
+    },
+    /// No such account, a disabled one, no code waiting, or a wrong one: never told apart.
+    Wrong,
+    /// Too many failures from this client; retry after the given time.
+    RateLimited(Duration),
+    /// The database failed.
+    Unavailable,
+}
+
 /// Outcome of [`Web::start_session`].
 #[derive(Debug)]
 pub enum Started {
@@ -342,6 +370,9 @@ pub enum SignIn {
 pub struct Web {
     pool: db::Pool,
     limiter: Arc<RateLimiter>,
+    /// Requests for password reset codes per client: each takes a token, as Login Flow starts
+    /// do, because asking is not a failure but sends mail.
+    reset_requests: RateLimiter,
     /// `scheme://host[:port]` of the public origin.
     origin: String,
     /// Mark cookies `Secure` (the public origin is HTTPS).
@@ -402,6 +433,7 @@ impl Web {
         Self {
             pool,
             limiter,
+            reset_requests: RateLimiter::new(),
             origin: base_url.origin().ascii_serialization(),
             secure: base_url.scheme() == "https",
             two_factor_key: None,
@@ -920,6 +952,93 @@ impl Web {
                 self.limiter.record_failure(client);
                 tracing::info!(%client, user = %username.trim(), "rejected web sign-in");
                 Verified::Invalid
+            }
+        }
+    }
+
+    /// Lets `client` ask for a password reset code, and counts the request; `Err` is how long
+    /// it has to wait. The limit is per client: the codes of one account have limits of their
+    /// own (`gono_server_core::email`).
+    pub fn allow_reset_request(&self, client: IpAddr) -> Result<(), Duration> {
+        if let Some(wait) = self.reset_requests.check(client) {
+            return Err(wait);
+        }
+        self.reset_requests.record_failure(client);
+        Ok(())
+    }
+
+    /// Resets the web login password of the account `login` names (its username or email
+    /// address) to `password` (already checked against the policy), if `code` is the code last
+    /// mailed to the account's address (see the module documentation).
+    ///
+    /// The form's answer must not tell whether the account exists or has an address: every
+    /// case does the same expensive work, the hash of the new password included (as
+    /// [`Web::verify_password`] hashes a dummy for unknown accounts), and every failure is the
+    /// same [`PasswordReset::Wrong`], counted by the failed-attempt limiter.
+    pub async fn reset_password(
+        &self,
+        client: IpAddr,
+        login: &str,
+        code: &str,
+        password: SecretString,
+    ) -> PasswordReset {
+        if let Some(wait) = self.limiter.check(client) {
+            return PasswordReset::RateLimited(wait);
+        }
+        let account = match email::find_account(&self.pool, login).await {
+            Ok(account) => account,
+            Err(err) => {
+                tracing::error!(error = %err, "password reset lookup failed");
+                return PasswordReset::Unavailable;
+            }
+        };
+        let hash = match tokio::task::spawn_blocking(move || password::hash(&password)).await {
+            Ok(Ok(hash)) => hash,
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "cannot hash a new password");
+                return PasswordReset::Unavailable;
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "cannot hash a new password");
+                return PasswordReset::Unavailable;
+            }
+        };
+        let user_id = account.as_ref().map(|(user, _)| user.id);
+        // A code that is not six digits matches no account's: the transaction runs as for an
+        // unknown one.
+        let code = email::parse_code(code);
+        let outcome = email::reset_password(
+            &self.pool,
+            user_id.filter(|_| code.is_some()),
+            code.as_deref().unwrap_or_default(),
+            &hash,
+            Some(client),
+            db::unix_now(),
+        )
+        .await;
+        match outcome {
+            Ok(email::Reset::Done { username, email }) => {
+                if let Some(user_id) = user_id {
+                    self.end_pending_sign_ins(user_id);
+                }
+                tracing::info!(%client, user = %username, "web login password reset with a mailed code");
+                PasswordReset::Done { username, email }
+            }
+            Ok(email::Reset::Refused) => {
+                self.limiter.record_failure(client);
+                match &account {
+                    Some((user, _)) => {
+                        tracing::info!(%client, user = %user.username, "rejected password reset");
+                    }
+                    None => {
+                        tracing::info!(%client, "rejected password reset of an unknown account");
+                    }
+                }
+                PasswordReset::Wrong
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "cannot reset a password");
+                PasswordReset::Unavailable
             }
         }
     }

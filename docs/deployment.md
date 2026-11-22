@@ -231,7 +231,7 @@ user sets up there:
 
 | Tab | What it shows |
 |---|---|
-| Overview (`/account/`) | The account's services, on or off, each linked to where it is used; two-step verification, the display name and the web login password. Every account has it, with or without services. |
+| Overview (`/account/`) | The account's services, on or off, each linked to where it is used; its email address ("Email" below), two-step verification, the display name and the web login password. Every account has it, with or without services. |
 | WebDAV (`/account/webdav`) | The server and WebDAV addresses clients connect to, and the user's app passwords, to create or revoke, for example for Finder, Windows Explorer or rclone. |
 | S3 (`/account/s3`) | The user's buckets and access keys ([s3.md](s3.md)). |
 | Direct connections (`/account/direct`) | The devices registered for remote access ("Remote access" below). |
@@ -280,8 +280,8 @@ gono app-password add alice --label "Alice's laptop"
 ```
 
 Accounts start without services, the first admin's too: a new account can sign in to its
-account page, change its password and display name and set up two-step verification, and
-nothing else until an admin turns its services on:
+account page, change its password and display name, add an email address ("Email" below) and
+set up two-step verification, and nothing else until an admin turns its services on:
 
 | Service | What it allows |
 |---|---|
@@ -413,6 +413,72 @@ app password that clients send, and with remote access also every device's crede
 statement and address (`docs/connect-threat-model.md`, section 2). Keep it on a host and under
 an administration you trust as much as the server; a hosting panel that manages it is part of
 that.
+
+## Email
+
+With a mail server, users can add an email address to their account and reset a forgotten web
+login password with a code mailed to it. Without one (the default) neither exists: the account
+page says that the server cannot send mail, and the sign-in page has no "Forgot your
+password?" link. Mail is sent only for this; the server sends no newsletters or other notices.
+
+Put the password of the mail account into a file of its own, readable by the service, and turn
+mail on in `/etc/gono-cloud/config.toml`; then restart the service:
+
+```sh
+sudo install -m 0640 -o root -g gono-cloud /dev/null /etc/gono-cloud/smtp-password
+sudoedit /etc/gono-cloud/smtp-password    # the password on the first line
+```
+
+```toml
+[smtp]
+enabled = true
+host = "smtp.example.com"
+# The defaults: TLS from the first byte on port 465. For STARTTLS on port 587 instead:
+# port = 587
+# security = "starttls"
+username = "cloud@example.com"
+password_file = "/etc/gono-cloud/smtp-password"
+from = "Gono Cloud <cloud@example.com>"
+```
+
+| Key | What it sets |
+|---|---|
+| `host`, `port` | The mail server that accepts the mail (submission). Default port: 465. |
+| `security` | `tls` (the default): TLS from the first byte, usually port 465. `starttls`: plain SMTP upgraded with STARTTLS, usually port 587; a server that does not offer STARTTLS is refused before anything is sent. `none`: no encryption, accepted only for a mail server on this host (`127.0.0.1`, `::1` or `localhost`), such as a local Postfix that relays the mail. The server's certificate is checked against the CA list built into the binary (Mozilla's, through webpki-roots), not the system's store, so a certificate of a private CA is refused. |
+| `username`, `password_file` | The account to sign in to the mail server with, and the file that holds its password (the first line; relative paths start in the directory of `config.toml`). Both or neither. The password never goes into `config.toml`; `config check` names the file and whether it exists, never the password, and `serve` reads it when it starts and refuses to start without it. |
+| `from` | The sender of every mail, an address with an optional name. Many providers accept only the address of the account that signs in. |
+
+`config check` validates the table and warns when the port does not fit `security` (465 with
+`starttls`, 587 or 25 with `tls`), and when `files_ui` is off: the pages that send mail are part
+of the web file UI. A mail that cannot be sent is logged as a warning; the codes and the texts
+of the mails are never logged.
+
+What users see:
+
+- **Adding an address.** On the account page (Overview, "Email") a user enters the new address
+  and the web login password, and a 6-digit code goes to that address; entering it on the same
+  page binds the address. A code is valid for 10 minutes and for 5 tries. Addresses are stored
+  in lower case, and an address belongs to one account: that another account has it is said
+  only when the code is entered, so only whoever receives the mail learns it, and the message
+  does not say which account. Replacing or removing the address needs the password too, and the
+  previous address gets a notice (which does not name the new one). A change ends the account's
+  sign-ins waiting for their second step. The admin UI shows each account's address.
+- **Forgot your password?** `/login/forgot` asks for the username or the email address. It
+  always answers with the same page, "if this account has an email address, a code was sent to
+  it", whether the account exists, has an address, is disabled or not, and as fast in every
+  case, so that nothing can be learnt about accounts from it. The code goes to the account's
+  address; with it and a new password, `/login/reset` sets the password. A reset ends every
+  browser session of the account and its sign-ins waiting for their second step, is recorded in
+  the audit log (`password.reset`) and is mailed to the address. App passwords stay valid, so
+  devices and Nextcloud apps keep working. Disabled accounts cannot reset.
+- **Two-step verification is not affected.** A reset changes the password only: an account
+  with two-step verification is still asked for its code at the next sign-in. A lost phone still
+  needs a recovery code or an admin ("Two-step verification" above).
+- **Limits.** Per account, one code a minute and ten a day for adding addresses, and the same
+  for resets; requests for reset codes are also limited per client address, and wrong reset
+  codes count as failed sign-ins of the client. Codes are stored only as digests and removed a
+  day after they were made. Mail is plain text in the language of the page (English or
+  Chinese), and the only secret it carries is its code.
 
 ## The S3 API
 

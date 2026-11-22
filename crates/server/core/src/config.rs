@@ -83,6 +83,9 @@ pub struct Config {
     /// `[two_factor]`: two-step verification of web sign-ins.
     #[serde(default)]
     pub two_factor: TwoFactorConfig,
+    /// `[smtp]`: the mail server that sends the codes of email addresses and password resets.
+    #[serde(default)]
+    pub smtp: SmtpConfig,
 }
 
 /// `[server]` table.
@@ -632,6 +635,84 @@ impl Default for S3Config {
     }
 }
 
+/// How the connection to `smtp.host` is protected (`smtp.security`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SmtpSecurity {
+    /// TLS from the first byte ("implicit TLS", SMTPS), usually on port 465.
+    #[default]
+    Tls,
+    /// Plain SMTP upgraded with STARTTLS, usually on port 587. A server that does not offer
+    /// STARTTLS is refused before anything is sent, so a man in the middle cannot strip it.
+    Starttls,
+    /// Plain SMTP without encryption. Accepted only for a relay on this host (`host` is a
+    /// loopback address or `localhost`), such as a local Postfix, and for tests.
+    None,
+}
+
+impl SmtpSecurity {
+    /// `tls`, `starttls` or `none`, as the configuration spells it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tls => "tls",
+            Self::Starttls => "starttls",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Default of `smtp.port`: SMTP submission with implicit TLS.
+pub const DEFAULT_SMTP_PORT: u16 = 465;
+
+/// `[smtp]` table: the mail server through which `serve` sends the one-time codes that bind an
+/// email address to an account and reset a forgotten web login password, and the notices that
+/// follow such changes. Without it (the default) accounts have no email addresses to add, and
+/// passwords cannot be reset by mail.
+///
+/// The password of the mail account never goes into the configuration: it is the first line of
+/// `password_file`, read when `serve` starts.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SmtpConfig {
+    /// Send mail.
+    pub enabled: bool,
+    /// The mail server's host name or IP address. Required when enabled.
+    pub host: Option<String>,
+    /// The mail server's port.
+    pub port: u16,
+    /// How the connection is protected.
+    pub security: SmtpSecurity,
+    /// The account to authenticate as, with `password_file`. Without both, nothing is
+    /// authenticated (a local relay).
+    pub username: Option<String>,
+    /// A file holding the password of `username`: its first line, without the line break.
+    /// Relative paths are resolved against the configuration file's directory.
+    pub password_file: Option<PathBuf>,
+    /// The sender of every mail: an address with an optional display name, for example
+    /// `Gono Cloud <cloud@example.com>`. Required when enabled.
+    pub from: Option<String>,
+}
+
+impl Default for SmtpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: None,
+            port: DEFAULT_SMTP_PORT,
+            security: SmtpSecurity::default(),
+            username: None,
+            password_file: None,
+            from: None,
+        }
+    }
+}
+
+/// Whether `host` names this host: a loopback address or `localhost`.
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Whether `domain` is a DNS name in lowercase: labels of 1 to 63 letters, digits and `-`, not
 /// starting or ending with `-`, at most 253 characters, no trailing dot, not an IP address.
 fn is_domain(domain: &str) -> bool {
@@ -812,6 +893,7 @@ impl Config {
             self.logging.file.as_mut(),
             self.relay.tls_cert.as_mut(),
             self.relay.tls_key.as_mut(),
+            self.smtp.password_file.as_mut(),
         ]
         .into_iter()
         .flatten()
@@ -910,6 +992,9 @@ impl Config {
 
         // [s3]
         self.validate_s3(&mut reject);
+
+        // [smtp]
+        self.validate_smtp(&mut reject);
 
         if issues.is_empty() {
             Ok(())
@@ -1146,6 +1231,87 @@ impl Config {
         }
     }
 
+    /// Checks the `[smtp]` table. Values that are set are always checked; what sending needs is
+    /// only required once it is enabled.
+    fn validate_smtp(&self, reject: &mut impl FnMut(&'static str, String)) {
+        let smtp = &self.smtp;
+        match smtp.host.as_deref() {
+            Some(host) => {
+                let name = host.to_ascii_lowercase();
+                if host.parse::<IpAddr>().is_err() && !is_domain(&name) {
+                    reject(
+                        "smtp.host",
+                        format!(
+                            "{host:?} is neither a host name nor an IP address; give the port in \
+                             smtp.port"
+                        ),
+                    );
+                } else if smtp.security == SmtpSecurity::None && !is_loopback_host(host) {
+                    // Codes that reset passwords must not cross a network in plain text.
+                    reject(
+                        "smtp.security",
+                        format!(
+                            "\"none\" sends mail and the password unencrypted, so it is accepted \
+                             only for a mail server on this host (a loopback address or \
+                             localhost), not {host}; use \"tls\" or \"starttls\""
+                        ),
+                    );
+                }
+            }
+            None if smtp.enabled => {
+                reject("smtp.host", "is required when smtp.enabled".to_owned());
+            }
+            None => {}
+        }
+        if smtp.port == 0 {
+            reject("smtp.port", "must be between 1 and 65535".to_owned());
+        }
+        match (&smtp.username, &smtp.password_file) {
+            (Some(username), _)
+                if username.is_empty() || username.chars().any(char::is_control) =>
+            {
+                reject(
+                    "smtp.username",
+                    "must not be empty or contain control characters".to_owned(),
+                );
+            }
+            (_, Some(file)) if file.as_os_str().is_empty() => {
+                reject("smtp.password_file", "must not be empty".to_owned());
+            }
+            (Some(_), None) => reject(
+                "smtp.password_file",
+                "is required with smtp.username: the file that holds its password".to_owned(),
+            ),
+            (None, Some(_)) => reject(
+                "smtp.username",
+                "is required with smtp.password_file: the account the password belongs to"
+                    .to_owned(),
+            ),
+            _ => {}
+        }
+        match &smtp.from {
+            Some(from) => {
+                if let Err(message) = crate::email::parse_mailbox(from) {
+                    reject(
+                        "smtp.from",
+                        format!(
+                            "{from:?} {message}; expected an address with an optional name, for \
+                             example \"Gono Cloud <cloud@example.com>\""
+                        ),
+                    );
+                }
+            }
+            None if smtp.enabled => {
+                reject(
+                    "smtp.from",
+                    "is required when smtp.enabled, for example \"Gono Cloud <cloud@example.com>\""
+                        .to_owned(),
+                );
+            }
+            None => {}
+        }
+    }
+
     /// Checks `s3.website_domain`: a DNS name of its own, below which no other host of this
     /// server lies and which is neither the virtual-hosted domain nor below or above it.
     fn validate_website_domain(&self, domain: &str, reject: &mut impl FnMut(&'static str, String)) {
@@ -1333,6 +1499,34 @@ impl Config {
                      reverse proxy can connect to it",
                     relay.bind
                 ));
+            }
+        }
+
+        let smtp = &self.smtp;
+        if smtp.enabled {
+            if !self.files_ui.enabled {
+                warnings.push(
+                    "smtp.enabled is true, but nothing sends mail: email addresses are added on \
+                     the account page and passwords reset from the sign-in page, which belong to \
+                     the web file UI that files_ui.enabled turns off"
+                        .to_owned(),
+                );
+            }
+            // The usual ports of the other kind of connection: a mismatch fails at the first
+            // mail with a confusing TLS or protocol error.
+            match (smtp.security, smtp.port) {
+                (SmtpSecurity::Tls, 25 | 587) => warnings.push(format!(
+                    "smtp.port {} usually expects STARTTLS, but smtp.security is \"tls\" (TLS \
+                     from the first byte, usually port 465); set security = \"starttls\" or the \
+                     port the server takes TLS on",
+                    smtp.port
+                )),
+                (SmtpSecurity::Starttls, 465) => warnings.push(
+                    "smtp.port 465 usually expects TLS from the first byte, but smtp.security is \
+                     \"starttls\" (usually port 587); set security = \"tls\" or port = 587"
+                        .to_owned(),
+                ),
+                _ => {}
             }
         }
         warnings
@@ -2281,5 +2475,161 @@ mod tests {
             ))
             .is_empty()
         );
+    }
+
+    /// Parses `MINIMAL` with an `[smtp]` table holding `body`.
+    fn with_smtp(body: &str) -> Config {
+        parse(&format!("{MINIMAL}\n[smtp]\n{body}\n"))
+    }
+
+    const SMTP: &str = "enabled = true\nhost = \"smtp.example.com\"\n\
+                        from = \"Gono Cloud <cloud@example.com>\"";
+
+    #[test]
+    fn smtp_is_off_by_default() {
+        let smtp = parse(MINIMAL).smtp;
+        assert!(!smtp.enabled);
+        assert_eq!(smtp.host, None);
+        assert_eq!(smtp.port, 465);
+        assert_eq!(smtp.security, SmtpSecurity::Tls);
+        assert_eq!(smtp.username, None);
+        assert_eq!(smtp.from, None);
+        assert!(issue_keys(&with_smtp("")).is_empty());
+    }
+
+    #[test]
+    fn enabled_smtp_needs_a_host_and_a_sender() {
+        let mut keys = issue_keys(&with_smtp("enabled = true"));
+        keys.sort_unstable();
+        assert_eq!(keys, ["smtp.from", "smtp.host"]);
+        let config = with_smtp(SMTP);
+        assert!(issue_keys(&config).is_empty());
+        assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+        for (extra, key) in [("port = 0", "smtp.port"), ("security = \"ssl\"", "")] {
+            let raw = format!("{MINIMAL}\n[smtp]\n{SMTP}\n{extra}\n");
+            match Config::from_toml(&raw) {
+                Ok(config) => assert_eq!(issue_keys(&config), [key], "{extra}"),
+                Err(err) => assert!(key.is_empty(), "{extra}: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn smtp_hosts_and_senders_are_checked() {
+        let host = |value: &str| issue_keys(&with_smtp(&SMTP.replace("smtp.example.com", value)));
+        for valid in [
+            "mail.example.com",
+            "Mail.Example.COM",
+            "192.0.2.25",
+            "::1",
+            "localhost",
+        ] {
+            assert!(host(valid).is_empty(), "{valid}");
+        }
+        for invalid in [
+            "",
+            "smtp.example.com:465",
+            "smtps://smtp.example.com",
+            "[::1]",
+            "mail example.com",
+        ] {
+            assert_eq!(host(invalid), ["smtp.host"], "{invalid}");
+        }
+        let from = |value: &str| {
+            issue_keys(&with_smtp(&format!(
+                "enabled = true\nhost = \"smtp.example.com\"\nfrom = {value:?}"
+            )))
+        };
+        for valid in [
+            "cloud@example.com",
+            "Gono Cloud <cloud@example.com>",
+            "\"Gono Cloud\" <Cloud@Example.com>",
+            "<cloud@example.com>",
+            "云盘 <cloud@example.com>",
+        ] {
+            assert!(from(valid).is_empty(), "{valid}");
+        }
+        for invalid in [
+            "",
+            "Gono Cloud",
+            "cloud@",
+            "Gono <cloud@example.com",
+            "a <b> <cloud@example.com>",
+            "Gono\nCloud <cloud@example.com>",
+            "cloud@example.com, other@example.com",
+        ] {
+            assert_eq!(from(invalid), ["smtp.from"], "{invalid}");
+        }
+    }
+
+    #[test]
+    fn plain_smtp_is_for_a_relay_on_this_host_only() {
+        let plain = |host: &str| {
+            issue_keys(&with_smtp(&format!(
+                "{}\nsecurity = \"none\"\nport = 25",
+                SMTP.replace("smtp.example.com", host)
+            )))
+        };
+        for local in ["127.0.0.1", "::1", "localhost", "LOCALHOST", "127.0.0.53"] {
+            assert!(plain(local).is_empty(), "{local}");
+        }
+        for remote in ["smtp.example.com", "192.0.2.25", "localhost.example.com"] {
+            assert_eq!(plain(remote), ["smtp.security"], "{remote}");
+        }
+        let starttls = with_smtp(&format!("{SMTP}\nsecurity = \"starttls\"\nport = 587"));
+        assert_eq!(starttls.smtp.security, SmtpSecurity::Starttls);
+        assert!(issue_keys(&starttls).is_empty());
+        assert!(starttls.warnings().is_empty(), "{:?}", starttls.warnings());
+    }
+
+    #[test]
+    fn smtp_credentials_come_together() {
+        let both = with_smtp(&format!(
+            "{SMTP}\nusername = \"cloud@example.com\"\npassword_file = \"smtp-password\""
+        ));
+        assert!(issue_keys(&both).is_empty());
+        for (extra, key) in [
+            ("username = \"cloud@example.com\"", "smtp.password_file"),
+            ("password_file = \"smtp-password\"", "smtp.username"),
+            (
+                "username = \"\"\npassword_file = \"smtp-password\"",
+                "smtp.username",
+            ),
+            (
+                "username = \"a\"\npassword_file = \"\"",
+                "smtp.password_file",
+            ),
+        ] {
+            assert_eq!(
+                issue_keys(&with_smtp(&format!("{SMTP}\n{extra}"))),
+                [key],
+                "{extra}"
+            );
+        }
+        let mut config = both;
+        config.resolve_relative_paths(Path::new("/etc/gono-cloud"));
+        assert_eq!(
+            config.smtp.password_file.as_deref(),
+            Some(Path::new("/etc/gono-cloud/smtp-password"))
+        );
+    }
+
+    #[test]
+    fn smtp_warns_about_mismatched_ports_and_a_missing_file_ui() {
+        let warned = |extra: &str| with_smtp(&format!("{SMTP}\n{extra}")).warnings();
+        assert!(warned("port = 2465").is_empty());
+        assert_eq!(warned("port = 587").len(), 1);
+        assert_eq!(warned("security = \"starttls\"").len(), 1);
+        let mut config = with_smtp(SMTP);
+        config.files_ui.enabled = false;
+        let warnings = config.warnings();
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("files_ui.enabled"),
+            "{warnings:?}"
+        );
+        // Off, nothing is warned about.
+        let mut off = with_smtp("port = 587");
+        off.files_ui.enabled = false;
+        assert!(off.warnings().is_empty());
     }
 }

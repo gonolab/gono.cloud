@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use gono_server_core::{
-    config::{DbConfig, RelayConfig, S3Config},
+    config::{DbConfig, RelayConfig, S3Config, SmtpConfig},
     db::Backend,
 };
 
@@ -81,6 +81,10 @@ pub fn run(config_path: &Path) -> anyhow::Result<()> {
     if config.s3.enabled {
         settings.extend(s3_settings(&config.s3));
     }
+    settings.push(("smtp.enabled", config.smtp.enabled.to_string()));
+    if config.smtp.enabled {
+        settings.extend(smtp_settings(&config.smtp));
+    }
     for (key, value) in settings {
         println!("  {key:<31} {value}");
     }
@@ -128,6 +132,33 @@ fn db_settings(db: &DbConfig) -> Vec<(&'static str, String)> {
         ("db.busy_timeout_secs", db.busy_timeout_secs.to_string()),
     ]);
     settings
+}
+
+/// The effective settings of enabled mail. The password file is named, never read here.
+fn smtp_settings(smtp: &SmtpConfig) -> Vec<(&'static str, String)> {
+    let none = || "(none)".to_owned();
+    vec![
+        ("smtp.host", smtp.host.clone().unwrap_or_else(none)),
+        ("smtp.port", smtp.port.to_string()),
+        ("smtp.security", smtp.security.as_str().to_owned()),
+        (
+            "smtp.username",
+            smtp.username
+                .clone()
+                .unwrap_or_else(|| "(none: no authentication)".to_owned()),
+        ),
+        (
+            "smtp.password_file",
+            smtp.password_file.as_ref().map_or_else(none, |file| {
+                format!(
+                    "{}{}",
+                    file.display(),
+                    if file.exists() { "" } else { " (missing)" }
+                )
+            }),
+        ),
+        ("smtp.from", smtp.from.clone().unwrap_or_else(none)),
+    ]
 }
 
 /// The effective settings of an enabled S3 API.

@@ -57,6 +57,7 @@ INSERT INTO id_sequences (name, last_id) VALUES
     ('change_log', 0),
     ('device_events', 0),
     ('devices', 0),
+    ('email_codes', 0),
     ('files', 0),
     ('login_flows', 0),
     ('s3_buckets', 0),
@@ -91,6 +92,13 @@ CREATE TABLE users (
     is_admin      INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1)),
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL,
+    -- The account's email address (`gono_server_core::email`): NULL, or an address its user
+    -- proved to receive mail at by entering a code sent there. Lets a forgotten web login
+    -- password be reset by mail. Stored lower-cased (ASCII only), so that Alice@Example.com and
+    -- alice@example.com are one address; an address belongs to one account at most.
+    email         TEXT    UNIQUE COLLATE BINARY
+                          CHECK (email IS NULL OR (length(email) BETWEEN 3 AND 254
+                                                   AND email = lower(email))),
     -- The services the account may use (`gono_server_core::services`), all off until an admin
     -- turns them on: the web file UI, WebDAV and the rest of the Nextcloud surface, the S3 API,
     -- remote access for devices with the relay at the limited rate ("direct"), and the relay at
@@ -605,3 +613,25 @@ CREATE TABLE recovery_codes (
     used_at   INTEGER,
     PRIMARY KEY (user_id, code_hash)
 ) STRICT;
+
+-- One-time codes sent by mail (`gono_server_core::email`): 'bind' proves an address before it
+-- becomes the account's, 'reset' resets the web login password through the account's address.
+-- Ids from `id_sequences`. A code is valid until `expires_at` and for 5 tries (`attempts`,
+-- counted before each comparison); a used or replaced code gets `expires_at` set to the time it
+-- ended. Rows stay a day after they were created, so that the limit of codes per day can count
+-- them, and are removed by the janitor after that.
+CREATE TABLE email_codes (
+    id         INTEGER PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    purpose    TEXT    NOT NULL CHECK (purpose IN ('bind', 'reset')),
+    -- The address the code was sent to, lower-cased like `users.email`.
+    email      TEXT    NOT NULL COLLATE BINARY CHECK (length(email) BETWEEN 3 AND 254),
+    -- SHA-256 of the code and the row's id. The code itself (6 digits) is never stored.
+    code_hash  BLOB    NOT NULL CHECK (length(code_hash) = 32),
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0)
+) STRICT;
+
+CREATE INDEX email_codes_user ON email_codes (user_id, purpose, created_at);
+CREATE INDEX email_codes_created_at ON email_codes (created_at);

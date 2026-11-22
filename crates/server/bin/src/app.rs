@@ -26,7 +26,8 @@
 //! - The web admin UI under `admin.path`, when `admin.enabled`: see [`crate::admin`].
 //! - The web file UI under `/apps/files/`, when `files_ui.enabled`: see [`crate::files`]; the
 //!   sign-in page `/login`, `/logout`, the theme switch and the assets of every HTML page:
-//!   see [`crate::site`].
+//!   see [`crate::site`]; resetting a forgotten password by mail under `/login/forgot` and
+//!   `/login/reset`, when `smtp.enabled` as well: see [`crate::recovery`].
 //!
 //! Every response to a WebDAV request passes [`OcHeadersLayer`], which adds the `OC-ETag`,
 //! `OC-FileId` and `X-NC-Permissions` headers, and [`DavPrefixLayer`], which writes the `DAV:`
@@ -70,7 +71,7 @@ use crate::{
     files::{self, Files},
     login_flow, nextcloud, notify_push,
     ratelimit::RateLimiter,
-    request_log,
+    recovery, request_log,
     s3::S3Ui,
     site,
     web::{self, Web},
@@ -106,6 +107,9 @@ pub struct AppState {
     pub connect: Option<Arc<gono_server_connect::Connect>>,
     /// What the account page and the admin UI show of the S3 API, when `s3.enabled`.
     pub s3: Option<Arc<S3Ui>>,
+    /// Outgoing mail, when `smtp.enabled`: the codes that bind email addresses and reset
+    /// passwords ([`crate::mail`]). Without it, the pages offer neither.
+    pub mailer: Option<Arc<dyn crate::mail::Mailer>>,
 }
 
 impl AppState {
@@ -230,6 +234,15 @@ pub fn router(state: AppState) -> Router {
         .route(
             web::TWO_STEP_PATH,
             get(site::two_step_page).post(site::two_step),
+        )
+        // Without `[smtp]` (or the file UI) these answer 404.
+        .route(
+            "/login/forgot",
+            get(recovery::forgot_page).post(recovery::forgot),
+        )
+        .route(
+            "/login/reset",
+            get(recovery::reset_page).post(recovery::reset),
         )
         .route(web::THEME_PATH, post(site::theme))
         .route("/apps/assets/{name}", get(site::asset));
@@ -573,6 +586,7 @@ mod tests {
             files: None,
             connect: None,
             s3: None,
+            mailer: None,
         };
         Fixture {
             dir,
