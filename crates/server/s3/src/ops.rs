@@ -544,6 +544,8 @@ impl GonoS3 {
             username: key.username.clone(),
             display_name: key.display_name.clone(),
             app_password_id: Some(key.id),
+            services: gono_server_core::services::Services::NONE
+                .with(gono_server_core::services::Service::S3, true),
             mounts: vec![Mount {
                 mount_path: RelPath::root(),
                 storage_path: RelPath::root(),

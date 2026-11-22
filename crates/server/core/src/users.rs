@@ -15,6 +15,7 @@ use sqlx::FromRow;
 use crate::{
     db::{self, Flag, Pool, Text},
     error::{Error, Result},
+    services::Services,
     types::Username,
 };
 
@@ -70,6 +71,9 @@ pub struct User {
     pub created_at: i64,
     /// Last change, UNIX seconds.
     pub updated_at: i64,
+    /// The services it may use.
+    #[sqlx(flatten)]
+    pub services: Services,
 }
 
 impl TryFrom<String> for Username {
@@ -101,7 +105,9 @@ pub struct NewUser<'a> {
     pub is_admin: bool,
 }
 
-const USER_COLUMNS: &str = "id, username, display_name, enabled, is_admin, created_at, updated_at";
+/// The columns of [`User`]; the last ones are [`crate::services::COLUMNS`].
+const USER_COLUMNS: &str = "id, username, display_name, enabled, is_admin, created_at, updated_at, \
+                            service_files, service_webdav, service_s3, service_direct, service_relay";
 
 /// Returns the number of user accounts.
 pub async fn count(pool: &Pool) -> Result<i64> {
@@ -334,6 +340,46 @@ pub async fn set_enabled(pool: &Pool, username: &Username, enabled: bool) -> Res
     Ok(())
 }
 
+/// The account with id `user_id`, if it exists.
+pub async fn by_id(pool: &Pool, user_id: i64) -> Result<Option<User>> {
+    let sql = format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?");
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?)
+}
+
+/// Sets the services account `username` may use, and returns them as stored: the relay needs
+/// direct connections, so [`Services::normalized`] turns those on with it.
+///
+/// `updated_at` stays as it is: the services are not credentials, so a sign-in waiting for its
+/// second step (which ends when `updated_at` changes) is not affected.
+pub async fn set_services(
+    pool: &Pool,
+    username: &Username,
+    services: Services,
+) -> Result<Services> {
+    let services = services.normalized();
+    let mut tx = db::begin_immediate(pool).await?;
+    let result = sqlx::query(
+        "UPDATE users SET service_files = ?, service_webdav = ?, service_s3 = ?, \
+         service_direct = ?, service_relay = ? WHERE username = ?",
+    )
+    .bind(services.files)
+    .bind(services.webdav)
+    .bind(services.s3)
+    .bind(services.direct)
+    .bind(services.relay)
+    .bind(username.as_str())
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(Error::UserNotFound(username.clone()));
+    }
+    tx.commit().await?;
+    Ok(services)
+}
+
 /// Grants or withdraws access to the web admin UI. The last enabled admin cannot be demoted.
 /// Granting the flag to an admin, or withdrawing it from an ordinary account, changes nothing
 /// and succeeds.
@@ -396,5 +442,12 @@ mod tests {
         assert!(display_name_or_default(Some("   "), &username).is_err());
         assert!(display_name_or_default(Some("a\u{7}b"), &username).is_err());
         assert!(display_name_or_default(Some(&"x".repeat(256)), &username).is_err());
+    }
+
+    #[test]
+    fn user_columns_end_with_the_service_columns() {
+        let columns: String = USER_COLUMNS.split_whitespace().collect();
+        let services: String = crate::services::COLUMNS.split_whitespace().collect();
+        assert!(columns.ends_with(&services), "{columns}");
     }
 }

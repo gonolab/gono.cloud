@@ -21,6 +21,7 @@
 //! - [`web_sessions`]: browser sessions of the server's HTML pages.
 //! - [`direct_downloads`]: links that let media players stream a file without credentials.
 //! - [`s3`]: S3 buckets (names bound to folders) and S3 access keys.
+//! - [`services`]: the services an account may use, which admins turn on.
 //! - [`rescan`]: walking a user's tree on disk for `gono-cloud rescan`.
 //! - [`secret`]: random tokens and their digests.
 //! - [`sealing`]: secrets stored encrypted because the server must read them back.
@@ -43,6 +44,7 @@ pub mod rescan;
 pub mod s3;
 pub mod sealing;
 pub mod secret;
+pub mod services;
 pub mod settings;
 pub mod stats;
 pub mod storage;

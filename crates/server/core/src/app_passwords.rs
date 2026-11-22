@@ -18,6 +18,7 @@ use crate::{
     db::{self, Flag, Pool, Text, Tx},
     error::{Error, Result},
     path::RelPath,
+    services::Services,
     types::{Permission, Username},
 };
 
@@ -83,6 +84,10 @@ pub struct Device {
     pub scopes: Vec<Scope>,
     /// Last recorded use, UNIX seconds.
     pub last_used_at: Option<i64>,
+    /// The services the owner may use. Authentication does not check them: each route checks
+    /// the one it belongs to (a device of remote access holds an app password too, which must
+    /// keep working on the control channel without WebDAV).
+    pub services: Services,
 }
 
 /// Generates a new app password token, for example `Ab3dE-fGh1j-KlMn0-pQrSt-Uv9Wx`.
@@ -315,6 +320,8 @@ struct DeviceRow {
     display_name: String,
     #[sqlx(try_from = "Flag")]
     enabled: bool,
+    #[sqlx(flatten)]
+    services: Services,
 }
 
 /// Checks `username` and an app password.
@@ -359,7 +366,8 @@ pub async fn device(pool: &Pool, id: i64, now: i64) -> Result<Option<Device>> {
 
 /// The columns of [`DeviceRow`].
 const DEVICE_QUERY: &str = "SELECT a.id, a.user_id, a.expires_at, a.last_used_at, u.username, \
-     u.display_name, u.enabled FROM app_passwords a JOIN users u ON u.id = a.user_id";
+     u.display_name, u.enabled, u.service_files, u.service_webdav, u.service_s3, \
+     u.service_direct, u.service_relay FROM app_passwords a JOIN users u ON u.id = a.user_id";
 
 /// The device of `row` with its scopes, unless the account is disabled or the app password
 /// expired at `now`.
@@ -385,6 +393,7 @@ async fn device_from_row(pool: &Pool, row: DeviceRow, now: i64) -> Result<Option
             .map(Scope::try_from)
             .collect::<Result<_>>()?,
         last_used_at: row.last_used_at,
+        services: row.services,
     }))
 }
 

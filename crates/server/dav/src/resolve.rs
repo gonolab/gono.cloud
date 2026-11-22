@@ -234,6 +234,7 @@ mod tests {
             display_name: "Alice".into(),
             app_password_id: Some(1),
             mounts,
+            services: gono_server_core::services::Services::ALL,
         }
     }
 

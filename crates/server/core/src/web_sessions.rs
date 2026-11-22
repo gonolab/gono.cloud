@@ -18,6 +18,7 @@ use crate::{
     db::{self, Flag, Pool, Text},
     error::Result,
     secret,
+    services::Services,
     types::Username,
 };
 
@@ -46,6 +47,8 @@ pub struct SessionUser {
     pub display_name: String,
     /// Whether it may use the web admin UI.
     pub is_admin: bool,
+    /// The services it may use.
+    pub services: Services,
 }
 
 /// Creates a session for `user_id` and returns the cookie token. The token is returned once;
@@ -85,6 +88,8 @@ struct Row {
     is_admin: bool,
     #[sqlx(try_from = "Flag")]
     enabled: bool,
+    #[sqlx(flatten)]
+    services: Services,
 }
 
 /// The account of the live session with cookie token `token`, extending the session.
@@ -92,8 +97,8 @@ pub async fn lookup(pool: &Pool, token: &str, now: i64) -> Result<Option<Session
     let digest = secret::digest(token);
     let row: Option<Row> = sqlx::query_as(
         "SELECT s.id, s.created_at, s.last_seen_at, s.expires_at, u.id AS user_id, u.username, \
-         u.display_name, u.is_admin, u.enabled FROM web_sessions s \
-         JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?",
+         u.display_name, u.is_admin, u.enabled, u.service_files, u.service_webdav, \
+         u.service_s3, u.service_direct, u.service_relay FROM web_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?",
     )
     .bind(&digest[..])
     .fetch_optional(pool)
@@ -121,6 +126,7 @@ pub async fn lookup(pool: &Pool, token: &str, now: i64) -> Result<Option<Session
         username: Username::new(row.username)?,
         display_name: row.display_name,
         is_admin: row.is_admin,
+        services: row.services,
     }))
 }
 

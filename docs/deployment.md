@@ -265,6 +265,26 @@ gono user promote alice
 gono app-password add alice --label "Alice's laptop"
 ```
 
+Accounts start without services, the first admin's too: a new account can sign in to its
+account page, change its password and display name and set up two-step verification, and
+nothing else until an admin turns its services on:
+
+| Service | What it allows |
+|---|---|
+| `files` | The web file UI at `/apps/files/`. |
+| `webdav` | WebDAV and everything else Nextcloud clients use: Login Flow v2, OCS, chunked uploads, notify_push and direct links. |
+| `s3` | The S3 API with the account's access keys, and anonymous reads of its public buckets. |
+| `direct` | Remote access for devices: registering them, finding the account's other devices and their addresses, pairing, and the relay at a limited rate, enough to set up direct connections. |
+| `relay` | The relay at the full rate, for devices that cannot connect directly. Needs `direct`, which it turns on. |
+
+```sh
+gono user services alice --enable webdav,files
+gono user services alice --enable all --disable s3
+```
+
+A running server applies a change to the next request, and to open control channels and
+relay connections within 30 seconds.
+
 Run as root (`sudo gono-cloud ...`), the commands refuse to touch an installation that belongs to
 the service user: files they would create, such as the database's write-ahead log or a new
 user's directories, would belong to root and could no longer be written by the server.
@@ -276,6 +296,7 @@ user's directories, would belong to root and could no longer be written by the s
 | `user set-password NAME` | Set a new web login password; ends the user's browser sessions. |
 | `user set-display-name NAME DISPLAY_NAME` | Change the name clients show. |
 | `user promote NAME`, `user demote NAME` | Grant or withdraw access to the admin UI. |
+| `user services NAME [--enable LIST] [--disable LIST]` | Show or switch the services of an account (see below). |
 | `user disable NAME`, `user enable NAME` | Block or allow signing in; disabling stops the user's app passwords too. |
 | `user delete NAME` | Delete the account; its files move to `data/deleted/`. The name of an account that registered devices for remote access cannot be given to a new account afterwards, and its revoked devices stay revoked. |
 | `app-password add NAME --label LABEL [--scope ...] [--expires-in-days N]` | Create an app password, shown once. |

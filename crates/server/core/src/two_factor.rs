@@ -328,13 +328,7 @@ pub async fn enable(
 /// (the name may have been given to another account since): `None` if it was deleted. The
 /// caller checks that it is still enabled and unchanged.
 pub async fn sign_in_account(pool: &Pool, user_id: i64) -> Result<Option<User>> {
-    Ok(sqlx::query_as(
-        "SELECT id, username, display_name, enabled, is_admin, created_at, updated_at \
-         FROM users WHERE id = ?",
-    )
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await?)
+    crate::users::by_id(pool, user_id).await
 }
 
 /// The recent uses of recovery codes of `user_id`, newest first: when, and from which client

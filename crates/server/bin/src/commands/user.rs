@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::Context;
 use gono_server_core::{
     db, password,
+    services::Service,
     storage::DataLayout,
     two_factor::{self, TurnedOff},
     users::{self, NewUser},
@@ -15,7 +16,10 @@ use super::{
     open_database,
     output::{format_time, print_table},
 };
-use crate::{cli::UserCommand, password_input};
+use crate::{
+    cli::{ServiceList, UserCommand},
+    password_input,
+};
 
 /// Runs one `user` subcommand.
 pub async fn run(config_path: &Path, command: UserCommand) -> anyhow::Result<()> {
@@ -62,6 +66,7 @@ pub async fn run(config_path: &Path, command: UserCommand) -> anyhow::Result<()>
                         user.display_name,
                         yes_no(user.is_admin),
                         yes_no(user.enabled),
+                        user.services.to_string(),
                         format_time(user.created_at),
                     ]
                 })
@@ -73,6 +78,7 @@ pub async fn run(config_path: &Path, command: UserCommand) -> anyhow::Result<()>
                     "DISPLAY NAME",
                     "ADMIN",
                     "ENABLED",
+                    "SERVICES",
                     "CREATED",
                 ],
                 &rows,
@@ -149,6 +155,11 @@ pub async fn run(config_path: &Path, command: UserCommand) -> anyhow::Result<()>
             println!("Changed the display name of {username} to \"{stored}\".");
             Ok(())
         }
+        UserCommand::Services {
+            username,
+            enable,
+            disable,
+        } => services(&pool, &username, enable, disable).await,
         UserCommand::Disable { username } => {
             let user = users::get(&pool, &username).await?;
             users::set_enabled(&pool, &username, false).await?;
@@ -180,4 +191,41 @@ async fn read_password_hash(
 
 fn yes_no(value: bool) -> String {
     if value { "yes" } else { "no" }.to_owned()
+}
+
+/// `user services`: prints the services of `username`, or turns some on and others off.
+async fn services(
+    pool: &db::Pool,
+    username: &gono_server_core::Username,
+    enable: Option<ServiceList>,
+    disable: Option<ServiceList>,
+) -> anyhow::Result<()> {
+    let user = users::get(pool, username).await?;
+    let (enable, disable) = (
+        enable.map(|list| list.0).unwrap_or_default(),
+        disable.map(|list| list.0).unwrap_or_default(),
+    );
+    let services = if enable.is_empty() && disable.is_empty() {
+        user.services
+    } else {
+        // --disable applies after --enable, so `--enable all --disable s3` means all but S3.
+        let mut services = user.services;
+        for service in enable {
+            services = services.with(service, true);
+        }
+        for service in disable {
+            services = services.with(service, false);
+        }
+        users::set_services(pool, username, services).await?
+    };
+    let rows: Vec<Vec<String>> = Service::ALL
+        .into_iter()
+        .map(|service| vec![service.to_string(), on_off(services.has(service))])
+        .collect();
+    print_table(&["SERVICE", username.as_str()], &rows);
+    Ok(())
+}
+
+fn on_off(on: bool) -> String {
+    if on { "on" } else { "off" }.to_owned()
 }

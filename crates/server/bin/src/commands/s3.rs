@@ -207,6 +207,8 @@ fn owner_identity(user: &users::User) -> Arc<Identity> {
         username: user.username.clone(),
         display_name: user.display_name.clone(),
         app_password_id: None,
+        // The CLI acts for the owner on the server's host; no service applies.
+        services: user.services,
         mounts: vec![Mount {
             mount_path: RelPath::root(),
             storage_path: RelPath::root(),

@@ -198,6 +198,9 @@ impl Authorized {
                 Caller::Anonymous => None,
             },
             mounts,
+            // Only requests the S3 service allows get this far.
+            services: gono_server_core::services::Services::NONE
+                .with(gono_server_core::services::Service::S3, true),
         }))
     }
 }

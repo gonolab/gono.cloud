@@ -297,6 +297,7 @@ async fn visitor(state: &AppState, headers: &HeaderMap, uri: &Uri) -> Option<Vis
         user.user_id,
         user.username.clone(),
         user.display_name.clone(),
+        user.services,
     );
     Some(Visitor {
         user,

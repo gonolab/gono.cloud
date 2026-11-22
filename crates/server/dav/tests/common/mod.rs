@@ -203,6 +203,7 @@ impl Harness {
             user_id: self.owner,
             username: Username::new("alice").unwrap(),
             display_name: "Alice".into(),
+            services: gono_server_core::services::Services::ALL,
             app_password_id: Some(1),
             mounts,
         })

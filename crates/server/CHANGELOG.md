@@ -12,6 +12,13 @@ compatible within a major version: released clients keep working with newer serv
 
 ### Added
 
+- **Services per account**: every account has five switches, all off for new accounts, the
+  first admin included: `files` (the web file UI), `webdav` (WebDAV and the other endpoints of
+  Nextcloud clients), `s3` (the S3 API), `direct` (remote access for devices, with the relay at
+  a limited rate) and `relay` (the relay at the full rate, which needs `direct`). An account
+  without services can still sign in to its account page. Turn them on with
+  `gono-cloud user services NAME --enable LIST` (`all`, or a comma-separated list; `--disable`
+  turns them off); `user list` shows them.
 - **MySQL as the database**, as an alternative to the built-in SQLite: `[db] backend =
   "mysql"` with `url` (for example `mysql://gono@127.0.0.1:3306/gono_cloud`, never with the
   password) and `password_file`. MySQL 5.7.44 or later with InnoDB and utf8mb4; MariaDB is not

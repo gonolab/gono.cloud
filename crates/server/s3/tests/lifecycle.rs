@@ -48,6 +48,7 @@ async fn fixture() -> Fixture {
         username: username.clone(),
         display_name: "Alice".into(),
         app_password_id: None,
+        services: gono_server_core::services::Services::ALL,
         mounts: vec![Mount {
             mount_path: RelPath::root(),
             storage_path: RelPath::root(),

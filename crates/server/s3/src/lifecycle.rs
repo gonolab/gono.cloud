@@ -555,6 +555,9 @@ async fn apply_to_bucket(
         username: bucket.owner_name.clone(),
         display_name: bucket.owner_display_name.clone(),
         app_password_id: None,
+        // Lifecycle rules act for the bucket's owner within the S3 API.
+        services: gono_server_core::services::Services::NONE
+            .with(gono_server_core::services::Service::S3, true),
         mounts: vec![Mount {
             mount_path: mount_path.clone(),
             storage_path: bucket.folder.clone(),

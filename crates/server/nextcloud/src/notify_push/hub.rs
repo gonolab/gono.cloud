@@ -428,6 +428,7 @@ mod tests {
             user_id,
             username: Username::new(format!("user{user_id}")).unwrap(),
             display_name: String::new(),
+            services: gono_server_core::services::Services::ALL,
             app_password_id: Some(user_id * 10),
             mounts: vec![Mount {
                 mount_path: RelPath::root(),

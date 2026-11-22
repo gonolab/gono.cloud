@@ -587,7 +587,7 @@ fn admins_can_be_promoted_and_demoted_and_renamed() {
         text(&demote.stderr)
     );
 
-    // Columns: ID, USERNAME, DISPLAY NAME (one word here), ADMIN, ENABLED, CREATED.
+    // Columns: ID, USERNAME, DISPLAY NAME (one word here), ADMIN, ENABLED, SERVICES, CREATED.
     let admin_column = |username: &str| {
         let line = listed(&instance, username);
         line.split_whitespace().nth(3).unwrap().to_owned()
@@ -609,6 +609,58 @@ fn admins_can_be_promoted_and_demoted_and_renamed() {
     let missing = run(&mut instance.command(&["user", "promote", "nobody"]));
     assert!(!missing.status.success());
     assert!(text(&missing.stderr).contains("does not exist"));
+}
+
+#[test]
+fn services_start_off_and_can_be_switched() {
+    let instance = Instance::new();
+    let init = instance.init();
+    assert!(init.status.success());
+    assert!(text(&init.stdout).contains("user services admin --enable all"));
+    // Columns: ID, USERNAME, DISPLAY NAME (one word here), ADMIN, ENABLED, SERVICES, CREATED.
+    let services_column = || {
+        let line = listed(&instance, "admin");
+        line.split_whitespace().nth(5).unwrap().to_owned()
+    };
+    assert_eq!(services_column(), "none");
+
+    let shown = |args: &[&str]| {
+        let output = run(&mut instance.command(args));
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        text(&output.stdout)
+    };
+    // The relay brings direct connections along.
+    let table = shown(&["user", "services", "admin", "--enable", "webdav,relay"]);
+    assert!(table.contains("relay") && table.contains("on"), "{table}");
+    assert_eq!(services_column(), "webdav,direct,relay");
+    // Without direct connections there is no relay either.
+    shown(&["user", "services", "admin", "--disable", "direct"]);
+    assert_eq!(services_column(), "webdav");
+    shown(&[
+        "user",
+        "services",
+        "admin",
+        "--enable",
+        "all",
+        "--disable",
+        "s3",
+    ]);
+    assert_eq!(services_column(), "files,webdav,direct,relay");
+    let table = shown(&["user", "services", "admin"]);
+    assert!(
+        table
+            .lines()
+            .any(|line| line.starts_with("s3") && line.ends_with("off")),
+        "{table}"
+    );
+
+    let unknown = run(&mut instance.command(&["user", "services", "admin", "--enable", "ftp"]));
+    assert!(!unknown.status.success());
+    assert!(
+        text(&unknown.stderr).contains("unknown service"),
+        "{}",
+        text(&unknown.stderr)
+    );
 }
 
 #[test]

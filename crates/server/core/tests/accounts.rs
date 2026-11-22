@@ -53,6 +53,56 @@ async fn failed_storage_setup_rolls_the_account_back() {
 }
 
 #[tokio::test]
+async fn accounts_start_without_services_and_keep_the_ones_set() {
+    use gono_server_core::services::{Service, Services};
+    let dir = tempfile::tempdir().unwrap();
+    let pool = database(dir.path()).await;
+    let alice = add_user(&pool, "alice").await;
+    let username = Username::new("alice").unwrap();
+    assert_eq!(
+        users::get(&pool, &username).await.unwrap().services,
+        Services::NONE
+    );
+
+    // The relay brings direct connections along, as stored.
+    let relay = Services {
+        relay: true,
+        ..Services::NONE
+    };
+    let stored = users::set_services(&pool, &username, relay).await.unwrap();
+    assert!(stored.has(Service::Direct) && stored.has(Service::Relay));
+    let user = users::by_id(&pool, alice).await.unwrap().unwrap();
+    assert_eq!(user.services, stored);
+    assert_eq!(users::list(&pool).await.unwrap()[0].services, stored);
+
+    // The app passwords of the account see the same switches.
+    let (_, token) = app_passwords::create(&pool, alice, "phone", vec![Scope::full_access()], None)
+        .await
+        .unwrap();
+    let device = app_passwords::authenticate(&pool, "alice", &token, db::unix_now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(device.services, stored);
+
+    // The schema refuses the relay without direct connections, whatever writes it.
+    let refused = sqlx::query("UPDATE users SET service_direct = 0 WHERE id = ?")
+        .bind(alice)
+        .execute(&pool)
+        .await;
+    // MySQL 5.7 does not enforce CHECK constraints; `users::set_services` is what keeps them.
+    if db::Backend::of(&pool) == db::Backend::Sqlite {
+        assert!(refused.is_err());
+    }
+
+    let missing = Username::new("nobody").unwrap();
+    assert!(matches!(
+        users::set_services(&pool, &missing, Services::ALL).await,
+        Err(Error::UserNotFound(_))
+    ));
+}
+
+#[tokio::test]
 async fn app_passwords_authenticate_only_their_owner() {
     let dir = tempfile::tempdir().unwrap();
     let pool = database(dir.path()).await;

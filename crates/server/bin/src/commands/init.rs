@@ -83,6 +83,11 @@ pub async fn run(config_path: &Path, args: InitArgs) -> anyhow::Result<()> {
     println!("  two-step key    {key}");
     println!("  admin account   {}", args.admin);
     println!();
+    println!(
+        "Accounts start without services, this one too. Turn them on in the admin UI or with \
+         `gono-cloud user services {} --enable all`.",
+        args.admin
+    );
     println!("Start the server with `gono-cloud serve`.");
     Ok(())
 }

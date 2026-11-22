@@ -3,7 +3,10 @@
 use std::{num::NonZeroU32, path::PathBuf, str::FromStr};
 
 use clap::{Args, Parser, Subcommand};
-use gono_server_core::{Permission, Username};
+use gono_server_core::{
+    Permission, Username,
+    services::{self, Service},
+};
 
 /// Gono Cloud: a self-hosted WebDAV file server compatible with Nextcloud clients.
 #[derive(Debug, Parser)]
@@ -175,6 +178,27 @@ pub enum UserCommand {
         username: Username,
     },
 
+    /// Show or change the services a user may use. New accounts have none.
+    ///
+    /// The services are `files` (the web file UI), `webdav` (WebDAV and the other endpoints of
+    /// Nextcloud clients), `s3` (the S3 API), `direct` (remote access for devices, with the relay
+    /// at the limited rate) and `relay` (the relay at the full rate; turns `direct` on). Without
+    /// --enable or --disable, prints which are on; --disable applies after --enable, so
+    /// `--enable all --disable s3` turns on all but S3. A running server applies a change to the next
+    /// request, and to open control channels and relay connections within 30 seconds.
+    Services {
+        /// Account whose services are shown or changed.
+        username: Username,
+
+        /// Services to turn on, separated by commas, or `all`.
+        #[arg(long, value_name = "LIST")]
+        enable: Option<ServiceList>,
+
+        /// Services to turn off, separated by commas, or `all`.
+        #[arg(long, value_name = "LIST")]
+        disable: Option<ServiceList>,
+    },
+
     /// Change the name clients show for a user.
     SetDisplayName {
         /// Account whose display name changes.
@@ -335,6 +359,25 @@ pub enum S3BucketCommand {
         /// Bucket name.
         name: String,
     },
+}
+
+/// A comma-separated list of services (`webdav,s3`, `all`), the value of `user services
+/// --enable` and `--disable`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceList(pub Vec<Service>);
+
+impl FromStr for ServiceList {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let services = services::parse_list(value).map_err(|err| err.to_string())?;
+        if services.is_empty() {
+            return Err(
+                "expected one or more of files, webdav, s3, direct, relay, or all".to_owned(),
+            );
+        }
+        Ok(Self(services))
+    }
 }
 
 /// One `--bucket <NAME>[:<view|full>]` argument.

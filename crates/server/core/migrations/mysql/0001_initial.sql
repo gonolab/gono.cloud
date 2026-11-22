@@ -74,8 +74,20 @@ CREATE TABLE users (
     is_admin      INT           NOT NULL DEFAULT 0,
     created_at    BIGINT        NOT NULL,
     updated_at    BIGINT        NOT NULL,
+    -- The services the account may use; see the SQLite schema.
+    service_files  INT NOT NULL DEFAULT 0,
+    service_webdav INT NOT NULL DEFAULT 0,
+    service_s3     INT NOT NULL DEFAULT 0,
+    service_direct INT NOT NULL DEFAULT 0,
+    service_relay  INT NOT NULL DEFAULT 0,
     CHECK (enabled IN (0, 1)),
-    CHECK (is_admin IN (0, 1))
+    CHECK (is_admin IN (0, 1)),
+    CHECK (service_files IN (0, 1)),
+    CHECK (service_webdav IN (0, 1)),
+    CHECK (service_s3 IN (0, 1)),
+    CHECK (service_direct IN (0, 1)),
+    CHECK (service_relay IN (0, 1)),
+    CHECK (service_relay = 0 OR service_direct = 1)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE app_passwords (

@@ -1892,6 +1892,7 @@ async fn secrets_shown_once_stay_with_the_account_of_their_session() {
         username: Username::new(name).unwrap(),
         display_name: name.to_owned(),
         is_admin: false,
+        services: gono_server_core::services::Services::ALL,
     };
     let (alice, bob) = (session(1, "alice"), session(2, "bob"));
     f.state.web.start_enrolment(&alice, None);
@@ -2681,6 +2682,7 @@ async fn s3_forms_need_the_session_csrf_token_and_the_users_own_buckets() {
         bob,
         Username::new("bob").unwrap(),
         "Bob".to_owned(),
+        gono_server_core::services::Services::ALL,
     );
     let folder = f
         .state

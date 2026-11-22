@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use gono_server_core::{Permission, RelPath, Username, app_passwords::Device};
+use gono_server_core::{Permission, RelPath, Username, app_passwords::Device, services::Services};
 
 /// One mount of the client's tree: `mount_path` (client side) shows `storage_path` (inside the
 /// owner's storage) with read-only or read-write access.
@@ -35,6 +35,9 @@ pub struct Identity {
     pub app_password_id: Option<i64>,
     /// Mounts, ordered by mount path. Mount paths are never nested.
     pub mounts: Vec<Mount>,
+    /// The services the user may use, as read when the request was authenticated. Each route
+    /// checks its own (`gono_server_core::services`).
+    pub services: Services,
 }
 
 impl Identity {
@@ -45,6 +48,7 @@ impl Identity {
             username: device.username,
             display_name: device.display_name,
             app_password_id: Some(device.app_password_id),
+            services: device.services,
             mounts: device
                 .scopes
                 .into_iter()
@@ -61,12 +65,18 @@ impl Identity {
     ///
     /// Only the web file UI builds these, from a live session of an enabled account; the
     /// WebDAV routes keep accepting app passwords only.
-    pub fn for_web_session(user_id: i64, username: Username, display_name: String) -> Arc<Self> {
+    pub fn for_web_session(
+        user_id: i64,
+        username: Username,
+        display_name: String,
+        services: Services,
+    ) -> Arc<Self> {
         Arc::new(Self {
             user_id,
             username,
             display_name,
             app_password_id: None,
+            services,
             mounts: vec![Mount {
                 mount_path: RelPath::root(),
                 storage_path: RelPath::root(),

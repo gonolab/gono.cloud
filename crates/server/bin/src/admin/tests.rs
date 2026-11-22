@@ -1311,6 +1311,7 @@ async fn new_app_passwords_are_shown_only_to_the_admin_who_created_them() {
         username: Username::new(name).unwrap(),
         display_name: name.to_owned(),
         is_admin: true,
+        services: gono_server_core::services::Services::ALL,
     };
     admin.remember(
         7,
@@ -1383,6 +1384,7 @@ async fn admins_see_revoke_and_remove_the_s3_keys_and_buckets_of_an_account() {
         f.alice,
         Username::new("alice").unwrap(),
         "alice".to_owned(),
+        gono_server_core::services::Services::ALL,
     );
     let folder = f
         .state

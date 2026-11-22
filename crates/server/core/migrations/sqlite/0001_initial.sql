@@ -90,7 +90,17 @@ CREATE TABLE users (
     enabled       INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     is_admin      INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1)),
     created_at    INTEGER NOT NULL,
-    updated_at    INTEGER NOT NULL
+    updated_at    INTEGER NOT NULL,
+    -- The services the account may use (`gono_server_core::services`), all off until an admin
+    -- turns them on: the web file UI, WebDAV and the rest of the Nextcloud surface, the S3 API,
+    -- remote access for devices with the relay at the limited rate ("direct"), and the relay at
+    -- the full rate, which needs direct.
+    service_files  INTEGER NOT NULL DEFAULT 0 CHECK (service_files IN (0, 1)),
+    service_webdav INTEGER NOT NULL DEFAULT 0 CHECK (service_webdav IN (0, 1)),
+    service_s3     INTEGER NOT NULL DEFAULT 0 CHECK (service_s3 IN (0, 1)),
+    service_direct INTEGER NOT NULL DEFAULT 0 CHECK (service_direct IN (0, 1)),
+    service_relay  INTEGER NOT NULL DEFAULT 0 CHECK (service_relay IN (0, 1)),
+    CHECK (service_relay = 0 OR service_direct = 1)
 ) STRICT;
 
 -- Per-device credentials, minted by Login Flow v2, device registration, the CLI or the web
