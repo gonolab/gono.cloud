@@ -304,8 +304,28 @@ pub struct AccountInfo {
     pub username: String,
     /// Display name.
     pub display_name: String,
-    /// Remote access is available (two-step verification is enrolled).
+    /// Remote access is available: the account may use direct connections and, if the server
+    /// requires it, has two-step verification enrolled.
     pub remote_access: bool,
+    /// How much of the relay the account's devices may use, while remote access is available
+    /// (protocol 11.1). Absent from servers before services per account, which relay every
+    /// device at the full rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayAccess>,
+}
+
+/// How much of the relay the devices of an account may use (protocol 11.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayAccess {
+    /// Relaying at the full rate: the account has the relay service.
+    Full,
+    /// Relaying at a limited rate, enough for handshakes and for setting up a direct
+    /// connection, but not for a session: the account has direct connections only.
+    Limited,
+    /// A value a newer server sent.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A pending pairing request, as other devices see it (protocol 8.2).
@@ -377,8 +397,11 @@ pub enum ErrorCode {
     NotFound,
     /// The authorization rules refuse it.
     NotPermitted,
-    /// Remote access is not available on this account.
+    /// Remote access is not available on this account: two-step verification is required.
     TwoFactorRequired,
+    /// Remote access is not available on this account: it may not use direct connections
+    /// (services per account).
+    ServiceNotEnabled,
     /// The target has no control connection.
     NotOnline,
     /// The state changed.
@@ -537,11 +560,15 @@ pub enum ServerMessage {
         /// `approved`, `declined`, `withdrawn` or `expired`.
         outcome: String,
     },
-    /// Remote access on the account changed (protocol 13.5).
+    /// Remote access on the account changed (protocol 13.5), or its relay access.
     #[serde(rename = "account")]
     Account {
         /// Remote access is available.
         remote_access: bool,
+        /// How much of the relay the account's devices may use, while remote access is
+        /// available (as in [`AccountInfo::relay`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay: Option<RelayAccess>,
     },
     /// A type a newer server sent (protocol 2.4: version 1 may add message types). Receivers
     /// ignore it (protocol 5.3); servers never send it.

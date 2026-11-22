@@ -304,6 +304,7 @@ Rules:
 | `200` | see below | Registered |
 | `400` | `{"error":"bad_proof"}` | The proof is invalid. The flow stays usable until it expires |
 | `404` | `{"error":"not_found"}` | The flow is unknown, expired, used already, or the user denied it |
+| `404` | `{"error":"service_not_enabled"}` | The account that was to grant it may not use direct connections (services per account, 10): the consent page refused it, or the account lost the service before this poll. The flow is used up; the device says that remote access is not enabled for the account and that an administrator turns it on |
 | `409` | `{"error":"endpoint_taken"}` | The endpoint ID belongs to another account on this server. The flow is used up |
 | `409` | `{"error":"endpoint_revoked"}` | The endpoint ID was revoked (9). The device needs a new key. The flow is used up |
 | `409` | `{"error":"too_many_devices"}` | The account reached its device limit (15) since the consent. The flow is used up |
@@ -473,7 +474,7 @@ seconds, it decides by the `error` code: `bad_signature`, `bad_request`, `not_fo
 {
   "type": "welcome",
   "server_time": 1763200001,
-  "account": { "username": "kim", "display_name": "Kim", "remote_access": true },
+  "account": { "username": "kim", "display_name": "Kim", "remote_access": true, "relay": "full" },
   "device": { "…": "own directory entry" },
   "relay_url": "https://relay.example.com/",
   "devices": [ { "…": "every directory entry of the account, revoked ones included" } ],
@@ -486,9 +487,18 @@ seconds, it decides by the `error` code: `bad_signature`, `bad_request`, `not_fo
 }
 ```
 
-- **`remote_access`** is false when the account lacks two-step verification and the server
-  requires it (13.1). While it is false, `connect`, `lookup` and the pairing requests are
-  refused with `two_factor_required`, and the device shows where to turn verification on.
+- **`remote_access`** is false when the account may not use direct connections (services
+  per account, 10), or lacks two-step verification and the server requires it (13.1). While
+  it is false, `connect`, `lookup` and the pairing requests are refused: with
+  `service_not_enabled` when the service is off, and the device says that an administrator
+  turns it on; with `two_factor_required` otherwise, and the device shows where to turn
+  verification on.
+- **`relay`** (added with services per account) says how much of the relay the account's
+  devices may use while `remote_access` is true (11.1): `"full"` with the relay service,
+  `"limited"` with direct connections alone, enough for handshakes and for setting up a
+  direct connection but not for a session. It is absent while `remote_access` is false, and
+  from older servers, which relay every device at the full rate. The `account` event carries
+  the same two fields when either changes.
 - **`devices`** is the full state of the directory. A device always acts on it, even when
   `events_truncated` is true (5.6).
 
@@ -520,7 +530,8 @@ the connection. Every request gets exactly one answer with the same `id`:
 | `bad_signature` | A statement failed verification |
 | `not_found` | The device or request does not exist, or the caller may not know about it |
 | `not_permitted` | The authorization rules (10) refuse it |
-| `two_factor_required` | Remote access is not available on this account |
+| `two_factor_required` | Remote access is not available on this account: two-step verification is required |
+| `service_not_enabled` | Remote access is not available on this account: it may not use direct connections (services per account) |
 | `not_online` | The target has no control connection. `last_seen_at` is included |
 | `conflict` | The state changed, for example a request was already decided |
 | `rate_limited` | Over a limit (15); `retry_after` is included |
@@ -1225,10 +1236,15 @@ device that is still in its user's hands.
 - its account is enabled;
 - its app password is valid.
 
+"Remote access is available" on an account means: it is enabled, an admin turned on its
+direct connection service (services per account: `direct`, and `relay` for the full-rate
+relay, which needs `direct`), and it has two-step verification enrolled if the server requires
+it (13.1).
+
 | Action | Who | Allowed when |
 |---|---|---|
 | Start registration (4.1) | anyone | rate limits |
-| Grant registration (4.2) | a signed-in user | password and second step passed; two-step verification enrolled if the server requires it (13.1); under the device limit |
+| Grant registration (4.2) | a signed-in user | password and second step passed; the direct connection service; two-step verification enrolled if the server requires it (13.1); under the device limit |
 | Complete registration (4.3) | the device | the flow is granted; the proof is valid; the endpoint is not taken or revoked (4.4) |
 | Open the control channel (5) | a device | active; valid `hello` proof |
 | Read the directory (6.2) | a device | same account |
@@ -1259,7 +1275,11 @@ The relay's `AccessControl::on_connect` admits endpoint E if either holds:
 
 1. E is listed in `relay.allowed_endpoints`. The static list stays for tests, for Phase 1
    spikes, and for relays on a host of their own (11.3).
-2. E is an active device (10) of an account on which remote access is available.
+2. E is an active device (10) of an account on which remote access is available, which
+   includes the direct connection service. Its relay connections are read at the full rate
+   (`relay.max_client_bytes_per_sec`) when the account also has the relay service, and at the
+   limited rate (`relay.limited_bytes_per_sec`) otherwise. A device whose rate changes is
+   disconnected by the next sweep (11.2) and reconnects at the new one.
 
 **How it decides:**
 - The decision uses the directory's admitted keys, held in memory so that no database query

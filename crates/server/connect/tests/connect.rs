@@ -682,6 +682,118 @@ async fn remote_access_needs_two_step_verification() {
 }
 
 #[tokio::test]
+async fn remote_access_follows_the_direct_and_relay_services() {
+    use gono_protocol::connect::message::RelayAccess;
+    use gono_server_core::services::{Service, Services};
+    let f = fixture_with(false).await;
+    let carol = f.user("carol", false).await;
+    let carol_name = Username::new("carol").unwrap();
+    let mut phone = f.device(carol, "carol", &key(1), "a").await;
+    let home = f.device(carol, "carol", &key(2), "b").await;
+    let target = home.id();
+    let connect = |id| ClientMessage::Connect {
+        id,
+        target,
+        service: "inputshow/1".to_owned(),
+        purpose: Purpose::Session,
+        request_id: None,
+    };
+    let welcome_relay = |welcome: ServerMessage| match welcome {
+        ServerMessage::Welcome(welcome) => (welcome.account.remote_access, welcome.account.relay),
+        other => panic!("{other:?}"),
+    };
+    let relay_tier = |f: &Fixture| f.connect.directory().tier(&key(1).public());
+
+    // Every service: full-rate relaying.
+    assert_eq!(
+        welcome_relay(phone.open(&f.connect, None).await),
+        (true, Some(RelayAccess::Full))
+    );
+    f.connect.directory().refresh().await.unwrap();
+    assert_eq!(relay_tier(&f), Some(Tier::Full));
+
+    // Direct connections alone: the relay at the limited rate.
+    users::set_services(
+        &f.pool,
+        &carol_name,
+        Services::ALL.with(Service::Relay, false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        welcome_relay(phone.open(&f.connect, None).await),
+        (true, Some(RelayAccess::Limited))
+    );
+    f.connect.directory().refresh().await.unwrap();
+    assert_eq!(relay_tier(&f), Some(Tier::Limited));
+    assert!(error_code(&phone.request(connect).await).is_none());
+
+    // Without direct connections: no remote access and no relay, with a reason of its own.
+    users::set_services(
+        &f.pool,
+        &carol_name,
+        Services::ALL.with(Service::Direct, false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        welcome_relay(phone.open(&f.connect, None).await),
+        (false, None)
+    );
+    assert_eq!(
+        error_code(&phone.request(connect).await),
+        Some(ErrorCode::ServiceNotEnabled)
+    );
+    f.connect.directory().refresh().await.unwrap();
+    assert_eq!(relay_tier(&f), None);
+}
+
+#[tokio::test]
+async fn a_refused_registration_tells_the_device_why() {
+    let f = fixture().await;
+    let now = db::unix_now();
+    let device = key(9);
+    let (status, body) = f
+        .connect
+        .start_login(
+            LoginStart {
+                endpoint_id: device.public().into(),
+                product: "input-show".to_owned(),
+                platform: "windows".to_owned(),
+                name: "desk".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            now,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let started: LoginStarted = serde_json::from_value(body).unwrap();
+    let login_token = started.login_url.rsplit('/').next().unwrap().to_owned();
+    let flow = login_flows::find(&f.pool, &login_token, now)
+        .await
+        .unwrap()
+        .unwrap();
+    // The consent page refuses it for an account without direct connections.
+    assert!(
+        login_flows::refuse_device(&f.pool, flow.id, "service_not_enabled")
+            .await
+            .unwrap()
+    );
+    let poll = || PollRequest {
+        token: started.poll.token.clone(),
+        proof: None,
+    };
+    let (status, answer) = f.connect.poll_login(poll(), now).await;
+    assert_eq!(
+        (status, answer["error"].as_str()),
+        (404, Some("service_not_enabled"))
+    );
+    // Told once; the flow is gone.
+    let (status, answer) = f.connect.poll_login(poll(), now).await;
+    assert_eq!((status, answer["error"].as_str()), (404, Some("not_found")));
+}
+
+#[tokio::test]
 async fn remote_access_needs_no_two_step_verification_unless_required() {
     // `connect.require_two_factor = false`, the development default (plan R10).
     let f = fixture_with(false).await;

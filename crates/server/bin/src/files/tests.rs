@@ -1138,6 +1138,7 @@ async fn register_device(
         login_flows::complete_device(&state.db, flow.poll_token.expose_secret(), now)
             .await
             .unwrap()
+            .done()
             .unwrap();
     let Registration::Registered { device, .. } = registration else {
         panic!("registered");

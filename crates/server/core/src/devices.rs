@@ -12,9 +12,11 @@
 //! - **Event log** (5.6). `device.added`, `device.revoked` and `pair.approved` are appended in
 //!   the same transaction as the change. Their bodies are the event's fields as the protocol
 //!   sends them, without `type` and `seq`.
-//! - **Remote access** is available for an account that is enabled and, when the server
-//!   requires it (`connect.require_two_factor`), has two-step verification enrolled
-//!   ([`remote_access`]); only its active devices are admitted to the relay ([`admissible`]).
+//! - **Remote access** is available for an account that is enabled, may use direct
+//!   connections ([`crate::services::Service::Direct`]) and, when the server requires it
+//!   (`connect.require_two_factor`), has two-step verification enrolled ([`remote_access`]);
+//!   only its active devices are admitted to the relay ([`admissible`]), at the full rate if
+//!   the account also has the relay service, at the limited rate otherwise.
 
 use std::{fmt, net::IpAddr, str::FromStr};
 
@@ -1115,36 +1117,82 @@ pub async fn purge_events(pool: &Pool, before: i64) -> Result<u64> {
     Ok(purged)
 }
 
-/// Whether remote access is available on account `user_id`: it is enabled and, if
-/// `require_two_factor` (`connect.require_two_factor`), has two-step verification enrolled.
+/// Whether remote access is available on account `user_id`: it is enabled, may use direct
+/// connections and, if `require_two_factor` (`connect.require_two_factor`), has two-step
+/// verification enrolled. [`account_access`] says why not.
 pub async fn remote_access(pool: &Pool, user_id: i64, require_two_factor: bool) -> Result<bool> {
-    let available: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM users u LEFT JOIN two_factor t ON t.user_id = u.id \
-         WHERE u.id = ? AND u.enabled = 1 AND (? = 0 OR t.user_id IS NOT NULL)",
+    Ok(account_access(pool, user_id, require_two_factor)
+        .await?
+        .refusal
+        .is_none())
+}
+
+/// What account `user_id` may do remotely: see [`account_access`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountAccess {
+    /// Why remote access is not available, or `None` if it is.
+    pub refusal: Option<RemoteAccessRefusal>,
+    /// The account has the relay service: its devices relay at the full rate.
+    pub full_relay: bool,
+}
+
+/// Why remote access is not available on an account (protocol 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteAccessRefusal {
+    /// The account is disabled or does not exist.
+    Disabled,
+    /// The account may not use direct connections ([`crate::services::Service::Direct`]).
+    ServiceOff,
+    /// The server requires two-step verification and the account has none.
+    TwoFactorRequired,
+}
+
+/// Whether remote access is available on account `user_id` and why not: it is when the
+/// account is enabled, has the direct connection service and, if `require_two_factor`,
+/// two-step verification. Also whether its devices may relay at the full rate.
+pub async fn account_access(
+    pool: &Pool,
+    user_id: i64,
+    require_two_factor: bool,
+) -> Result<AccountAccess> {
+    let row: Option<(Flag, Flag, Flag, Flag)> = sqlx::query_as(
+        "SELECT u.enabled, u.service_direct, u.service_relay, t.user_id IS NOT NULL \
+         FROM users u LEFT JOIN two_factor t ON t.user_id = u.id WHERE u.id = ?",
     )
     .bind(user_id)
-    .bind(require_two_factor)
     .fetch_optional(pool)
     .await?;
-    Ok(available.is_some())
+    let refusal = match row {
+        None | Some((Flag(false), ..)) => Some(RemoteAccessRefusal::Disabled),
+        Some((_, Flag(false), ..)) => Some(RemoteAccessRefusal::ServiceOff),
+        Some((.., Flag(false))) if require_two_factor => {
+            Some(RemoteAccessRefusal::TwoFactorRequired)
+        }
+        Some(_) => None,
+    };
+    Ok(AccountAccess {
+        refusal,
+        full_relay: row.is_some_and(|(_, _, Flag(relay), _)| relay),
+    })
 }
 
 /// The keys the relay admits from the directory (protocol 11.1): registered devices (neither
-/// revoked nor signed out) of enabled accounts, with two-step verification if
-/// `require_two_factor`.
-pub async fn admissible(pool: &Pool, require_two_factor: bool) -> Result<Vec<EndpointId>> {
-    let keys: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT d.endpoint_id FROM devices d JOIN users u ON u.id = d.user_id \
+/// revoked nor signed out) of enabled accounts with the direct connection service, and with
+/// two-step verification if `require_two_factor`. Each comes with whether its account also has
+/// the relay service, which admits it at the full rate rather than the limited one.
+pub async fn admissible(pool: &Pool, require_two_factor: bool) -> Result<Vec<(EndpointId, bool)>> {
+    let rows: Vec<(Vec<u8>, Flag)> = sqlx::query_as(
+        "SELECT d.endpoint_id, u.service_relay FROM devices d JOIN users u ON u.id = d.user_id \
          LEFT JOIN two_factor t ON t.user_id = u.id \
-         WHERE d.app_password_id IS NOT NULL AND u.enabled = 1 \
+         WHERE d.app_password_id IS NOT NULL AND u.enabled = 1 AND u.service_direct = 1 \
          AND (? = 0 OR t.user_id IS NOT NULL)",
     )
     .bind(require_two_factor)
     .fetch_all(pool)
     .await?;
-    Ok(keys
+    Ok(rows
         .iter()
-        .filter_map(|key| EndpointId::from_slice(key))
+        .filter_map(|(key, Flag(relay))| Some((EndpointId::from_slice(key)?, *relay)))
         .collect())
 }
 
@@ -1167,16 +1215,24 @@ pub async fn enabled_accounts(pool: &Pool) -> Result<Vec<i64>> {
         .await?)
 }
 
-/// The accounts on which remote access is available: enabled, with two-step verification if
-/// `require_two_factor`.
-pub async fn remote_access_accounts(pool: &Pool, require_two_factor: bool) -> Result<Vec<i64>> {
-    Ok(sqlx::query_scalar(
-        "SELECT u.id FROM users u LEFT JOIN two_factor t ON t.user_id = u.id \
-         WHERE u.enabled = 1 AND (? = 0 OR t.user_id IS NOT NULL)",
+/// The accounts on which remote access is available: enabled, with the direct connection
+/// service, and with two-step verification if `require_two_factor`; each with whether it has
+/// the relay service too (full-rate relaying).
+pub async fn remote_access_accounts(
+    pool: &Pool,
+    require_two_factor: bool,
+) -> Result<Vec<(i64, bool)>> {
+    let rows: Vec<(i64, Flag)> = sqlx::query_as(
+        "SELECT u.id, u.service_relay FROM users u LEFT JOIN two_factor t ON t.user_id = u.id \
+         WHERE u.enabled = 1 AND u.service_direct = 1 AND (? = 0 OR t.user_id IS NOT NULL)",
     )
     .bind(require_two_factor)
     .fetch_all(pool)
-    .await?)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, Flag(relay))| (id, relay))
+        .collect())
 }
 
 #[cfg(test)]

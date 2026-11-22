@@ -38,7 +38,7 @@ use gono_server_core::{
     audit::{self, Actor, Record},
     db::{self, Pool},
     devices::{self, Device, EndpointId, NewDevice, Registration},
-    login_flows::{self, DevicePoll},
+    login_flows::{self, DeviceCompletion, DevicePoll},
 };
 use gono_server_relay::{Admission, RelayStatus, Tier};
 use serde_json::{Value, json};
@@ -264,6 +264,8 @@ impl Connect {
         let (endpoint_id, challenge) = match state {
             DevicePoll::Pending => return (202, json!({ "status": "pending" })),
             DevicePoll::Gone => return (404, json!({ "error": "not_found" })),
+            // The consent page refused it because of the account (`service_not_enabled`).
+            DevicePoll::Refused(reason) => return (404, json!({ "error": reason })),
             DevicePoll::Granted {
                 endpoint_id,
                 challenge,
@@ -290,8 +292,9 @@ impl Connect {
             }
         };
         match completed {
-            None => (404, json!({ "error": "not_found" })),
-            Some((username, registration)) => match registration {
+            DeviceCompletion::Gone => (404, json!({ "error": "not_found" })),
+            DeviceCompletion::ServiceNotEnabled => (404, json!({ "error": "service_not_enabled" })),
+            DeviceCompletion::Done(username, registration) => match registration {
                 Registration::Registered {
                     device,
                     app_password,
@@ -526,7 +529,7 @@ impl Connect {
                 );
             }
         }
-        let available: HashSet<i64> =
+        let available: HashMap<i64, bool> =
             match devices::remote_access_accounts(&self.pool, self.config.require_two_factor).await
             {
                 Ok(accounts) => accounts.into_iter().collect(),
@@ -536,9 +539,14 @@ impl Connect {
                 }
             };
         for user_id in self.hub.accounts() {
-            let remote_access = available.contains(&user_id);
-            if self.hub.set_remote_access(user_id, remote_access) {
-                let message = ServerMessage::Account { remote_access };
+            let full_relay = available.get(&user_id).copied();
+            let remote_access = full_relay.is_some();
+            let relay = session::relay_access(remote_access, full_relay.unwrap_or(false));
+            if self.hub.set_remote_access(user_id, remote_access, relay) {
+                let message = ServerMessage::Account {
+                    remote_access,
+                    relay,
+                };
                 self.hub.broadcast(user_id, &message.to_text(), None);
             }
         }
@@ -621,7 +629,9 @@ pub struct Directory {
     require_two_factor: bool,
     /// Held while the directory is read, so that an older read never replaces a newer one.
     refreshing: tokio::sync::Mutex<()>,
-    admitted: RwLock<HashSet<EndpointId>>,
+    /// The admitted devices with their tier: full with the relay service, limited with direct
+    /// connections alone.
+    admitted: RwLock<HashMap<EndpointId, Tier>>,
     /// Tombstones, with their accounts, so that a revoked key that tries the relay is recorded.
     revoked: RwLock<HashMap<EndpointId, i64>>,
     /// When a refused tombstone was last recorded.
@@ -634,7 +644,7 @@ impl Directory {
             pool,
             require_two_factor,
             refreshing: tokio::sync::Mutex::new(()),
-            admitted: RwLock::new(HashSet::new()),
+            admitted: RwLock::new(HashMap::new()),
             revoked: RwLock::new(HashMap::new()),
             recorded: Mutex::new(HashMap::new()),
         }
@@ -643,10 +653,11 @@ impl Directory {
     /// Reads the admitted keys and the tombstones from the database.
     pub async fn refresh(&self) -> gono_server_core::Result<()> {
         let _serialized = self.refreshing.lock().await;
-        let admitted: HashSet<EndpointId> =
+        let admitted: HashMap<EndpointId, Tier> =
             devices::admissible(&self.pool, self.require_two_factor)
                 .await?
                 .into_iter()
+                .map(|(key, relay)| (key, if relay { Tier::Full } else { Tier::Limited }))
                 .collect();
         let revoked: HashMap<EndpointId, i64> = devices::revoked_keys(&self.pool)
             .await?
@@ -660,20 +671,20 @@ impl Directory {
         Ok(())
     }
 
-    fn admits_key(&self, key: &EndpointId) -> bool {
+    fn tier_of(&self, key: &EndpointId) -> Option<Tier> {
         self.admitted
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains(key)
+            .get(key)
+            .copied()
     }
 }
 
 impl Admission for Directory {
-    /// Every device the directory admits gets full relay access until accounts have service
-    /// permissions.
+    /// Devices of accounts with the relay service relay at the full rate; those with direct
+    /// connections alone at the limited rate, enough to set up a direct connection.
     fn tier(&self, device: &iroh_base::EndpointId) -> Option<Tier> {
-        self.admits_key(&EndpointId(*device.as_bytes()))
-            .then_some(Tier::Full)
+        self.tier_of(&EndpointId(*device.as_bytes()))
     }
 
     fn count(&self) -> usize {

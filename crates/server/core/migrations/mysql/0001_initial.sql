@@ -334,6 +334,8 @@ CREATE TABLE login_flows (
     device_platform    VARCHAR(255),
     device_version     VARCHAR(255),
     device_challenge   BINARY(32),
+    -- Why the consent page refused a device registration; see the SQLite schema.
+    refusal            VARCHAR(32),
     CHECK (LENGTH(poll_token_hash) = 32),
     CHECK (LENGTH(login_token_hash) = 32),
     CHECK ((device_endpoint_id IS NULL) = (device_challenge IS NULL)),

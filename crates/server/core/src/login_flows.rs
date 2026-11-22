@@ -308,6 +308,9 @@ pub async fn complete(pool: &Pool, poll_token: &str, now: i64) -> Result<Option<
 pub enum DevicePoll {
     /// The user has not decided yet.
     Pending,
+    /// The consent page refused the registration because of the account; the reason is an
+    /// error code of protocol 4.3 (`service_not_enabled`). The flow is used up.
+    Refused(String),
     /// Unknown, expired, used, denied, or not a device registration.
     Gone,
     /// Granted: the device must now prove that it holds `endpoint_id` by signing `challenge`.
@@ -321,8 +324,10 @@ pub enum DevicePoll {
 
 /// Looks up the device registration polled with `poll_token` without consuming it.
 pub async fn device_poll(pool: &Pool, poll_token: &str, now: i64) -> Result<DevicePoll> {
-    let row: Option<(Option<i64>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
-        "SELECT granted_user_id, device_endpoint_id, device_challenge FROM login_flows \
+    type Row = (i64, Option<i64>, Vec<u8>, Vec<u8>, Option<Text>);
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT id, granted_user_id, device_endpoint_id, device_challenge, refusal \
+         FROM login_flows \
          WHERE poll_token_hash = ? AND expires_at > ? AND device_endpoint_id IS NOT NULL",
     )
     .bind(&secret::digest(poll_token)[..])
@@ -331,8 +336,18 @@ pub async fn device_poll(pool: &Pool, poll_token: &str, now: i64) -> Result<Devi
     .await?;
     Ok(match row {
         None => DevicePoll::Gone,
-        Some((None, _, _)) => DevicePoll::Pending,
-        Some((Some(_), endpoint_id, challenge)) => {
+        Some((id, _, _, _, Some(Text(reason)))) => {
+            // Told once: the flow ends with this answer.
+            let mut tx = db::begin_immediate(pool).await?;
+            sqlx::query("DELETE FROM login_flows WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            DevicePoll::Refused(reason)
+        }
+        Some((_, None, _, _, None)) => DevicePoll::Pending,
+        Some((_, Some(_), endpoint_id, challenge, None)) => {
             match (
                 EndpointId::from_slice(&endpoint_id),
                 <[u8; 32]>::try_from(challenge.as_slice()),
@@ -347,17 +362,54 @@ pub async fn device_poll(pool: &Pool, poll_token: &str, now: i64) -> Result<Devi
     })
 }
 
+/// Refuses the pending device registration `id` because of its account, with `reason`, an
+/// error code of protocol 4.3 that the device's next poll gets (`service_not_enabled`).
+/// Returns `false` if there is no such pending registration.
+pub async fn refuse_device(pool: &Pool, id: i64, reason: &'static str) -> Result<bool> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let refused = sqlx::query(
+        "UPDATE login_flows SET refusal = ? WHERE id = ? AND granted_user_id IS NULL \
+         AND device_endpoint_id IS NOT NULL",
+    )
+    .bind(reason)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    tx.commit().await?;
+    Ok(refused)
+}
+
+/// How [`complete_device`] ended.
+#[derive(Debug)]
+pub enum DeviceCompletion {
+    /// The flow is not (or no longer) granted, or its account was disabled since.
+    Gone,
+    /// The account lost the direct connection service since it granted the flow, which is
+    /// used up (`service_not_enabled`).
+    ServiceNotEnabled,
+    /// The registration ran.
+    Done(Username, Registration),
+}
+
+impl DeviceCompletion {
+    /// The account and outcome of a registration that ran.
+    pub fn done(self) -> Option<(Username, Registration)> {
+        match self {
+            Self::Done(username, registration) => Some((username, registration)),
+            Self::Gone | Self::ServiceNotEnabled => None,
+        }
+    }
+}
+
 /// Completes the granted device registration polled with `poll_token`, once the caller has
 /// checked the device's proof (protocol 4.3): deletes the flow and registers the device in the
 /// same transaction ([`devices::register`]). Returns `None` for a flow that is not (or no
 /// longer) granted, and consumes the flow without registering anything when the account was
 /// disabled since. Every outcome of [`Registration`] other than `TooMany` consumes the flow;
 /// `TooMany` does too, since the user has to free a place and sign the device in again.
-pub async fn complete_device(
-    pool: &Pool,
-    poll_token: &str,
-    now: i64,
-) -> Result<Option<(Username, Registration)>> {
+pub async fn complete_device(pool: &Pool, poll_token: &str, now: i64) -> Result<DeviceCompletion> {
     let mut tx = db::begin_immediate(pool).await?;
     type Row = (
         i64,
@@ -382,23 +434,27 @@ pub async fn complete_device(
     .await?;
     let Some((flow_id, name, user_id, granted_ip, endpoint_id, product, platform, version)) = flow
     else {
-        return Ok(None);
+        return Ok(DeviceCompletion::Gone);
     };
     sqlx::query("DELETE FROM login_flows WHERE id = ?")
         .bind(flow_id)
         .execute(&mut *tx)
         .await?;
-    let user: Option<(Text, Flag)> =
-        sqlx::query_as("SELECT username, enabled FROM users WHERE id = ?")
+    let user: Option<(Text, Flag, Flag)> =
+        sqlx::query_as("SELECT username, enabled, service_direct FROM users WHERE id = ?")
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?;
-    let (Some((Text(username), Flag(true))), Some(endpoint_id)) =
+    let (Some((Text(username), Flag(true), direct)), Some(endpoint_id)) =
         (user, EndpointId::from_slice(&endpoint_id))
     else {
         tx.commit().await?;
-        return Ok(None);
+        return Ok(DeviceCompletion::Gone);
     };
+    if !direct.0 {
+        tx.commit().await?;
+        return Ok(DeviceCompletion::ServiceNotEnabled);
+    }
     let new = NewDevice {
         endpoint_id,
         product: product.unwrap_or_default(),
@@ -409,7 +465,10 @@ pub async fn complete_device(
     let granted_from = granted_ip.and_then(|ip| ip.parse().ok());
     let registration = devices::register(&mut tx, user_id, &new, granted_from, now).await?;
     tx.commit().await?;
-    Ok(Some((Username::new(username)?, registration)))
+    Ok(DeviceCompletion::Done(
+        Username::new(username)?,
+        registration,
+    ))
 }
 
 /// Removes every flow that expired at `now`. Returns how many there were.

@@ -104,6 +104,7 @@ async fn register(pool: &Pool, user_id: i64, device: &NewDevice, now: i64) -> Re
     let (_, registration) = login_flows::complete_device(pool, poll, now)
         .await
         .unwrap()
+        .done()
         .unwrap();
     assert_eq!(
         login_flows::device_poll(pool, poll, now).await.unwrap(),
@@ -111,6 +112,18 @@ async fn register(pool: &Pool, user_id: i64, device: &NewDevice, now: i64) -> Re
         "used once"
     );
     registration
+}
+
+/// The accounts of a `remote_access_accounts` answer, all with every service (relay included).
+fn account_ids(accounts: Vec<(i64, bool)>) -> Vec<i64> {
+    assert!(accounts.iter().all(|(_, relay)| *relay));
+    accounts.into_iter().map(|(id, _)| id).collect()
+}
+
+/// The keys of an `admissible` answer, all of accounts with every service (relay included).
+fn admitted_keys(admitted: Vec<(EndpointId, bool)>) -> Vec<EndpointId> {
+    assert!(admitted.iter().all(|(_, relay)| *relay));
+    admitted.into_iter().map(|(key, _)| key).collect()
 }
 
 #[tokio::test]
@@ -547,32 +560,38 @@ async fn the_relay_admits_active_devices_of_accounts_with_two_step_verification(
     register(&pool, alice, &new_device(1, "a1"), 100).await;
     register(&pool, alice, &new_device(2, "a2"), 100).await;
     register(&pool, bob, &new_device(3, "b1"), 100).await;
-    assert!(devices::admissible(&pool, true).await.unwrap().is_empty());
+    assert!(admitted_keys(devices::admissible(&pool, true).await.unwrap()).is_empty());
     assert!(!devices::remote_access(&pool, alice, true).await.unwrap());
 
     enroll(&pool, alice).await;
     assert!(two_factor::is_enrolled(&pool, alice).await.unwrap());
     assert!(devices::remote_access(&pool, alice, true).await.unwrap());
-    let mut admitted = devices::admissible(&pool, true).await.unwrap();
+    let mut admitted = admitted_keys(devices::admissible(&pool, true).await.unwrap());
     admitted.sort();
     assert_eq!(admitted, [key(1), key(2)]);
 
     devices::revoke(&pool, alice, &[key(2)], RevokedBy::Cli, None, 110)
         .await
         .unwrap();
-    assert_eq!(devices::admissible(&pool, true).await.unwrap(), [key(1)]);
+    assert_eq!(
+        admitted_keys(devices::admissible(&pool, true).await.unwrap()),
+        [key(1)]
+    );
     // A signed-out device is not admitted either.
     let a1 = devices::find(&pool, key(1)).await.unwrap().unwrap();
     devices::leave(&pool, a1.id, audit::Actor::Device, 115)
         .await
         .unwrap();
-    assert!(devices::admissible(&pool, true).await.unwrap().is_empty());
+    assert!(admitted_keys(devices::admissible(&pool, true).await.unwrap()).is_empty());
     register(&pool, alice, &new_device(1, "a1"), 116).await;
-    assert_eq!(devices::admissible(&pool, true).await.unwrap(), [key(1)]);
+    assert_eq!(
+        admitted_keys(devices::admissible(&pool, true).await.unwrap()),
+        [key(1)]
+    );
     users::set_enabled(&pool, &Username::new("alice").unwrap(), false)
         .await
         .unwrap();
-    assert!(devices::admissible(&pool, true).await.unwrap().is_empty());
+    assert!(admitted_keys(devices::admissible(&pool, true).await.unwrap()).is_empty());
     assert!(!devices::remote_access(&pool, alice, true).await.unwrap());
 }
 
@@ -588,18 +607,21 @@ async fn remote_access_needs_no_two_step_verification_unless_required() {
 
     assert!(devices::remote_access(&pool, alice, false).await.unwrap());
     assert!(devices::remote_access(&pool, bob, false).await.unwrap());
-    let mut admitted = devices::admissible(&pool, false).await.unwrap();
+    let mut admitted = admitted_keys(devices::admissible(&pool, false).await.unwrap());
     admitted.sort();
     assert_eq!(admitted, [key(1), key(2)]);
-    let mut accounts = devices::remote_access_accounts(&pool, false).await.unwrap();
+    let mut accounts = account_ids(devices::remote_access_accounts(&pool, false).await.unwrap());
     accounts.sort_unstable();
     assert_eq!(accounts, [alice, bob]);
 
     // Required, only bob's account qualifies: the behaviour before the setting.
     assert!(!devices::remote_access(&pool, alice, true).await.unwrap());
-    assert_eq!(devices::admissible(&pool, true).await.unwrap(), [key(2)]);
     assert_eq!(
-        devices::remote_access_accounts(&pool, true).await.unwrap(),
+        admitted_keys(devices::admissible(&pool, true).await.unwrap()),
+        [key(2)]
+    );
+    assert_eq!(
+        account_ids(devices::remote_access_accounts(&pool, true).await.unwrap()),
         [bob]
     );
 
@@ -608,14 +630,17 @@ async fn remote_access_needs_no_two_step_verification_unless_required() {
     devices::leave(&pool, a1.id, audit::Actor::Device, 105)
         .await
         .unwrap();
-    assert_eq!(devices::admissible(&pool, false).await.unwrap(), [key(2)]);
+    assert_eq!(
+        admitted_keys(devices::admissible(&pool, false).await.unwrap()),
+        [key(2)]
+    );
     users::set_enabled(&pool, &Username::new("bob").unwrap(), false)
         .await
         .unwrap();
-    assert!(devices::admissible(&pool, false).await.unwrap().is_empty());
+    assert!(admitted_keys(devices::admissible(&pool, false).await.unwrap()).is_empty());
     assert!(!devices::remote_access(&pool, bob, false).await.unwrap());
     assert_eq!(
-        devices::remote_access_accounts(&pool, false).await.unwrap(),
+        account_ids(devices::remote_access_accounts(&pool, false).await.unwrap()),
         [alice]
     );
 }

@@ -1575,6 +1575,7 @@ mod tests {
                 username: "kim".to_owned(),
                 display_name: "Kim".to_owned(),
                 remote_access: true,
+                relay: Some(gono_protocol::connect::message::RelayAccess::Full),
             },
             device: entry(1),
             relay_url: "https://relay.example.com/".to_owned(),
@@ -1633,6 +1634,7 @@ mod tests {
                 ServerMessage::result(999, &()).to_text(),
                 ServerMessage::Account {
                     remote_access: false,
+                    relay: None,
                 }
                 .to_text(),
             ] {
@@ -1651,7 +1653,7 @@ mod tests {
         ));
         let event = next(&mut events).await;
         assert!(
-            matches!(&event, ChannelEvent::Message(message) if matches!(**message, ServerMessage::Account { remote_access: false })),
+            matches!(&event, ChannelEvent::Message(message) if matches!(**message, ServerMessage::Account { remote_access: false, .. })),
             "{event:?}"
         );
         assert!(channel.last_heard().is_some());

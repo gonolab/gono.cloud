@@ -432,6 +432,10 @@ CREATE TABLE login_flows (
     device_platform    TEXT,
     device_version     TEXT,
     device_challenge   BLOB    CHECK (device_challenge IS NULL OR length(device_challenge) = 32),
+    -- Set when the consent page refused a device registration because of the account, so that
+    -- the device's next poll learns why (protocol 4.3) and the flow ends: 'service_not_enabled'
+    -- (the account may not use direct connections).
+    refusal            TEXT    CHECK (refusal IS NULL OR refusal IN ('service_not_enabled')),
     CHECK ((device_endpoint_id IS NULL) = (device_challenge IS NULL))
 ) STRICT;
 

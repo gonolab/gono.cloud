@@ -334,6 +334,24 @@ fn webdav_refusal(headers: &HeaderMap) -> Response {
     .respond(StatusCode::FORBIDDEN)
 }
 
+/// The page that refuses a device registration to an account without direct connections. The
+/// flow ends here, so that the device's next poll answers `service_not_enabled` instead of
+/// waiting until the flow expires (`docs/connect-protocol.md`, 4.3).
+async fn direct_refusal(state: &AppState, headers: &HeaderMap, flow_id: i64) -> Response {
+    if let Err(err) = login_flows::refuse_device(&state.db, flow_id, "service_not_enabled").await {
+        tracing::error!(error = %err, "cannot end a refused device registration");
+    }
+    let chrome = Chrome::for_request(headers);
+    let t = chrome.t;
+    Message::new(
+        chrome,
+        t.service_off,
+        t.service_off,
+        t.service_off_direct_lead,
+    )
+    .respond(StatusCode::FORBIDDEN)
+}
+
 /// Why a device registration cannot be granted to `user_id` (`docs/connect-protocol.md`,
 /// 4.2): the account has no two-step verification while the server requires it
 /// (`connect.require_two_factor`), or holds the most devices already.
@@ -424,6 +442,9 @@ pub async fn page(
         Some((user, _)) if flow.device.is_none() && !user.services.has(Service::Webdav) => {
             webdav_refusal(&headers)
         }
+        Some((user, _)) if flow.device.is_some() && !user.services.has(Service::Direct) => {
+            direct_refusal(&state, &headers, flow.id).await
+        }
         Some(session) => consent_page(&state, &headers, &flow, &session),
         None => login_page(&state, &headers, StatusCode::OK, &flow.client_name, None),
     }
@@ -508,6 +529,9 @@ pub async fn submit(
     let user = &session.0;
     if form.action == "grant" && flow.device.is_none() && !user.services.has(Service::Webdav) {
         return webdav_refusal(&headers);
+    }
+    if form.action == "grant" && flow.device.is_some() && !user.services.has(Service::Direct) {
+        return direct_refusal(&state, &headers, flow.id).await;
     }
     if form.action == "grant"
         && flow.device.is_some()

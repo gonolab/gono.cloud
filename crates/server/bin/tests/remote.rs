@@ -218,6 +218,12 @@ async fn two_devices_register_reach_each_other_and_hear_of_a_revocation() {
         .write_all(format!("{PASSWORD}\n").as_bytes())
         .unwrap();
     assert!(init.wait().unwrap().success());
+    // Remote access with full-rate relaying (the relay service brings direct connections).
+    let services = instance
+        .command(&["user", "services", "admin", "--enable", "relay"])
+        .output()
+        .unwrap();
+    assert!(services.status.success());
     // Two-step verification as part 2c will store it.
     instance
         .sql(

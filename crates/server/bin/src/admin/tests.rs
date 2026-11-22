@@ -1174,6 +1174,7 @@ async fn admins_revoke_devices_after_a_second_confirmation() {
         login_flows::complete_device(&f.state.db, flow.poll_token.expose_secret(), now)
             .await
             .unwrap()
+            .done()
             .unwrap()
     else {
         panic!("registered");

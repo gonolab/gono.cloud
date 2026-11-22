@@ -16,8 +16,8 @@ use gono_protocol::connect::{
     limits,
     message::{
         AccountInfo, AddressResult, ConnectionLimits, Envelope, HelloMessage, PairRequestResult,
-        PairRequested, Purpose, SessionEvent, SessionReport, SettingsChange, SettingsResult,
-        Welcome,
+        PairRequested, Purpose, RelayAccess, SessionEvent, SessionReport, SettingsChange,
+        SettingsResult, Welcome,
     },
     name, statement,
 };
@@ -25,7 +25,7 @@ use gono_server_core::{
     app_passwords,
     audit::{self, Actor, Record},
     db,
-    devices::{self, Device, EndpointId, Settings},
+    devices::{self, Device, EndpointId, RemoteAccessRefusal, Settings},
     error::Error,
 };
 use rand::RngExt as _;
@@ -375,15 +375,20 @@ impl Session {
         now: i64,
     ) -> gono_server_core::Result<String> {
         let pool = &self.connect.pool;
-        let remote_access =
-            devices::remote_access(pool, self.user_id, self.connect.requires_two_factor()).await?;
+        let access =
+            devices::account_access(pool, self.user_id, self.connect.requires_two_factor()).await?;
+        let remote_access = access.refusal.is_none();
+        let relay = relay_access(remote_access, access.full_relay);
         if self
             .connect
             .hub
-            .set_remote_access(self.user_id, remote_access)
+            .set_remote_access(self.user_id, remote_access, relay)
         {
             // Noticed here before the background task: the other devices hear of it now.
-            let message = ServerMessage::Account { remote_access };
+            let message = ServerMessage::Account {
+                remote_access,
+                relay,
+            };
             self.connect
                 .hub
                 .broadcast(self.user_id, &message.to_text(), Some(self.key));
@@ -432,6 +437,7 @@ impl Session {
                 username: login.username.clone(),
                 display_name: login.display_name.clone(),
                 remote_access,
+                relay,
             },
             device: entry(&self.device, true).ok_or(Error::InvalidDevice {
                 field: "endpoint_id",
@@ -673,19 +679,31 @@ impl Session {
                 return refused(id, ErrorCode::Unavailable, "try again later");
             }
         }
-        match devices::remote_access(
+        match devices::account_access(
             &self.connect.pool,
             self.user_id,
             self.connect.requires_two_factor(),
         )
         .await
         {
-            Ok(true) => Ok(()),
-            Ok(false) => refused(
-                id,
-                ErrorCode::TwoFactorRequired,
-                "remote access is not available",
-            ),
+            Ok(access) => match access.refusal {
+                None => Ok(()),
+                Some(RemoteAccessRefusal::ServiceOff) => refused(
+                    id,
+                    ErrorCode::ServiceNotEnabled,
+                    "the direct connection service is not enabled for this account",
+                ),
+                Some(RemoteAccessRefusal::TwoFactorRequired) => refused(
+                    id,
+                    ErrorCode::TwoFactorRequired,
+                    "remote access needs two-step verification on this account",
+                ),
+                Some(RemoteAccessRefusal::Disabled) => refused(
+                    id,
+                    ErrorCode::NotPermitted,
+                    "remote access is not available",
+                ),
+            },
             Err(err) => {
                 tracing::warn!(error = %err, "cannot read remote access of an account");
                 refused(id, ErrorCode::Unavailable, "try again later")
@@ -1428,4 +1446,13 @@ impl Connect {
             tracing::warn!(error = %err, kind = record.kind, "cannot write the audit log");
         }
     }
+}
+
+/// The relay access announced with remote access (protocol 11.1): none without remote access.
+pub(crate) fn relay_access(remote_access: bool, full_relay: bool) -> Option<RelayAccess> {
+    remote_access.then_some(if full_relay {
+        RelayAccess::Full
+    } else {
+        RelayAccess::Limited
+    })
 }

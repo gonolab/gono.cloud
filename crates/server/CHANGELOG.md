@@ -29,6 +29,13 @@ compatible within a major version: released clients keep working with newer serv
     nobody, anonymous readers and websites included, and their lifecycle rules wait.
   - Without `files`, `/apps/files/` (files and favorites) shows that the service is not
     enabled, and `/` leads to the account page instead.
+  - Without `direct`, remote access is not available: the control channel refuses
+    `connect`, `lookup` and pairing with the new error `service_not_enabled`, the relay
+    refuses the account's devices, and the consent page refuses device registrations and ends
+    them, so that the device's poll answers `404 {"error":"service_not_enabled"}` at once.
+    With `direct` but without `relay`, the relay reads the devices at
+    `relay.limited_bytes_per_sec` instead of the full rate; `welcome.account` and the
+    `account` event say which (`"relay": "full"` or `"limited"`).
 - **MySQL as the database**, as an alternative to the built-in SQLite: `[db] backend =
   "mysql"` with `url` (for example `mysql://gono@127.0.0.1:3306/gono_cloud`, never with the
   password) and `password_file`. MySQL 5.7.44 or later with InnoDB and utf8mb4; MariaDB is not
