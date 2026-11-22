@@ -24,6 +24,9 @@ compatible within a major version: released clients keep working with newer serv
     Nextcloud apps forget the account); open push connections end at their next heartbeat, a
     device can still give its app password back, and the Login Flow v2 consent page says so
     instead of granting an app password the client could not use.
+  - Without `s3`, requests signed with the account's access keys get `AccessDenied` ("S3 is not
+    enabled for this account"; the signature is still checked first), its buckets answer
+    nobody, anonymous readers and websites included, and their lifecycle rules wait.
 - **MySQL as the database**, as an alternative to the built-in SQLite: `[db] backend =
   "mysql"` with `url` (for example `mysql://gono@127.0.0.1:3306/gono_cloud`, never with the
   password) and `password_file`. MySQL 5.7.44 or later with InnoDB and utf8mb4; MariaDB is not

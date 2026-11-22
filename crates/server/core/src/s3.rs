@@ -133,7 +133,9 @@ pub struct Bucket {
     pub owner_name: Username,
     /// Owner's display name.
     pub owner_display_name: String,
-    /// Whether the owner's account is enabled; a disabled account's buckets answer nobody.
+    /// Whether the owner's account is enabled and may use the S3 API
+    /// ([`crate::services::Service::S3`]); the buckets of any other account answer nobody, not
+    /// even anonymous readers, and their lifecycle rules wait.
     pub owner_enabled: bool,
     /// File id of the folder.
     pub root_file_id: i64,
@@ -205,7 +207,7 @@ impl TryFrom<BucketRow> for Bucket {
 }
 
 const BUCKET_QUERY: &str = "SELECT b.id, b.name, b.owner_id, u.username AS owner_name, \
-     u.display_name AS owner_display_name, u.enabled AS owner_enabled, b.root_file_id, f.rel_path, \
+     u.display_name AS owner_display_name, (u.enabled = 1 AND u.service_s3 = 1) AS owner_enabled, b.root_file_id, f.rel_path, \
      b.anonymous, b.anonymous_list, b.cors, b.tags, b.lifecycle, b.website, b.created_at \
      FROM s3_buckets b JOIN files f ON f.id = b.root_file_id JOIN users u ON u.id = b.owner_id";
 
@@ -455,7 +457,8 @@ fn check_json(what: &'static str, value: Option<&str>) -> Result<()> {
 /// The buckets with lifecycle rules, of enabled accounts.
 pub async fn buckets_with_lifecycle(pool: &Pool) -> Result<Vec<Bucket>> {
     let rows: Vec<BucketRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "{BUCKET_QUERY} WHERE b.lifecycle IS NOT NULL AND u.enabled = 1 ORDER BY b.id"
+        "{BUCKET_QUERY} WHERE b.lifecycle IS NOT NULL AND u.enabled = 1 AND u.service_s3 = 1 \
+         ORDER BY b.id"
     )))
     .fetch_all(pool)
     .await?;
@@ -521,6 +524,10 @@ pub struct SigningKey {
     pub grants: Vec<Grant>,
     /// Last recorded use, UNIX seconds.
     pub last_used_at: Option<i64>,
+    /// Whether the owner may use the S3 API ([`crate::services::Service::S3`]). A key of an
+    /// account without it still verifies signatures, so that only the holder of the secret
+    /// learns that the service is off; the S3 API then refuses the request.
+    pub service: bool,
 }
 
 /// A new access key id.
@@ -731,6 +738,8 @@ struct SigningRow {
     display_name: String,
     #[sqlx(try_from = "Flag")]
     enabled: bool,
+    #[sqlx(try_from = "Flag")]
+    service_s3: bool,
 }
 
 /// The access key `access_key_id` with its secret, if it may sign requests at `now`: it exists,
@@ -747,8 +756,8 @@ pub async fn signing_key(
     }
     let row: Option<SigningRow> = sqlx::query_as(
         "SELECT a.id, a.user_id, a.secret_sealed, a.expires_at, a.last_used_at, u.username, \
-         u.display_name, u.enabled FROM app_passwords a JOIN users u ON u.id = a.user_id \
-         WHERE a.kind = 's3' AND a.access_key_id = ?",
+         u.display_name, u.enabled, u.service_s3 FROM app_passwords a \
+         JOIN users u ON u.id = a.user_id WHERE a.kind = 's3' AND a.access_key_id = ?",
     )
     .bind(access_key_id)
     .fetch_optional(pool)
@@ -786,6 +795,7 @@ pub async fn signing_key(
         secret: SecretString::from(secret),
         grants: grants.iter().map(Grant::try_from).collect::<Result<_>>()?,
         last_used_at: row.last_used_at,
+        service: row.service_s3,
     }))
 }
 

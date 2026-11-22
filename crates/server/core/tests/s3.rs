@@ -394,6 +394,53 @@ async fn keys_stop_signing_when_they_expire_or_the_account_is_disabled() {
 }
 
 #[tokio::test]
+async fn accounts_without_the_s3_service_serve_no_bucket() {
+    use gono_server_core::services::{Service, Services};
+    let f = fixture().await;
+    let alice = f.user("alice").await;
+    let folder = f.folder(alice, "Photos").await;
+    let bucket = f.bucket(alice, "photos", folder).await.unwrap();
+    s3::set_bucket_lifecycle(&f.pool, alice, bucket.id, Some("[]"))
+        .await
+        .unwrap();
+    let (key, _) = s3::create_key(
+        &f.pool,
+        &f.sealing,
+        alice,
+        "k",
+        vec![Grant::everything()],
+        None,
+    )
+    .await
+    .unwrap();
+    let state = |f: &Fixture| {
+        let id = key.access_key_id.clone();
+        let pool = f.pool.clone();
+        let sealing = f.sealing.clone();
+        async move {
+            let bucket = s3::bucket(&pool, "photos").await.unwrap().unwrap();
+            let signing = s3::signing_key(&pool, &sealing, &id, 0)
+                .await
+                .unwrap()
+                .unwrap();
+            let lifecycle = s3::buckets_with_lifecycle(&pool).await.unwrap().len();
+            (bucket.owner_enabled, signing.service, lifecycle)
+        }
+    };
+    assert_eq!(state(&f).await, (true, true, 1));
+    let alice_name = Username::new("alice").unwrap();
+    users::set_services(&f.pool, &alice_name, Services::ALL.with(Service::S3, false))
+        .await
+        .unwrap();
+    // The key still verifies signatures; its owner serves nothing, and lifecycle rules wait.
+    assert_eq!(state(&f).await, (false, false, 0));
+    users::set_services(&f.pool, &alice_name, Services::ALL)
+        .await
+        .unwrap();
+    assert_eq!(state(&f).await, (true, true, 1));
+}
+
+#[tokio::test]
 async fn grants_name_buckets_of_the_owner() {
     let f = fixture().await;
     let alice = f.user("alice").await;

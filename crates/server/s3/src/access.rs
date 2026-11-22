@@ -310,6 +310,12 @@ impl S3Access for Access {
                 .await
                 .map_err(unavailable)?
                 .ok_or_else(|| s3_error!(InvalidAccessKeyId))?;
+                if !key.service {
+                    return Err(s3_error!(
+                        AccessDenied,
+                        "S3 is not enabled for this account"
+                    ));
+                }
                 Caller::Key(Arc::new(key))
             }
             None => Caller::Anonymous,
@@ -375,6 +381,7 @@ mod tests {
             secret: SecretString::from("x"),
             grants,
             last_used_at: None,
+            service: true,
         }))
     }
 
