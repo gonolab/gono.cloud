@@ -14,8 +14,7 @@ use gono_protocol::connect::{
 use gono_server_connect::{Connect, ConnectConfig, DeviceLogin, Outgoing, Refusal, Session};
 use gono_server_core::{
     Username, app_passwords,
-    config::DbConfig,
-    db::{self, OpenMode, Pool},
+    db::{self, Pool},
     devices::{self, EndpointId, RevokedBy},
     login_flows,
     users::{self, NewUser},
@@ -40,15 +39,7 @@ async fn fixture() -> Fixture {
 /// A fixture with `connect.require_two_factor` set to `require_two_factor`.
 async fn fixture_with(require_two_factor: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let config = DbConfig {
-        path: dir.path().join("gono-cloud.db"),
-        max_connections: 4,
-        busy_timeout_secs: 5,
-    };
-    let pool = db::connect(&config, OpenMode::CreateIfMissing)
-        .await
-        .unwrap();
-    db::migrate(&pool).await.unwrap();
+    let pool = db::testing::database(dir.path()).await;
     let connect = Connect::new(
         pool.clone(),
         ConnectConfig {
@@ -85,7 +76,7 @@ impl Fixture {
         .unwrap();
         if two_factor {
             sqlx::query(
-                "INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?1, x'00', 0)",
+                "INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?, x'00', 0)",
             )
             .bind(id)
             .execute(&self.pool)

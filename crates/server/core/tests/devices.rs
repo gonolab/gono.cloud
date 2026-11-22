@@ -3,8 +3,7 @@
 
 use gono_server_core::{
     Username, app_passwords, audit,
-    config::DbConfig,
-    db::{self, OpenMode, Pool},
+    db::{self, Pool},
     devices::{self, EndpointId, NewDevice, Registration, RevokedBy, Settings},
     login_flows::{self, DevicePoll},
     two_factor,
@@ -14,15 +13,7 @@ use secrecy::ExposeSecret as _;
 
 async fn fixture() -> (tempfile::TempDir, Pool) {
     let dir = tempfile::tempdir().unwrap();
-    let config = DbConfig {
-        path: dir.path().join("gono-cloud.db"),
-        max_connections: 4,
-        busy_timeout_secs: 5,
-    };
-    let pool = db::connect(&config, OpenMode::CreateIfMissing)
-        .await
-        .unwrap();
-    db::migrate(&pool).await.unwrap();
+    let pool = db::testing::database(dir.path()).await;
     (dir, pool)
 }
 
@@ -44,7 +35,7 @@ async fn user(pool: &Pool, name: &str) -> i64 {
 
 /// Two-step verification as part 2c will store it; the secret does not matter here.
 async fn enroll(pool: &Pool, user_id: i64) {
-    sqlx::query("INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?1, x'00', 0)")
+    sqlx::query("INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?, x'00', 0)")
         .bind(user_id)
         .execute(pool)
         .await
@@ -465,7 +456,7 @@ async fn an_app_password_in_use_by_a_device_cannot_be_deleted_directly() {
     else {
         panic!()
     };
-    let result = sqlx::query("DELETE FROM app_passwords WHERE id = ?1")
+    let result = sqlx::query("DELETE FROM app_passwords WHERE id = ?")
         .bind(device.app_password_id)
         .execute(&pool)
         .await;

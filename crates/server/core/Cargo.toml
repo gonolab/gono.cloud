@@ -27,10 +27,17 @@ url.workspace = true
 # The write gate of the database (db::begin_immediate).
 tokio = { workspace = true, features = ["sync"] }
 
+[features]
+# `db::testing`: fresh test databases on SQLite, or on MySQL when `GONO_TEST_MYSQL_URL` is set.
+# Enabled by the dev-dependencies of the crates whose tests need a database.
+testing = []
+
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 
 [dev-dependencies]
+# The crate itself with `testing`, for its integration tests.
+gono-server-core = { path = ".", features = ["testing"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 

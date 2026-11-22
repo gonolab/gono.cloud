@@ -15,7 +15,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use sqlx::FromRow;
 
 use crate::{
-    db::{self, Pool},
+    db::{self, Flag, Pool, Text},
     error::Result,
     secret,
     types::Username,
@@ -54,12 +54,15 @@ pub async fn create(pool: &Pool, user_id: i64, now: i64) -> Result<SecretString>
     let token = secret::random_token(TOKEN_CHARS);
     let digest = secret::digest(token.expose_secret());
     let mut tx = db::begin_immediate(pool).await?;
+    let id = db::next_id(&mut tx, "web_sessions").await?;
     sqlx::query(
-        "INSERT INTO web_sessions (token_hash, user_id, created_at, last_seen_at, expires_at) \
-         VALUES (?1, ?2, ?3, ?3, ?4)",
+        "INSERT INTO web_sessions (id, token_hash, user_id, created_at, last_seen_at, \
+         expires_at) VALUES (?, ?, ?, ?, ?, ?)",
     )
+    .bind(id)
     .bind(&digest[..])
     .bind(user_id)
+    .bind(now)
     .bind(now)
     .bind(now.saturating_add(IDLE_TIMEOUT_SECS.min(MAX_LIFETIME_SECS)))
     .execute(&mut *tx)
@@ -75,9 +78,12 @@ struct Row {
     last_seen_at: i64,
     expires_at: i64,
     user_id: i64,
+    #[sqlx(try_from = "Text")]
     username: String,
     display_name: String,
+    #[sqlx(try_from = "Flag")]
     is_admin: bool,
+    #[sqlx(try_from = "Flag")]
     enabled: bool,
 }
 
@@ -87,7 +93,7 @@ pub async fn lookup(pool: &Pool, token: &str, now: i64) -> Result<Option<Session
     let row: Option<Row> = sqlx::query_as(
         "SELECT s.id, s.created_at, s.last_seen_at, s.expires_at, u.id AS user_id, u.username, \
          u.display_name, u.is_admin, u.enabled FROM web_sessions s \
-         JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?1",
+         JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?",
     )
     .bind(&digest[..])
     .fetch_optional(pool)
@@ -101,10 +107,10 @@ pub async fn lookup(pool: &Pool, token: &str, now: i64) -> Result<Option<Session
             .saturating_add(IDLE_TIMEOUT_SECS)
             .min(row.created_at.saturating_add(MAX_LIFETIME_SECS));
         let mut tx = db::begin_immediate(pool).await?;
-        sqlx::query("UPDATE web_sessions SET last_seen_at = ?2, expires_at = ?3 WHERE id = ?1")
-            .bind(row.id)
+        sqlx::query("UPDATE web_sessions SET last_seen_at = ?, expires_at = ? WHERE id = ?")
             .bind(now)
             .bind(expires_at)
+            .bind(row.id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -122,7 +128,7 @@ pub async fn lookup(pool: &Pool, token: &str, now: i64) -> Result<Option<Session
 pub async fn delete(pool: &Pool, token: &str) -> Result<bool> {
     let digest = secret::digest(token);
     let mut tx = db::begin_immediate(pool).await?;
-    let deleted = sqlx::query("DELETE FROM web_sessions WHERE token_hash = ?1")
+    let deleted = sqlx::query("DELETE FROM web_sessions WHERE token_hash = ?")
         .bind(&digest[..])
         .execute(&mut *tx)
         .await?
@@ -137,12 +143,15 @@ pub async fn delete(pool: &Pool, token: &str) -> Result<bool> {
 /// sessions ended.
 pub async fn delete_for_user(pool: &Pool, user_id: i64, keep: Option<i64>) -> Result<u64> {
     let mut tx = db::begin_immediate(pool).await?;
-    let deleted = sqlx::query("DELETE FROM web_sessions WHERE user_id = ?1 AND id IS NOT ?2")
-        .bind(user_id)
-        .bind(keep)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    // `(? IS NULL OR id <> ?)`: MySQL has no `IS NOT` for values, SQLite no `<=>`.
+    let deleted =
+        sqlx::query("DELETE FROM web_sessions WHERE user_id = ? AND (? IS NULL OR id <> ?)")
+            .bind(user_id)
+            .bind(keep)
+            .bind(keep)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
     tx.commit().await?;
     Ok(deleted)
 }
@@ -150,7 +159,7 @@ pub async fn delete_for_user(pool: &Pool, user_id: i64, keep: Option<i64>) -> Re
 /// Removes every session that expired at `now`. Returns how many there were.
 pub async fn purge_expired(pool: &Pool, now: i64) -> Result<u64> {
     let mut tx = db::begin_immediate(pool).await?;
-    let purged = sqlx::query("DELETE FROM web_sessions WHERE expires_at <= ?1")
+    let purged = sqlx::query("DELETE FROM web_sessions WHERE expires_at <= ?")
         .bind(now)
         .execute(&mut *tx)
         .await?

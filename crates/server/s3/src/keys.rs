@@ -71,6 +71,7 @@ pub fn target(bucket: &str, key: &str) -> Result<Target, KeyError> {
                 PathError::DotSegment => "the key contains a '.' or '..' segment",
                 PathError::Nul => "the key contains a NUL character",
                 PathError::TooLong => "a segment of the key is longer than 255 bytes",
+                PathError::PathTooLong => "the path of the key is longer than 4096 bytes",
                 PathError::Slash | PathError::NotUtf8 => "the key is not a valid path",
             })
         })?;

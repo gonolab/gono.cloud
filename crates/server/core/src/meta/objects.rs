@@ -21,7 +21,11 @@ use std::collections::BTreeMap;
 use sqlx::FromRow;
 
 use super::store::{FileRow, MetaStore, Row};
-use crate::{db, error::Result, path::RelPath};
+use crate::{
+    db::{self, Backend, Flag, Text},
+    error::Result,
+    path::RelPath,
+};
 
 /// The S3 metadata of the current version of a file (see the `object_meta` table).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -87,6 +91,7 @@ pub struct ObjectPart {
 #[derive(FromRow)]
 struct MetaRow {
     s3_etag: Option<String>,
+    #[sqlx(try_from = "Flag")]
     public_read: bool,
     content_type: Option<String>,
     content_encoding: Option<String>,
@@ -138,17 +143,17 @@ pub(super) async fn store_object_meta(
     let user_meta =
         serde_json::to_string(&meta.user_meta).unwrap_or_else(|_| unreachable!("a string map"));
     let tags = serde_json::to_string(&meta.tags).unwrap_or_else(|_| unreachable!("a string map"));
-    // The parts of the replaced version go first (REPLACE does not cascade without recursive
-    // triggers).
-    sqlx::query("DELETE FROM object_parts WHERE file_id = ?1")
+    // Delete and insert, as `INSERT OR REPLACE` would, in SQL both backends speak. The parts of
+    // the replaced version go with its row (`ON DELETE CASCADE`).
+    sqlx::query("DELETE FROM object_meta WHERE file_id = ?")
         .bind(file_id)
         .execute(&mut **tx)
         .await?;
     sqlx::query(
-        "INSERT OR REPLACE INTO object_meta (file_id, s3_etag, public_read, content_type, \
+        "INSERT INTO object_meta (file_id, s3_etag, public_read, content_type, \
          content_encoding, content_disposition, content_language, cache_control, expires, \
          user_meta, checksum_algorithm, checksum_value, checksum_type, tags, written_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(file_id)
     .bind(meta.s3_etag.as_deref())
@@ -176,7 +181,7 @@ pub(super) async fn store_object_meta(
     for (number, part) in (1_i64..).zip(&meta.parts) {
         sqlx::query(
             "INSERT INTO object_parts (file_id, part_number, size, checksum) \
-             VALUES (?1, ?2, ?3, ?4)",
+             VALUES (?, ?, ?, ?)",
         )
         .bind(file_id)
         .bind(number)
@@ -191,7 +196,7 @@ pub(super) async fn store_object_meta(
 /// Deletes the `object_meta` row of `file_id` inside `tx`, if there is one.
 pub(super) async fn clear_object_meta(tx: &mut db::Tx, file_id: i64) -> Result<()> {
     // Its parts go with it (`ON DELETE CASCADE`).
-    sqlx::query("DELETE FROM object_meta WHERE file_id = ?1")
+    sqlx::query("DELETE FROM object_meta WHERE file_id = ?")
         .bind(file_id)
         .execute(&mut **tx)
         .await?;
@@ -325,7 +330,7 @@ impl MetaStore {
         let row: Option<MetaRow> = sqlx::query_as(
             "SELECT s3_etag, public_read, content_type, content_encoding, content_disposition, \
              content_language, cache_control, expires, user_meta, checksum_algorithm, \
-             checksum_value, checksum_type, tags FROM object_meta WHERE file_id = ?1",
+             checksum_value, checksum_type, tags FROM object_meta WHERE file_id = ?",
         )
         .bind(file_id)
         .fetch_optional(self.pool())
@@ -340,7 +345,7 @@ impl MetaStore {
     /// checks that the metadata belongs to the file's current version.
     pub async fn written_at(&self, file_id: i64) -> Result<Option<i64>> {
         let written_at: Option<Option<i64>> = sqlx::query_scalar(
-            "SELECT written_at FROM object_meta WHERE file_id = ?1 AND s3_etag IS NOT NULL",
+            "SELECT written_at FROM object_meta WHERE file_id = ? AND s3_etag IS NOT NULL",
         )
         .bind(file_id)
         .fetch_optional(self.pool())
@@ -364,13 +369,14 @@ impl MetaStore {
             "SELECT f.id, f.rel_path, f.is_dir, f.etag, f.mtime_ns, f.size, f.favorite, \
              f.creation_time, f.s3_path, f.md5, o.tags, o.written_at \
              FROM files f JOIN object_meta o ON o.file_id = f.id \
-             WHERE f.owner_id = ?1 AND f.is_dir = 0 AND f.rel_path >= ?2 AND f.rel_path < ?3 \
+             WHERE f.owner_id = ? AND f.is_dir = 0 AND f.rel_path >= ? AND f.rel_path < ? \
              AND o.s3_etag IS NOT NULL AND o.written_at IS NOT NULL \
-             AND (?4 IS NULL OR o.written_at <= ?4) AND f.id > ?5 ORDER BY f.id LIMIT ?6",
+             AND (? IS NULL OR o.written_at <= ?) AND f.id > ? ORDER BY f.id LIMIT ?",
         )
         .bind(owner)
         .bind(lower)
         .bind(upper)
+        .bind(written_before)
         .bind(written_before)
         .bind(after)
         .bind(i64::from(limit))
@@ -391,7 +397,7 @@ impl MetaStore {
     /// wrote, which the caller checks.
     pub async fn object_parts(&self, file_id: i64) -> Result<Vec<ObjectPart>> {
         let rows: Vec<(i64, Option<String>)> = sqlx::query_as(
-            "SELECT size, checksum FROM object_parts WHERE file_id = ?1 ORDER BY part_number",
+            "SELECT size, checksum FROM object_parts WHERE file_id = ? ORDER BY part_number",
         )
         .bind(file_id)
         .fetch_all(self.pool())
@@ -417,19 +423,23 @@ impl MetaStore {
         let tags = serde_json::to_string(tags).unwrap_or_else(|_| unreachable!("a string map"));
         let mut tx = db::begin_immediate(self.pool()).await?;
         // The WHERE clause also tells SQLite's parser that ON CONFLICT belongs to the INSERT.
-        let changed = sqlx::query(
-            "INSERT INTO object_meta (file_id, tags) \
-             SELECT id, ?3 FROM files WHERE id = ?1 AND etag = ?2 AND is_dir = 0 \
+        // MySQL counts an updated row twice, so any count means the version was there.
+        let changed = sqlx::query(tx.backend().pick(
+            "INSERT INTO object_meta (file_id, tags, user_meta) \
+             SELECT id, ?, '{}' FROM files WHERE id = ? AND etag = ? AND is_dir = 0 \
              ON CONFLICT (file_id) DO UPDATE SET tags = excluded.tags",
-        )
+            "INSERT INTO object_meta (file_id, tags, user_meta) \
+             SELECT id, ?, '{}' FROM files WHERE id = ? AND etag = ? AND is_dir = 0 \
+             ON DUPLICATE KEY UPDATE tags = VALUES(tags)",
+        ))
+        .bind(tags)
         .bind(file_id)
         .bind(etag)
-        .bind(tags)
         .execute(&mut *tx)
         .await?
         .rows_affected();
         tx.commit().await?;
-        Ok(changed == 1)
+        Ok(changed > 0)
     }
 
     /// Sets or clears the `public-read` ACL of the version of file `file_id` whose WebDAV ETag
@@ -440,14 +450,17 @@ impl MetaStore {
     pub async fn set_object_public(&self, file_id: i64, etag: &str, public: bool) -> Result<bool> {
         let mut tx = db::begin_immediate(self.pool()).await?;
         // The WHERE clause also tells SQLite's parser that ON CONFLICT belongs to the INSERT.
-        let changed = sqlx::query(
-            "INSERT INTO object_meta (file_id, public_read) \
-             SELECT id, ?3 FROM files WHERE id = ?1 AND etag = ?2 AND is_dir = 0 \
+        let changed = sqlx::query(tx.backend().pick(
+            "INSERT INTO object_meta (file_id, public_read, user_meta, tags) \
+             SELECT id, ?, '{}', '{}' FROM files WHERE id = ? AND etag = ? AND is_dir = 0 \
              ON CONFLICT (file_id) DO UPDATE SET public_read = excluded.public_read",
-        )
+            "INSERT INTO object_meta (file_id, public_read, user_meta, tags) \
+             SELECT id, ?, '{}', '{}' FROM files WHERE id = ? AND etag = ? AND is_dir = 0 \
+             ON DUPLICATE KEY UPDATE public_read = VALUES(public_read)",
+        ))
+        .bind(public)
         .bind(file_id)
         .bind(etag)
-        .bind(public)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -463,20 +476,22 @@ impl MetaStore {
         owner: i64,
         file_ids: &[i64],
     ) -> Result<std::collections::HashMap<i64, String>> {
-        if file_ids.is_empty() {
-            return Ok(std::collections::HashMap::new());
+        let mut found = std::collections::HashMap::new();
+        for chunk in file_ids.chunks(db::MAX_LIST) {
+            let sql = format!(
+                "SELECT f.id, f.etag FROM object_meta o JOIN files f ON f.id = o.file_id \
+                 WHERE o.public_read = 1 AND f.owner_id = ? AND f.is_dir = 0 \
+                 AND o.file_id IN ({})",
+                db::placeholders(chunk.len())
+            );
+            let mut query =
+                sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(sql)).bind(owner);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            found.extend(query.fetch_all(self.pool()).await?);
         }
-        let ids = serde_json::to_string(file_ids).unwrap_or_else(|_| unreachable!("numbers"));
-        let rows: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT f.id, f.etag FROM object_meta o JOIN files f ON f.id = o.file_id \
-             WHERE o.public_read = 1 AND f.owner_id = ?1 AND f.is_dir = 0 \
-             AND o.file_id IN (SELECT value FROM json_each(?2))",
-        )
-        .bind(owner)
-        .bind(ids)
-        .fetch_all(self.pool())
-        .await?;
-        Ok(rows.into_iter().collect())
+        Ok(found)
     }
 
     /// Of `owner`'s entries `file_ids`, those that S3 spells otherwise than their path, with
@@ -486,19 +501,26 @@ impl MetaStore {
         owner: i64,
         file_ids: &[i64],
     ) -> Result<std::collections::HashMap<i64, String>> {
-        if file_ids.is_empty() {
-            return Ok(std::collections::HashMap::new());
+        let mut found = std::collections::HashMap::new();
+        for chunk in file_ids.chunks(db::MAX_LIST) {
+            let sql = format!(
+                "SELECT id, s3_path FROM files WHERE owner_id = ? AND s3_path IS NOT NULL \
+                 AND id IN ({})",
+                db::placeholders(chunk.len())
+            );
+            let mut query = sqlx::query_as::<_, (i64, Text)>(sqlx::AssertSqlSafe(sql)).bind(owner);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            found.extend(
+                query
+                    .fetch_all(self.pool())
+                    .await?
+                    .into_iter()
+                    .map(|(id, spelled)| (id, spelled.0)),
+            );
         }
-        let ids = serde_json::to_string(file_ids).unwrap_or_else(|_| unreachable!("numbers"));
-        let rows: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT id, s3_path FROM files WHERE owner_id = ?1 AND s3_path IS NOT NULL \
-             AND id IN (SELECT value FROM json_each(?2))",
-        )
-        .bind(owner)
-        .bind(ids)
-        .fetch_all(self.pool())
-        .await?;
-        Ok(rows.into_iter().collect())
+        Ok(found)
     }
 
     /// Lists `owner`'s files below `query.root` in S3 key order, with S3's prefix, delimiter
@@ -588,7 +610,8 @@ impl MetaStore {
     }
 
     /// Up to `limit` file rows of `owner` from `from` to before `upper`, in the order of their
-    /// spelled paths (the expression and the condition of the index `files_s3_listing`).
+    /// spelled paths (the expression and the condition of the index `files_s3_listing`; MySQL
+    /// indexes the generated column `s3_key`, which is that expression).
     async fn scan_files(
         &self,
         owner: i64,
@@ -600,25 +623,28 @@ impl MetaStore {
             Start::Including(start) => (">=", start),
             Start::After(start) => (">", start),
         };
-        // Separate statements with and without an upper bound: `?3 IS NULL OR ... < ?3` would
+        let key = Backend::of(self.pool()).pick("COALESCE(f.s3_path, f.rel_path)", "f.s3_key");
+        // Separate statements with and without an upper bound: `? IS NULL OR ... < ?` would
         // keep SQLite from ending the index range scan there.
         let upper_clause = if upper.is_some() {
-            "AND COALESCE(f.s3_path, f.rel_path) < ?3"
+            format!("AND {key} < ?")
         } else {
-            ""
+            String::new()
         };
         let sql = format!(
             "SELECT f.id, f.rel_path, f.is_dir, f.etag, f.mtime_ns, f.size, f.favorite, \
              f.creation_time, f.s3_path, f.md5, o.s3_etag FROM files f \
              LEFT JOIN object_meta o ON o.file_id = f.id \
-             WHERE f.owner_id = ?1 AND COALESCE(f.s3_path, f.rel_path) {op} ?2 {upper_clause} \
-             AND f.is_dir = 0 \
-             ORDER BY COALESCE(f.s3_path, f.rel_path) LIMIT ?4"
+             WHERE f.owner_id = ? AND f.is_dir = 0 AND {key} {op} ? {upper_clause} \
+             ORDER BY {key} LIMIT ?"
         );
-        let rows = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        let mut query = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(owner)
-            .bind(start.as_str())
-            .bind(upper.unwrap_or_default())
+            .bind(start.as_str());
+        if let Some(upper) = upper {
+            query = query.bind(upper);
+        }
+        let rows = query
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
             .fetch_all(self.pool())
             .await?;

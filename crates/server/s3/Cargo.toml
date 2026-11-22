@@ -33,6 +33,8 @@ tower-service.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# Test databases on SQLite or MySQL (`gono_server_core::db::testing`).
+gono-server-core = { workspace = true, features = ["testing"] }
 sqlx.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

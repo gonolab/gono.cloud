@@ -54,7 +54,7 @@ pub async fn create(
     let mut tx = db::begin_immediate(pool).await?;
     sqlx::query(
         "INSERT INTO direct_downloads (token_hash, app_password_id, file_id, created_at, \
-         expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+         expires_at) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(&digest[..])
     .bind(app_password_id)
@@ -72,7 +72,7 @@ pub async fn lookup(pool: &Pool, token: &str, now: i64) -> Result<Option<DirectD
     let digest = secret::digest(token);
     let row: Option<(i64, i64)> = sqlx::query_as(
         "SELECT app_password_id, file_id FROM direct_downloads \
-         WHERE token_hash = ?1 AND expires_at > ?2",
+         WHERE token_hash = ? AND expires_at > ?",
     )
     .bind(&digest[..])
     .bind(now)
@@ -87,7 +87,7 @@ pub async fn lookup(pool: &Pool, token: &str, now: i64) -> Result<Option<DirectD
 /// Removes every link that expired at `now`. Returns how many there were.
 pub async fn purge_expired(pool: &Pool, now: i64) -> Result<u64> {
     let mut tx = db::begin_immediate(pool).await?;
-    let purged = sqlx::query("DELETE FROM direct_downloads WHERE expires_at <= ?1")
+    let purged = sqlx::query("DELETE FROM direct_downloads WHERE expires_at <= ?")
         .bind(now)
         .execute(&mut *tx)
         .await?

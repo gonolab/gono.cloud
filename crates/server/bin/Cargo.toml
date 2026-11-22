@@ -51,6 +51,8 @@ url.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]
+# Test databases on SQLite or MySQL (`gono_server_core::db::testing`).
+gono-server-core = { workspace = true, features = ["testing"] }
 # The end-to-end test of remote access (tests/remote.rs) runs two devices with it.
 gono-connect.workspace = true
 iroh-base.workspace = true

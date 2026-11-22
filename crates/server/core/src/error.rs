@@ -31,6 +31,29 @@ pub enum Error {
         path: PathBuf,
     },
 
+    /// The MySQL database holds no Gono Cloud schema and the caller did not ask to create one.
+    #[error(
+        "MySQL database {database} holds no Gono Cloud schema; run `gono-cloud init` to create it"
+    )]
+    DatabaseUninitialized {
+        /// The database named by `db.url`.
+        database: String,
+    },
+
+    /// `init` found a MySQL database that holds the tables of something else.
+    #[error(
+        "MySQL database {database} is not empty and holds no Gono Cloud schema; give Gono Cloud \
+         a database of its own"
+    )]
+    DatabaseForeign {
+        /// The database named by `db.url`.
+        database: String,
+    },
+
+    /// The database server, or a setting of the database, is not supported.
+    #[error("unsupported database: {0}")]
+    DatabaseUnsupported(String),
+
     /// The configured data directory does not exist.
     #[error(
         "data directory {} does not exist; run `gono-cloud init` or fix storage.data_dir",
@@ -192,6 +215,11 @@ pub enum Error {
     /// The grants of an S3 access key are inconsistent.
     #[error("invalid S3 key grants: {0}")]
     InvalidGrants(String),
+
+    /// A value stored as JSON (a bucket's CORS rules, tags, lifecycle rules or website
+    /// configuration) is not JSON.
+    #[error("the {0} of a bucket must be JSON")]
+    InvalidJson(&'static str),
 }
 
 /// Errors raised while loading or validating the configuration file.

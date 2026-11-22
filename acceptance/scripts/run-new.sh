@@ -22,6 +22,15 @@
 #                          use instead of the server's own address; for testing a reverse
 #                          proxy that forwards PUBLIC_URL to 127.0.0.1:SERVER_PORT (see
 #                          docs/reverse-proxy.md)
+#   DB_BACKEND=mysql       keep the metadata in a new database on a MySQL server instead of
+#                          SQLite (default: sqlite); the database is dropped again on exit
+#   GONO_ACCEPT_MYSQL_URL=<url>
+#                          the MySQL server for DB_BACKEND=mysql, as mysql://user[:password]@
+#                          host[:port] (default: GONO_TEST_MYSQL_URL, for example the server of
+#                          acceptance/scripts/mysql-instance.sh); the account must be allowed
+#                          to create databases
+#   MYSQL=<path>           mysql command line client to create and drop that database
+#                          (default: mysql on PATH)
 set -Eeuo pipefail
 
 ACCEPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,7 +42,7 @@ MODE="test"
 CARGO_TEST_ARGS=()
 
 usage() {
-  sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while (($#)); do
@@ -94,6 +103,48 @@ require_cmd curl
 require_cmd python3
 require_cmd sed
 
+DB_BACKEND="${DB_BACKEND:-sqlite}"
+case "${DB_BACKEND}" in
+  sqlite) ;;
+  mysql)
+    MYSQL_CLIENT="${MYSQL:-mysql}"
+    require_cmd "${MYSQL_CLIENT}"
+    MYSQL_SERVER_URL="${GONO_ACCEPT_MYSQL_URL:-${GONO_TEST_MYSQL_URL:-}}"
+    if [[ -z "${MYSQL_SERVER_URL}" ]]; then
+      echo "DB_BACKEND=mysql needs GONO_ACCEPT_MYSQL_URL (or GONO_TEST_MYSQL_URL)" >&2
+      exit 2
+    fi
+    # Host, port, account and password of the URL, shell-quoted.
+    eval "$(python3 - "${MYSQL_SERVER_URL}" <<'PY'
+import shlex, sys
+from urllib.parse import unquote, urlsplit
+url = urlsplit(sys.argv[1])
+if url.scheme != "mysql" or not url.hostname:
+    sys.exit(f"not a mysql:// URL: {sys.argv[1]}")
+for name, value in [
+    ("MYSQL_HOST", url.hostname),
+    ("MYSQL_PORT", str(url.port or 3306)),
+    ("MYSQL_USER", unquote(url.username or "root")),
+    ("MYSQL_PASSWORD", unquote(url.password or "")),
+]:
+    print(f"{name}={shlex.quote(value)}")
+PY
+)"
+    MYSQL_DATABASE="gono_accept_$(date +%s)_${RANDOM}"
+    ;;
+  *)
+    echo "DB_BACKEND must be sqlite or mysql, not ${DB_BACKEND}" >&2
+    exit 2
+    ;;
+esac
+
+# The mysql client on the server of GONO_ACCEPT_MYSQL_URL; the password goes through the
+# environment, never the command line.
+mysql_admin() {
+  MYSQL_PWD="${MYSQL_PASSWORD}" "${MYSQL_CLIENT}" --protocol=tcp -h "${MYSQL_HOST}" \
+    -P "${MYSQL_PORT}" -u "${MYSQL_USER}" "$@"
+}
+
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gono-new-accept.XXXXXX")"
 TARGET_DIR="${NEW_TARGET_DIR:-${REPO_ROOT}/target}"
 CONFIG_FILE="${WORK_DIR}/config.toml"
@@ -120,8 +171,14 @@ cleanup() {
   fi
   if [[ "${KEEP_WORK_DIR}" == "1" ]]; then
     echo "kept work dir: ${WORK_DIR}" >&2
+    if [[ "${DB_BACKEND}" == "mysql" ]]; then
+      echo "kept MySQL database: ${MYSQL_DATABASE}" >&2
+    fi
   else
     rm -rf "${WORK_DIR}"
+    if [[ "${DB_BACKEND}" == "mysql" ]]; then
+      mysql_admin -e "DROP DATABASE IF EXISTS \`${MYSQL_DATABASE}\`" || true
+    fi
   fi
   exit "${status}"
 }
@@ -190,6 +247,21 @@ SERVER_URL="http://127.0.0.1:${PORT}"
 BASE_URL="${PUBLIC_URL:-${SERVER_URL}}"
 BASE_URL="${BASE_URL%/}"
 
+if [[ "${DB_BACKEND}" == "mysql" ]]; then
+  echo "==> creating MySQL database ${MYSQL_DATABASE} on ${MYSQL_HOST}:${MYSQL_PORT}"
+  mysql_admin -e "CREATE DATABASE \`${MYSQL_DATABASE}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"
+  # The URL names no password; the server reads it from a file, as an installation does.
+  DB_URL="$(python3 -c 'import sys; from urllib.parse import quote; print("mysql://%s@%s:%s/%s" % (quote(sys.argv[1], safe=""), sys.argv[2], sys.argv[3], sys.argv[4]))' \
+    "${MYSQL_USER}" "${MYSQL_HOST}" "${MYSQL_PORT}" "${MYSQL_DATABASE}")"
+  DB_TABLE="backend = \"mysql\""$'\n'"url = \"${DB_URL}\""
+  if [[ -n "${MYSQL_PASSWORD}" ]]; then
+    (umask 077 && printf '%s\n' "${MYSQL_PASSWORD}" >"${WORK_DIR}/mysql-password")
+    DB_TABLE+=$'\n'"password_file = \"${WORK_DIR}/mysql-password\""
+  fi
+else
+  DB_TABLE="path = \"${WORK_DIR}/gono-cloud.db\""
+fi
+
 cat >"${CONFIG_FILE}" <<EOF
 [server]
 bind = "127.0.0.1:${PORT}"
@@ -199,7 +271,7 @@ base_url = "${BASE_URL}"
 data_dir = "${WORK_DIR}/data"
 
 [db]
-path = "${WORK_DIR}/gono-cloud.db"
+${DB_TABLE}
 
 [logging]
 level = "warn"

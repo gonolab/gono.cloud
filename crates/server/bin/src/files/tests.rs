@@ -10,9 +10,7 @@ use axum::{
 };
 use base64::Engine as _;
 use gono_server_core::{
-    Username, app_passwords,
-    config::DbConfig,
-    db::{self, OpenMode},
+    Username, app_passwords, db,
     meta::MetaStore,
     password,
     storage::DataLayout,
@@ -46,15 +44,7 @@ async fn fixture_with(files: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let layout = DataLayout::new(dir.path().join("data"));
     layout.create().unwrap();
-    let config = DbConfig {
-        path: dir.path().join("db.sqlite"),
-        max_connections: 4,
-        busy_timeout_secs: 5,
-    };
-    let pool = db::connect(&config, OpenMode::CreateIfMissing)
-        .await
-        .unwrap();
-    db::migrate(&pool).await.unwrap();
+    let pool = db::testing::database(dir.path()).await;
     let username = Username::new("alice").unwrap();
     let hash = password::hash(&SecretString::from(ALICE_PASSWORD.to_owned())).unwrap();
     let alice = users::create(
@@ -1695,11 +1685,15 @@ async fn concurrent_wrong_codes_on_the_account_page_are_limited_too() {
 async fn a_failure_that_cannot_be_recorded_does_not_pass_as_a_wrong_code() {
     let f = fixture().await;
     let (alice, _) = enrolled_alice(&f).await;
-    // The database refuses the record of a failure, as it would when it stays busy.
-    sqlx::query(
+    // The database refuses the record of a failure, as it would when it stays busy. (MySQL
+    // creates triggers through the text protocol only, which `raw_sql` uses.)
+    sqlx::raw_sql(db::Backend::of(&f.state.db).pick(
         "CREATE TRIGGER refuse_failures BEFORE INSERT ON audit_log \
          WHEN NEW.kind = 'two_factor.failed' BEGIN SELECT RAISE(ABORT, 'database is locked'); END",
-    )
+        "CREATE TRIGGER refuse_failures BEFORE INSERT ON audit_log FOR EACH ROW BEGIN \
+         IF NEW.kind = 'two_factor.failed' THEN \
+         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'database is locked'; END IF; END",
+    ))
     .execute(&f.state.db)
     .await
     .unwrap();

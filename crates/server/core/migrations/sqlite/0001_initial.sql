@@ -1,15 +1,20 @@
--- Schema of Gono Cloud.
+-- Schema of Gono Cloud on SQLite.
 --
--- Rules that apply to this file and every later migration:
+-- `../mysql/0001_initial.sql` is its MySQL twin: the same tables, columns, keys and cascades in
+-- MySQL's dialect. Every change is made to both, and the tests run on both backends. The
+-- comments here explain the schema; the MySQL file explains only where MySQL differs.
 --
--- 1. Published with 2.0.0; migrations are append-only since. Until then the whole schema lived
---    in this file and was edited in place, so a database of 1.x must be created again (sqlx
---    refuses it, because this file's checksum differs). A published migration is never edited,
---    reformatted or renamed: schema changes go into a new, higher-numbered file, and
+-- Rules that apply to these files and every later migration:
+--
+-- 1. Until the next release the schema is edited in place: no installation has to keep a
+--    database of it, so there are no migrations from earlier schemas (sqlx refuses a database
+--    of an earlier version of this file, because its checksum differs). Once released, the
+--    migrations are append-only: a published migration is never edited, reformatted or
+--    renamed, schema changes go into a new, higher-numbered file in both directories, and
 --    `crates/server/core/tests/migrations.rs` pins the checksum of every published migration.
 --
--- 2. `rel_path` columns use BINARY collation (spelled out explicitly below). Paths compare
---    byte-for-byte; `Foo` and `foo` are different files.
+-- 2. `rel_path` columns use BINARY collation (spelled out explicitly below; MySQL stores them
+--    as VARBINARY). Paths compare byte-for-byte; `Foo` and `foo` are different files.
 --
 -- 3. Subtree ("prefix") queries use a half-open range, never LIKE:
 --
@@ -18,9 +23,16 @@
 --    '0' is the byte after '/'. LIKE treats '_' and '%' in file names as wildcards and is
 --    case-insensitive for ASCII in SQLite, so it matches unrelated rows.
 --
+-- 4. Ids that must never be handed out again (see `users` below) come from `id_sequences`:
+--    the inserting transaction allocates them with `gono_server_core::db::next_id` and names
+--    them in the INSERT. There is no AUTOINCREMENT, because MySQL could not match it: MySQL
+--    5.7 sets its AUTO_INCREMENT counter back to the highest id plus one when it restarts.
+--
 -- Conventions:
 --
 -- - `rel_path` is relative to the owner's root: no leading or trailing slash, '' for the root.
+--   Paths have at most 4096 bytes (`gono_server_core::path::MAX_PATH_BYTES`, checked before
+--   they are stored), the size of MySQL's path columns.
 -- - Timestamps named `*_at` are UNIX seconds (UTC). `mtime_ns` is UNIX nanoseconds.
 -- - Booleans are INTEGER 0/1 with a CHECK constraint.
 -- - Secrets (app passwords, session cookies, Login Flow tokens, recovery codes) are stored only
@@ -30,6 +42,26 @@
 --   with the secret): they are sealed with the key file of `two_factor.key_file`
 --   (`gono_server_core::sealing`), so a copy of the database alone gives none of them away.
 -- - Tables are STRICT so SQLite enforces the declared column types.
+
+-- The last id handed out for each table whose ids are never reused (rule 4). Written only by
+-- `gono_server_core::db::next_id`, inside the write transaction that inserts the row, so a
+-- rolled back insert also gives its id back.
+CREATE TABLE id_sequences (
+    name    TEXT    NOT NULL PRIMARY KEY COLLATE BINARY,
+    last_id INTEGER NOT NULL CHECK (last_id >= 0)
+) STRICT;
+
+INSERT INTO id_sequences (name, last_id) VALUES
+    ('app_passwords', 0),
+    ('audit_log', 0),
+    ('change_log', 0),
+    ('device_events', 0),
+    ('devices', 0),
+    ('files', 0),
+    ('login_flows', 0),
+    ('s3_buckets', 0),
+    ('users', 0),
+    ('web_sessions', 0);
 
 -- Server-wide settings that are generated once and must stay stable for the lifetime of the
 -- installation.
@@ -45,11 +77,11 @@ INSERT INTO settings (name, value) VALUES ('instance_id', 'oc' || lower(hex(rand
 
 -- Accounts. Users authenticate devices with app passwords; the web login password below is
 -- used only for the server's HTML pages (sign-in, Login Flow v2, the file and admin UIs).
--- Ids of accounts, credentials, sessions and devices are AUTOINCREMENT: in-memory state keyed
--- by them (the control channel, pending sign-ins, the "shown once" pages) must never carry
--- over to a newer row that reuses a deleted one's id.
+-- Ids of accounts, credentials, sessions, sign-ins and devices come from `id_sequences` (rule
+-- 4): in-memory state keyed by them (the control channel, pending sign-ins, the "shown once"
+-- pages) must never carry over to a newer row that reuses a deleted one's id.
 CREATE TABLE users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    id            INTEGER PRIMARY KEY,
     -- Validated by `gono_server_core::Username`: lowercase ASCII, appears verbatim in DAV URLs.
     username      TEXT    NOT NULL UNIQUE COLLATE BINARY,
     display_name  TEXT    NOT NULL,
@@ -66,7 +98,7 @@ CREATE TABLE users (
 -- A credential of one kind never works as the other: S3 keys never pass HTTP Basic, and app
 -- passwords never sign S3 requests.
 CREATE TABLE app_passwords (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    id            INTEGER PRIMARY KEY,
     user_id       INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     -- 'dav': an app password for HTTP Basic (WebDAV, OCS, notify_push), with scopes in
     -- app_password_scopes. 's3': an S3 access key, with grants in s3_key_grants.
@@ -109,9 +141,9 @@ CREATE TABLE app_password_scopes (
 
 -- Metadata of every file and directory, written only through MetaStore.
 CREATE TABLE files (
-    -- Exposed to clients as `oc:fileid`. AUTOINCREMENT so that ids of deleted entries are never
-    -- handed out again; clients cache them. Preserved across MOVE.
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- Exposed to clients as `oc:fileid`. From `id_sequences`, so that ids of deleted entries
+    -- are never handed out again; clients cache them. Preserved across MOVE.
+    id            INTEGER PRIMARY KEY,
     owner_id      INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     rel_path      TEXT    NOT NULL COLLATE BINARY,
     is_dir        INTEGER NOT NULL CHECK (is_dir IN (0, 1)),
@@ -144,13 +176,14 @@ CREATE TABLE files (
 CREATE INDEX files_favorites ON files (owner_id, rel_path) WHERE favorite = 1;
 
 -- S3 listings: file rows in the byte order of their S3 spelling. Queries must use exactly
--- this expression and `is_dir = 0` for SQLite to use the index.
+-- this expression and `is_dir = 0` for SQLite to use the index. (MySQL indexes a generated
+-- column with this expression, `s3_key`, which its queries name instead.)
 CREATE INDEX files_s3_listing ON files (owner_id, COALESCE(s3_path, rel_path)) WHERE is_dir = 0;
 
 -- S3 buckets: a bucket is a name bound to a folder of its owner's tree, and its objects are the
 -- files below that folder.
 CREATE TABLE s3_buckets (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    id             INTEGER PRIMARY KEY,
     -- Unique across the server: an anonymous request names only the bucket. 3 to 63 characters
     -- from [a-z0-9-], starting and ending with a letter or digit.
     name           TEXT    NOT NULL UNIQUE COLLATE BINARY,
@@ -191,7 +224,8 @@ CREATE TABLE s3_key_grants (
     permission      TEXT    NOT NULL CHECK (permission IN ('view', 'full'))
 ) STRICT;
 
--- One grant per key and bucket; NULL counts as the bucket "every bucket".
+-- One grant per key and bucket; NULL counts as the bucket "every bucket". (MySQL: a generated
+-- column with this expression.)
 CREATE UNIQUE INDEX s3_key_grants_key_bucket ON s3_key_grants (app_password_id, ifnull(bucket_id, 0));
 CREATE INDEX s3_key_grants_bucket_id ON s3_key_grants (bucket_id);
 
@@ -299,9 +333,9 @@ CREATE TABLE object_parts (
 ) STRICT;
 
 -- Append-only journal of changes per owner, written in the same transaction as the change.
--- `id` is a monotonically increasing sequence number.
+-- `id` is a monotonically increasing sequence number (from `id_sequences`).
 CREATE TABLE change_log (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    id           INTEGER PRIMARY KEY,
     owner_id     INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     -- No foreign key: the row outlives the deleted file it describes.
     file_id      INTEGER NOT NULL,
@@ -364,6 +398,8 @@ CREATE INDEX upload_sessions_expires_at ON upload_sessions (expires_at);
 -- the user granted access, inside the transaction that deletes the flow row, so their plaintext
 -- is never stored.
 CREATE TABLE login_flows (
+    -- From `id_sequences`: the consent page names the flow by id, and a stale page must never
+    -- name a newer flow.
     id                 INTEGER PRIMARY KEY,
     -- SHA-256 of the token the client polls with.
     poll_token_hash    BLOB    NOT NULL UNIQUE CHECK (length(poll_token_hash) = 32),
@@ -394,7 +430,7 @@ CREATE INDEX login_flows_expires_at ON login_flows (expires_at);
 -- Browser sessions of the server's HTML pages. Created only by signing in with the web login
 -- password; app passwords cannot create them.
 CREATE TABLE web_sessions (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    id           INTEGER PRIMARY KEY,
     -- SHA-256 of the session cookie value.
     token_hash   BLOB    NOT NULL UNIQUE CHECK (length(token_hash) = 32),
     user_id      INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
@@ -429,7 +465,7 @@ CREATE INDEX direct_downloads_expires_at ON direct_downloads (expires_at);
 -- Devices registered for remote access (docs/connect-protocol.md, sections 4 and 6). One row
 -- per Ed25519 key: the key is the device's identity and its iroh `EndpointId`.
 CREATE TABLE devices (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    id                 INTEGER PRIMARY KEY,
     user_id            INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     -- The 32-byte Ed25519 public key. Unique across accounts: a key belongs to one account.
     endpoint_id        BLOB    NOT NULL UNIQUE CHECK (length(endpoint_id) = 32),
@@ -482,9 +518,9 @@ CREATE TABLE retired_usernames (
 ) STRICT;
 
 -- Events that must reach devices that are offline when they happen (protocol 5.6). `seq` is
--- the event's number on the control channel; it only grows.
+-- the event's number on the control channel; it only grows (from `id_sequences`).
 CREATE TABLE device_events (
-    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    seq        INTEGER PRIMARY KEY,
     user_id    INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     kind       TEXT    NOT NULL CHECK (kind IN ('device.added', 'device.revoked', 'pair.approved')),
     -- The event's fields as a JSON object, without `type` and `seq`.
@@ -518,7 +554,7 @@ CREATE INDEX revocations_applied_device_id ON revocations_applied (device_id);
 
 -- Who did what, and when (protocol 12). Never content, never addresses that devices publish.
 CREATE TABLE audit_log (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    id        INTEGER PRIMARY KEY,
     -- The account the record belongs to; NULL for records about no account.
     user_id   INTEGER REFERENCES users (id) ON DELETE CASCADE,
     at        INTEGER NOT NULL,

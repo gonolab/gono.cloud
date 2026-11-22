@@ -733,17 +733,36 @@ async fn devices_can_be_listed_and_revoked_after_a_confirmation() {
     let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", instance.db().display()))
         .await
         .unwrap();
-    let password: i64 = sqlx::query_scalar(
-        "INSERT INTO app_passwords (user_id, token_hash, label, created_at) \
-         VALUES (1, randomblob(32), 'Phone', 0) RETURNING id",
+    // Ids come from `id_sequences`, as the server allocates them.
+    let next_id = |table: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("UPDATE id_sequences SET last_id = last_id + 1 WHERE name = ?")
+                .bind(table)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query_scalar::<_, i64>("SELECT last_id FROM id_sequences WHERE name = ?")
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let password = next_id("app_passwords").await;
+    sqlx::query(
+        "INSERT INTO app_passwords (id, user_id, token_hash, label, created_at) \
+         VALUES (?, 1, randomblob(32), 'Phone', 0)",
     )
-    .fetch_one(&pool)
+    .bind(password)
+    .execute(&pool)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO devices (user_id, endpoint_id, app_password_id, product, platform, name, \
-         registered_at) VALUES (1, ?1, ?2, 'input-show', 'android', 'Phone', 0)",
+        "INSERT INTO devices (id, user_id, endpoint_id, app_password_id, product, platform, \
+         name, registered_at) VALUES (?, 1, ?, ?, 'input-show', 'android', 'Phone', 0)",
     )
+    .bind(next_id("devices").await)
     .bind(vec![1u8; 32])
     .bind(password)
     .execute(&pool)
@@ -1091,4 +1110,102 @@ fn s3_keys_and_buckets_can_be_managed() {
     );
     ok(&["s3", "key", "delete", "admin", "1"]);
     assert!(fails(&["s3", "key", "delete", "admin", "1"]).contains("no S3 access key"));
+}
+
+/// The command line on a MySQL database (only with `GONO_TEST_MYSQL_URL`, see
+/// `gono_server_core::db::testing`): `init` needs a database without the schema, `serve` one
+/// with it, the password comes from `db.password_file`, and `config check` shows the settings
+/// without it.
+#[tokio::test]
+async fn mysql_installations_are_initialized_and_managed() {
+    use gono_server_core::db::{Backend, testing};
+
+    if testing::backend() != Backend::MySql {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let database = testing::config(dir.path()).await.url.unwrap();
+    let name = database.path().trim_start_matches('/').to_owned();
+
+    // An account of its own with a password and the privileges docs/deployment.md lists, as
+    // an installation has.
+    let root = testing::mysql_server().unwrap();
+    sqlx::any::install_default_drivers();
+    let admin = sqlx::AnyPool::connect(root.as_str()).await.unwrap();
+    let account = format!("u{}", &name[name.len() - 12..]);
+    let secret = "pa'ss w0rd";
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE USER '{account}'@'127.0.0.1' IDENTIFIED BY 'pa''ss w0rd'"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP, REFERENCES \
+         ON `{name}`.* TO '{account}'@'127.0.0.1'"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
+    std::fs::write(dir.path().join("mysql-password"), format!("{secret}\n")).unwrap();
+
+    let mut url = database.clone();
+    url.set_username(&account).unwrap();
+    let instance = Instance::new();
+    let config = std::fs::read_to_string(instance.config()).unwrap().replace(
+        "path = \"db/gono-cloud.db\"",
+        &format!(
+            "backend = \"mysql\"\nurl = \"{url}\"\npassword_file = \"{}\"",
+            dir.path().join("mysql-password").display()
+        ),
+    );
+    std::fs::write(instance.config(), config).unwrap();
+
+    let check = run(&mut instance.command(&["config", "check"]));
+    assert!(check.status.success(), "{}", text(&check.stderr));
+    let shown = text(&check.stdout);
+    assert!(
+        shown.contains("db.backend") && shown.contains("mysql"),
+        "{shown}"
+    );
+    assert!(shown.contains(url.as_str()), "{shown}");
+    assert!(
+        !shown.contains("w0rd"),
+        "the password is never shown: {shown}"
+    );
+
+    let serve = run(&mut instance.command(&["serve"]));
+    assert!(!serve.status.success());
+    assert!(
+        text(&serve.stderr).contains("gono-cloud init"),
+        "{}",
+        text(&serve.stderr)
+    );
+
+    let init = instance.init();
+    assert!(init.status.success(), "{}", text(&init.stderr));
+    assert!(text(&init.stdout).contains(&format!("MySQL {url}")));
+    assert!(!instance.db().exists(), "no SQLite file");
+    let again = instance.init();
+    assert!(!again.status.success());
+    assert!(text(&again.stderr).contains("already contains users"));
+
+    let add = run_with_stdin(
+        &mut instance.command(&["user", "add", "alice", "--password-stdin"]),
+        &format!("{PASSWORD}\n"),
+    );
+    assert!(add.status.success(), "{}", text(&add.stderr));
+    let list = text(&run(&mut instance.command(&["user", "list"])).stdout);
+    assert!(list.contains("admin") && list.contains("alice"), "{list}");
+
+    // A wrong password is refused by MySQL.
+    std::fs::write(dir.path().join("mysql-password"), "wrong\n").unwrap();
+    let refused = run(&mut instance.command(&["user", "list"]));
+    assert!(!refused.status.success());
+
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP USER '{account}'@'127.0.0.1'"
+    )))
+    .execute(&admin)
+    .await;
 }

@@ -1583,6 +1583,7 @@ version = "2.0.2"
 dependencies = [
  "argon2",
  "gono-protocol",
+ "gono-server-core",
  "ipnet",
  "rand 0.10.3",
  "ring",
@@ -4452,6 +4453,7 @@ dependencies = [
  "log",
  "memchr",
  "percent-encoding",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4461,6 +4463,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4493,6 +4496,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx-core",
+ "sqlx-mysql",
  "sqlx-sqlite",
  "syn 2.0.119",
  "thiserror 2.0.21",

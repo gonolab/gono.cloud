@@ -10,6 +10,29 @@ compatible within a major version: released clients keep working with newer serv
 
 ## [Unreleased]
 
+### Added
+
+- **MySQL as the database**, as an alternative to the built-in SQLite: `[db] backend =
+  "mysql"` with `url` (for example `mysql://gono@127.0.0.1:3306/gono_cloud`, never with the
+  password) and `password_file`. MySQL 5.7.44 or later with InnoDB and utf8mb4; MariaDB is not
+  supported. `init` creates the tables in an existing, empty database; `serve` refuses a
+  database without them, an older server, a database that is not utf8mb4 and tables that are
+  not InnoDB. Paths, names and keys compare byte for byte as on SQLite (`a` and `a ` are two
+  files), writers of the server and the command line take turns, and ids are never handed out
+  again. TLS to a remote server is built in (`?ssl-mode=verify_identity`); `config check`
+  warns about a remote server without it. MySQL 8's `caching_sha2_password` needs TLS. See
+  "Choosing the database" in `docs/deployment.md`, also for backups with `mysqldump`. SQLite
+  stays the default.
+
+### Changed
+
+- **The database schema changed in place and starts anew**: a database created by 2.0.x is
+  refused (its migration checksum differs); create the installation again as after "Upgrading
+  from 1.x" in `docs/deployment.md`. Ids now come from a table of sequences instead of
+  SQLite's AUTOINCREMENT, the same way on both databases.
+- Paths are limited to 4096 bytes in total (each name still to 255 bytes), on every database;
+  longer paths are refused like overlong names.
+
 ## [2.0.2] - 2026-11-18
 
 Remote access no longer requires two-step verification by default while remote control is in

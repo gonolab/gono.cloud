@@ -1,4 +1,5 @@
-//! `SqliteLs`: the persistent `DavLockSystem` backed by the `locks` table.
+//! `SqliteLs`: the persistent `DavLockSystem` backed by the `locks` table (named after the
+//! database it was written for; it works on every backend of [`gono_server_core::db`]).
 //!
 //! - Locks are stored by owner and **storage** path, so the same file reached through
 //!   different mounts conflicts correctly. dav-server only hands the lock system DAV paths, so

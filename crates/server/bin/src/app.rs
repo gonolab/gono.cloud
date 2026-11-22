@@ -459,8 +459,6 @@ mod tests {
     use gono_server_core::{
         Permission, RelPath, Username,
         app_passwords::{self, Scope},
-        config::DbConfig,
-        db::OpenMode,
         storage::DataLayout,
         users::{self, NewUser},
     };
@@ -482,15 +480,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = DataLayout::new(dir.path().join("data"));
         layout.create().unwrap();
-        let config = DbConfig {
-            path: dir.path().join("db.sqlite"),
-            max_connections: 4,
-            busy_timeout_secs: 5,
-        };
-        let pool = db::connect(&config, OpenMode::CreateIfMissing)
-            .await
-            .unwrap();
-        db::migrate(&pool).await.unwrap();
+        let pool = db::testing::database(dir.path()).await;
         let mut ids = Vec::new();
         for name in ["alice", "bob"] {
             let username = Username::new(name).unwrap();
@@ -1303,7 +1293,7 @@ mod tests {
         let id_of = |path: &'static str| {
             let db = f.state.db.clone();
             async move {
-                sqlx::query_scalar::<_, i64>("SELECT id FROM files WHERE rel_path = ?1")
+                sqlx::query_scalar::<_, i64>("SELECT id FROM files WHERE rel_path = ?")
                     .bind(path)
                     .fetch_one(&db)
                     .await

@@ -117,8 +117,11 @@ pub struct ServerInfo {
     pub log: String,
     /// `storage.data_dir`.
     pub data_dir: PathBuf,
-    /// `db.path`.
-    pub db_path: PathBuf,
+    /// `db.path` of a SQLite database; `None` for MySQL.
+    pub db_path: Option<PathBuf>,
+    /// The database as the overview names it: the SQLite file or the MySQL URL, which carries
+    /// no password ([`gono_server_core::config::DbConfig::describe`]).
+    pub database: String,
     /// Whether the data directory ignores case (`None`: could not be determined).
     pub case_insensitive: Option<bool>,
     /// `webdav.max_lock_timeout_secs`.
@@ -902,15 +905,27 @@ async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Response
 
     let data_dir = info.data_dir.clone();
     let db_path = info.db_path.clone();
-    let (disk, db_bytes) = tokio::task::spawn_blocking(move || {
+    let (disk, file_bytes) = tokio::task::spawn_blocking(move || {
         let disk = gono_server_dav::fs::disk_space(&data_dir);
         let file_size = |path: PathBuf| std::fs::metadata(path).map_or(0, |meta| meta.len());
-        let mut wal = db_path.clone().into_os_string();
-        wal.push("-wal");
-        (disk, file_size(db_path) + file_size(PathBuf::from(wal)))
+        let db_bytes = db_path.map(|db_path| {
+            let mut wal = db_path.clone().into_os_string();
+            wal.push("-wal");
+            file_size(db_path) + file_size(PathBuf::from(wal))
+        });
+        (disk, db_bytes)
     })
     .await
-    .unwrap_or((None, 0));
+    .unwrap_or((None, None));
+    // MySQL keeps its files to itself; it reports the size of the tables and indexes.
+    let db_bytes = match file_bytes {
+        Some(bytes) => bytes,
+        None => db::size_on_server(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0),
+    };
 
     let (storage_number, storage_unit) = pages::split_bytes(stats.storage_used);
     let free_of_total = disk.map_or_else(
@@ -1052,7 +1067,7 @@ async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Response
         case_insensitive: info.case_insensitive,
         storage_used: format_bytes(stats.storage_used),
         free_of_total,
-        db_path: info.db_path.display().to_string(),
+        database: info.database.clone(),
         db_size: format_bytes(db_bytes),
         features,
         stats,

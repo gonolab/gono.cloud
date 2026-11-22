@@ -144,7 +144,7 @@ async fn register(
     );
     instance
         .sql(
-            "UPDATE login_flows SET granted_user_id = 1 WHERE device_endpoint_id = ?1",
+            "UPDATE login_flows SET granted_user_id = 1 WHERE device_endpoint_id = ?",
             Some(key.public().as_bytes().to_vec()),
         )
         .await;

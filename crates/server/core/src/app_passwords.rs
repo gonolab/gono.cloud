@@ -15,7 +15,7 @@ use secrecy::{ExposeSecret, SecretString};
 use sqlx::FromRow;
 
 use crate::{
-    db::{self, Pool, Tx},
+    db::{self, Flag, Pool, Text, Tx},
     error::{Error, Result},
     path::RelPath,
     types::{Permission, Username},
@@ -186,21 +186,23 @@ pub(crate) async fn insert(
     token: &SecretString,
 ) -> Result<i64> {
     let hash = hash_token(token.expose_secret());
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO app_passwords (user_id, token_hash, label, created_at, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5) RETURNING id",
+    let id = db::next_id(tx, "app_passwords").await?;
+    sqlx::query(
+        "INSERT INTO app_passwords (id, user_id, token_hash, label, created_at, expires_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
+    .bind(id)
     .bind(user_id)
     .bind(&hash[..])
     .bind(label)
     .bind(db::unix_now())
     .bind(expires_at)
-    .fetch_one(&mut **tx)
+    .execute(&mut **tx)
     .await?;
     for scope in scopes {
         sqlx::query(
             "INSERT INTO app_password_scopes (app_password_id, mount_path, storage_path, \
-             permission) VALUES (?1, ?2, ?3, ?4)",
+             permission) VALUES (?, ?, ?, ?)",
         )
         .bind(id)
         .bind(scope.mount_path.as_str())
@@ -225,7 +227,9 @@ struct AppPasswordRow {
 #[derive(FromRow)]
 struct ScopeRow {
     app_password_id: i64,
+    #[sqlx(try_from = "Text")]
     mount_path: String,
+    #[sqlx(try_from = "Text")]
     storage_path: String,
     permission: String,
 }
@@ -248,7 +252,7 @@ impl TryFrom<ScopeRow> for Scope {
 pub async fn list(pool: &Pool, user_id: i64) -> Result<Vec<AppPassword>> {
     let rows: Vec<AppPasswordRow> = sqlx::query_as(
         "SELECT id, user_id, label, created_at, expires_at, last_used_at FROM app_passwords \
-         WHERE user_id = ?1 AND kind = 'dav' AND id NOT IN (SELECT app_password_id FROM devices \
+         WHERE user_id = ? AND kind = 'dav' AND id NOT IN (SELECT app_password_id FROM devices \
          WHERE app_password_id IS NOT NULL) ORDER BY id",
     )
     .bind(user_id)
@@ -257,7 +261,7 @@ pub async fn list(pool: &Pool, user_id: i64) -> Result<Vec<AppPassword>> {
     let scope_rows: Vec<ScopeRow> = sqlx::query_as(
         "SELECT s.app_password_id, s.mount_path, s.storage_path, s.permission \
          FROM app_password_scopes s JOIN app_passwords a ON a.id = s.app_password_id \
-         WHERE a.user_id = ?1 ORDER BY s.app_password_id, s.mount_path",
+         WHERE a.user_id = ? ORDER BY s.app_password_id, s.mount_path",
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -289,7 +293,7 @@ pub async fn list(pool: &Pool, user_id: i64) -> Result<Vec<AppPassword>> {
 pub async fn delete(pool: &Pool, user_id: i64, id: i64) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
     let result = sqlx::query(
-        "DELETE FROM app_passwords WHERE id = ?1 AND user_id = ?2 AND kind = 'dav' \
+        "DELETE FROM app_passwords WHERE id = ? AND user_id = ? AND kind = 'dav' \
          AND id NOT IN (SELECT app_password_id FROM devices WHERE app_password_id IS NOT NULL)",
     )
     .bind(id)
@@ -306,8 +310,10 @@ struct DeviceRow {
     user_id: i64,
     expires_at: Option<i64>,
     last_used_at: Option<i64>,
+    #[sqlx(try_from = "Text")]
     username: String,
     display_name: String,
+    #[sqlx(try_from = "Flag")]
     enabled: bool,
 }
 
@@ -324,7 +330,7 @@ pub async fn authenticate(
 ) -> Result<Option<Device>> {
     let hash = hash_token(token.expose_secret());
     let row: Option<DeviceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "{DEVICE_QUERY} WHERE a.kind = 'dav' AND a.token_hash = ?1"
+        "{DEVICE_QUERY} WHERE a.kind = 'dav' AND a.token_hash = ?"
     )))
     .bind(&hash[..])
     .fetch_optional(pool)
@@ -340,7 +346,7 @@ pub async fn authenticate(
 /// a direct download link.
 pub async fn device(pool: &Pool, id: i64, now: i64) -> Result<Option<Device>> {
     let row: Option<DeviceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "{DEVICE_QUERY} WHERE a.kind = 'dav' AND a.id = ?1"
+        "{DEVICE_QUERY} WHERE a.kind = 'dav' AND a.id = ?"
     )))
     .bind(id)
     .fetch_optional(pool)
@@ -364,7 +370,7 @@ async fn device_from_row(pool: &Pool, row: DeviceRow, now: i64) -> Result<Option
 
     let scopes: Vec<ScopeRow> = sqlx::query_as(
         "SELECT app_password_id, mount_path, storage_path, permission \
-         FROM app_password_scopes WHERE app_password_id = ?1 ORDER BY mount_path",
+         FROM app_password_scopes WHERE app_password_id = ? ORDER BY mount_path",
     )
     .bind(row.id)
     .fetch_all(pool)
@@ -388,7 +394,7 @@ async fn device_from_row(pool: &Pool, row: DeviceRow, now: i64) -> Result<Option
 pub async fn is_active(pool: &Pool, id: i64, now: i64) -> Result<bool> {
     let active: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM app_passwords a JOIN users u ON u.id = a.user_id \
-         WHERE a.id = ?1 AND u.enabled = 1 AND (a.expires_at IS NULL OR a.expires_at > ?2)",
+         WHERE a.id = ? AND u.enabled = 1 AND (a.expires_at IS NULL OR a.expires_at > ?)",
     )
     .bind(id)
     .bind(now)
@@ -403,9 +409,10 @@ pub async fn is_active(pool: &Pool, id: i64, now: i64) -> Result<bool> {
 /// when the stored value is older than `now`.
 pub async fn record_use(pool: &Pool, id: i64, now: i64) -> Result<()> {
     sqlx::query(
-        "UPDATE app_passwords SET last_used_at = ?2 \
-         WHERE id = ?1 AND (last_used_at IS NULL OR last_used_at < ?2)",
+        "UPDATE app_passwords SET last_used_at = ? \
+         WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)",
     )
+    .bind(now)
     .bind(id)
     .bind(now)
     .execute(pool)

@@ -281,7 +281,8 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
                     .map_or_else(|| "stdout".to_owned(), |file| file.display().to_string())
             ),
             data_dir: config.storage.data_dir.clone(),
-            db_path: config.db.path.clone(),
+            db_path: (config.db.backend == db::Backend::Sqlite).then(|| config.db.path.clone()),
+            database: config.db.describe(),
             case_insensitive,
             lock_timeout_secs: config.webdav.max_lock_timeout_secs,
             push: push.as_ref().map(|hub| *hub.settings()),

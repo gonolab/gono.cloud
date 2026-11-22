@@ -99,7 +99,7 @@ pub fn client_path(identity: &Identity, path: &DavPath) -> Result<RelPath, FsErr
     let bytes = path.as_bytes();
     let root = dav_root_len(identity, bytes).ok_or(FsError::NotFound)?;
     RelPath::from_raw_segments(bytes[root..].split(|&b| b == b'/')).map_err(|err| match err {
-        PathError::TooLong => FsError::PathTooLong,
+        PathError::TooLong | PathError::PathTooLong => FsError::PathTooLong,
         _ => FsError::Forbidden,
     })
 }

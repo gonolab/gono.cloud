@@ -78,7 +78,7 @@ pub async fn run(config_path: &Path, args: InitArgs) -> anyhow::Result<()> {
 
     println!("Initialized {PRODUCT_NAME}.");
     println!();
-    println!("  database        {}", config.db.path.display());
+    println!("  database        {}", config.db.describe());
     println!("  data directory  {}", config.storage.data_dir.display());
     println!("  two-step key    {key}");
     println!("  admin account   {}", args.admin);

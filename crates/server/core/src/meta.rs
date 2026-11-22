@@ -16,8 +16,9 @@
 //!
 //! # Comparison rules
 //!
-//! - `rel_path` columns use `BINARY` collation. Paths compare byte-for-byte: `Foo` and `foo`
-//!   are different files, exactly like on the underlying file system.
+//! - `rel_path` columns use `BINARY` collation (`VARBINARY` in MySQL, whose `utf8mb4_bin`
+//!   would ignore trailing spaces). Paths compare byte-for-byte: `Foo`, `foo` and `foo ` are
+//!   different files, exactly like on the underlying file system.
 //! - Subtree ("prefix") queries use a half-open range, **never `LIKE`**:
 //!
 //!   ```sql
@@ -27,7 +28,8 @@
 //!   `'0'` is the byte after `'/'`, so the range holds exactly the paths that start with `a/`.
 //!   `LIKE` would treat `_` and `%` in file names as wildcards and, in SQLite, compares ASCII
 //!   case-insensitively, so it silently matches unrelated rows. The range form also uses the
-//!   `(owner_id, rel_path)` index. [`descendant_bounds`] computes the two bounds.
+//!   `(owner_id, rel_path)` index (in MySQL, its prefix of 3000 bytes). [`descendant_bounds`]
+//!   computes the two bounds.
 
 pub mod changes;
 mod objects;

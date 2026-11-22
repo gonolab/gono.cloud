@@ -2,7 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use gono_server_core::config::{RelayConfig, S3Config};
+use gono_server_core::{
+    config::{DbConfig, RelayConfig, S3Config},
+    db::Backend,
+};
 
 use super::load_config;
 
@@ -37,7 +40,9 @@ pub fn run(config_path: &Path) -> anyhow::Result<()> {
             "storage.data_dir",
             config.storage.data_dir.display().to_string(),
         ),
-        ("db.path", config.db.path.display().to_string()),
+    ];
+    settings.extend(db_settings(&config.db));
+    settings.extend([
         (
             "two_factor.key_file",
             format!(
@@ -64,7 +69,7 @@ pub fn run(config_path: &Path) -> anyhow::Result<()> {
         ("files_ui.enabled", config.files_ui.enabled.to_string()),
         ("admin.path", config.admin.path.clone()),
         ("relay.enabled", config.relay.enabled.to_string()),
-    ];
+    ]);
     if config.relay.enabled {
         settings.extend(relay_settings(&config.relay));
         settings.push((
@@ -88,6 +93,41 @@ pub fn run(config_path: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The effective settings of the database. The MySQL URL carries no password (validation
+/// refuses one), and the password file is named, never read here.
+fn db_settings(db: &DbConfig) -> Vec<(&'static str, String)> {
+    let mut settings = vec![("db.backend", db.backend.as_str().to_owned())];
+    match db.backend {
+        Backend::Sqlite => settings.push(("db.path", db.path.display().to_string())),
+        Backend::MySql => {
+            settings.push((
+                "db.url",
+                db.url
+                    .as_ref()
+                    .map_or_else(|| "(none)".to_owned(), ToString::to_string),
+            ));
+            settings.push((
+                "db.password_file",
+                db.password_file.as_ref().map_or_else(
+                    || "(none: the account has no password)".to_owned(),
+                    |file| {
+                        format!(
+                            "{}{}",
+                            file.display(),
+                            if file.exists() { "" } else { " (missing)" }
+                        )
+                    },
+                ),
+            ));
+        }
+    }
+    settings.extend([
+        ("db.max_connections", db.max_connections.to_string()),
+        ("db.busy_timeout_secs", db.busy_timeout_secs.to_string()),
+    ]);
+    settings
 }
 
 /// The effective settings of an enabled S3 API.

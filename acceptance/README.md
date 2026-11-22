@@ -49,6 +49,9 @@ listed test passes, or (with `RUN_LITMUS=1`) when litmus is missing or fails. li
 | `SERVER_PORT=<port>` | Loopback port of the server instead of a free one. |
 | `S3_PORT=<port>` | Loopback port of the S3 API instead of a free one. |
 | `PUBLIC_URL=<url>` | Public origin (`base_url`) that the suite and litmus use instead of the server's own address: a reverse proxy forwarding to `127.0.0.1:SERVER_PORT`. |
+| `DB_BACKEND=mysql` | Keep the metadata in a new database on a MySQL server instead of SQLite; the database is dropped on exit (kept with `KEEP_WORK_DIR=1`). |
+| `GONO_ACCEPT_MYSQL_URL=<url>` | That MySQL server, `mysql://user[:password]@host[:port]`, with an account that may create databases (default: `GONO_TEST_MYSQL_URL`). `scripts/mysql-instance.sh start` runs one on `127.0.0.1:3317`. |
+| `MYSQL=<path>` | `mysql` client that creates and drops the database (default: the one on `PATH`). |
 
 The script turns the S3 API on (with anonymous access allowed), creates the buckets
 `acceptance` (`acl`) and `acceptance-public` (`public-read`, listable) for `gono` and a key with

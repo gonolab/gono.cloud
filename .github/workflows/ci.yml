@@ -47,6 +47,52 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  # The same tests on MySQL 5.7.44, the oldest release the server supports: with
+  # GONO_TEST_MYSQL_URL, every test that needs a database gets a new one on this server
+  # (gono_server_core::db::testing). Root without a password, reachable from the runner only.
+  mysql:
+    name: Tests on MySQL 5.7.44 (Linux)
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:5.7.44
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_ROOT_HOST: "%"
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -u root"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      GONO_TEST_MYSQL_URL: mysql://root@127.0.0.1:3306
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      # The tests create their databases with utf8mb4 explicitly (the image's default is
+      # latin1, which the server refuses). Tests run in parallel, each with a database and a
+      # pool of its own, whose connections keep prepared statements.
+      - name: Configure MySQL
+        run: |
+          mysql --protocol=tcp -h 127.0.0.1 -P 3306 -u root -e "
+            SET GLOBAL max_connections = 500;
+            SET GLOBAL max_prepared_stmt_count = 200000;
+            SELECT VERSION(), @@innodb_default_row_format, @@binlog_format;"
+
+      - name: Test
+        run: cargo test --workspace --locked
+
   acceptance:
     name: Acceptance suite, litmus and nextcloudcmd (Linux)
     runs-on: ubuntu-latest

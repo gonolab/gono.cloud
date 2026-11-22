@@ -14,6 +14,7 @@ from source for development (see `CONTRIBUTING.md`), but there are no macOS rele
 | **Linux** | x86_64 or aarch64, any distribution: the binary is statically linked (musl) and needs no C library, so glibc-based and musl-based systems (Alpine) work alike. The install script and the unit need systemd; systemd 247 or newer applies every hardening option of the unit, older versions ignore some of them with a warning. Without systemd, run the binary from the archive with your own service manager ([Installing by hand](#installing-by-hand)). |
 | **Reverse proxy** | nginx or Caddy on the same host, terminating HTTPS for a domain name. Gono Cloud has no TLS of its own and listens on `127.0.0.1:16102`. |
 | **Storage** | A local file system for the database and the data directory; the data directory must be a single file system. A case-sensitive file system (ext4, XFS, Btrfs) is recommended: on a case-insensitive one, `Report.pdf` and `report.pdf` cannot coexist. Keep the SQLite database off network file systems. |
+| **Database** | SQLite, built in: nothing to install. Or MySQL 5.7.44 or later, on this host or another ([Choosing the database](#choosing-the-database)). |
 
 ## Installing with the install script
 
@@ -80,7 +81,7 @@ gh attestation verify gono-cloud-2.0.0-x86_64-unknown-linux-musl.tar.gz --repo g
 |---|---|
 | Binary | `/usr/local/bin/gono-cloud` |
 | Configuration | `/etc/gono-cloud/config.toml` |
-| Database | `/var/lib/gono-cloud/gono-cloud.db` |
+| Database | `/var/lib/gono-cloud/gono-cloud.db` (SQLite) |
 | Files | `/var/lib/gono-cloud/data/` |
 | Database backups of upgrades | `/var/lib/gono-cloud/backups/` |
 | Logs | the journal: `journalctl -u gono-cloud` |
@@ -126,6 +127,86 @@ directories and configuration the same way (on Alpine:
 `addgroup -S gono-cloud && adduser -S -D -H -G gono-cloud gono-cloud`) and let the
 service manager run `gono-cloud --config /etc/gono-cloud/config.toml serve` as `gono-cloud`. It
 logs to standard output and stops cleanly on SIGTERM within 30 seconds.
+
+## Choosing the database
+
+The database holds the accounts, app passwords and sessions, the metadata of the files (ids,
+ETags, favorites, dead properties, locks, S3 metadata), the device directory and the audit log.
+The files themselves are always in the data directory. `[db] backend` chooses where the
+database lives:
+
+- **SQLite** (`backend = "sqlite"`, the default): built into the binary, one file
+  (`db.path`) next to the data. There is nothing to set up or administer, and it is the right
+  choice for most installations. Everything else in this guide assumes it.
+- **MySQL 5.7.44 or later** (`backend = "mysql"`): for operators who run MySQL already, want
+  the metadata on a database server of its own, or back it up with their database tooling.
+  The tables are InnoDB with utf8mb4. MariaDB is not supported.
+
+Both behave the same: paths compare byte for byte (`Report.pdf`, `report.pdf` and
+`report.pdf ` with a trailing space are three files), paths have at most 4096 bytes, ids are
+never handed out again, and one writer at a time changes the database, the server and the
+command line together. There is no tool that moves an installation from one backend to the
+other: choose before `gono-cloud init`.
+
+### Setting up MySQL
+
+1. Create an empty database with the utf8mb4 character set, and an account that may use it,
+   in the `mysql` client as an administrator:
+
+   ```sql
+   CREATE DATABASE gono_cloud CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+   CREATE USER 'gono'@'127.0.0.1' IDENTIFIED BY '<password>';
+   GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP, REFERENCES
+     ON gono_cloud.* TO 'gono'@'127.0.0.1';
+   ```
+
+   The schema changes need `CREATE`, `ALTER`, `INDEX`, `DROP` and `REFERENCES`; the account
+   needs nothing outside its database. Use the host the server connects from instead of
+   `127.0.0.1` for a database on another host.
+2. Put the password into a file that only the service can read, as its first line:
+
+   ```sh
+   sudo install -m 0640 -o root -g gono-cloud /dev/null /etc/gono-cloud/mysql-password
+   sudoedit /etc/gono-cloud/mysql-password
+   ```
+
+3. In `/etc/gono-cloud/config.toml`, replace `path` in `[db]`:
+
+   ```toml
+   [db]
+   backend = "mysql"
+   url = "mysql://gono@127.0.0.1:3306/gono_cloud"
+   password_file = "/etc/gono-cloud/mysql-password"
+   ```
+
+   The URL never contains the password (`config check` refuses one). For a database on another
+   host, require TLS: `?ssl-mode=verify_identity`, with `&ssl-ca=/etc/gono-cloud/mysql-ca.pem`
+   for a private CA; `config check` warns about a remote database without it. By default
+   (`ssl-mode=preferred`) the connection uses TLS when the server offers it.
+4. Run `gono-cloud init` as the service user, which creates the tables in the empty database
+   and the first admin account, and start the service.
+
+With the install script, install with `--no-start`: it writes the configuration and runs
+`init` on SQLite. Delete the SQLite files it created (`/var/lib/gono-cloud/gono-cloud.db*`),
+follow the steps above, and start the service with `sudo systemctl start gono-cloud`. Upgrades
+with the install script work as with SQLite, except that it does not back up a MySQL database:
+do that yourself first ([Backup and restore](#backup-and-restore)).
+
+`init` refuses a database that holds tables of something else, and `serve` and the other
+commands refuse a database without Gono Cloud's tables, so that a typo in `db.url` never starts
+from an empty database. At every start the server also refuses, with a message that says what
+to change: MySQL older than 5.7.44, a database whose default character set is not utf8mb4,
+tables that are not InnoDB, InnoDB without index keys of 3072 bytes (keep
+`innodb_default_row_format = DYNAMIC`, the default), and binary logging with
+`binlog_format = STATEMENT` (`ROW`, the default, and `MIXED` work). Gono Cloud's connections
+set what they need themselves (strict mode, `READ COMMITTED` isolation, UTC, utf8mb4); the
+defaults of the MySQL server's configuration need no changes.
+
+**MySQL 8.0 and later** authenticate accounts with `caching_sha2_password` by default. Without
+TLS, that needs an RSA key exchange, which Gono Cloud does not include, so the connection must
+use TLS: the default `ssl-mode=preferred` does when the server offers TLS (MySQL 8 does out of
+the box), and `ssl-mode=required` or `verify_identity` insist on it. Where the server still
+offers it, an account `IDENTIFIED WITH mysql_native_password` works without TLS.
 
 ## The first admin account
 
@@ -627,8 +708,8 @@ A complete backup consists of:
 - the configuration, `/etc/gono-cloud/config.toml`, and the key of two-step verification next
   to it, `/etc/gono-cloud/two-factor.key` (keep it apart from copies of the database; it also
   encrypts the secrets of S3 access keys);
-- the database, `/var/lib/gono-cloud/gono-cloud.db`: accounts, app passwords, file metadata
-  (ids, ETags, favorites, locks) and the instance id;
+- the database, `/var/lib/gono-cloud/gono-cloud.db` (or the MySQL database): accounts, app
+  passwords, file metadata (ids, ETags, favorites, locks) and the instance id;
 - the data directory, `/var/lib/gono-cloud/data/`: the users' files.
 
 ### The database
@@ -653,6 +734,19 @@ produce a backup that misses recent changes or is corrupt.** Use one of these:
   `gono-cloud.db-wal` together, start the service. This is what the install script does before
   an upgrade.
 
+A **MySQL** database is backed up with `mysqldump`, while the server runs: `--single-transaction`
+reads every table in one consistent snapshot without locking the server out, and `--hex-blob`
+writes the byte strings (paths, digests, keys) in hex:
+
+```sh
+mysqldump --single-transaction --hex-blob --default-character-set=utf8mb4 \
+  -h 127.0.0.1 -u gono -p gono_cloud > gono-cloud-$(date +%Y%m%d).sql
+```
+
+To restore it, create an empty database as in [Setting up MySQL](#setting-up-mysql), load the
+dump with `mysql --default-character-set=utf8mb4 -h 127.0.0.1 -u gono -p gono_cloud < <file>`
+with the service stopped, and continue with `rescan --all` below.
+
 ### The files
 
 Back up the data directory with any file-level tool (restic, Borg, rsync, a file system
@@ -670,7 +764,7 @@ matter: `rescan` reconciles the metadata with the files after a restore.
 3. Put back the database as `/var/lib/gono-cloud/gono-cloud.db`, owned by `gono-cloud` with mode
    `0640`, and delete any `gono-cloud.db-wal` and `gono-cloud.db-shm` left next to it from the
    replaced database. A `-wal` file from the same backup (a copy taken with the server stopped)
-   belongs next to it.
+   belongs next to it. A MySQL dump goes into an empty database (see above).
 4. Reconcile the metadata with the restored files, as the service user:
    `sudo -u gono-cloud gono-cloud --config /etc/gono-cloud/config.toml rescan --all`.
 5. Start the service: `sudo systemctl start gono-cloud`.

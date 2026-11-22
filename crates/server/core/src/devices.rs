@@ -25,7 +25,7 @@ use sqlx::FromRow;
 use crate::{
     app_passwords,
     audit::{self, Actor, Record},
-    db::{self, Pool, Tx},
+    db::{self, Flag, Pool, Tx},
     error::{Error, Result},
 };
 
@@ -277,7 +277,9 @@ struct DeviceRow {
     platform: String,
     name: String,
     version: String,
+    #[sqlx(try_from = "Flag")]
     accept_remote: bool,
+    #[sqlx(try_from = "Flag")]
     unattended: bool,
     services: String,
     pairing_open_until: Option<i64>,
@@ -353,7 +355,7 @@ pub enum Registration {
 /// The number of registered devices of `user_id`: neither revoked nor signed out.
 pub async fn count_active(pool: &Pool, user_id: i64) -> Result<i64> {
     Ok(sqlx::query_scalar(
-        "SELECT COUNT(*) FROM devices WHERE user_id = ?1 AND app_password_id IS NOT NULL",
+        "SELECT COUNT(*) FROM devices WHERE user_id = ? AND app_password_id IS NOT NULL",
     )
     .bind(user_id)
     .fetch_one(pool)
@@ -373,7 +375,7 @@ pub(crate) async fn register(
     now: i64,
 ) -> Result<Registration> {
     let existing: Option<DeviceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM devices WHERE endpoint_id = ?1"
+        "SELECT {COLUMNS} FROM devices WHERE endpoint_id = ?"
     )))
     .bind(&new.endpoint_id.0[..])
     .fetch_optional(&mut **tx)
@@ -382,7 +384,7 @@ pub(crate) async fn register(
     // revoked (protocol 9.1).
     if existing.is_none() {
         let revoked: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM revoked_keys WHERE endpoint_id = ?1")
+            sqlx::query_scalar("SELECT 1 FROM revoked_keys WHERE endpoint_id = ?")
                 .bind(&new.endpoint_id.0[..])
                 .fetch_optional(&mut **tx)
                 .await?;
@@ -407,25 +409,25 @@ pub(crate) async fn register(
         let password_id =
             app_passwords::insert(tx, user_id, &label, &[], None, &app_password).await?;
         sqlx::query(
-            "UPDATE devices SET app_password_id = ?2, product = ?3, platform = ?4, name = ?5, \
-             version = ?6, pairing_open_until = ?7 WHERE id = ?1",
+            "UPDATE devices SET app_password_id = ?, product = ?, platform = ?, name = ?, \
+             version = ?, pairing_open_until = ? WHERE id = ?",
         )
-        .bind(existing.id)
         .bind(password_id)
         .bind(&new.product)
         .bind(&new.platform)
         .bind(&new.name)
         .bind(&new.version)
         .bind(pairing_until)
+        .bind(existing.id)
         .execute(&mut **tx)
         .await?;
-        sqlx::query("DELETE FROM app_passwords WHERE id = ?1")
+        sqlx::query("DELETE FROM app_passwords WHERE id = ?")
             .bind(old_password)
             .execute(&mut **tx)
             .await?;
         let device = get_in(tx, existing.id).await?;
-        audit::record(
-            &mut **tx,
+        audit::record_in(
+            tx,
             &Record::new(user_id, "device.reregistered", Actor::User)
                 .device(new.endpoint_id)
                 .client_ip(granted_from)
@@ -448,11 +450,13 @@ pub(crate) async fn register(
         return Ok(Registration::TooMany);
     }
     let password_id = app_passwords::insert(tx, user_id, &label, &[], None, &app_password).await?;
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO devices (user_id, endpoint_id, app_password_id, product, platform, name, \
-         version, pairing_open_until, registered_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) RETURNING id",
+    let id = db::next_id(tx, "devices").await?;
+    sqlx::query(
+        "INSERT INTO devices (id, user_id, endpoint_id, app_password_id, product, platform, \
+         name, version, pairing_open_until, registered_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
+    .bind(id)
     .bind(user_id)
     .bind(&new.endpoint_id.0[..])
     .bind(password_id)
@@ -462,7 +466,7 @@ pub(crate) async fn register(
     .bind(&new.version)
     .bind(pairing_until)
     .bind(now)
-    .fetch_one(&mut **tx)
+    .execute(&mut **tx)
     .await?;
     let device = get_in(tx, id).await?;
     append_event(
@@ -473,8 +477,8 @@ pub(crate) async fn register(
         now,
     )
     .await?;
-    audit::record(
-        &mut **tx,
+    audit::record_in(
+        tx,
         &Record::new(user_id, "device.registered", Actor::User)
             .device(new.endpoint_id)
             .client_ip(granted_from)
@@ -510,16 +514,16 @@ async fn come_back(
     let password_id =
         app_passwords::insert(tx, user_id, &new.name, &[], None, &app_password).await?;
     sqlx::query(
-        "UPDATE devices SET app_password_id = ?2, left_at = NULL, product = ?3, platform = ?4, \
-         name = ?5, version = ?6, pairing_open_until = ?7 WHERE id = ?1",
+        "UPDATE devices SET app_password_id = ?, left_at = NULL, product = ?, platform = ?, \
+         name = ?, version = ?, pairing_open_until = ? WHERE id = ?",
     )
-    .bind(id)
     .bind(password_id)
     .bind(&new.product)
     .bind(&new.platform)
     .bind(&new.name)
     .bind(&new.version)
     .bind(now.saturating_add(PAIRING_WINDOW_SECS))
+    .bind(id)
     .execute(&mut **tx)
     .await?;
     let device = get_in(tx, id).await?;
@@ -531,8 +535,8 @@ async fn come_back(
         now,
     )
     .await?;
-    audit::record(
-        &mut **tx,
+    audit::record_in(
+        tx,
         &Record::new(user_id, "device.reregistered", Actor::User)
             .device(new.endpoint_id)
             .client_ip(granted_from)
@@ -554,7 +558,7 @@ async fn come_back(
 
 async fn count_active_in(tx: &mut Tx, user_id: i64) -> Result<i64> {
     Ok(sqlx::query_scalar(
-        "SELECT COUNT(*) FROM devices WHERE user_id = ?1 AND app_password_id IS NOT NULL",
+        "SELECT COUNT(*) FROM devices WHERE user_id = ? AND app_password_id IS NOT NULL",
     )
     .bind(user_id)
     .fetch_one(&mut **tx)
@@ -563,7 +567,7 @@ async fn count_active_in(tx: &mut Tx, user_id: i64) -> Result<i64> {
 
 async fn get_in(tx: &mut Tx, id: i64) -> Result<Device> {
     let row: DeviceRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM devices WHERE id = ?1"
+        "SELECT {COLUMNS} FROM devices WHERE id = ?"
     )))
     .bind(id)
     .fetch_one(&mut **tx)
@@ -574,7 +578,7 @@ async fn get_in(tx: &mut Tx, id: i64) -> Result<Device> {
 /// Every directory entry of `user_id`, revoked ones included, oldest first.
 pub async fn list(pool: &Pool, user_id: i64) -> Result<Vec<Device>> {
     let rows: Vec<DeviceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM devices WHERE user_id = ?1 ORDER BY id"
+        "SELECT {COLUMNS} FROM devices WHERE user_id = ? ORDER BY id"
     )))
     .bind(user_id)
     .fetch_all(pool)
@@ -585,7 +589,7 @@ pub async fn list(pool: &Pool, user_id: i64) -> Result<Vec<Device>> {
 /// The entry with row id `id`.
 pub async fn get(pool: &Pool, id: i64) -> Result<Option<Device>> {
     let row: Option<DeviceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM devices WHERE id = ?1"
+        "SELECT {COLUMNS} FROM devices WHERE id = ?"
     )))
     .bind(id)
     .fetch_optional(pool)
@@ -596,7 +600,7 @@ pub async fn get(pool: &Pool, id: i64) -> Result<Option<Device>> {
 /// The entry of key `endpoint_id`, in any account.
 pub async fn find(pool: &Pool, endpoint_id: EndpointId) -> Result<Option<Device>> {
     let row: Option<DeviceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM devices WHERE endpoint_id = ?1"
+        "SELECT {COLUMNS} FROM devices WHERE endpoint_id = ?"
     )))
     .bind(&endpoint_id.0[..])
     .fetch_optional(pool)
@@ -607,7 +611,7 @@ pub async fn find(pool: &Pool, endpoint_id: EndpointId) -> Result<Option<Device>
 /// The unrevoked device whose credential is app password `app_password_id`.
 pub async fn find_by_app_password(pool: &Pool, app_password_id: i64) -> Result<Option<Device>> {
     let row: Option<DeviceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM devices WHERE app_password_id = ?1"
+        "SELECT {COLUMNS} FROM devices WHERE app_password_id = ?"
     )))
     .bind(app_password_id)
     .fetch_optional(pool)
@@ -657,7 +661,7 @@ pub async fn update_settings(
         .map(|services| serde_json::Value::from(services).to_string());
     let mut tx = db::begin_immediate(pool).await?;
     let Some(before) = sqlx::query_as::<_, DeviceRow>(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM devices WHERE id = ?1 AND app_password_id IS NOT NULL"
+        "SELECT {COLUMNS} FROM devices WHERE id = ? AND app_password_id IS NOT NULL"
     )))
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -666,21 +670,21 @@ pub async fn update_settings(
         return Ok(None);
     };
     sqlx::query(
-        "UPDATE devices SET name = COALESCE(?2, name), \
-         accept_remote = COALESCE(?3, accept_remote), unattended = COALESCE(?4, unattended), \
-         services = COALESCE(?5, services) WHERE id = ?1",
+        "UPDATE devices SET name = COALESCE(?, name), \
+         accept_remote = COALESCE(?, accept_remote), unattended = COALESCE(?, unattended), \
+         services = COALESCE(?, services) WHERE id = ?",
     )
-    .bind(id)
     .bind(&name)
-    .bind(settings.accept_remote)
-    .bind(settings.unattended)
+    .bind(settings.accept_remote.map(i64::from))
+    .bind(settings.unattended.map(i64::from))
     .bind(&services)
+    .bind(id)
     .execute(&mut *tx)
     .await?;
     let after = get_in(&mut tx, id).await?;
     if before.name != after.name {
-        audit::record(
-            &mut *tx,
+        audit::record_in(
+            &mut tx,
             &Record::new(after.user_id, "device.renamed", actor)
                 .device(after.endpoint_id)
                 .details(json!({ "from": before.name, "to": after.name })),
@@ -689,8 +693,8 @@ pub async fn update_settings(
         .await?;
     }
     if before.accept_remote != after.accept_remote || before.unattended != after.unattended {
-        audit::record(
-            &mut *tx,
+        audit::record_in(
+            &mut tx,
             &Record::new(after.user_id, "device.settings", actor)
                 .device(after.endpoint_id)
                 .details(json!({
@@ -708,9 +712,10 @@ pub async fn update_settings(
 /// Records that device `id` had a control connection at `now`.
 pub async fn record_seen(pool: &Pool, id: i64, now: i64) -> Result<()> {
     sqlx::query(
-        "UPDATE devices SET last_seen_at = ?2 \
-         WHERE id = ?1 AND (last_seen_at IS NULL OR last_seen_at < ?2)",
+        "UPDATE devices SET last_seen_at = ? \
+         WHERE id = ? AND (last_seen_at IS NULL OR last_seen_at < ?)",
     )
+    .bind(now)
     .bind(id)
     .bind(now)
     .execute(pool)
@@ -729,12 +734,12 @@ pub async fn open_pairing(
 ) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
     let opened = sqlx::query(
-        "UPDATE devices SET pairing_open_until = ?3 \
-         WHERE user_id = ?1 AND endpoint_id = ?2 AND app_password_id IS NOT NULL",
+        "UPDATE devices SET pairing_open_until = ? \
+         WHERE user_id = ? AND endpoint_id = ? AND app_password_id IS NOT NULL",
     )
+    .bind(until)
     .bind(user_id)
     .bind(&endpoint_id.0[..])
-    .bind(until)
     .execute(&mut *tx)
     .await?
     .rows_affected()
@@ -790,7 +795,7 @@ pub async fn revoke(
     for endpoint_id in endpoint_ids {
         let row: Option<(i64, Option<i64>)> = sqlx::query_as(
             "SELECT id, app_password_id FROM devices \
-             WHERE user_id = ?1 AND endpoint_id = ?2 AND revoked_at IS NULL",
+             WHERE user_id = ? AND endpoint_id = ? AND revoked_at IS NULL",
         )
         .bind(user_id)
         .bind(&endpoint_id.0[..])
@@ -800,25 +805,29 @@ pub async fn revoke(
             continue;
         };
         sqlx::query(
-            "UPDATE devices SET revoked_at = ?2, app_password_id = NULL, \
-             pairing_open_until = NULL WHERE id = ?1",
+            "UPDATE devices SET revoked_at = ?, app_password_id = NULL, \
+             pairing_open_until = NULL WHERE id = ?",
         )
-        .bind(id)
         .bind(now)
+        .bind(id)
         .execute(&mut *tx)
         .await?;
         if let Some(app_password_id) = app_password_id {
-            sqlx::query("DELETE FROM app_passwords WHERE id = ?1")
+            sqlx::query("DELETE FROM app_passwords WHERE id = ?")
                 .bind(app_password_id)
                 .execute(&mut *tx)
                 .await?;
         }
         // Kept after the account is deleted, which removes the entry (protocol 9.1).
-        sqlx::query("INSERT OR IGNORE INTO revoked_keys (endpoint_id, revoked_at) VALUES (?1, ?2)")
-            .bind(&endpoint_id.0[..])
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(tx.backend().pick(
+            "INSERT OR IGNORE INTO revoked_keys (endpoint_id, revoked_at) VALUES (?, ?)",
+            "INSERT INTO revoked_keys (endpoint_id, revoked_at) VALUES (?, ?) \
+             ON DUPLICATE KEY UPDATE endpoint_id = endpoint_id",
+        ))
+        .bind(&endpoint_id.0[..])
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
         append_event(
             &mut tx,
             user_id,
@@ -835,8 +844,8 @@ pub async fn revoke(
             .filter(|other| other.id != device.id)
             .map(|other| other.endpoint_id.to_hex())
             .collect();
-        audit::record(
-            &mut *tx,
+        audit::record_in(
+            &mut tx,
             &Record::new(user_id, "device.revoked", by.actor())
                 .device(device.endpoint_id)
                 .client_ip(client_ip)
@@ -857,7 +866,7 @@ pub async fn revoke(
 pub async fn leave(pool: &Pool, id: i64, actor: Actor, now: i64) -> Result<Option<Device>> {
     let mut tx = db::begin_immediate(pool).await?;
     let Some(device) = sqlx::query_as::<_, DeviceRow>(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM devices WHERE id = ?1 AND app_password_id IS NOT NULL"
+        "SELECT {COLUMNS} FROM devices WHERE id = ? AND app_password_id IS NOT NULL"
     )))
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -866,19 +875,19 @@ pub async fn leave(pool: &Pool, id: i64, actor: Actor, now: i64) -> Result<Optio
         return Ok(None);
     };
     sqlx::query(
-        "UPDATE devices SET app_password_id = NULL, left_at = ?2, pairing_open_until = NULL \
-         WHERE id = ?1",
+        "UPDATE devices SET app_password_id = NULL, left_at = ?, pairing_open_until = NULL \
+         WHERE id = ?",
     )
-    .bind(id)
     .bind(now)
+    .bind(id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("DELETE FROM app_passwords WHERE id = ?1")
+    sqlx::query("DELETE FROM app_passwords WHERE id = ?")
         .bind(device.app_password_id)
         .execute(&mut *tx)
         .await?;
-    audit::record(
-        &mut *tx,
+    audit::record_in(
+        &mut tx,
         &Record::new(device.user_id, "device.removed", actor).device(device.endpoint_id),
         now,
     )
@@ -893,7 +902,7 @@ pub async fn leave(pool: &Pool, id: i64, actor: Actor, now: i64) -> Result<Optio
 pub async fn introduced_by(pool: &Pool, approver: i64) -> Result<Vec<Device>> {
     let rows: Vec<DeviceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {} FROM devices d JOIN device_approvals a ON a.subject_id = d.id \
-         WHERE a.approver_id = ?1 AND d.revoked_at IS NULL ORDER BY a.approved_at, d.id",
+         WHERE a.approver_id = ? AND d.revoked_at IS NULL ORDER BY a.approved_at, d.id",
         COLUMNS
             .split(", ")
             .map(|column| format!("d.{column}"))
@@ -919,10 +928,12 @@ pub async fn record_approval(
 ) -> Result<i64> {
     let mut tx = db::begin_immediate(pool).await?;
     let seq = append_event(&mut tx, user_id, "pair.approved", body, now).await?;
-    sqlx::query(
-        "INSERT INTO device_approvals (approver_id, subject_id, approved_at) VALUES (?1, ?2, ?3) \
+    sqlx::query(tx.backend().pick(
+        "INSERT INTO device_approvals (approver_id, subject_id, approved_at) VALUES (?, ?, ?) \
          ON CONFLICT (approver_id, subject_id) DO UPDATE SET approved_at = excluded.approved_at",
-    )
+        "INSERT INTO device_approvals (approver_id, subject_id, approved_at) VALUES (?, ?, ?) \
+         ON DUPLICATE KEY UPDATE approved_at = VALUES(approved_at)",
+    ))
     .bind(approver)
     .bind(subject)
     .bind(now)
@@ -943,21 +954,39 @@ pub async fn record_applied(
     let mut tx = db::begin_immediate(pool).await?;
     let mut recorded = Vec::new();
     for endpoint_id in revoked {
-        let inserted = sqlx::query(
-            "INSERT INTO revocations_applied (revoked_device_id, device_id, applied_at) \
-             SELECT r.id, d.id, ?3 FROM devices r JOIN devices d ON d.user_id = r.user_id \
-             WHERE r.endpoint_id = ?2 AND r.revoked_at IS NOT NULL AND d.id = ?1 \
-             ON CONFLICT DO NOTHING",
+        // A revoked device of the same account, whose revocation this device has not applied
+        // yet. The write transaction keeps the checks and the insert together.
+        let revoked_id: Option<i64> = sqlx::query_scalar(
+            "SELECT r.id FROM devices r JOIN devices d ON d.user_id = r.user_id \
+             WHERE r.endpoint_id = ? AND r.revoked_at IS NOT NULL AND d.id = ?",
         )
-        .bind(device_id)
         .bind(&endpoint_id.0[..])
+        .bind(device_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(revoked_id) = revoked_id else {
+            continue;
+        };
+        let applied: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM revocations_applied WHERE revoked_device_id = ? AND device_id = ?",
+        )
+        .bind(revoked_id)
+        .bind(device_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if applied.is_some() {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO revocations_applied (revoked_device_id, device_id, applied_at) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(revoked_id)
+        .bind(device_id)
         .bind(now)
         .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if inserted == 1 {
-            recorded.push(*endpoint_id);
-        }
+        .await?;
+        recorded.push(*endpoint_id);
     }
     tx.commit().await?;
     Ok(recorded)
@@ -968,7 +997,7 @@ pub async fn record_applied(
 pub async fn applied(pool: &Pool, user_id: i64) -> Result<Vec<(i64, i64)>> {
     Ok(sqlx::query_as(
         "SELECT a.revoked_device_id, a.device_id FROM revocations_applied a \
-         JOIN devices r ON r.id = a.revoked_device_id WHERE r.user_id = ?1",
+         JOIN devices r ON r.id = a.revoked_device_id WHERE r.user_id = ?",
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -998,16 +1027,18 @@ pub(crate) async fn append_event(
     body: &serde_json::Value,
     now: i64,
 ) -> Result<i64> {
-    Ok(sqlx::query_scalar(
-        "INSERT INTO device_events (user_id, kind, body, created_at) VALUES (?1, ?2, ?3, ?4) \
-         RETURNING seq",
+    let seq = db::next_id(tx, "device_events").await?;
+    sqlx::query(
+        "INSERT INTO device_events (seq, user_id, kind, body, created_at) VALUES (?, ?, ?, ?, ?)",
     )
+    .bind(seq)
     .bind(user_id)
     .bind(kind)
     .bind(body.to_string())
     .bind(now)
-    .fetch_one(&mut **tx)
-    .await?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(seq)
 }
 
 /// Up to `limit` events of `user_id` after `since`, oldest first, and whether events after
@@ -1023,7 +1054,7 @@ pub async fn events_since(
 ) -> Result<(Vec<Event>, bool)> {
     let mut events: Vec<Event> = sqlx::query_as(
         "SELECT seq, user_id, kind, body, created_at FROM device_events \
-         WHERE user_id = ?1 AND seq > ?2 ORDER BY seq DESC LIMIT ?3",
+         WHERE user_id = ? AND seq > ? ORDER BY seq DESC LIMIT ?",
     )
     .bind(user_id)
     .bind(since)
@@ -1039,7 +1070,7 @@ pub async fn events_since(
     // and needs none of the old ones.
     if since > 0 && !truncated {
         let kept: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM device_events WHERE user_id = ?1 AND seq = ?2")
+            sqlx::query_scalar("SELECT 1 FROM device_events WHERE user_id = ? AND seq = ?")
                 .bind(user_id)
                 .bind(since)
                 .fetch_optional(pool)
@@ -1054,7 +1085,7 @@ pub async fn events_since(
 pub async fn events_after(pool: &Pool, seq: i64, limit: i64) -> Result<Vec<Event>> {
     Ok(sqlx::query_as(
         "SELECT seq, user_id, kind, body, created_at FROM device_events \
-         WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+         WHERE seq > ? ORDER BY seq LIMIT ?",
     )
     .bind(seq)
     .bind(limit)
@@ -1064,9 +1095,9 @@ pub async fn events_after(pool: &Pool, seq: i64, limit: i64) -> Result<Vec<Event
 
 /// The highest sequence number ever handed out, 0 if none.
 pub async fn last_seq(pool: &Pool) -> Result<i64> {
-    // `sqlite_sequence` remembers the highest AUTOINCREMENT value even after rows are purged.
+    // `id_sequences` remembers the highest number even after the events are purged.
     let seq: Option<i64> =
-        sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name = 'device_events'")
+        sqlx::query_scalar("SELECT last_id FROM id_sequences WHERE name = 'device_events'")
             .fetch_optional(pool)
             .await?;
     Ok(seq.unwrap_or(0))
@@ -1075,7 +1106,7 @@ pub async fn last_seq(pool: &Pool) -> Result<i64> {
 /// Removes every event appended before `before`. Returns how many there were.
 pub async fn purge_events(pool: &Pool, before: i64) -> Result<u64> {
     let mut tx = db::begin_immediate(pool).await?;
-    let purged = sqlx::query("DELETE FROM device_events WHERE created_at < ?1")
+    let purged = sqlx::query("DELETE FROM device_events WHERE created_at < ?")
         .bind(before)
         .execute(&mut *tx)
         .await?
@@ -1089,7 +1120,7 @@ pub async fn purge_events(pool: &Pool, before: i64) -> Result<u64> {
 pub async fn remote_access(pool: &Pool, user_id: i64, require_two_factor: bool) -> Result<bool> {
     let available: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM users u LEFT JOIN two_factor t ON t.user_id = u.id \
-         WHERE u.id = ?1 AND u.enabled = 1 AND (?2 = 0 OR t.user_id IS NOT NULL)",
+         WHERE u.id = ? AND u.enabled = 1 AND (? = 0 OR t.user_id IS NOT NULL)",
     )
     .bind(user_id)
     .bind(require_two_factor)
@@ -1106,7 +1137,7 @@ pub async fn admissible(pool: &Pool, require_two_factor: bool) -> Result<Vec<End
         "SELECT d.endpoint_id FROM devices d JOIN users u ON u.id = d.user_id \
          LEFT JOIN two_factor t ON t.user_id = u.id \
          WHERE d.app_password_id IS NOT NULL AND u.enabled = 1 \
-         AND (?1 = 0 OR t.user_id IS NOT NULL)",
+         AND (? = 0 OR t.user_id IS NOT NULL)",
     )
     .bind(require_two_factor)
     .fetch_all(pool)
@@ -1141,7 +1172,7 @@ pub async fn enabled_accounts(pool: &Pool) -> Result<Vec<i64>> {
 pub async fn remote_access_accounts(pool: &Pool, require_two_factor: bool) -> Result<Vec<i64>> {
     Ok(sqlx::query_scalar(
         "SELECT u.id FROM users u LEFT JOIN two_factor t ON t.user_id = u.id \
-         WHERE u.enabled = 1 AND (?1 = 0 OR t.user_id IS NOT NULL)",
+         WHERE u.enabled = 1 AND (? = 0 OR t.user_id IS NOT NULL)",
     )
     .bind(require_two_factor)
     .fetch_all(pool)

@@ -128,7 +128,7 @@ pub struct OverviewPage {
     pub case_insensitive: Option<bool>,
     pub storage_used: String,
     pub free_of_total: String,
-    pub db_path: String,
+    pub database: String,
     pub db_size: String,
     pub features: Vec<Feature>,
 }

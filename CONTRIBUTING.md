@@ -37,12 +37,27 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
+The tests that need a database run on SQLite. For changes to SQL, the schema or
+`gono_server_core::db`, run them on MySQL as well (CI does, in the `mysql` job): with
+`GONO_TEST_MYSQL_URL`, every test gets a new database on that server.
+`acceptance/scripts/mysql-instance.sh` starts a throwaway MySQL 5.7 on `127.0.0.1:3317` (from
+Homebrew's `mysql@5.7`, or `MYSQL_BASEDIR`):
+
+```sh
+acceptance/scripts/mysql-instance.sh start
+GONO_TEST_MYSQL_URL=$(acceptance/scripts/mysql-instance.sh url) cargo test --workspace --locked
+```
+
+A schema change goes into both `crates/server/core/migrations/sqlite/` and `.../mysql/`.
+
 For changes to the server's behavior, also run the acceptance suite, which builds the server,
 starts it on a throwaway installation and talks to it over HTTP only:
 
 ```sh
 acceptance/scripts/run-new.sh
 RUN_LITMUS=1 acceptance/scripts/run-new.sh       # also the litmus WebDAV suite, if installed
+DB_BACKEND=mysql GONO_ACCEPT_MYSQL_URL=$(acceptance/scripts/mysql-instance.sh url) \
+  acceptance/scripts/run-new.sh                  # on a new MySQL database (needs the mysql client)
 acceptance/scripts/nextcloudcmd-scenarios.sh     # Nextcloud desktop client, if installed
 ```
 

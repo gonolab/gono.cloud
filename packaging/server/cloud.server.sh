@@ -546,10 +546,17 @@ install_release() {
 		if ! "$PAYLOAD/gono-cloud" --config "$CONFIG_FILE" config check >/dev/null; then
 			die "Gono Cloud $NEW_VERSION does not accept $CONFIG_FILE; fix it and run the installer again"
 		fi
-		db_path=$(setting "$PAYLOAD/gono-cloud" "$CONFIG_FILE" db.path)
-		# A configuration without a database: an earlier install stopped before `init`.
-		[ -e "$db_path" ] || needs_init=1
-		[ "$needs_init" = 1 ] || refuse_upgrade_from_1x "$db_path"
+		if [ "$(setting "$PAYLOAD/gono-cloud" "$CONFIG_FILE" db.backend)" = mysql ]; then
+			# MySQL: the database is no file here, and `init` ran when it was set up
+			# (docs/deployment.md, "Choosing the database"). Its backups are the operator's.
+			db_path=""
+			log "The database is MySQL: back it up with mysqldump before upgrades"
+		else
+			db_path=$(setting "$PAYLOAD/gono-cloud" "$CONFIG_FILE" db.path)
+			# A configuration without a database: an earlier install stopped before `init`.
+			[ -e "$db_path" ] || needs_init=1
+			[ "$needs_init" = 1 ] || refuse_upgrade_from_1x "$db_path"
+		fi
 	fi
 	if [ "$needs_init" = 1 ] && [ "$PASSWORD_STDIN" = 0 ] && ! [ -t 0 ]; then
 		die "a fresh install creates the first admin account: run the installer from a terminal, or pass --admin-password-stdin"

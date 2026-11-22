@@ -1,22 +1,14 @@
 //! The database's write gate (`db::begin_immediate`): writers queue in this process instead of
-//! in SQLite's busy handler, one at a time, and readers are never held up by them.
+//! in the database's lock wait, one at a time, and readers are never held up by them. On MySQL
+//! the row lock of `write_lock` also serializes writers of different processes. The tests run on
+//! the backend `GONO_TEST_MYSQL_URL` chooses (see `db::testing`).
 
 use std::time::Duration;
 
-use gono_server_core::{
-    config::DbConfig,
-    db::{self, OpenMode, Pool},
-};
+use gono_server_core::db::{self, Backend, OpenMode, Pool};
 
 async fn database(dir: &std::path::Path) -> Pool {
-    let config = DbConfig {
-        path: dir.join("gono-cloud.db"),
-        max_connections: 4,
-        busy_timeout_secs: 5,
-    };
-    let pool = db::connect(&config, OpenMode::CreateIfMissing)
-        .await
-        .expect("connect");
+    let pool = db::testing::database(dir).await;
     sqlx::query("CREATE TABLE counter (n INTEGER NOT NULL)")
         .execute(&pool)
         .await
@@ -115,4 +107,69 @@ async fn databases_have_gates_of_their_own() {
         .unwrap();
     other.commit().await.unwrap();
     held.commit().await.unwrap();
+}
+
+/// Two pools on one MySQL database stand for two processes (the server and the CLI): they
+/// have gates of their own, and the row lock of `write_lock` still lets one writer at a time
+/// through.
+#[tokio::test]
+async fn mysql_writers_of_different_processes_take_turns() {
+    if db::testing::backend() != Backend::MySql {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = db::testing::config(dir.path()).await;
+    let first = db::testing::open(&config).await;
+    sqlx::query("CREATE TABLE counter (n INTEGER NOT NULL)")
+        .execute(&first)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO counter (n) VALUES (0)")
+        .execute(&first)
+        .await
+        .unwrap();
+    // Another URL for the same database: another gate, as in another process.
+    let mut other = config.clone();
+    let mut url = other.url.clone().unwrap();
+    url.set_query(Some("statement-cache-capacity=99"));
+    other.url = Some(url);
+    let second = db::connect(&other, OpenMode::MustExist).await.unwrap();
+
+    let mut held = db::begin_immediate(&first).await.unwrap();
+    sqlx::query("UPDATE counter SET n = n + 1")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let waiting = tokio::spawn(async move {
+        let mut tx = db::begin_immediate(&second).await.unwrap();
+        let seen: i64 = sqlx::query_scalar("SELECT n FROM counter")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE counter SET n = n * 10")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        seen
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !waiting.is_finished(),
+        "the other process's writer did not wait"
+    );
+    held.commit().await.unwrap();
+    let seen = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("the other process's writer never got the lock")
+        .unwrap();
+    assert_eq!(
+        seen, 1,
+        "the second writer read after the first one committed"
+    );
+    let n: i64 = sqlx::query_scalar("SELECT n FROM counter")
+        .fetch_one(&first)
+        .await
+        .unwrap();
+    assert_eq!(n, 10);
 }

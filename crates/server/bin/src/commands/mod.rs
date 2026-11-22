@@ -40,12 +40,16 @@ fn load_config(path: &Path) -> anyhow::Result<Config> {
 /// data directory. A command started as root (`sudo gono-cloud user add ...`) would create files
 /// the server cannot write afterwards: the SQLite WAL and shared-memory files, the storage
 /// directories of new users, partial uploads. Such commands have to run as the owner instead
-/// (`sudo -u gono-cloud gono-cloud ...`). Installations owned by root are not affected.
+/// (`sudo -u gono-cloud gono-cloud ...`). Installations owned by root are not affected. A
+/// MySQL database has no files here; only the data directory counts then.
 fn refuse_root_on_foreign_install(config: &Config) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         let euid = rustix::process::geteuid().as_raw();
-        let paths = [config.db.path.as_path(), config.storage.data_dir.as_path()];
+        let mut paths = vec![config.storage.data_dir.as_path()];
+        if config.db.backend == db::Backend::Sqlite {
+            paths.insert(0, config.db.path.as_path());
+        }
         if let Some((path, owner)) = foreign_owner(euid, &paths) {
             bail!(
                 "this command runs as root, but {} belongs to user id {owner}; files it creates \

@@ -392,8 +392,6 @@ mod tests {
     use gono_server_core::{
         Permission, RelPath, Username,
         app_passwords::{self, Scope},
-        config::DbConfig,
-        db::OpenMode,
         meta::{DiskStat, MetaStore},
         storage::DataLayout,
         users::{self, NewUser},
@@ -440,15 +438,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = DataLayout::new(dir.path().join("data"));
         layout.create().unwrap();
-        let config = DbConfig {
-            path: dir.path().join("db.sqlite"),
-            max_connections: 4,
-            busy_timeout_secs: 5,
-        };
-        let pool = db::connect(&config, OpenMode::CreateIfMissing)
-            .await
-            .unwrap();
-        db::migrate(&pool).await.unwrap();
+        let pool = db::testing::database(dir.path()).await;
         let username = Username::new("alice").unwrap();
         let alice = users::create(
             &pool,

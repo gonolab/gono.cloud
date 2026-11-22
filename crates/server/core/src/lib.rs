@@ -1,7 +1,8 @@
 //! Core building blocks of Gono Cloud that do not depend on any HTTP framework.
 //!
 //! - [`config`]: the TOML configuration file, its defaults and its validation.
-//! - [`db`]: SQLite connection setup and the embedded schema migrations.
+//! - [`db`]: the database (SQLite or MySQL): connections, write transactions, ids, the
+//!   embedded schema migrations and the helpers that keep queries portable.
 //! - [`meta`]: rules shared by every query on path-keyed metadata.
 //! - [`path`]: [`RelPath`], the validated and NFC-normalized form of storage paths.
 //! - [`storage`]: layout of the data directory.

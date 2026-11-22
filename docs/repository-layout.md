@@ -23,8 +23,10 @@ other's way.
 │       ├── CHANGELOG.md    Changes of each server release
 │       ├── bin/            gono-server: the `gono-cloud` binary (CLI, HTTP routing, Login Flow
 │       │                   and admin UI pages with their templates and assets)
-│       ├── core/           gono-server-core: configuration, SQLite metadata store and
-│       │                   migrations, users, app passwords, web sessions, rescan
+│       ├── core/           gono-server-core: configuration, the metadata store on SQLite or
+│       │                   MySQL with its migrations (migrations/sqlite/ and
+│       │                   migrations/mysql/, one file of each per version), users, app
+│       │                   passwords, web sessions, rescan
 │       ├── dav/            gono-server-dav: WebDAV file system on top of dav-server
 │       ├── nextcloud/      gono-server-nextcloud: status, capabilities, OCS, chunked upload v2,
 │       │                   Login Flow v2 documents, notify_push hub
@@ -131,6 +133,17 @@ Server and clients are released independently, and users do not update them toge
 file and never depends on a crate of this repository, including `gono-protocol`: shared types
 would let a wire-format change slip through on both sides at once, while the suite's own
 definitions catch it.
+
+### The schema exists once per database
+
+The server's metadata store runs on SQLite and on MySQL. Its schema is written twice, in
+`crates/server/core/migrations/sqlite/` and `crates/server/core/migrations/mysql/`: every
+version has a file of the same number and name in both, with the same tables, columns, keys and
+cascades (`crates/server/core/tests/migrations.rs` checks that the versions match and pins
+their checksums). Queries are written once for both wherever the dialects agree;
+`gono_server_core::db` describes the rules. The tests run on SQLite by default and on MySQL
+with `GONO_TEST_MYSQL_URL` (`acceptance/scripts/mysql-instance.sh` starts a local server; CI
+runs the `mysql` job on MySQL 5.7.44).
 
 ### One lock file, with an escape hatch
 

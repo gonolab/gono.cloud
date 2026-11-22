@@ -13,7 +13,10 @@
 //! - Segments are never empty, `.` or `..`, and contain neither `/` nor NUL, so a [`RelPath`]
 //!   can be joined onto a root directory without escaping it lexically. (Symbolic links are a
 //!   separate concern, handled by the code that touches the file system.)
-//! - Segments are at most [`MAX_SEGMENT_BYTES`] bytes long, the limit of common file systems.
+//! - Segments are at most [`MAX_SEGMENT_BYTES`] bytes long, the limit of common file systems,
+//!   and a whole path at most [`MAX_PATH_BYTES`] bytes, Linux's `PATH_MAX`. The database stores
+//!   paths of up to that length on every backend (MySQL's path columns are `VARBINARY(4096)`),
+//!   so a path is accepted or refused the same way whichever database holds the metadata.
 //!
 //! The textual form has no leading or trailing slash and is `""` for the root, matching the
 //! `rel_path` convention described in [`crate::meta`].
@@ -27,6 +30,12 @@ use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 
 /// Longest accepted path segment, in bytes (after NFC normalization).
 pub const MAX_SEGMENT_BYTES: usize = 255;
+
+/// Longest accepted path, in bytes, without leading slash (after NFC normalization).
+///
+/// The `rel_path` columns of the MySQL schema hold exactly this many bytes; keep the two in
+/// step.
+pub const MAX_PATH_BYTES: usize = 4096;
 
 /// Why a path segment was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -49,6 +58,9 @@ pub enum PathError {
     /// The segment is longer than [`MAX_SEGMENT_BYTES`].
     #[error("path segment is longer than 255 bytes")]
     TooLong,
+    /// The whole path is longer than [`MAX_PATH_BYTES`].
+    #[error("path is longer than 4096 bytes")]
+    PathTooLong,
 }
 
 /// Validates one raw (already percent-decoded) path segment and returns it in NFC.
@@ -118,7 +130,8 @@ impl RelPath {
 
     /// Builds a path from raw segments, validating and normalizing each one.
     ///
-    /// Empty segments (from doubled or trailing slashes) are skipped.
+    /// Empty segments (from doubled or trailing slashes) are skipped. The whole path may have
+    /// at most [`MAX_PATH_BYTES`] bytes.
     pub fn from_raw_segments<'a>(
         segments: impl IntoIterator<Item = &'a [u8]>,
     ) -> Result<Self, PathError> {
@@ -128,8 +141,21 @@ impl RelPath {
                 continue;
             }
             path.push_normalized(&normalize_segment(raw)?);
+            path.check_length()?;
         }
         Ok(path)
+    }
+
+    /// Fails with [`PathError::PathTooLong`] if the path has more than [`MAX_PATH_BYTES`]
+    /// bytes. Paths built with [`RelPath::join`] or [`RelPath::join_path`] can grow past the
+    /// limit; whatever stores them checks it (the metadata store does, for every row it
+    /// writes).
+    pub fn check_length(&self) -> Result<(), PathError> {
+        if self.0.len() > MAX_PATH_BYTES {
+            Err(PathError::PathTooLong)
+        } else {
+            Ok(())
+        }
     }
 
     /// Parses a slash-separated path such as `"/Photos/2024"` or `"Photos/2024/"`.
@@ -309,6 +335,33 @@ mod tests {
         assert_eq!(disk_segment(OsStr::new(NFC_E_ACUTE)), Some(NFC_E_ACUTE));
         assert_eq!(disk_segment(OsStr::new(NFD_E_ACUTE)), None);
         assert_eq!(disk_segment(OsStr::new("..")), None);
+    }
+
+    #[test]
+    fn whole_paths_are_limited() {
+        // 15 segments of 255 bytes and two shorter ones: exactly 4096 bytes.
+        let segment = "x".repeat(255);
+        let mut longest = vec![segment.as_str(); 15].join("/");
+        longest.push('/');
+        longest.push_str(&"y".repeat(200));
+        longest.push('/');
+        longest.push_str(&"z".repeat(MAX_PATH_BYTES - longest.len()));
+        assert_eq!(longest.len(), MAX_PATH_BYTES);
+        let path = RelPath::parse(&longest).unwrap();
+        assert_eq!(path.as_str().len(), MAX_PATH_BYTES);
+        assert!(path.check_length().is_ok());
+
+        let too_long = format!("{longest}y");
+        assert_eq!(RelPath::parse(&too_long), Err(PathError::PathTooLong));
+        // Redundant slashes do not count, NFC normalization does.
+        assert!(RelPath::parse(&format!("//{longest}/")).is_ok());
+        let nfd = format!("{}/{NFD_E_ACUTE}", &longest[..MAX_PATH_BYTES - 4]);
+        assert_eq!(
+            RelPath::parse(&nfd).unwrap().as_str().len(),
+            MAX_PATH_BYTES - 1
+        );
+        // Joining can grow past the limit; `check_length` tells.
+        assert_eq!(path.join("z").check_length(), Err(PathError::PathTooLong));
     }
 
     #[test]

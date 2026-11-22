@@ -1,16 +1,17 @@
-//! MetaStore against a real SQLite database: file ids, ETag and size propagation, dead
-//! properties, and subtree operations on names that `LIKE` would get wrong.
+//! MetaStore against a real database (SQLite, or MySQL with `GONO_TEST_MYSQL_URL`, see
+//! `db::testing`): file ids, ETag and size propagation, dead properties, and subtree operations
+//! on names that `LIKE` would get wrong.
 
 use gono_server_core::{
     RelPath, Username,
-    config::DbConfig,
-    db::{self, OpenMode, Pool},
+    db::{self, Backend, Pool, Text},
     meta::{
         Checksum, DeadProp, DiskStat, ListEntry, MetaStore, ObjectListing, ObjectMeta, ObjectPart,
         ObjectQuery, PropChange,
     },
     users::{self, NewUser},
 };
+use sqlx::Row as _;
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -20,15 +21,7 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let config = DbConfig {
-        path: dir.path().join("gono-cloud.db"),
-        max_connections: 4,
-        busy_timeout_secs: 5,
-    };
-    let pool = db::connect(&config, OpenMode::CreateIfMissing)
-        .await
-        .unwrap();
-    db::migrate(&pool).await.unwrap();
+    let pool = db::testing::database(dir.path()).await;
     let owner = add_user(&pool, "alice").await;
     let store = MetaStore::new(pool);
     store
@@ -154,14 +147,17 @@ impl Fixture {
     }
 
     async fn changes(&self) -> Vec<(String, String, Option<String>)> {
-        sqlx::query_as(
-            "SELECT operation, rel_path, old_rel_path FROM change_log WHERE owner_id = ?1 \
+        let rows: Vec<(String, Text, Option<Text>)> = sqlx::query_as(
+            "SELECT operation, rel_path, old_rel_path FROM change_log WHERE owner_id = ? \
              ORDER BY id",
         )
         .bind(self.owner)
         .fetch_all(self.store.pool())
         .await
-        .unwrap()
+        .unwrap();
+        rows.into_iter()
+            .map(|(operation, path, old)| (operation, path.0, old.map(String::from)))
+            .collect()
     }
 }
 
@@ -381,6 +377,115 @@ async fn names_differing_only_in_case_are_distinct() {
         .unwrap();
     assert!(f.exists("DOCS").await, "case variant untouched by the move");
     assert!(f.exists("Moved/x.txt").await);
+}
+
+/// MySQL's `utf8mb4_bin` would call `a` and `a ` equal; the paths are VARBINARY there, so
+/// every backend keeps them apart, like the file system does.
+#[tokio::test]
+async fn names_differing_only_in_trailing_spaces_are_distinct() {
+    let f = fixture().await;
+    let plain = f.write("a", 1).await;
+    let spaced = f.write("a ", 2).await;
+    let twice = f.write("a  ", 3).await;
+    assert!(plain != spaced && spaced != twice && plain != twice);
+    for (path, id, size) in [("a", plain, 1), ("a ", spaced, 2), ("a  ", twice, 3)] {
+        let row = f.store.get(f.owner, &p(path)).await.unwrap().unwrap();
+        assert_eq!((row.id, row.size, row.rel_path.as_str()), (id, size, path));
+    }
+    f.mkdir("d ").await;
+    f.write("d /x", 4).await;
+    f.mkdir("d").await;
+    assert!(f.exists("d /x").await, "creating `d` left `d ` alone");
+    f.store.record_delete(f.owner, &p("a ")).await.unwrap();
+    assert!(f.exists("a").await && f.exists("a  ").await);
+    assert!(!f.exists("a ").await);
+    assert_eq!(
+        f.store
+            .get(f.owner, &RelPath::root())
+            .await
+            .unwrap()
+            .unwrap()
+            .size,
+        8
+    );
+}
+
+/// Paths of up to 4096 bytes are stored on every backend; longer ones on none, also when a
+/// move or a copy would make them.
+#[tokio::test]
+async fn paths_longer_than_4096_bytes_are_refused() {
+    let f = fixture().await;
+    let segment = "s".repeat(255);
+    // 15 folders of 255 bytes and one of 200: 4040 bytes with the slashes.
+    let mut deep = RelPath::root();
+    for index in 0..16 {
+        let name = if index < 15 {
+            segment.clone()
+        } else {
+            "t".repeat(200)
+        };
+        deep = deep.join(&name);
+        f.store.record_mkdir(f.owner, &deep, 5).await.unwrap();
+    }
+    assert_eq!(deep.as_str().len(), 4040);
+    let longest = deep.join(&"f".repeat(4096 - deep.as_str().len() - 1));
+    assert_eq!(longest.as_str().len(), 4096);
+    f.store
+        .record_write(f.owner, &longest, file_stat(1), None)
+        .await
+        .unwrap();
+    let row = f.store.get(f.owner, &longest).await.unwrap().unwrap();
+    assert_eq!(row.rel_path, longest);
+
+    let too_long = deep.join(&"g".repeat(4096 - deep.as_str().len()));
+    assert!(too_long.check_length().is_err());
+    assert_eq!(too_long.as_str().len(), 4097);
+    let err = f
+        .store
+        .record_write(f.owner, &too_long, file_stat(1), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            gono_server_core::Error::InvalidPath {
+                source: gono_server_core::path::PathError::PathTooLong,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(f.store.get(f.owner, &too_long).await.unwrap().is_none());
+
+    // Moving the tree one level deeper would make its file 4098 bytes long: refused, and
+    // nothing moves.
+    f.mkdir("x").await;
+    let top = p(&segment);
+    let err = f
+        .store
+        .record_move(f.owner, &top, &p(&format!("x/{segment}")), dir_stat())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, gono_server_core::Error::InvalidPath { .. }),
+        "{err:?}"
+    );
+    assert!(f.exists(longest.as_str()).await);
+    // A copy that would be too long fails as a whole.
+    let err = f
+        .store
+        .record_copy(
+            f.owner,
+            &longest,
+            &deep.join(&"h".repeat(4096 - deep.as_str().len())),
+            &[(RelPath::root(), file_stat(1))],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, gono_server_core::Error::InvalidPath { .. }),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -1028,6 +1133,54 @@ async fn names_are_searched_by_subtree_ignoring_case() {
     assert!(search("", "", 10).await.is_empty());
 }
 
+/// The narrowing `LIKE` of an ASCII needle ignores ASCII case only, on every backend: `İ`
+/// (U+0130) lowercases to `i` and a combining dot in Unicode, but SQLite's `LIKE` (and MySQL's
+/// emulation of it) sees no `i` in it, so `İpek` is not found for `i`. Every backend returns
+/// these exact rows.
+#[tokio::test]
+async fn name_search_matches_on_every_backend() {
+    let f = fixture().await;
+    for path in [
+        "\u{130}pek",
+        "KELVIN.md",
+        "kelvin_",
+        "Ünïcode.TXT",
+        "back\\slash",
+        "trailing ",
+        "MiXeD",
+        "naïve",
+    ] {
+        f.write(path, 1).await;
+    }
+    let search = |needle: &'static str| {
+        let store = f.store.clone();
+        let owner = f.owner;
+        async move {
+            store
+                .search_names(owner, &RelPath::root(), needle, 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.rel_path.as_str().to_owned())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(search("kelvin").await, ["KELVIN.md", "kelvin_"]);
+    assert_eq!(
+        search("i").await,
+        ["KELVIN.md", "MiXeD", "kelvin_", "trailing "]
+    );
+    // A needle that is not ASCII skips the narrowing: Unicode lowercasing alone decides.
+    assert_eq!(search("i\u{307}").await, ["\u{130}pek"]);
+    assert_eq!(search("ünï").await, ["Ünïcode.TXT"]);
+    assert_eq!(search(".txt").await, ["Ünïcode.TXT"]);
+    assert_eq!(search("\\").await, ["back\\slash"]);
+    assert_eq!(search("g ").await, ["trailing "]);
+    assert_eq!(search("XED").await, ["MiXeD"]);
+    assert_eq!(search("NAÏ").await, ["naïve"]);
+    assert_eq!(search("_").await, ["kelvin_"]);
+}
+
 fn object(etag: &str) -> ObjectMeta {
     ObjectMeta {
         s3_etag: Some(etag.to_owned()),
@@ -1142,7 +1295,7 @@ async fn object_meta_belongs_to_one_version() {
         .record_delete(f.owner, &p("b/moved.png"))
         .await
         .unwrap();
-    let orphans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM object_meta WHERE file_id = ?1")
+    let orphans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM object_meta WHERE file_id = ?")
         .bind(id)
         .fetch_one(f.store.pool())
         .await
@@ -1667,20 +1820,40 @@ async fn s3_spellings_follow_their_entries() {
         .list("b", "", Some("/"), Some(&format!("{nfd}/")), 10)
         .await;
     assert_eq!(names(&page), ["plain.txt"]);
-    // The listing uses its index (`files_s3_listing`).
-    let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
-        "EXPLAIN QUERY PLAN SELECT id FROM files WHERE owner_id = 1 \
-         AND COALESCE(s3_path, rel_path) >= 'b/' AND COALESCE(s3_path, rel_path) < 'b0' \
-         AND is_dir = 0 ORDER BY COALESCE(s3_path, rel_path) LIMIT 5",
-    )
-    .fetch_all(f.store.pool())
-    .await
-    .unwrap();
-    assert!(
-        plan.iter()
-            .any(|(_, _, _, detail)| detail.contains("files_s3_listing")),
-        "{plan:?}"
-    );
+    // The listing uses its index (`files_s3_listing`), on MySQL through the generated column
+    // `s3_key` that its queries name.
+    match Backend::of(f.store.pool()) {
+        Backend::Sqlite => {
+            let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+                "EXPLAIN QUERY PLAN SELECT id FROM files WHERE owner_id = 1 \
+                 AND COALESCE(s3_path, rel_path) >= 'b/' AND COALESCE(s3_path, rel_path) < 'b0' \
+                 AND is_dir = 0 ORDER BY COALESCE(s3_path, rel_path) LIMIT 5",
+            )
+            .fetch_all(f.store.pool())
+            .await
+            .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|(_, _, _, detail)| detail.contains("files_s3_listing")),
+                "{plan:?}"
+            );
+        }
+        Backend::MySql => {
+            let plan = sqlx::query(
+                "EXPLAIN SELECT f.id FROM files f WHERE f.owner_id = 1 AND f.is_dir = 0 \
+                 AND f.s3_key >= 'b/' AND f.s3_key < 'b0' ORDER BY f.s3_key LIMIT 5",
+            )
+            .fetch_one(f.store.pool())
+            .await
+            .unwrap();
+            let keys: Option<Text> = plan.try_get("possible_keys").unwrap();
+            assert!(
+                keys.as_deref()
+                    .is_some_and(|keys| keys.split(',').any(|key| key == "files_s3_listing")),
+                "{keys:?}"
+            );
+        }
+    }
 
     // A move that keeps the name keeps the folder's spelling, and its files' with it.
     f.mkdir("c").await;

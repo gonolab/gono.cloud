@@ -39,13 +39,13 @@ use super::{
     objects::{self, ObjectMeta},
 };
 use crate::{
-    db::{self, Pool, Tx},
-    error::Result,
-    path::RelPath,
+    db::{self, Backend, Flag, Pool, Text, Tx},
+    error::{Error, Result},
+    path::{MAX_PATH_BYTES, PathError, RelPath},
 };
 
 /// Upper bound of bind parameters per statement in batched lookups.
-const BATCH: usize = 400;
+const BATCH: usize = db::MAX_LIST;
 
 /// One row of the `files` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,14 +184,14 @@ pub struct DeadProp {
 #[derive(FromRow)]
 pub(super) struct Row {
     id: i64,
-    rel_path: String,
-    is_dir: bool,
+    rel_path: Text,
+    is_dir: Flag,
     etag: String,
     mtime_ns: i64,
     size: i64,
-    favorite: bool,
+    favorite: Flag,
     creation_time: i64,
-    s3_path: Option<String>,
+    s3_path: Option<Text>,
     md5: Option<Vec<u8>>,
 }
 
@@ -199,14 +199,14 @@ impl From<Row> for FileRow {
     fn from(row: Row) -> Self {
         Self {
             id: row.id,
-            rel_path: RelPath::from_db(row.rel_path),
-            is_dir: row.is_dir,
+            rel_path: RelPath::from_db(row.rel_path.0),
+            is_dir: row.is_dir.0,
             etag: row.etag,
             mtime_ns: row.mtime_ns,
             size: u64::try_from(row.size).unwrap_or(0),
-            favorite: row.favorite,
+            favorite: row.favorite.0,
             creation_time: row.creation_time,
-            s3_path: row.s3_path,
+            s3_path: row.s3_path.map(String::from),
             md5: row.md5.and_then(|md5| <[u8; 16]>::try_from(md5).ok()),
         }
     }
@@ -303,9 +303,9 @@ impl MetaStore {
 
     /// Up to `limit` logged changes with an id greater than `after`, oldest first.
     pub async fn changes_since(&self, after: i64, limit: u32) -> Result<Vec<ChangeEvent>> {
-        let rows: Vec<(i64, i64, i64, String, Option<String>, String)> = sqlx::query_as(
+        let rows: Vec<(i64, i64, i64, Text, Option<Text>, String)> = sqlx::query_as(
             "SELECT id, owner_id, file_id, rel_path, old_rel_path, operation FROM change_log \
-             WHERE id > ?1 ORDER BY id LIMIT ?2",
+             WHERE id > ? ORDER BY id LIMIT ?",
         )
         .bind(after)
         .bind(i64::from(limit))
@@ -321,8 +321,8 @@ impl MetaStore {
                 id,
                 owner_id,
                 file_id,
-                rel_path: RelPath::from_db(rel_path),
-                old_rel_path: old_rel_path.map(RelPath::from_db),
+                rel_path: RelPath::from_db(rel_path.0),
+                old_rel_path: old_rel_path.map(|path| RelPath::from_db(path.0)),
                 operation,
             });
         }
@@ -335,7 +335,7 @@ impl MetaStore {
 
     /// The row of one entry.
     pub async fn get(&self, owner: i64, rel: &RelPath) -> Result<Option<FileRow>> {
-        let sql = format!("SELECT {COLUMNS} FROM files WHERE owner_id = ?1 AND rel_path = ?2");
+        let sql = format!("SELECT {COLUMNS} FROM files WHERE owner_id = ? AND rel_path = ?");
         let row: Option<Row> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(owner)
             .bind(rel.as_str())
@@ -346,7 +346,7 @@ impl MetaStore {
 
     /// The row of `owner`'s entry with file id `id`, wherever it is now.
     pub async fn get_by_id(&self, owner: i64, id: i64) -> Result<Option<FileRow>> {
-        let sql = format!("SELECT {COLUMNS} FROM files WHERE owner_id = ?1 AND id = ?2");
+        let sql = format!("SELECT {COLUMNS} FROM files WHERE owner_id = ? AND id = ?");
         let row: Option<Row> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(owner)
             .bind(id)
@@ -384,8 +384,8 @@ impl MetaStore {
         let rows: Vec<Row> = match descendant_bounds(dir.as_str()) {
             Some((lower, upper)) => {
                 let sql = format!(
-                    "SELECT {COLUMNS} FROM files WHERE owner_id = ?1 \
-                     AND (rel_path = ?2 OR (rel_path >= ?3 AND rel_path < ?4)) ORDER BY rel_path"
+                    "SELECT {COLUMNS} FROM files WHERE owner_id = ? \
+                     AND (rel_path = ? OR (rel_path >= ? AND rel_path < ?)) ORDER BY rel_path"
                 );
                 sqlx::query_as(sqlx::AssertSqlSafe(sql))
                     .bind(owner)
@@ -397,7 +397,7 @@ impl MetaStore {
             }
             None => {
                 let sql =
-                    format!("SELECT {COLUMNS} FROM files WHERE owner_id = ?1 ORDER BY rel_path");
+                    format!("SELECT {COLUMNS} FROM files WHERE owner_id = ? ORDER BY rel_path");
                 sqlx::query_as(sqlx::AssertSqlSafe(sql))
                     .bind(owner)
                     .fetch_all(&self.pool)
@@ -412,8 +412,8 @@ impl MetaStore {
         let count: (i64,) = match descendant_bounds(dir.as_str()) {
             Some((lower, upper)) => {
                 sqlx::query_as(
-                    "SELECT COUNT(*) FROM files WHERE owner_id = ?1 \
-                     AND rel_path >= ?2 AND rel_path < ?3",
+                    "SELECT COUNT(*) FROM files WHERE owner_id = ? \
+                     AND rel_path >= ? AND rel_path < ?",
                 )
                 .bind(owner)
                 .bind(lower)
@@ -422,7 +422,7 @@ impl MetaStore {
                 .await?
             }
             None => {
-                sqlx::query_as("SELECT COUNT(*) FROM files WHERE owner_id = ?1 AND rel_path <> ''")
+                sqlx::query_as("SELECT COUNT(*) FROM files WHERE owner_id = ? AND rel_path <> ''")
                     .bind(owner)
                     .fetch_one(&self.pool)
                     .await?
@@ -438,6 +438,12 @@ impl MetaStore {
     /// the whole path narrows the rows first (SQLite's `LIKE` ignores ASCII case only); the
     /// name itself is then compared with full Unicode lowercasing. At most `MAX_SCANNED` rows
     /// are looked at, so a search of a huge tree stays bounded.
+    ///
+    /// MySQL narrows exactly as SQLite does, so that both find the same rows: its `LIKE` on
+    /// the bytes of `VARBINARY` is case-sensitive, so it compares the path with ASCII letters
+    /// lowercased. `LOWER` of the bytes read as latin1 lowercases A to Z and maps no other byte
+    /// to ASCII (the needle is ASCII, and in UTF-8 no byte of a multi-byte character is), and
+    /// the comparison is then made on the resulting bytes.
     pub async fn search_names(
         &self,
         owner: i64,
@@ -465,10 +471,13 @@ impl MetaStore {
             pattern.push('%');
             pattern
         });
+        let like = Backend::of(&self.pool).pick(
+            "rel_path LIKE ? ESCAPE '\\'",
+            "CAST(LOWER(CONVERT(rel_path USING latin1)) AS BINARY) LIKE ? ESCAPE '\\'",
+        );
         let sql = format!(
-            "SELECT {COLUMNS} FROM files WHERE owner_id = ?1 AND rel_path > ?2 AND rel_path < ?3 \
-             AND rel_path <> '' AND (?4 IS NULL OR rel_path LIKE ?4 ESCAPE '\\') \
-             ORDER BY rel_path LIMIT ?5"
+            "SELECT {COLUMNS} FROM files WHERE owner_id = ? AND rel_path > ? AND rel_path < ? \
+             AND rel_path <> '' AND (? IS NULL OR {like}) ORDER BY rel_path LIMIT ?"
         );
         let mut found = Vec::new();
         let mut after = lower.clone();
@@ -478,6 +487,7 @@ impl MetaStore {
                 .bind(owner)
                 .bind(&after)
                 .bind(&upper)
+                .bind(pattern.as_deref())
                 .bind(pattern.as_deref())
                 .bind(PAGE)
                 .fetch_all(&self.pool)
@@ -515,8 +525,8 @@ impl MetaStore {
         let rows: Vec<Row> = match descendant_bounds(dir.as_str()) {
             Some((lower, upper)) => {
                 let sql = format!(
-                    "SELECT {COLUMNS} FROM files WHERE owner_id = ?1 AND favorite = 1 \
-                     AND ((rel_path >= ?2 AND rel_path < ?3) OR (?4 AND rel_path = ?5)) \
+                    "SELECT {COLUMNS} FROM files WHERE owner_id = ? AND favorite = 1 \
+                     AND ((rel_path >= ? AND rel_path < ?) OR (? AND rel_path = ?)) \
                      ORDER BY rel_path"
                 );
                 sqlx::query_as(sqlx::AssertSqlSafe(sql))
@@ -530,8 +540,8 @@ impl MetaStore {
             }
             None => {
                 let sql = format!(
-                    "SELECT {COLUMNS} FROM files WHERE owner_id = ?1 AND favorite = 1 \
-                     AND (rel_path <> '' OR ?2) ORDER BY rel_path"
+                    "SELECT {COLUMNS} FROM files WHERE owner_id = ? AND favorite = 1 \
+                     AND (rel_path <> '' OR ?) ORDER BY rel_path"
                 );
                 sqlx::query_as(sqlx::AssertSqlSafe(sql))
                     .bind(owner)
@@ -545,8 +555,8 @@ impl MetaStore {
 
     /// All dead properties of an entry.
     pub async fn dead_props(&self, file_id: i64) -> Result<Vec<DeadProp>> {
-        let rows: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
-            "SELECT namespace, name, xml FROM dead_props WHERE file_id = ?1 \
+        let rows: Vec<(Text, Text, Vec<u8>)> = sqlx::query_as(
+            "SELECT namespace, name, xml FROM dead_props WHERE file_id = ? \
              ORDER BY namespace, name",
         )
         .bind(file_id)
@@ -555,8 +565,8 @@ impl MetaStore {
         Ok(rows
             .into_iter()
             .map(|(namespace, name, xml)| DeadProp {
-                namespace,
-                name,
+                namespace: namespace.0,
+                name: name.0,
                 xml,
             })
             .collect())
@@ -574,14 +584,14 @@ impl MetaStore {
                  WHERE file_id IN ({placeholders}) ORDER BY file_id, namespace, name"
             );
             let mut query =
-                sqlx::query_as::<_, (i64, String, String, Vec<u8>)>(sqlx::AssertSqlSafe(sql));
+                sqlx::query_as::<_, (i64, Text, Text, Vec<u8>)>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(id);
             }
             for (file_id, namespace, name, xml) in query.fetch_all(&self.pool).await? {
                 found.entry(file_id).or_default().push(DeadProp {
-                    namespace,
-                    name,
+                    namespace: namespace.0,
+                    name: name.0,
                     xml,
                 });
             }
@@ -597,7 +607,7 @@ impl MetaStore {
         name: &str,
     ) -> Result<Option<Vec<u8>>> {
         Ok(sqlx::query_scalar(
-            "SELECT xml FROM dead_props WHERE file_id = ?1 AND namespace = ?2 AND name = ?3",
+            "SELECT xml FROM dead_props WHERE file_id = ? AND namespace = ? AND name = ?",
         )
         .bind(file_id)
         .bind(namespace)
@@ -688,13 +698,13 @@ impl MetaStore {
             Some(old) if !old.is_dir => {
                 let etag = written_file_etag(old.id, stat.mtime_ns, stat.size);
                 sqlx::query(
-                    "UPDATE files SET etag = ?2, mtime_ns = ?3, size = ?4, md5 = ?5 WHERE id = ?1",
+                    "UPDATE files SET etag = ?, mtime_ns = ?, size = ?, md5 = ? WHERE id = ?",
                 )
-                .bind(old.id)
                 .bind(&etag)
                 .bind(stat.mtime_ns)
                 .bind(to_db_size(stat.size))
                 .bind(md5.as_ref().map(<[u8; 16]>::as_slice))
+                .bind(old.id)
                 .execute(&mut *tx)
                 .await?;
                 let delta = to_db_size(stat.size) - to_db_size(old.size);
@@ -744,10 +754,10 @@ impl MetaStore {
     pub async fn set_md5(&self, file_id: i64, etag: &str, md5: [u8; 16]) -> Result<bool> {
         let mut tx = db::begin_immediate(&self.pool).await?;
         let updated =
-            sqlx::query("UPDATE files SET md5 = ?3 WHERE id = ?1 AND etag = ?2 AND is_dir = 0")
+            sqlx::query("UPDATE files SET md5 = ? WHERE id = ? AND etag = ? AND is_dir = 0")
+                .bind(md5.as_slice())
                 .bind(file_id)
                 .bind(etag)
-                .bind(md5.as_slice())
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
@@ -770,11 +780,12 @@ impl MetaStore {
             row: Row,
         }
         let sql = format!(
-            "SELECT owner_id, {COLUMNS} FROM files WHERE is_dir = 0 AND md5 IS NULL AND id > ?1 \
-             AND (?2 IS NULL OR owner_id = ?2) ORDER BY id LIMIT ?3"
+            "SELECT owner_id, {COLUMNS} FROM files WHERE is_dir = 0 AND md5 IS NULL AND id > ? \
+             AND (? IS NULL OR owner_id = ?) ORDER BY id LIMIT ?"
         );
         let rows: Vec<Owned> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(after)
+            .bind(owner)
             .bind(owner)
             .bind(i64::from(limit))
             .fetch_all(&self.pool)
@@ -839,9 +850,9 @@ impl MetaStore {
             return Ok(false);
         };
         let (lower, upper) = descendant_bounds(rel.as_str()).unwrap_or_default();
-        let has_files: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM files WHERE owner_id = ?1 AND is_dir = 0 \
-             AND rel_path >= ?2 AND rel_path < ?3)",
+        let Flag(has_files) = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM files WHERE owner_id = ? AND is_dir = 0 \
+             AND rel_path >= ? AND rel_path < ?)",
         )
         .bind(owner)
         .bind(&lower)
@@ -851,16 +862,18 @@ impl MetaStore {
         if !folder.is_dir || has_files {
             return Ok(false);
         }
+        // `length` and `substr` count characters in SQLite and bytes of the VARBINARY column in
+        // MySQL; either way they agree with each other.
         sqlx::query(
-            "UPDATE files SET s3_path = ?4 || substr(COALESCE(s3_path, rel_path), length(?5) + 1) \
-             WHERE owner_id = ?1 AND (rel_path = ?6 OR (rel_path >= ?2 AND rel_path < ?3))",
+            "UPDATE files SET s3_path = ? || substr(COALESCE(s3_path, rel_path), length(?) + 1) \
+             WHERE owner_id = ? AND (rel_path = ? OR (rel_path >= ? AND rel_path < ?))",
         )
-        .bind(owner)
-        .bind(&lower)
-        .bind(&upper)
         .bind(spelled)
         .bind(folder.spelled())
+        .bind(owner)
         .bind(rel.as_str())
+        .bind(&lower)
+        .bind(&upper)
         .execute(&mut *tx)
         .await?;
         drop_plain_spellings(&mut tx, owner, rel).await?;
@@ -905,6 +918,7 @@ impl MetaStore {
             "invalid move {from} -> {to}"
         );
         let mut tx = db::begin_immediate(&self.pool).await?;
+        check_moved_length(&mut tx, owner, from, to).await?;
 
         // Whatever was at the destination has been replaced.
         let replaced = select(&mut tx, owner, to).await?;
@@ -915,24 +929,24 @@ impl MetaStore {
         let (row, event) = match select(&mut tx, owner, from).await? {
             Some(source) => {
                 respell_moved(&mut tx, owner, &source, from, to).await?;
-                sqlx::query("UPDATE files SET rel_path = ?3 WHERE owner_id = ?1 AND rel_path = ?2")
+                sqlx::query("UPDATE files SET rel_path = ? WHERE owner_id = ? AND rel_path = ?")
+                    .bind(to.as_str())
                     .bind(owner)
                     .bind(from.as_str())
-                    .bind(to.as_str())
                     .execute(&mut *tx)
                     .await?;
                 if let Some((lower, upper)) = descendant_bounds(from.as_str()) {
-                    // `?4 || substr(rel_path, length(?2) + 1)` keeps the part below `from`,
-                    // including its leading slash.
+                    // `<to> || substr(rel_path, length(<from>) + 1)` keeps the part below
+                    // `from`, including its leading slash.
                     sqlx::query(
-                        "UPDATE files SET rel_path = ?4 || substr(rel_path, length(?5) + 1) \
-                         WHERE owner_id = ?1 AND rel_path >= ?2 AND rel_path < ?3",
+                        "UPDATE files SET rel_path = ? || substr(rel_path, length(?) + 1) \
+                         WHERE owner_id = ? AND rel_path >= ? AND rel_path < ?",
                     )
+                    .bind(to.as_str())
+                    .bind(from.as_str())
                     .bind(owner)
                     .bind(lower)
                     .bind(upper)
-                    .bind(to.as_str())
-                    .bind(from.as_str())
                     .execute(&mut *tx)
                     .await?;
                 }
@@ -1013,36 +1027,49 @@ impl MetaStore {
         }
 
         let mut top = None;
+        let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+        let mut next_id = db::next_ids(&mut tx, "files", count).await?;
         for (relative, stat) in entries {
             let mut stat = *stat;
             if stat.is_dir {
                 stat.size = dir_sizes.get(relative).copied().unwrap_or(0);
             }
             let rel = to.join_path(relative);
-            let mut row = insert(&mut tx, owner, &rel, stat, Etag::Written, None).await?;
+            let id = next_id;
+            next_id += 1;
+            let mut row = insert_as(&mut tx, id, owner, &rel, stat, Etag::Written, None).await?;
             if let Some(source_id) = sources.get(relative) {
                 sqlx::query(
                     "INSERT INTO dead_props (file_id, namespace, name, xml) \
-                     SELECT ?1, namespace, name, xml FROM dead_props WHERE file_id = ?2",
+                     SELECT ?, namespace, name, xml FROM dead_props WHERE file_id = ?",
                 )
                 .bind(row.id)
                 .bind(source_id)
                 .execute(&mut *tx)
                 .await?;
                 // The same content: the MD5 is the source's, if its size still matches.
-                let (creation_time, md5): (i64, Option<Vec<u8>>) = sqlx::query_as(
-                    "UPDATE files SET creation_time = \
-                     (SELECT creation_time FROM files WHERE id = ?2), \
-                     md5 = (SELECT md5 FROM files WHERE id = ?2 AND is_dir = 0 AND size = ?3) \
-                     WHERE id = ?1 RETURNING creation_time, md5",
+                let (creation_time, Flag(source_is_dir), source_size, source_md5): (
+                    i64,
+                    Flag,
+                    i64,
+                    Option<Vec<u8>>,
+                ) = sqlx::query_as(
+                    "SELECT creation_time, is_dir, size, md5 FROM files WHERE id = ?",
                 )
-                .bind(row.id)
                 .bind(source_id)
-                .bind(to_db_size(stat.size))
                 .fetch_one(&mut *tx)
                 .await?;
+                let md5 = source_md5
+                    .filter(|_| !source_is_dir && source_size == to_db_size(stat.size))
+                    .and_then(|md5| <[u8; 16]>::try_from(md5).ok());
+                sqlx::query("UPDATE files SET creation_time = ?, md5 = ? WHERE id = ?")
+                    .bind(creation_time)
+                    .bind(md5.as_ref().map(<[u8; 16]>::as_slice))
+                    .bind(row.id)
+                    .execute(&mut *tx)
+                    .await?;
                 row.creation_time = creation_time;
-                row.md5 = md5.and_then(|md5| <[u8; 16]>::try_from(md5).ok());
+                row.md5 = md5;
             }
             top.get_or_insert(row);
         }
@@ -1140,11 +1167,22 @@ impl MetaStore {
         // `entries` lists parents before children, so a new entry's parent is new exactly when
         // it was inserted earlier in this loop.
         let mut new_paths: HashSet<RelPath> = HashSet::new();
+        let is_new = |rel: &RelPath| {
+            !current.contains_key(rel) && !known.iter().any(|(known, _)| known == rel)
+        };
+        let count = entries.iter().filter(|(rel, _)| is_new(rel)).count();
+        let mut next_id = match u32::try_from(count) {
+            Ok(0) => 0,
+            Ok(count) => db::next_ids(&mut tx, "files", count).await?,
+            Err(_) => db::next_ids(&mut tx, "files", u32::MAX).await?,
+        };
         for (rel, stat) in entries {
             if current.contains_key(rel) || known.iter().any(|(known, _)| known == rel) {
                 continue;
             }
-            let row = insert(&mut tx, owner, rel, *stat, Etag::Derived, None).await?;
+            let id = next_id;
+            next_id += 1;
+            let row = insert_as(&mut tx, id, owner, rel, *stat, Etag::Derived, None).await?;
             report.added_rows += 1;
             let parent_is_new = rel
                 .parent()
@@ -1170,12 +1208,12 @@ impl MetaStore {
             }
             let etag = derived_file_etag(row.id, stat.mtime_ns, stat.size);
             sqlx::query(
-                "UPDATE files SET etag = ?2, mtime_ns = ?3, size = ?4, md5 = NULL WHERE id = ?1",
+                "UPDATE files SET etag = ?, mtime_ns = ?, size = ?, md5 = NULL WHERE id = ?",
             )
-            .bind(row.id)
             .bind(&etag)
             .bind(stat.mtime_ns)
             .bind(to_db_size(stat.size))
+            .bind(row.id)
             .execute(&mut *tx)
             .await?;
             // New content behind the server's back: the S3 metadata and the MD5 described the
@@ -1214,9 +1252,9 @@ impl MetaStore {
             if row.size == *size {
                 continue;
             }
-            sqlx::query("UPDATE files SET size = ?2 WHERE id = ?1")
-                .bind(row.id)
+            sqlx::query("UPDATE files SET size = ? WHERE id = ?")
                 .bind(to_db_size(*size))
+                .bind(row.id)
                 .execute(&mut *tx)
                 .await?;
             if !new_paths.contains(rel) && !adopted.contains(rel) && !explained.contains(rel) {
@@ -1237,12 +1275,13 @@ impl MetaStore {
             bump.extend(scope.ancestors());
         }
         for ancestor in scope.ancestors() {
-            sqlx::query(
-                "UPDATE files SET size = max(size + ?3, 0) WHERE owner_id = ?1 AND rel_path = ?2",
-            )
+            sqlx::query(tx.backend().pick(
+                "UPDATE files SET size = max(size + ?, 0) WHERE owner_id = ? AND rel_path = ?",
+                "UPDATE files SET size = GREATEST(size + ?, 0) WHERE owner_id = ? AND rel_path = ?",
+            ))
+            .bind(delta)
             .bind(owner)
             .bind(ancestor.as_str())
-            .bind(delta)
             .execute(&mut *tx)
             .await?;
         }
@@ -1250,11 +1289,11 @@ impl MetaStore {
         // 6. New ETags for every directory above a change.
         for dir in &bump {
             sqlx::query(
-                "UPDATE files SET etag = ?3 WHERE owner_id = ?1 AND rel_path = ?2 AND is_dir = 1",
+                "UPDATE files SET etag = ? WHERE owner_id = ? AND rel_path = ? AND is_dir = 1",
             )
+            .bind(dir_etag())
             .bind(owner)
             .bind(dir.as_str())
-            .bind(dir_etag())
             .execute(&mut *tx)
             .await?;
         }
@@ -1272,9 +1311,9 @@ impl MetaStore {
     /// seconds. Not content, so ETags stay the same.
     pub async fn set_creation_time(&self, file_id: i64, seconds: i64) -> Result<()> {
         let mut tx = db::begin_immediate(&self.pool).await?;
-        sqlx::query("UPDATE files SET creation_time = ?2 WHERE id = ?1")
-            .bind(file_id)
+        sqlx::query("UPDATE files SET creation_time = ? WHERE id = ?")
             .bind(seconds.max(0))
+            .bind(file_id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -1284,9 +1323,9 @@ impl MetaStore {
     /// Sets or clears the favorite flag. Favorites are not content, so ETags stay the same.
     pub async fn set_favorite(&self, file_id: i64, favorite: bool) -> Result<()> {
         let mut tx = db::begin_immediate(&self.pool).await?;
-        sqlx::query("UPDATE files SET favorite = ?2 WHERE id = ?1")
-            .bind(file_id)
+        sqlx::query("UPDATE files SET favorite = ? WHERE id = ?")
             .bind(favorite)
+            .bind(file_id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -1300,11 +1339,13 @@ impl MetaStore {
         for change in changes {
             match change {
                 PropChange::Set(prop) => {
-                    sqlx::query(
+                    sqlx::query(tx.backend().pick(
                         "INSERT INTO dead_props (file_id, namespace, name, xml) \
-                         VALUES (?1, ?2, ?3, ?4) \
+                         VALUES (?, ?, ?, ?) \
                          ON CONFLICT (file_id, namespace, name) DO UPDATE SET xml = excluded.xml",
-                    )
+                        "INSERT INTO dead_props (file_id, namespace, name, xml) \
+                         VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE xml = VALUES(xml)",
+                    ))
                     .bind(file_id)
                     .bind(&prop.namespace)
                     .bind(&prop.name)
@@ -1314,7 +1355,7 @@ impl MetaStore {
                 }
                 PropChange::Remove(namespace, name) => {
                     sqlx::query(
-                        "DELETE FROM dead_props WHERE file_id = ?1 AND namespace = ?2 AND name = ?3",
+                        "DELETE FROM dead_props WHERE file_id = ? AND namespace = ? AND name = ?",
                     )
                     .bind(file_id)
                     .bind(namespace)
@@ -1374,9 +1415,9 @@ async fn respell_moved(
     if old_spelled == from.as_str() && new_spelled == to.as_str() {
         // Spelled as the tree on both sides: only rows below with a spelling of their own
         // change, and their prefix maps as rel_path does.
-        let has_spellings: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM files WHERE owner_id = ?1 AND s3_path IS NOT NULL \
-             AND rel_path >= ?2 AND rel_path < ?3)",
+        let Flag(has_spellings) = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM files WHERE owner_id = ? AND s3_path IS NOT NULL \
+             AND rel_path >= ? AND rel_path < ?)",
         )
         .bind(owner)
         .bind(format!("{}/", from.as_str()))
@@ -1387,17 +1428,18 @@ async fn respell_moved(
             return Ok(());
         }
     }
-    // `?4 || substr(spelled, length(?5) + 1)` keeps the part below `from`, with its slash.
+    // `<new> || substr(spelled, length(<old>) + 1)` keeps the part below `from`, with its
+    // slash.
     sqlx::query(
-        "UPDATE files SET s3_path = ?4 || substr(COALESCE(s3_path, rel_path), length(?5) + 1) \
-         WHERE owner_id = ?1 AND (rel_path = ?6 OR (rel_path >= ?2 AND rel_path < ?3))",
+        "UPDATE files SET s3_path = ? || substr(COALESCE(s3_path, rel_path), length(?) + 1) \
+         WHERE owner_id = ? AND (rel_path = ? OR (rel_path >= ? AND rel_path < ?))",
     )
-    .bind(owner)
-    .bind(format!("{}/", from.as_str()))
-    .bind(format!("{}0", from.as_str()))
     .bind(&new_spelled)
     .bind(&old_spelled)
+    .bind(owner)
     .bind(from.as_str())
+    .bind(format!("{}/", from.as_str()))
+    .bind(format!("{}0", from.as_str()))
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1407,20 +1449,20 @@ async fn respell_moved(
 /// their path.
 async fn drop_plain_spellings(tx: &mut Tx, owner: i64, to: &RelPath) -> Result<()> {
     sqlx::query(
-        "UPDATE files SET s3_path = NULL WHERE owner_id = ?1 AND s3_path = rel_path \
-         AND (rel_path = ?4 OR (rel_path >= ?2 AND rel_path < ?3))",
+        "UPDATE files SET s3_path = NULL WHERE owner_id = ? AND s3_path = rel_path \
+         AND (rel_path = ? OR (rel_path >= ? AND rel_path < ?))",
     )
     .bind(owner)
+    .bind(to.as_str())
     .bind(format!("{}/", to.as_str()))
     .bind(format!("{}0", to.as_str()))
-    .bind(to.as_str())
     .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
 async fn select(tx: &mut Tx, owner: i64, rel: &RelPath) -> Result<Option<FileRow>> {
-    let sql = format!("SELECT {COLUMNS} FROM files WHERE owner_id = ?1 AND rel_path = ?2");
+    let sql = format!("SELECT {COLUMNS} FROM files WHERE owner_id = ? AND rel_path = ?");
     let row: Option<Row> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(owner)
         .bind(rel.as_str())
@@ -1432,21 +1474,21 @@ async fn select(tx: &mut Tx, owner: i64, rel: &RelPath) -> Result<Option<FileRow
 async fn select_subtree(tx: &mut Tx, owner: i64, dir: &RelPath) -> Result<Vec<FileRow>> {
     let (lower, upper) = descendant_bounds(dir.as_str()).unwrap_or_default();
     let sql = format!(
-        "SELECT {COLUMNS} FROM files WHERE owner_id = ?1 \
-         AND (rel_path = ?2 OR (rel_path >= ?3 AND rel_path < ?4) OR ?2 = '')"
+        "SELECT {COLUMNS} FROM files WHERE owner_id = ? \
+         AND (rel_path = ? OR (rel_path >= ? AND rel_path < ?) OR ? = '')"
     );
     let rows: Vec<Row> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(owner)
         .bind(dir.as_str())
         .bind(lower)
         .bind(upper)
+        .bind(dir.as_str())
         .fetch_all(&mut **tx)
         .await?;
     Ok(rows.into_iter().map(FileRow::from).collect())
 }
 
-/// Inserts a row and returns it. Directories start with size 0 unless `stat.size` says
-/// otherwise (used by [`MetaStore::record_copy`]). A file's content has the MD5 `md5`, if known.
+/// Inserts a row with a new id and returns it. See [`insert_as`].
 async fn insert(
     tx: &mut Tx,
     owner: i64,
@@ -1455,46 +1497,61 @@ async fn insert(
     etag: Etag,
     md5: Option<[u8; 16]>,
 ) -> Result<FileRow> {
+    let id = db::next_id(tx, "files").await?;
+    insert_as(tx, id, owner, rel, stat, etag, md5).await
+}
+
+/// Inserts the row `id` (from [`db::next_id`] or [`db::next_ids`]) and returns it.
+/// Directories start with size 0 unless `stat.size` says otherwise (used by
+/// [`MetaStore::record_copy`]). A file's content has the MD5 `md5`, if known. Paths longer
+/// than [`MAX_PATH_BYTES`] are refused, so that every backend stores the same paths.
+#[allow(clippy::too_many_arguments)]
+async fn insert_as(
+    tx: &mut Tx,
+    id: i64,
+    owner: i64,
+    rel: &RelPath,
+    stat: DiskStat,
+    etag: Etag,
+    md5: Option<[u8; 16]>,
+) -> Result<FileRow> {
+    rel.check_length().map_err(|source| too_long(rel, source))?;
     let size = to_db_size(stat.size);
     // Below a folder that S3 spelled otherwise, the new entry is spelled that way too.
     let s3_path = match (rel.parent(), rel.file_name()) {
         (Some(parent), Some(name)) if !parent.is_root() => {
-            let parent_spelling: Option<Option<String>> = sqlx::query_scalar(
-                "SELECT s3_path FROM files WHERE owner_id = ?1 AND rel_path = ?2",
-            )
-            .bind(owner)
-            .bind(parent.as_str())
-            .fetch_optional(&mut **tx)
-            .await?;
+            let parent_spelling: Option<Option<Text>> =
+                sqlx::query_scalar("SELECT s3_path FROM files WHERE owner_id = ? AND rel_path = ?")
+                    .bind(owner)
+                    .bind(parent.as_str())
+                    .fetch_optional(&mut **tx)
+                    .await?;
             parent_spelling
                 .flatten()
-                .map(|parent| format!("{parent}/{name}"))
+                .map(|parent| format!("{}/{name}", &*parent))
         }
         _ => None,
     };
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO files (owner_id, rel_path, is_dir, etag, mtime_ns, size, s3_path, md5) \
-         VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7) RETURNING id",
-    )
-    .bind(owner)
-    .bind(rel.as_str())
-    .bind(stat.is_dir)
-    .bind(stat.mtime_ns)
-    .bind(size)
-    .bind(s3_path.as_deref())
-    .bind(md5.as_ref().map(<[u8; 16]>::as_slice))
-    .fetch_one(&mut **tx)
-    .await?;
     let etag = match (stat.is_dir, etag) {
         (true, _) => dir_etag(),
         (false, Etag::Written) => written_file_etag(id, stat.mtime_ns, stat.size),
         (false, Etag::Derived) => derived_file_etag(id, stat.mtime_ns, stat.size),
     };
-    sqlx::query("UPDATE files SET etag = ?2 WHERE id = ?1")
-        .bind(id)
-        .bind(&etag)
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO files (id, owner_id, rel_path, is_dir, etag, mtime_ns, size, s3_path, md5) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(rel.as_str())
+    .bind(stat.is_dir)
+    .bind(&etag)
+    .bind(stat.mtime_ns)
+    .bind(size)
+    .bind(s3_path.as_deref())
+    .bind(md5.as_ref().map(<[u8; 16]>::as_slice))
+    .execute(&mut **tx)
+    .await?;
     Ok(FileRow {
         id,
         rel_path: rel.clone(),
@@ -1509,6 +1566,40 @@ async fn insert(
     })
 }
 
+fn too_long(rel: &RelPath, source: PathError) -> Error {
+    Error::InvalidPath {
+        path: rel.to_string(),
+        source,
+    }
+}
+
+/// Refuses a move of `from` to `to` that would give a row at or below `to` a path longer than
+/// [`MAX_PATH_BYTES`]. Checked before anything changes, so that every backend refuses the same
+/// moves.
+async fn check_moved_length(tx: &mut Tx, owner: i64, from: &RelPath, to: &RelPath) -> Result<()> {
+    to.check_length().map_err(|source| too_long(to, source))?;
+    let Some((lower, upper)) = descendant_bounds(from.as_str()) else {
+        return Ok(());
+    };
+    // The longest path below `from`, in bytes.
+    let longest: i64 = sqlx::query_scalar(tx.backend().pick(
+        "SELECT COALESCE(MAX(length(CAST(rel_path AS BLOB))), 0) FROM files \
+         WHERE owner_id = ? AND rel_path >= ? AND rel_path < ?",
+        "SELECT COALESCE(MAX(LENGTH(rel_path)), 0) FROM files \
+         WHERE owner_id = ? AND rel_path >= ? AND rel_path < ?",
+    ))
+    .bind(owner)
+    .bind(lower)
+    .bind(upper)
+    .fetch_one(&mut **tx)
+    .await?;
+    let longest = usize::try_from(longest).unwrap_or(usize::MAX);
+    if longest.saturating_sub(from.as_str().len()) + to.as_str().len() > MAX_PATH_BYTES {
+        return Err(too_long(to, PathError::PathTooLong));
+    }
+    Ok(())
+}
+
 /// Sets how S3 spells the row `id` at `rel`: `spelled`, or no spelling of its own if that is
 /// `rel` itself. Returns the stored value.
 async fn set_spelling(
@@ -1518,9 +1609,9 @@ async fn set_spelling(
     spelled: &str,
 ) -> Result<Option<String>> {
     let s3_path = (spelled != rel.as_str()).then(|| spelled.to_owned());
-    sqlx::query("UPDATE files SET s3_path = ?2 WHERE id = ?1")
-        .bind(id)
+    sqlx::query("UPDATE files SET s3_path = ? WHERE id = ?")
         .bind(s3_path.as_deref())
+        .bind(id)
         .execute(&mut **tx)
         .await?;
     Ok(s3_path)
@@ -1530,21 +1621,28 @@ async fn set_spelling(
 /// Returns the total size of the deleted file rows.
 async fn delete_subtree(tx: &mut Tx, owner: i64, rel: &RelPath) -> Result<i64> {
     let (lower, upper) = descendant_bounds(rel.as_str()).expect("never the root");
-    let removed: Vec<(bool, i64)> = sqlx::query_as(
-        "DELETE FROM files WHERE owner_id = ?1 \
-         AND (rel_path = ?2 OR (rel_path >= ?3 AND rel_path < ?4)) RETURNING is_dir, size",
+    // Summed, then deleted: the write transaction keeps the two in step.
+    let removed: i64 = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(size), 0) AS SIGNED) FROM files WHERE owner_id = ? \
+         AND is_dir = 0 AND (rel_path = ? OR (rel_path >= ? AND rel_path < ?))",
+    )
+    .bind(owner)
+    .bind(rel.as_str())
+    .bind(&lower)
+    .bind(&upper)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM files WHERE owner_id = ? \
+         AND (rel_path = ? OR (rel_path >= ? AND rel_path < ?))",
     )
     .bind(owner)
     .bind(rel.as_str())
     .bind(lower)
     .bind(upper)
-    .fetch_all(&mut **tx)
+    .execute(&mut **tx)
     .await?;
-    Ok(removed
-        .into_iter()
-        .filter(|(is_dir, _)| !is_dir)
-        .map(|(_, size)| size)
-        .sum())
+    Ok(removed)
 }
 
 /// Gives every ancestor of `rel` a new ETag and adds `delta` to its recursive size.
@@ -1553,14 +1651,15 @@ async fn delete_subtree(tx: &mut Tx, owner: i64, rel: &RelPath) -> Result<i64> {
 /// until the next `rescan`, and a drifted size must never make a write fail.
 async fn propagate(tx: &mut Tx, owner: i64, rel: &RelPath, delta: i64) -> Result<()> {
     for ancestor in rel.ancestors() {
-        sqlx::query(
-            "UPDATE files SET etag = ?3, size = max(size + ?4, 0) \
-             WHERE owner_id = ?1 AND rel_path = ?2",
-        )
-        .bind(owner)
-        .bind(ancestor.as_str())
+        sqlx::query(tx.backend().pick(
+            "UPDATE files SET etag = ?, size = max(size + ?, 0) WHERE owner_id = ? AND rel_path = ?",
+            "UPDATE files SET etag = ?, size = GREATEST(size + ?, 0) \
+             WHERE owner_id = ? AND rel_path = ?",
+        ))
         .bind(dir_etag())
         .bind(delta)
+        .bind(owner)
+        .bind(ancestor.as_str())
         .execute(&mut **tx)
         .await?;
     }
@@ -1576,17 +1675,19 @@ async fn log_change(
     old: Option<&RelPath>,
     operation: ChangeOperation,
 ) -> Result<ChangeEvent> {
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO change_log (owner_id, file_id, rel_path, old_rel_path, operation, \
-         changed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING id",
+    let id = db::next_id(tx, "change_log").await?;
+    sqlx::query(
+        "INSERT INTO change_log (id, owner_id, file_id, rel_path, old_rel_path, operation, \
+         changed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
+    .bind(id)
     .bind(owner)
     .bind(file_id)
     .bind(rel.as_str())
     .bind(old.map(RelPath::as_str))
     .bind(operation.as_str())
     .bind(db::unix_now())
-    .fetch_one(&mut **tx)
+    .execute(&mut **tx)
     .await?;
     Ok(ChangeEvent {
         id,

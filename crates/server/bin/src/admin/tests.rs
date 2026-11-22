@@ -11,8 +11,8 @@ use axum::{
 use gono_server_core::{
     RelPath, Username,
     app_passwords::{self, Scope},
-    config::{DbConfig, RelayConfig},
-    db::{self, OpenMode},
+    config::RelayConfig,
+    db,
     meta::MetaStore,
     password,
     storage::DataLayout,
@@ -69,15 +69,8 @@ async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let layout = DataLayout::new(dir.path().join("data"));
     layout.create().unwrap();
-    let config = DbConfig {
-        path: dir.path().join("db.sqlite"),
-        max_connections: 4,
-        busy_timeout_secs: 5,
-    };
-    let pool = db::connect(&config, OpenMode::CreateIfMissing)
-        .await
-        .unwrap();
-    db::migrate(&pool).await.unwrap();
+    let config = db::testing::config(dir.path()).await;
+    let pool = db::testing::open(&config).await;
     let root = add_user(&pool, &layout, "root", ROOT_PASSWORD, true).await;
     let alice = add_user(&pool, &layout, "alice", ALICE_PASSWORD, false).await;
     let (_, device) = app_passwords::create(&pool, root, "laptop", Vec::new(), None)
@@ -105,7 +98,8 @@ async fn fixture() -> Fixture {
         config_path: dir.path().join("config.toml"),
         log: "info → stdout".into(),
         data_dir: layout.root().to_path_buf(),
-        db_path: config.path.clone(),
+        db_path: (config.backend == db::Backend::Sqlite).then(|| config.path.clone()),
+        database: config.describe(),
         case_insensitive: Some(false),
         lock_timeout_secs: 3600,
         push: None,
@@ -537,7 +531,7 @@ async fn accounts_are_created_changed_and_deleted_with_redirects() {
             .enabled
     );
     assert!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM web_sessions WHERE user_id = ?1")
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM web_sessions WHERE user_id = ?")
             .bind(carol.id)
             .fetch_one(&f.state.db)
             .await
@@ -1229,7 +1223,7 @@ async fn admins_revoke_devices_after_a_second_confirmation() {
 #[tokio::test]
 async fn admins_with_two_step_verification_pass_the_second_step_first() {
     let f = fixture().await;
-    sqlx::query("INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?1, x'00', 0)")
+    sqlx::query("INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?, x'00', 0)")
         .bind(f.root)
         .execute(&f.state.db)
         .await
@@ -1249,13 +1243,13 @@ async fn admins_with_two_step_verification_pass_the_second_step_first() {
 
     // The admin page shows it and resets it.
     let mut admin = Browser::new(&f.state);
-    sqlx::query("DELETE FROM two_factor WHERE user_id = ?1")
+    sqlx::query("DELETE FROM two_factor WHERE user_id = ?")
         .bind(f.root)
         .execute(&f.state.db)
         .await
         .unwrap();
     let csrf = admin.root().await;
-    sqlx::query("INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?1, x'00', 0)")
+    sqlx::query("INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?, x'00', 0)")
         .bind(f.alice)
         .execute(&f.state.db)
         .await
@@ -1280,10 +1274,12 @@ async fn admins_with_two_step_verification_pass_the_second_step_first() {
 /// Turns two-step verification on for alice (if it is not) and starts a sign-in of hers
 /// waiting for its second step.
 async fn alice_waits_for_her_second_step(f: &Fixture) {
-    sqlx::query(
-        "INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?1, x'00', 0) \
+    sqlx::query(db::Backend::of(&f.state.db).pick(
+        "INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?, x'00', 0) \
          ON CONFLICT (user_id) DO NOTHING",
-    )
+        "INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?, x'00', 0) \
+         ON DUPLICATE KEY UPDATE user_id = user_id",
+    ))
     .bind(f.alice)
     .execute(&f.state.db)
     .await
@@ -1308,7 +1304,7 @@ async fn new_app_passwords_are_shown_only_to_the_admin_who_created_them() {
     let f = fixture().await;
     let admin = f.state.admin.as_ref().unwrap();
     // Two sessions with the same row id, as SQLite handed one out again after a sign-out
-    // before the ids were AUTOINCREMENT.
+    // before the ids came from a sequence that never goes back.
     let session = |user_id, name: &str| SessionUser {
         session_id: 7,
         user_id,

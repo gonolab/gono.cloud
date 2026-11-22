@@ -177,8 +177,6 @@ pub fn basic_challenge() -> HeaderValue {
 mod tests {
     use gono_server_core::{
         Username,
-        config::DbConfig,
-        db::OpenMode,
         users::{self, NewUser},
     };
     use secrecy::ExposeSecret;
@@ -215,15 +213,7 @@ mod tests {
 
     async fn setup() -> (tempfile::TempDir, db::Pool, String) {
         let dir = tempfile::tempdir().unwrap();
-        let config = DbConfig {
-            path: dir.path().join("db.sqlite"),
-            max_connections: 2,
-            busy_timeout_secs: 5,
-        };
-        let pool = db::connect(&config, OpenMode::CreateIfMissing)
-            .await
-            .unwrap();
-        db::migrate(&pool).await.unwrap();
+        let pool = db::testing::database(dir.path()).await;
         let username = Username::new("alice").unwrap();
         let id = users::create(
             &pool,

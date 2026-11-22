@@ -21,7 +21,10 @@ use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, de::Error as _};
 use url::Url;
 
-use crate::error::{ConfigError, ValidationIssue};
+use crate::{
+    db::Backend,
+    error::{ConfigError, ValidationIssue},
+};
 
 /// Default listen address. Loopback only: a reverse proxy terminates HTTPS in front of us.
 pub const DEFAULT_BIND: SocketAddr =
@@ -51,7 +54,7 @@ pub struct Config {
     pub server: ServerConfig,
     /// `[storage]`: where user files live.
     pub storage: StorageConfig,
-    /// `[db]`: the SQLite metadata database.
+    /// `[db]`: the metadata database (SQLite or MySQL).
     pub db: DbConfig,
     /// `[webdav]`: WebDAV protocol limits.
     #[serde(default)]
@@ -122,23 +125,194 @@ pub struct StorageConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DbConfig {
-    /// Path of the SQLite database file.
+    /// The database system: `sqlite` (built in, the default) or `mysql` (MySQL 5.7.44 or
+    /// later).
+    #[serde(default)]
+    pub backend: Backend,
+
+    /// SQLite only: path of the database file.
+    #[serde(default)]
     pub path: PathBuf,
+
+    /// MySQL only: the server and the database, for example
+    /// `mysql://gono@127.0.0.1:3306/gono_cloud`, without a password (that goes into
+    /// `password_file`). Query parameters such as `ssl-mode=verify_identity` and `ssl-ca` set up
+    /// TLS.
+    #[serde(default)]
+    pub url: Option<Url>,
+
+    /// MySQL only: a file holding the password of the MySQL account, read at every start.
+    /// Without it the account must not need a password.
+    #[serde(default)]
+    pub password_file: Option<PathBuf>,
 
     /// Upper bound of the connection pool.
     #[serde(default = "default_db_max_connections")]
     pub max_connections: u32,
 
-    /// How long a connection waits for a writer of another process (the CLI) before giving
-    /// up, in seconds. The server's own writers queue at the write gate instead
-    /// ([`crate::db::begin_immediate`]).
+    /// How long a writer waits for a writer of another process (the CLI) before giving up, in
+    /// seconds: SQLite's busy timeout, MySQL's `innodb_lock_wait_timeout`. The server's own
+    /// writers queue at the write gate instead ([`crate::db::begin_immediate`]).
     #[serde(default = "default_db_busy_timeout_secs")]
     pub busy_timeout_secs: u64,
+}
+
+impl DbConfig {
+    /// A SQLite database at `path`, with the default pool settings.
+    pub fn sqlite(path: impl Into<PathBuf>) -> Self {
+        Self {
+            backend: Backend::Sqlite,
+            path: path.into(),
+            url: None,
+            password_file: None,
+            max_connections: default_db_max_connections(),
+            busy_timeout_secs: default_db_busy_timeout_secs(),
+        }
+    }
+
+    /// The MySQL database at `url`, with the default pool settings and no password file.
+    pub fn mysql(url: Url) -> Self {
+        Self {
+            backend: Backend::MySql,
+            path: PathBuf::new(),
+            url: Some(url),
+            password_file: None,
+            max_connections: default_db_max_connections(),
+            busy_timeout_secs: default_db_busy_timeout_secs(),
+        }
+    }
+
+    /// The database for people: the SQLite file, or the MySQL URL (which carries no password).
+    pub fn describe(&self) -> String {
+        match (self.backend, &self.url) {
+            (Backend::MySql, Some(url)) => format!("MySQL {url}"),
+            (Backend::MySql, None) => "MySQL (no db.url)".to_owned(),
+            (Backend::Sqlite, _) => format!("SQLite {}", self.path.display()),
+        }
+    }
+
+    fn validate(&self, reject: &mut impl FnMut(&'static str, String)) {
+        match self.backend {
+            Backend::Sqlite => {
+                if self.path.as_os_str().is_empty() {
+                    reject("db.path", "must not be empty".to_owned());
+                }
+                if self.url.is_some() {
+                    reject("db.url", "is for backend = \"mysql\" only".to_owned());
+                }
+                if self.password_file.is_some() {
+                    reject(
+                        "db.password_file",
+                        "is for backend = \"mysql\" only".to_owned(),
+                    );
+                }
+            }
+            Backend::MySql => {
+                if !self.path.as_os_str().is_empty() {
+                    reject(
+                        "db.path",
+                        "is for backend = \"sqlite\" only; MySQL is configured by db.url"
+                            .to_owned(),
+                    );
+                }
+                match &self.url {
+                    None => reject(
+                        "db.url",
+                        "is required with backend = \"mysql\", for example \
+                         mysql://gono@127.0.0.1:3306/gono_cloud"
+                            .to_owned(),
+                    ),
+                    Some(url) => {
+                        if let Err(message) = check_mysql_url(url) {
+                            reject("db.url", message);
+                        }
+                    }
+                }
+                if self
+                    .password_file
+                    .as_ref()
+                    .is_some_and(|file| file.as_os_str().is_empty())
+                {
+                    reject("db.password_file", "must not be empty".to_owned());
+                }
+            }
+        }
+        if !(1..=MAX_DB_CONNECTIONS).contains(&self.max_connections) {
+            reject(
+                "db.max_connections",
+                format!("must be between 1 and {MAX_DB_CONNECTIONS}"),
+            );
+        }
+        if self.busy_timeout_secs == 0 {
+            reject("db.busy_timeout_secs", "must be greater than 0".to_owned());
+        }
+        if self.busy_timeout_secs > MAX_DB_BUSY_TIMEOUT_SECS {
+            reject(
+                "db.busy_timeout_secs",
+                format!("must be at most {MAX_DB_BUSY_TIMEOUT_SECS} (one day)"),
+            );
+        }
+    }
+}
+
+/// Checks the shape of `db.url`: a `mysql://` URL with a host and one database, without a
+/// password.
+fn check_mysql_url(url: &Url) -> Result<(), String> {
+    if url.scheme() != "mysql" {
+        return Err(format!("{url} must start with mysql://"));
+    }
+    if url.password().is_some() {
+        return Err(
+            "must not contain a password; put the password into a file and name it in \
+             db.password_file"
+                .to_owned(),
+        );
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(format!("{url} names no host"));
+    }
+    let database = url.path().trim_start_matches('/');
+    if database.is_empty() || database.contains('/') {
+        return Err(format!(
+            "{url} must name exactly one database, as in mysql://gono@127.0.0.1:3306/gono_cloud"
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(format!("{url} must not have a fragment"));
+    }
+    Ok(())
+}
+
+/// Whether a MySQL URL names this host. `mysql://` is not a special scheme to the URL parser,
+/// so IPv4 addresses come back as names.
+fn mysql_host_is_local(url: &Url) -> bool {
+    let host = url.host_str().unwrap_or_default();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether a MySQL URL insists on TLS (`ssl-mode` of `required`, `verify_ca` or
+/// `verify_identity`); sqlx's default, `preferred`, falls back to plain TCP.
+fn mysql_requires_tls(url: &Url) -> bool {
+    url.query_pairs().any(|(key, value)| {
+        matches!(&*key, "ssl-mode" | "sslmode")
+            && ["required", "verify_ca", "verify_identity"]
+                .iter()
+                .any(|mode| value.replace('-', "_").eq_ignore_ascii_case(mode))
+    })
 }
 
 /// Highest accepted value of `db.max_connections`. SQLite serializes writers anyway; a large
 /// pool only adds contention.
 pub const MAX_DB_CONNECTIONS: u32 = 64;
+
+/// Highest accepted value of `db.busy_timeout_secs`: MySQL's `innodb_lock_wait_timeout` stops
+/// at a year, but a writer that waits for a day is stuck anyway.
+pub const MAX_DB_BUSY_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
 /// `[webdav]` table.
 #[derive(Debug, Clone, Deserialize)]
@@ -616,6 +790,9 @@ impl Config {
         };
         resolve(&mut self.storage.data_dir);
         resolve(&mut self.db.path);
+        if let Some(file) = self.db.password_file.as_mut() {
+            resolve(file);
+        }
         resolve(&mut self.two_factor.key_file);
         self.two_factor.config_dir = Some(base_dir.to_path_buf());
         for file in [
@@ -670,18 +847,7 @@ impl Config {
         }
 
         // [db]
-        if self.db.path.as_os_str().is_empty() {
-            reject("db.path", "must not be empty".to_owned());
-        }
-        if !(1..=MAX_DB_CONNECTIONS).contains(&self.db.max_connections) {
-            reject(
-                "db.max_connections",
-                format!("must be between 1 and {MAX_DB_CONNECTIONS}"),
-            );
-        }
-        if self.db.busy_timeout_secs == 0 {
-            reject("db.busy_timeout_secs", "must be greater than 0".to_owned());
-        }
+        self.db.validate(&mut reject);
 
         // [webdav]
         if !(1..=MAX_LOCK_TIMEOUT_SECS).contains(&self.webdav.max_lock_timeout_secs) {
@@ -1038,6 +1204,8 @@ impl Config {
                 key.display()
             ));
         } else if let Some(db_dir) = self.db.path.parent().filter(|dir| {
+            // MySQL has no path.
+            self.db.backend == Backend::Sqlite &&
             // A database kept in the configuration directory itself (as in the example
             // configuration) shares it with the key by design: that directory is backed up
             // as the configuration, which the key belongs to.
@@ -1049,6 +1217,19 @@ impl Config {
                  directory would give the second factor of every account away; keep the key in \
                  the configuration directory",
                 key.display()
+            ));
+        }
+        if let Some(url) = self
+            .db
+            .url
+            .as_ref()
+            .filter(|url| self.db.backend == Backend::MySql && !mysql_requires_tls(url))
+            .filter(|url| !mysql_host_is_local(url))
+        {
+            warnings.push(format!(
+                "db.url {url} reaches MySQL on another host without requiring TLS; the password \
+                 and every query cross the network unencrypted unless the server offers TLS on \
+                 its own. Add ?ssl-mode=verify_identity (and ssl-ca=<file> for a private CA)"
             ));
         }
         let url = &self.server.base_url;
@@ -1197,11 +1378,7 @@ mod tests {
 
     #[test]
     fn required_keys_are_required() {
-        for (table, key) in [
-            ("server", "base_url"),
-            ("storage", "data_dir"),
-            ("db", "path"),
-        ] {
+        for (table, key) in [("server", "base_url"), ("storage", "data_dir")] {
             let raw: String = MINIMAL
                 .lines()
                 .filter(|line| !line.trim_start().starts_with(key))
@@ -1210,6 +1387,105 @@ mod tests {
             let err = Config::from_toml(&raw).expect_err(key).to_string();
             assert!(err.contains(key), "[{table}] {key}: {err}");
         }
+        // `db.path` may be missing for MySQL, so validation asks for it.
+        let raw = MINIMAL.replace("path = \"gono-cloud.db\"", "");
+        assert_eq!(issue_keys(&parse(&raw)), ["db.path"]);
+    }
+
+    /// `MINIMAL` with a `[db]` table for MySQL instead of SQLite.
+    fn mysql(db: &str) -> Config {
+        parse(&MINIMAL.replace("path = \"gono-cloud.db\"", db))
+    }
+
+    #[test]
+    fn mysql_needs_a_url_without_password() {
+        let config = mysql(
+            "backend = \"mysql\"\nurl = \"mysql://gono@127.0.0.1:3306/gono_cloud\"\n\
+             password_file = \"mysql-password\"",
+        );
+        assert_eq!(config.db.backend, Backend::MySql);
+        assert!(issue_keys(&config).is_empty());
+        assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+        assert_eq!(
+            config.db.describe(),
+            "MySQL mysql://gono@127.0.0.1:3306/gono_cloud"
+        );
+
+        for (db, key) in [
+            ("backend = \"mysql\"", "db.url"),
+            (
+                "backend = \"mysql\"\nurl = \"mysql://gono:secret@127.0.0.1/gono_cloud\"",
+                "db.url",
+            ),
+            (
+                "backend = \"mysql\"\nurl = \"mysql://gono@127.0.0.1:3306\"",
+                "db.url",
+            ),
+            (
+                "backend = \"mysql\"\nurl = \"mysql://gono@127.0.0.1/a/b\"",
+                "db.url",
+            ),
+            (
+                "backend = \"mysql\"\nurl = \"postgres://gono@127.0.0.1/gono\"",
+                "db.url",
+            ),
+            (
+                "backend = \"mysql\"\nurl = \"mysql://gono@127.0.0.1/gono\"\npath = \"x.db\"",
+                "db.path",
+            ),
+            (
+                "backend = \"mysql\"\nurl = \"mysql://gono@127.0.0.1/gono\"\npassword_file = \"\"",
+                "db.password_file",
+            ),
+            (
+                "path = \"gono-cloud.db\"\nurl = \"mysql://gono@127.0.0.1/gono\"",
+                "db.url",
+            ),
+            (
+                "path = \"gono-cloud.db\"\npassword_file = \"mysql-password\"",
+                "db.password_file",
+            ),
+        ] {
+            assert_eq!(issue_keys(&mysql(db)), [key], "{db}");
+        }
+        let raw = MINIMAL.replace("path = \"gono-cloud.db\"", "backend = \"postgres\"");
+        assert!(Config::from_toml(&raw).is_err());
+    }
+
+    #[test]
+    fn mysql_password_files_resolve_against_the_config_directory() {
+        let mut config = mysql(
+            "backend = \"mysql\"\nurl = \"mysql://gono@127.0.0.1/gono\"\n\
+             password_file = \"secrets/mysql\"",
+        );
+        config.resolve_relative_paths(Path::new("/etc/gono-cloud"));
+        assert_eq!(
+            config.db.password_file.as_deref(),
+            Some(Path::new("/etc/gono-cloud/secrets/mysql"))
+        );
+        // The empty `db.path` of MySQL stays empty.
+        assert!(config.db.path.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn remote_mysql_without_tls_is_warned_about() {
+        let warned = |url: &str| {
+            mysql(&format!("backend = \"mysql\"\nurl = \"{url}\""))
+                .warnings()
+                .iter()
+                .any(|w| w.contains("db.url"))
+        };
+        assert!(warned("mysql://gono@db.example.com/gono"));
+        assert!(warned("mysql://gono@10.0.0.5:3306/gono?ssl-mode=preferred"));
+        assert!(!warned(
+            "mysql://gono@db.example.com/gono?ssl-mode=verify_identity"
+        ));
+        assert!(!warned(
+            "mysql://gono@db.example.com/gono?ssl-mode=REQUIRED"
+        ));
+        assert!(!warned("mysql://gono@127.0.0.1/gono"));
+        assert!(!warned("mysql://gono@[::1]:3306/gono"));
+        assert!(!warned("mysql://gono@localhost/gono"));
     }
 
     #[test]

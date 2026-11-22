@@ -15,9 +15,11 @@
 //! - `files/`, `uploads/`, `s3-uploads/` and `tmp/` must live on the same file system: uploads
 //!   are finished with an atomic `rename(2)` from `tmp/` or `uploads/` into `files/`, and S3
 //!   parts are renamed from `tmp/` into `s3-uploads/`, which fails across file systems. [`DataLayout::open`] and [`DataLayout::create_user`] check this.
-//! - SQLite reuses the highest user id after that user is deleted. `user delete` therefore
-//!   moves the user's directories to `deleted/`, and [`DataLayout::create_user`] refuses to
-//!   adopt a non-empty leftover directory, so a new account never sees an old account's files.
+//! - User ids are never handed out again (`id_sequences`, see [`crate::db::next_id`]), but a
+//!   database created anew, or restored from an older backup, starts counting again.
+//!   `user delete` therefore moves the user's directories to `deleted/`, and
+//!   [`DataLayout::create_user`] refuses to adopt a non-empty leftover directory, so a new
+//!   account never sees an old account's files.
 //! - Directories are created with mode `0700` on Unix.
 
 use std::{

@@ -1,7 +1,8 @@
 //! Counts shown on the web admin UI.
 //!
 //! Read-only aggregate queries over the account and metadata tables. Every query uses an
-//! index or touches one row per user; none scans the `files` table.
+//! index or touches one row per user; none scans the `files` table. Sums are cast to `SIGNED`,
+//! since MySQL returns them as `DECIMAL` (see [`crate::db`]).
 
 use std::collections::HashMap;
 
@@ -48,13 +49,13 @@ fn size(value: i64) -> u64 {
 /// The server-wide counts at `now` (UNIX seconds).
 pub async fn overview(pool: &Pool, now: i64) -> Result<Overview> {
     let (users, admins, disabled): (i64, i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COALESCE(SUM(is_admin = 1 AND enabled = 1), 0), \
-         COALESCE(SUM(enabled = 0), 0) FROM users",
+        "SELECT COUNT(*), CAST(COALESCE(SUM(is_admin = 1 AND enabled = 1), 0) AS SIGNED), \
+         CAST(COALESCE(SUM(enabled = 0), 0) AS SIGNED) FROM users",
     )
     .fetch_one(pool)
     .await?;
     let (app_passwords, app_passwords_used_today): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COALESCE(SUM(last_used_at >= ?1), 0) FROM app_passwords \
+        "SELECT COUNT(*), CAST(COALESCE(SUM(last_used_at >= ?), 0) AS SIGNED) FROM app_passwords \
              WHERE kind = 'dav'",
     )
     .bind(now - 24 * 3600)
@@ -66,13 +67,13 @@ pub async fn overview(pool: &Pool, now: i64) -> Result<Overview> {
             .fetch_one(pool)
             .await
     };
-    let web_sessions = count("SELECT COUNT(*) FROM web_sessions WHERE expires_at > ?1").await?;
+    let web_sessions = count("SELECT COUNT(*) FROM web_sessions WHERE expires_at > ?").await?;
     let pending_login_flows =
-        count("SELECT COUNT(*) FROM login_flows WHERE expires_at > ?1").await?;
-    let uploads = count("SELECT COUNT(*) FROM upload_sessions WHERE expires_at > ?1").await?;
-    let locks = count("SELECT COUNT(*) FROM locks WHERE timeout_at > ?1").await?;
+        count("SELECT COUNT(*) FROM login_flows WHERE expires_at > ?").await?;
+    let uploads = count("SELECT COUNT(*) FROM upload_sessions WHERE expires_at > ?").await?;
+    let locks = count("SELECT COUNT(*) FROM locks WHERE timeout_at > ?").await?;
     let storage_used: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(f.size), 0) FROM users u \
+        "SELECT CAST(COALESCE(SUM(f.size), 0) AS SIGNED) FROM users u \
          JOIN files f ON f.owner_id = u.id AND f.rel_path = ''",
     )
     .fetch_one(pool)

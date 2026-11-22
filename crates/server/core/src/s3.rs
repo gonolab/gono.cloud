@@ -20,7 +20,7 @@ use sqlx::FromRow;
 
 use crate::{
     app_passwords::check_label,
-    db::{self, Pool, Tx},
+    db::{self, Flag, Pool, Text, Tx},
     error::{Error, Result},
     path::RelPath,
     sealing::{Key, Purpose},
@@ -159,14 +159,19 @@ pub struct Bucket {
 #[derive(FromRow)]
 struct BucketRow {
     id: i64,
+    #[sqlx(try_from = "Text")]
     name: String,
     owner_id: i64,
+    #[sqlx(try_from = "Text")]
     owner_name: String,
     owner_display_name: String,
+    #[sqlx(try_from = "Flag")]
     owner_enabled: bool,
     root_file_id: i64,
+    #[sqlx(try_from = "Text")]
     rel_path: String,
     anonymous: String,
+    #[sqlx(try_from = "Flag")]
     anonymous_list: bool,
     cors: Option<String>,
     tags: Option<String>,
@@ -207,7 +212,7 @@ const BUCKET_QUERY: &str = "SELECT b.id, b.name, b.owner_id, u.username AS owner
 /// The bucket called `name`, if there is one.
 pub async fn bucket(pool: &Pool, name: &str) -> Result<Option<Bucket>> {
     let row: Option<BucketRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "{BUCKET_QUERY} WHERE b.name = ?1"
+        "{BUCKET_QUERY} WHERE b.name = ?"
     )))
     .bind(name)
     .fetch_optional(pool)
@@ -218,7 +223,7 @@ pub async fn bucket(pool: &Pool, name: &str) -> Result<Option<Bucket>> {
 /// The bucket with row id `id`, if there is one.
 pub async fn bucket_by_id(pool: &Pool, id: i64) -> Result<Option<Bucket>> {
     let row: Option<BucketRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "{BUCKET_QUERY} WHERE b.id = ?1"
+        "{BUCKET_QUERY} WHERE b.id = ?"
     )))
     .bind(id)
     .fetch_optional(pool)
@@ -229,7 +234,7 @@ pub async fn bucket_by_id(pool: &Pool, id: i64) -> Result<Option<Bucket>> {
 /// The buckets of `owner`, by name.
 pub async fn buckets_of(pool: &Pool, owner: i64) -> Result<Vec<Bucket>> {
     let rows: Vec<BucketRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "{BUCKET_QUERY} WHERE b.owner_id = ?1 ORDER BY b.name"
+        "{BUCKET_QUERY} WHERE b.owner_id = ? ORDER BY b.name"
     )))
     .bind(owner)
     .fetch_all(pool)
@@ -249,7 +254,7 @@ pub async fn create_bucket(
     folder_id: i64,
 ) -> Result<Bucket> {
     let mut tx = db::begin_immediate(pool).await?;
-    let taken: Option<i64> = sqlx::query_scalar("SELECT owner_id FROM s3_buckets WHERE name = ?1")
+    let taken: Option<i64> = sqlx::query_scalar("SELECT owner_id FROM s3_buckets WHERE name = ?")
         .bind(name.as_str())
         .fetch_optional(&mut *tx)
         .await?;
@@ -259,8 +264,8 @@ pub async fn create_bucket(
             yours: taken_by == owner,
         });
     }
-    let folder: Option<(String, bool)> =
-        sqlx::query_as("SELECT rel_path, is_dir FROM files WHERE id = ?1 AND owner_id = ?2")
+    let folder: Option<(Text, Flag)> =
+        sqlx::query_as("SELECT rel_path, is_dir FROM files WHERE id = ? AND owner_id = ?")
             .bind(folder_id)
             .bind(owner)
             .fetch_optional(&mut *tx)
@@ -274,8 +279,8 @@ pub async fn create_bucket(
         reason,
     };
     let path = match folder {
-        Some((path, true)) => RelPath::from_db(path),
-        Some((path, false)) => return Err(invalid(&path, "not a folder")),
+        Some((Text(path), Flag(true))) => RelPath::from_db(path),
+        Some((Text(path), Flag(false))) => return Err(invalid(&path, "not a folder")),
         None => return Err(invalid(&format!("#{folder_id}"), "no such folder")),
     };
     if path.is_root() {
@@ -292,18 +297,20 @@ pub async fn create_bucket(
             ));
         }
     }
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO s3_buckets (name, owner_id, root_file_id, created_at) \
-         VALUES (?1, ?2, ?3, ?4) RETURNING id",
+    let id = db::next_id(&mut tx, "s3_buckets").await?;
+    sqlx::query(
+        "INSERT INTO s3_buckets (id, name, owner_id, root_file_id, created_at) \
+         VALUES (?, ?, ?, ?, ?)",
     )
+    .bind(id)
     .bind(name.as_str())
     .bind(owner)
     .bind(folder_id)
     .bind(db::unix_now())
-    .fetch_one(&mut *tx)
+    .execute(&mut *tx)
     .await?;
     let row: BucketRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "{BUCKET_QUERY} WHERE b.id = ?1"
+        "{BUCKET_QUERY} WHERE b.id = ?"
     )))
     .bind(id)
     .fetch_one(&mut *tx)
@@ -314,7 +321,7 @@ pub async fn create_bucket(
 
 async fn buckets_in(tx: &mut Tx, owner: i64) -> Result<Vec<Bucket>> {
     let rows: Vec<BucketRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "{BUCKET_QUERY} WHERE b.owner_id = ?1"
+        "{BUCKET_QUERY} WHERE b.owner_id = ?"
     )))
     .bind(owner)
     .fetch_all(&mut **tx)
@@ -326,7 +333,7 @@ async fn buckets_in(tx: &mut Tx, owner: i64) -> Result<Vec<Bucket>> {
 /// if there is no such bucket.
 pub async fn delete_bucket(pool: &Pool, owner: i64, id: i64) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
-    let removed = sqlx::query("DELETE FROM s3_buckets WHERE id = ?1 AND owner_id = ?2")
+    let removed = sqlx::query("DELETE FROM s3_buckets WHERE id = ? AND owner_id = ?")
         .bind(id)
         .bind(owner)
         .execute(&mut *tx)
@@ -347,12 +354,12 @@ pub async fn set_anonymous(
 ) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
     let changed = sqlx::query(
-        "UPDATE s3_buckets SET anonymous = ?3, anonymous_list = ?4 WHERE id = ?1 AND owner_id = ?2",
+        "UPDATE s3_buckets SET anonymous = ?, anonymous_list = ? WHERE id = ? AND owner_id = ?",
     )
-    .bind(id)
-    .bind(owner)
     .bind(anonymous.as_str())
     .bind(list)
+    .bind(id)
+    .bind(owner)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -363,11 +370,12 @@ pub async fn set_anonymous(
 /// Replaces the CORS rules of `owner`'s bucket `id` with `cors` (a JSON array; `None` removes
 /// them). Returns `false` if there is no such bucket.
 pub async fn set_cors(pool: &Pool, owner: i64, id: i64, cors: Option<&str>) -> Result<bool> {
+    check_json("CORS rules", cors)?;
     let mut tx = db::begin_immediate(pool).await?;
-    let changed = sqlx::query("UPDATE s3_buckets SET cors = ?3 WHERE id = ?1 AND owner_id = ?2")
+    let changed = sqlx::query("UPDATE s3_buckets SET cors = ? WHERE id = ? AND owner_id = ?")
+        .bind(cors)
         .bind(id)
         .bind(owner)
-        .bind(cors)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -378,11 +386,12 @@ pub async fn set_cors(pool: &Pool, owner: i64, id: i64, cors: Option<&str>) -> R
 /// Replaces the tags of `owner`'s bucket `id` with `tags` (a JSON object; `None` removes them).
 /// Returns `false` if there is no such bucket.
 pub async fn set_bucket_tags(pool: &Pool, owner: i64, id: i64, tags: Option<&str>) -> Result<bool> {
+    check_json("tags", tags)?;
     let mut tx = db::begin_immediate(pool).await?;
-    let changed = sqlx::query("UPDATE s3_buckets SET tags = ?3 WHERE id = ?1 AND owner_id = ?2")
+    let changed = sqlx::query("UPDATE s3_buckets SET tags = ? WHERE id = ? AND owner_id = ?")
+        .bind(tags)
         .bind(id)
         .bind(owner)
-        .bind(tags)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -398,15 +407,15 @@ pub async fn set_bucket_lifecycle(
     id: i64,
     lifecycle: Option<&str>,
 ) -> Result<bool> {
+    check_json("lifecycle rules", lifecycle)?;
     let mut tx = db::begin_immediate(pool).await?;
-    let changed =
-        sqlx::query("UPDATE s3_buckets SET lifecycle = ?3 WHERE id = ?1 AND owner_id = ?2")
-            .bind(id)
-            .bind(owner)
-            .bind(lifecycle)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+    let changed = sqlx::query("UPDATE s3_buckets SET lifecycle = ? WHERE id = ? AND owner_id = ?")
+        .bind(lifecycle)
+        .bind(id)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
     tx.commit().await?;
     Ok(changed == 1)
 }
@@ -419,16 +428,28 @@ pub async fn set_bucket_website(
     id: i64,
     website: Option<&str>,
 ) -> Result<bool> {
+    check_json("website configuration", website)?;
     let mut tx = db::begin_immediate(pool).await?;
-    let changed = sqlx::query("UPDATE s3_buckets SET website = ?3 WHERE id = ?1 AND owner_id = ?2")
+    let changed = sqlx::query("UPDATE s3_buckets SET website = ? WHERE id = ? AND owner_id = ?")
+        .bind(website)
         .bind(id)
         .bind(owner)
-        .bind(website)
         .execute(&mut *tx)
         .await?
         .rows_affected();
     tx.commit().await?;
     Ok(changed == 1)
+}
+
+/// Refuses a value of a JSON column that is not JSON. SQLite's CHECK constraint refuses it as
+/// well; MySQL 5.7 does not enforce CHECK constraints, so the code keeps the rule for both.
+fn check_json(what: &'static str, value: Option<&str>) -> Result<()> {
+    match value {
+        Some(value) if serde_json::from_str::<serde_json::Value>(value).is_err() => {
+            Err(Error::InvalidJson(what))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The buckets with lifecycle rules, of enabled accounts.
@@ -546,7 +567,7 @@ async fn check_grants(tx: &mut Tx, owner: i64, grants: Vec<Grant>) -> Result<Vec
     }
     for id in grants.iter().filter_map(|grant| grant.bucket_id) {
         let found: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM s3_buckets WHERE id = ?1 AND owner_id = ?2")
+            sqlx::query_scalar("SELECT 1 FROM s3_buckets WHERE id = ? AND owner_id = ?")
                 .bind(id)
                 .bind(owner)
                 .fetch_optional(&mut **tx)
@@ -577,27 +598,25 @@ pub async fn create_key(
     let created_at = db::unix_now();
     // 36^16 ids: a collision is not going to happen, but would only fail the insert.
     let access_key_id = generate_access_key_id();
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO app_passwords (user_id, kind, access_key_id, secret_sealed, label, \
-         created_at, expires_at) VALUES (?1, 's3', ?2, x'', ?3, ?4, ?5) RETURNING id",
+    // The row id is part of the associated data of the sealed secret.
+    let id = db::next_id(&mut tx, "app_passwords").await?;
+    sqlx::query(
+        "INSERT INTO app_passwords (id, user_id, kind, access_key_id, secret_sealed, label, \
+         created_at, expires_at) VALUES (?, ?, 's3', ?, ?, ?, ?, ?)",
     )
+    .bind(id)
     .bind(user_id)
     .bind(&access_key_id)
+    .bind(sealing.seal(Purpose::S3Secret, id, secret.expose_secret().as_bytes()))
     .bind(&label)
     .bind(created_at)
     .bind(expires_at)
-    .fetch_one(&mut *tx)
+    .execute(&mut *tx)
     .await?;
-    // The row id is part of the associated data, so the secret is sealed once it is known.
-    sqlx::query("UPDATE app_passwords SET secret_sealed = ?2 WHERE id = ?1")
-        .bind(id)
-        .bind(sealing.seal(Purpose::S3Secret, id, secret.expose_secret().as_bytes()))
-        .execute(&mut *tx)
-        .await?;
     for grant in &grants {
         sqlx::query(
             "INSERT INTO s3_key_grants (app_password_id, bucket_id, permission) \
-             VALUES (?1, ?2, ?3)",
+             VALUES (?, ?, ?)",
         )
         .bind(id)
         .bind(grant.bucket_id)
@@ -623,6 +642,7 @@ pub async fn create_key(
 struct KeyRow {
     id: i64,
     user_id: i64,
+    #[sqlx(try_from = "Text")]
     access_key_id: String,
     label: String,
     created_at: i64,
@@ -652,14 +672,14 @@ impl TryFrom<&GrantRow> for Grant {
 pub async fn list_keys(pool: &Pool, user_id: i64) -> Result<Vec<S3Key>> {
     let rows: Vec<KeyRow> = sqlx::query_as(
         "SELECT id, user_id, access_key_id, label, created_at, expires_at, last_used_at \
-         FROM app_passwords WHERE user_id = ?1 AND kind = 's3' ORDER BY id",
+         FROM app_passwords WHERE user_id = ? AND kind = 's3' ORDER BY id",
     )
     .bind(user_id)
     .fetch_all(pool)
     .await?;
     let grants: Vec<GrantRow> = sqlx::query_as(
         "SELECT g.app_password_id, g.bucket_id, g.permission FROM s3_key_grants g \
-         JOIN app_passwords a ON a.id = g.app_password_id WHERE a.user_id = ?1 \
+         JOIN app_passwords a ON a.id = g.app_password_id WHERE a.user_id = ? \
          ORDER BY g.app_password_id, g.bucket_id",
     )
     .bind(user_id)
@@ -689,7 +709,7 @@ pub async fn list_keys(pool: &Pool, user_id: i64) -> Result<Vec<S3Key>> {
 pub async fn delete_key(pool: &Pool, user_id: i64, id: i64) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
     let removed =
-        sqlx::query("DELETE FROM app_passwords WHERE id = ?1 AND user_id = ?2 AND kind = 's3'")
+        sqlx::query("DELETE FROM app_passwords WHERE id = ? AND user_id = ? AND kind = 's3'")
             .bind(id)
             .bind(user_id)
             .execute(&mut *tx)
@@ -706,8 +726,10 @@ struct SigningRow {
     secret_sealed: Vec<u8>,
     expires_at: Option<i64>,
     last_used_at: Option<i64>,
+    #[sqlx(try_from = "Text")]
     username: String,
     display_name: String,
+    #[sqlx(try_from = "Flag")]
     enabled: bool,
 }
 
@@ -726,7 +748,7 @@ pub async fn signing_key(
     let row: Option<SigningRow> = sqlx::query_as(
         "SELECT a.id, a.user_id, a.secret_sealed, a.expires_at, a.last_used_at, u.username, \
          u.display_name, u.enabled FROM app_passwords a JOIN users u ON u.id = a.user_id \
-         WHERE a.kind = 's3' AND a.access_key_id = ?1",
+         WHERE a.kind = 's3' AND a.access_key_id = ?",
     )
     .bind(access_key_id)
     .fetch_optional(pool)
@@ -750,7 +772,7 @@ pub async fn signing_key(
     };
     let grants: Vec<GrantRow> = sqlx::query_as(
         "SELECT app_password_id, bucket_id, permission FROM s3_key_grants \
-         WHERE app_password_id = ?1 ORDER BY bucket_id",
+         WHERE app_password_id = ? ORDER BY bucket_id",
     )
     .bind(row.id)
     .fetch_all(pool)
@@ -808,8 +830,10 @@ pub struct UploadPart {
 
 #[derive(FromRow)]
 struct UploadRow {
+    #[sqlx(try_from = "Text")]
     upload_id: String,
     bucket_id: i64,
+    #[sqlx(try_from = "Text")]
     key: String,
     meta: String,
     created_at: i64,
@@ -875,8 +899,8 @@ pub async fn create_upload(
     let upload_id = generate_upload_id();
     let mut tx = db::begin_immediate(pool).await?;
     sqlx::query(
-        "INSERT INTO s3_uploads (upload_id, bucket_id, key, meta, created_at, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO s3_uploads (upload_id, bucket_id, `key`, meta, created_at, expires_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&upload_id)
     .bind(bucket_id)
@@ -890,14 +914,15 @@ pub async fn create_upload(
     Ok(upload_id)
 }
 
-const UPLOAD_COLUMNS: &str =
-    "upload_id, bucket_id, key, meta, created_at, expires_at, completed_etag, completed_checksum";
+/// `key` is a reserved word in MySQL; both backends accept it in backticks.
+const UPLOAD_COLUMNS: &str = "upload_id, bucket_id, `key`, meta, created_at, expires_at, \
+     completed_etag, completed_checksum";
 
 /// The upload `upload_id`, if it is in progress or was completed lately
 /// ([`Upload::completed_etag`]).
 pub async fn upload(pool: &Pool, upload_id: &str) -> Result<Option<Upload>> {
     let row: Option<UploadRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {UPLOAD_COLUMNS} FROM s3_uploads WHERE upload_id = ?1"
+        "SELECT {UPLOAD_COLUMNS} FROM s3_uploads WHERE upload_id = ?"
     )))
     .bind(upload_id)
     .fetch_optional(pool)
@@ -908,8 +933,8 @@ pub async fn upload(pool: &Pool, upload_id: &str) -> Result<Option<Upload>> {
 /// The uploads in progress into bucket `bucket_id`, by key and then by id.
 pub async fn uploads_of_bucket(pool: &Pool, bucket_id: i64) -> Result<Vec<Upload>> {
     let rows: Vec<UploadRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT {UPLOAD_COLUMNS} FROM s3_uploads WHERE bucket_id = ?1 AND completed_etag IS NULL \
-         ORDER BY key, upload_id"
+        "SELECT {UPLOAD_COLUMNS} FROM s3_uploads WHERE bucket_id = ? AND completed_etag IS NULL \
+         ORDER BY `key`, upload_id"
     )))
     .bind(bucket_id)
     .fetch_all(pool)
@@ -928,10 +953,10 @@ pub async fn record_part(
 ) -> Result<Option<Option<String>>> {
     let mut tx = db::begin_immediate(pool).await?;
     let updated = sqlx::query(
-        "UPDATE s3_uploads SET expires_at = ?2 WHERE upload_id = ?1 AND completed_etag IS NULL",
+        "UPDATE s3_uploads SET expires_at = ? WHERE upload_id = ? AND completed_etag IS NULL",
     )
-    .bind(upload_id)
     .bind(expires_at)
+    .bind(upload_id)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -939,15 +964,21 @@ pub async fn record_part(
         return Ok(None);
     }
     let replaced: Option<String> = sqlx::query_scalar(
-        "SELECT file_name FROM s3_upload_parts WHERE upload_id = ?1 AND part_number = ?2",
+        "SELECT file_name FROM s3_upload_parts WHERE upload_id = ? AND part_number = ?",
     )
     .bind(upload_id)
     .bind(i64::from(part.part_number))
     .fetch_optional(&mut *tx)
     .await?;
+    // Delete and insert: what `INSERT OR REPLACE` does, in SQL both backends speak.
+    sqlx::query("DELETE FROM s3_upload_parts WHERE upload_id = ? AND part_number = ?")
+        .bind(upload_id)
+        .bind(i64::from(part.part_number))
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
-        "INSERT OR REPLACE INTO s3_upload_parts (upload_id, part_number, file_name, etag, size, \
-         uploaded_at, checksum) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO s3_upload_parts (upload_id, part_number, file_name, etag, size, \
+         uploaded_at, checksum) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(upload_id)
     .bind(i64::from(part.part_number))
@@ -966,7 +997,7 @@ pub async fn record_part(
 pub async fn parts(pool: &Pool, upload_id: &str) -> Result<Vec<UploadPart>> {
     let rows: Vec<PartRow> = sqlx::query_as(
         "SELECT part_number, file_name, etag, size, uploaded_at, checksum FROM s3_upload_parts \
-         WHERE upload_id = ?1 ORDER BY part_number",
+         WHERE upload_id = ? ORDER BY part_number",
     )
     .bind(upload_id)
     .fetch_all(pool)
@@ -986,17 +1017,17 @@ pub async fn complete_upload(
 ) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
     let updated = sqlx::query(
-        "UPDATE s3_uploads SET completed_etag = ?2, completed_checksum = ?4, expires_at = ?3 \
-         WHERE upload_id = ?1 AND completed_etag IS NULL",
+        "UPDATE s3_uploads SET completed_etag = ?, completed_checksum = ?, expires_at = ? \
+         WHERE upload_id = ? AND completed_etag IS NULL",
     )
-    .bind(upload_id)
     .bind(etag)
-    .bind(expires_at)
     .bind(checksum)
+    .bind(expires_at)
+    .bind(upload_id)
     .execute(&mut *tx)
     .await?
     .rows_affected();
-    sqlx::query("DELETE FROM s3_upload_parts WHERE upload_id = ?1")
+    sqlx::query("DELETE FROM s3_upload_parts WHERE upload_id = ?")
         .bind(upload_id)
         .execute(&mut *tx)
         .await?;
@@ -1008,7 +1039,7 @@ pub async fn complete_upload(
 /// `false` if it was gone already.
 pub async fn delete_upload(pool: &Pool, upload_id: &str) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
-    let removed = sqlx::query("DELETE FROM s3_uploads WHERE upload_id = ?1")
+    let removed = sqlx::query("DELETE FROM s3_uploads WHERE upload_id = ?")
         .bind(upload_id)
         .execute(&mut *tx)
         .await?
@@ -1021,21 +1052,26 @@ pub async fn delete_upload(pool: &Pool, upload_id: &str) -> Result<bool> {
 /// caller removes.
 pub async fn purge_expired_uploads(pool: &Pool, now: i64) -> Result<Vec<String>> {
     let mut tx = db::begin_immediate(pool).await?;
-    let ids: Vec<String> =
-        sqlx::query_scalar("DELETE FROM s3_uploads WHERE expires_at <= ?1 RETURNING upload_id")
+    // Selected, then deleted: the write transaction keeps the two in step.
+    let ids: Vec<Text> =
+        sqlx::query_scalar("SELECT upload_id FROM s3_uploads WHERE expires_at <= ?")
             .bind(now)
             .fetch_all(&mut *tx)
             .await?;
+    sqlx::query("DELETE FROM s3_uploads WHERE expires_at <= ?")
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
-    Ok(ids)
+    Ok(ids.into_iter().map(String::from).collect())
 }
 
 /// The ids of every upload, in progress or completed lately.
 pub async fn upload_ids(pool: &Pool) -> Result<std::collections::HashSet<String>> {
-    let ids: Vec<String> = sqlx::query_scalar("SELECT upload_id FROM s3_uploads")
+    let ids: Vec<Text> = sqlx::query_scalar("SELECT upload_id FROM s3_uploads")
         .fetch_all(pool)
         .await?;
-    Ok(ids.into_iter().collect())
+    Ok(ids.into_iter().map(String::from).collect())
 }
 
 #[cfg(test)]

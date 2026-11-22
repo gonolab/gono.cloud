@@ -43,14 +43,27 @@ trusted_proxies = ["127.0.0.1", "::1"]
 data_dir = "data"
 
 [db]
-# SQLite database with accounts and file metadata. Created by `gono-cloud init`. Required.
+# The database with accounts and file metadata: "sqlite" (built in) or "mysql" (MySQL 5.7.44 or
+# later). Default: "sqlite". See "Choosing the database" in docs/deployment.md.
+# backend = "sqlite"
+
+# SQLite only: the database file. Created by `gono-cloud init`. Required for SQLite.
 path = "gono-cloud.db"
+
+# MySQL instead of SQLite: remove `path` above and set these. `url` names the server, the
+# account and the database (which must exist and be empty before `gono-cloud init`), never the
+# password: that is the first line of `password_file`, read at every start (relative paths
+# start in this file's directory). Away from this host, require TLS with
+# ?ssl-mode=verify_identity (add &ssl-ca=<file> for a private CA).
+# backend = "mysql"
+# url = "mysql://gono@127.0.0.1:3306/gono_cloud"
+# password_file = "mysql-password"
 
 # Maximum number of pooled connections, 1 to 64. Default: 8.
 max_connections = 8
 
-# Seconds a connection waits for a writer of another process (the CLI) before failing.
-# Writers of the server queue in the server itself and do not count. Default: 5.
+# Seconds a writer waits for a writer of another process (the CLI) before failing. Writers of
+# the server queue in the server itself and do not count. Default: 5.
 busy_timeout_secs = 5
 
 [webdav]

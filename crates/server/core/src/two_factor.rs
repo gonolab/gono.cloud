@@ -207,7 +207,7 @@ fn recovery_digest(code: &str) -> [u8; 32] {
 
 /// Whether account `user_id` has two-step verification enrolled.
 pub async fn is_enrolled(pool: &Pool, user_id: i64) -> Result<bool> {
-    let enrolled: Option<i64> = sqlx::query_scalar("SELECT 1 FROM two_factor WHERE user_id = ?1")
+    let enrolled: Option<i64> = sqlx::query_scalar("SELECT 1 FROM two_factor WHERE user_id = ?")
         .bind(user_id)
         .fetch_optional(pool)
         .await?;
@@ -234,7 +234,7 @@ pub struct Status {
 /// The two-step verification of `user_id`, if enrolled.
 pub async fn status(pool: &Pool, user_id: i64) -> Result<Option<Status>> {
     let enabled_at: Option<i64> =
-        sqlx::query_scalar("SELECT enabled_at FROM two_factor WHERE user_id = ?1")
+        sqlx::query_scalar("SELECT enabled_at FROM two_factor WHERE user_id = ?")
             .bind(user_id)
             .fetch_optional(pool)
             .await?;
@@ -242,7 +242,7 @@ pub async fn status(pool: &Pool, user_id: i64) -> Result<Option<Status>> {
         return Ok(None);
     };
     let left: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM recovery_codes WHERE user_id = ?1 AND used_at IS NULL",
+        "SELECT COUNT(*) FROM recovery_codes WHERE user_id = ? AND used_at IS NULL",
     )
     .bind(user_id)
     .fetch_one(pool)
@@ -255,14 +255,14 @@ pub async fn status(pool: &Pool, user_id: i64) -> Result<Option<Status>> {
 
 /// Replaces the recovery codes of `user_id` inside `tx` and returns the new ones.
 async fn replace_recovery_codes(tx: &mut db::Tx, user_id: i64) -> Result<Vec<String>> {
-    sqlx::query("DELETE FROM recovery_codes WHERE user_id = ?1")
+    sqlx::query("DELETE FROM recovery_codes WHERE user_id = ?")
         .bind(user_id)
         .execute(&mut **tx)
         .await?;
     let codes: Vec<String> = (0..RECOVERY_CODES).map(|_| new_recovery_code()).collect();
     for code in &codes {
         let canonical = normalize_recovery_code(code).unwrap_or_default();
-        sqlx::query("INSERT INTO recovery_codes (user_id, code_hash) VALUES (?1, ?2)")
+        sqlx::query("INSERT INTO recovery_codes (user_id, code_hash) VALUES (?, ?)")
             .bind(user_id)
             .bind(&recovery_digest(&canonical)[..])
             .execute(&mut **tx)
@@ -290,28 +290,32 @@ pub async fn enable(
     now: i64,
 ) -> Result<Vec<String>> {
     let mut tx = db::begin_immediate(pool).await?;
-    let inserted = sqlx::query(
-        "INSERT INTO two_factor (user_id, secret, last_step, enabled_at) VALUES (?1, ?2, ?3, ?4) \
-         ON CONFLICT (user_id) DO NOTHING",
+    // Inside the write transaction nobody can enroll in between.
+    let enrolled: Option<i64> = sqlx::query_scalar("SELECT 1 FROM two_factor WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if enrolled.is_some() {
+        return Err(Error::TwoFactorEnrolled);
+    }
+    sqlx::query(
+        "INSERT INTO two_factor (user_id, secret, last_step, enabled_at) VALUES (?, ?, ?, ?)",
     )
     .bind(user_id)
     .bind(key.seal(Purpose::Totp, user_id, secret))
     .bind(step)
     .bind(now)
     .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if inserted == 0 {
-        return Err(Error::TwoFactorEnrolled);
-    }
-    sqlx::query("DELETE FROM web_sessions WHERE user_id = ?1 AND id IS NOT ?2")
+    .await?;
+    sqlx::query("DELETE FROM web_sessions WHERE user_id = ? AND (? IS NULL OR id <> ?)")
         .bind(user_id)
+        .bind(keep_session)
         .bind(keep_session)
         .execute(&mut *tx)
         .await?;
     let codes = replace_recovery_codes(&mut tx, user_id).await?;
-    audit::record(
-        &mut *tx,
+    audit::record_in(
+        &mut tx,
         &Record::new(user_id, "two_factor.enabled", Actor::User).client_ip(client_ip),
         now,
     )
@@ -326,7 +330,7 @@ pub async fn enable(
 pub async fn sign_in_account(pool: &Pool, user_id: i64) -> Result<Option<User>> {
     Ok(sqlx::query_as(
         "SELECT id, username, display_name, enabled, is_admin, created_at, updated_at \
-         FROM users WHERE id = ?1",
+         FROM users WHERE id = ?",
     )
     .bind(user_id)
     .fetch_optional(pool)
@@ -343,8 +347,8 @@ pub async fn recovery_code_uses(
 ) -> Result<Vec<(i64, Option<String>)>> {
     Ok(sqlx::query_as(
         "SELECT at, client_ip FROM audit_log \
-         WHERE user_id = ?1 AND kind = 'recovery_code.used' AND at > ?2 \
-         ORDER BY id DESC LIMIT ?3",
+         WHERE user_id = ? AND kind = 'recovery_code.used' AND at > ? \
+         ORDER BY id DESC LIMIT ?",
     )
     .bind(user_id)
     .bind(since)
@@ -362,8 +366,8 @@ pub async fn renew_recovery_codes(
 ) -> Result<Vec<String>> {
     let mut tx = db::begin_immediate(pool).await?;
     let codes = replace_recovery_codes(&mut tx, user_id).await?;
-    audit::record(
-        &mut *tx,
+    audit::record_in(
+        &mut tx,
         &Record::new(user_id, "recovery_codes.renewed", Actor::User).client_ip(client_ip),
         now,
     )
@@ -392,13 +396,13 @@ pub async fn disable(
     now: i64,
 ) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
-    let removed = sqlx::query("DELETE FROM two_factor WHERE user_id = ?1")
+    let removed = sqlx::query("DELETE FROM two_factor WHERE user_id = ?")
         .bind(user_id)
         .execute(&mut *tx)
         .await?
         .rows_affected()
         == 1;
-    sqlx::query("DELETE FROM recovery_codes WHERE user_id = ?1")
+    sqlx::query("DELETE FROM recovery_codes WHERE user_id = ?")
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
@@ -408,8 +412,8 @@ pub async fn disable(
             TurnedOff::Admin => ("two_factor.reset", Actor::Admin),
             TurnedOff::Cli => ("two_factor.reset", Actor::Cli),
         };
-        audit::record(
-            &mut *tx,
+        audit::record_in(
+            &mut tx,
             &Record::new(user_id, kind, actor).client_ip(client_ip),
             now,
         )
@@ -449,7 +453,7 @@ pub async fn verify(
     now: i64,
 ) -> Result<Verification> {
     let row: Option<(Vec<u8>, i64)> =
-        sqlx::query_as("SELECT secret, last_step FROM two_factor WHERE user_id = ?1")
+        sqlx::query_as("SELECT secret, last_step FROM two_factor WHERE user_id = ?")
             .bind(user_id)
             .fetch_optional(pool)
             .await?;
@@ -465,15 +469,15 @@ pub async fn verify(
         };
         let mut tx = db::begin_immediate(pool).await?;
         // Only one request can move the step past `step - 1`: a code works once.
-        let used = sqlx::query(
-            "UPDATE two_factor SET last_step = ?2 WHERE user_id = ?1 AND last_step < ?2",
-        )
-        .bind(user_id)
-        .bind(step)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-            == 1;
+        let used =
+            sqlx::query("UPDATE two_factor SET last_step = ? WHERE user_id = ? AND last_step < ?")
+                .bind(step)
+                .bind(user_id)
+                .bind(step)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                == 1;
         tx.commit().await?;
         return Ok(if used {
             Verification::Code
@@ -484,12 +488,12 @@ pub async fn verify(
     if let Some(code) = normalize_recovery_code(input) {
         let mut tx = db::begin_immediate(pool).await?;
         let used = sqlx::query(
-            "UPDATE recovery_codes SET used_at = ?3 \
-             WHERE user_id = ?1 AND code_hash = ?2 AND used_at IS NULL",
+            "UPDATE recovery_codes SET used_at = ? \
+             WHERE user_id = ? AND code_hash = ? AND used_at IS NULL",
         )
+        .bind(now)
         .bind(user_id)
         .bind(&recovery_digest(&code)[..])
-        .bind(now)
         .execute(&mut *tx)
         .await?
         .rows_affected()
@@ -498,14 +502,14 @@ pub async fn verify(
             tx.commit().await?;
             return Ok(Verification::Wrong);
         }
-        audit::record(
-            &mut *tx,
+        audit::record_in(
+            &mut tx,
             &Record::new(user_id, "recovery_code.used", Actor::User).client_ip(client_ip),
             now,
         )
         .await?;
         let left: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM recovery_codes WHERE user_id = ?1 AND used_at IS NULL",
+            "SELECT COUNT(*) FROM recovery_codes WHERE user_id = ? AND used_at IS NULL",
         )
         .bind(user_id)
         .fetch_one(&mut *tx)
@@ -519,11 +523,11 @@ pub async fn verify(
 /// Whether the second step of `user_id` is locked at `now` by too many failures.
 pub async fn locked(pool: &Pool, user_id: i64, now: i64) -> Result<bool> {
     let (window, day): (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(SUM(at > ?2), 0), COUNT(*) FROM audit_log \
-         WHERE user_id = ?1 AND kind = 'two_factor.failed' AND at > ?3",
+        "SELECT CAST(COALESCE(SUM(at > ?), 0) AS SIGNED), COUNT(*) FROM audit_log \
+         WHERE user_id = ? AND kind = 'two_factor.failed' AND at > ?",
     )
-    .bind(user_id)
     .bind(now - FAILURE_WINDOW_SECS)
+    .bind(user_id)
     .bind(now - 24 * 60 * 60)
     .fetch_one(pool)
     .await?;

@@ -374,9 +374,7 @@ mod tests {
     };
     use gono_server_connect::ConnectConfig;
     use gono_server_core::{
-        Username,
-        config::DbConfig,
-        db::{self, OpenMode},
+        Username, db,
         devices::{self, EndpointId, RevokedBy},
         login_flows,
         storage::DataLayout,
@@ -415,15 +413,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = DataLayout::new(dir.path().join("data"));
         layout.create().unwrap();
-        let config = DbConfig {
-            path: dir.path().join("db.sqlite"),
-            max_connections: 4,
-            busy_timeout_secs: 5,
-        };
-        let pool = db::connect(&config, OpenMode::CreateIfMissing)
-            .await
-            .unwrap();
-        db::migrate(&pool).await.unwrap();
+        let pool = db::testing::database(dir.path()).await;
         let username = Username::new("alice").unwrap();
         let alice = users::create(
             &pool,
@@ -439,7 +429,7 @@ mod tests {
         .unwrap();
         if two_factor {
             sqlx::query(
-                "INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?1, x'00', 0)",
+                "INSERT INTO two_factor (user_id, secret, enabled_at) VALUES (?, x'00', 0)",
             )
             .bind(alice)
             .execute(&pool)

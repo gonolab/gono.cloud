@@ -1550,15 +1550,7 @@ mod tests {
     #[tokio::test]
     async fn cookies_of_https_origins_are_host_only() {
         let dir = tempfile::tempdir().unwrap();
-        let config = gono_server_core::config::DbConfig {
-            path: dir.path().join("db.sqlite"),
-            max_connections: 2,
-            busy_timeout_secs: 5,
-        };
-        let pool = db::connect(&config, db::OpenMode::CreateIfMissing)
-            .await
-            .unwrap();
-        db::migrate(&pool).await.unwrap();
+        let pool = db::testing::database(dir.path()).await;
         let limiter = Arc::new(RateLimiter::new());
         let https = Web::new(
             pool.clone(),

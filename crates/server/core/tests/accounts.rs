@@ -3,23 +3,13 @@
 use gono_server_core::{
     Error, Permission, RelPath, Username,
     app_passwords::{self, Scope},
-    config::DbConfig,
-    db::{self, OpenMode, Pool},
+    db::{self, Pool},
     users::{self, NewUser},
 };
 use secrecy::{ExposeSecret, SecretString};
 
 async fn database(dir: &std::path::Path) -> Pool {
-    let config = DbConfig {
-        path: dir.join("gono-cloud.db"),
-        max_connections: 4,
-        busy_timeout_secs: 5,
-    };
-    let pool = db::connect(&config, OpenMode::CreateIfMissing)
-        .await
-        .unwrap();
-    db::migrate(&pool).await.unwrap();
-    pool
+    db::testing::database(dir).await
 }
 
 async fn add_user(pool: &Pool, name: &str) -> i64 {

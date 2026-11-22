@@ -27,7 +27,7 @@ use sqlx::FromRow;
 
 use crate::{
     app_passwords::{self, Scope},
-    db::{self, Pool},
+    db::{self, Flag, Pool, Text},
     devices::{self, EndpointId, NewDevice, Registration},
     error::Result,
     secret,
@@ -160,18 +160,20 @@ async fn insert(
     let login_token = secret::random_token(TOKEN_CHARS);
     let expires_at = now.saturating_add(FLOW_TTL_SECS);
     let mut tx = db::begin_immediate(pool).await?;
-    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM login_flows WHERE expires_at > ?1")
+    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM login_flows WHERE expires_at > ?")
         .bind(now)
         .fetch_one(&mut *tx)
         .await?;
     if live >= MAX_PENDING_FLOWS {
         return Ok(None);
     }
+    let id = db::next_id(&mut tx, "login_flows").await?;
     sqlx::query(
-        "INSERT INTO login_flows (poll_token_hash, login_token_hash, client_name, created_at, \
-         expires_at, device_endpoint_id, device_product, device_platform, device_version, \
-         device_challenge) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO login_flows (id, poll_token_hash, login_token_hash, client_name, \
+         created_at, expires_at, device_endpoint_id, device_product, device_platform, \
+         device_version, device_challenge) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
+    .bind(id)
     .bind(&secret::digest(poll_token.expose_secret())[..])
     .bind(&secret::digest(login_token.expose_secret())[..])
     .bind(client_name)
@@ -197,7 +199,7 @@ pub async fn find(pool: &Pool, login_token: &str, now: i64) -> Result<Option<Flo
     let row: Option<FlowRow> = sqlx::query_as(
         "SELECT id, client_name, granted_user_id, expires_at, device_endpoint_id, \
          device_product, device_platform, device_version FROM login_flows \
-         WHERE login_token_hash = ?1 AND expires_at > ?2",
+         WHERE login_token_hash = ? AND expires_at > ?",
     )
     .bind(&secret::digest(login_token)[..])
     .bind(now)
@@ -217,13 +219,13 @@ pub async fn grant(
 ) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
     let granted = sqlx::query(
-        "UPDATE login_flows SET granted_user_id = ?2, granted_client_ip = ?4 \
-         WHERE id = ?1 AND granted_user_id IS NULL AND expires_at > ?3",
+        "UPDATE login_flows SET granted_user_id = ?, granted_client_ip = ? \
+         WHERE id = ? AND granted_user_id IS NULL AND expires_at > ?",
     )
-    .bind(id)
     .bind(user_id)
-    .bind(now)
     .bind(client_ip.map(|ip| ip.to_canonical().to_string()))
+    .bind(id)
+    .bind(now)
     .execute(&mut *tx)
     .await?
     .rows_affected()
@@ -235,7 +237,7 @@ pub async fn grant(
 /// Ends the flow `id` without granting anything. Returns `false` if there was none.
 pub async fn deny(pool: &Pool, id: i64) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
-    let denied = sqlx::query("DELETE FROM login_flows WHERE id = ?1")
+    let denied = sqlx::query("DELETE FROM login_flows WHERE id = ?")
         .bind(id)
         .execute(&mut *tx)
         .await?
@@ -252,24 +254,29 @@ pub async fn deny(pool: &Pool, id: i64) -> Result<bool> {
 /// without minting anything.
 pub async fn complete(pool: &Pool, poll_token: &str, now: i64) -> Result<Option<Credentials>> {
     let mut tx = db::begin_immediate(pool).await?;
-    let flow: Option<(String, i64)> = sqlx::query_as(
-        "DELETE FROM login_flows WHERE poll_token_hash = ?1 AND granted_user_id IS NOT NULL \
-         AND expires_at > ?2 AND device_endpoint_id IS NULL \
-         RETURNING client_name, granted_user_id",
+    // Selected, then deleted: the write transaction keeps anyone else from consuming it in
+    // between.
+    let flow: Option<(i64, String, i64)> = sqlx::query_as(
+        "SELECT id, client_name, granted_user_id FROM login_flows WHERE poll_token_hash = ? \
+         AND granted_user_id IS NOT NULL AND expires_at > ? AND device_endpoint_id IS NULL",
     )
     .bind(&secret::digest(poll_token)[..])
     .bind(now)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((client_name, user_id)) = flow else {
+    let Some((flow_id, client_name, user_id)) = flow else {
         return Ok(None);
     };
-    let user: Option<(String, bool)> =
-        sqlx::query_as("SELECT username, enabled FROM users WHERE id = ?1")
+    sqlx::query("DELETE FROM login_flows WHERE id = ?")
+        .bind(flow_id)
+        .execute(&mut *tx)
+        .await?;
+    let user: Option<(Text, Flag)> =
+        sqlx::query_as("SELECT username, enabled FROM users WHERE id = ?")
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?;
-    let Some((username, true)) = user else {
+    let Some((Text(username), Flag(true))) = user else {
         tx.commit().await?;
         return Ok(None);
     };
@@ -314,7 +321,7 @@ pub enum DevicePoll {
 pub async fn device_poll(pool: &Pool, poll_token: &str, now: i64) -> Result<DevicePoll> {
     let row: Option<(Option<i64>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
         "SELECT granted_user_id, device_endpoint_id, device_challenge FROM login_flows \
-         WHERE poll_token_hash = ?1 AND expires_at > ?2 AND device_endpoint_id IS NOT NULL",
+         WHERE poll_token_hash = ? AND expires_at > ? AND device_endpoint_id IS NOT NULL",
     )
     .bind(&secret::digest(poll_token)[..])
     .bind(now)
@@ -351,6 +358,7 @@ pub async fn complete_device(
 ) -> Result<Option<(Username, Registration)>> {
     let mut tx = db::begin_immediate(pool).await?;
     type Row = (
+        i64,
         String,
         i64,
         Option<String>,
@@ -359,25 +367,32 @@ pub async fn complete_device(
         Option<String>,
         Option<String>,
     );
+    // Selected, then deleted, as in `complete`.
     let flow: Option<Row> = sqlx::query_as(
-        "DELETE FROM login_flows WHERE poll_token_hash = ?1 AND granted_user_id IS NOT NULL \
-         AND expires_at > ?2 AND device_endpoint_id IS NOT NULL RETURNING client_name, \
-         granted_user_id, granted_client_ip, device_endpoint_id, device_product, \
-         device_platform, device_version",
+        "SELECT id, client_name, granted_user_id, granted_client_ip, device_endpoint_id, \
+         device_product, device_platform, device_version FROM login_flows \
+         WHERE poll_token_hash = ? AND granted_user_id IS NOT NULL AND expires_at > ? \
+         AND device_endpoint_id IS NOT NULL",
     )
     .bind(&secret::digest(poll_token)[..])
     .bind(now)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((name, user_id, granted_ip, endpoint_id, product, platform, version)) = flow else {
+    let Some((flow_id, name, user_id, granted_ip, endpoint_id, product, platform, version)) = flow
+    else {
         return Ok(None);
     };
-    let user: Option<(String, bool)> =
-        sqlx::query_as("SELECT username, enabled FROM users WHERE id = ?1")
+    sqlx::query("DELETE FROM login_flows WHERE id = ?")
+        .bind(flow_id)
+        .execute(&mut *tx)
+        .await?;
+    let user: Option<(Text, Flag)> =
+        sqlx::query_as("SELECT username, enabled FROM users WHERE id = ?")
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?;
-    let (Some((username, true)), Some(endpoint_id)) = (user, EndpointId::from_slice(&endpoint_id))
+    let (Some((Text(username), Flag(true))), Some(endpoint_id)) =
+        (user, EndpointId::from_slice(&endpoint_id))
     else {
         tx.commit().await?;
         return Ok(None);
@@ -398,7 +413,7 @@ pub async fn complete_device(
 /// Removes every flow that expired at `now`. Returns how many there were.
 pub async fn purge_expired(pool: &Pool, now: i64) -> Result<u64> {
     let mut tx = db::begin_immediate(pool).await?;
-    let purged = sqlx::query("DELETE FROM login_flows WHERE expires_at <= ?1")
+    let purged = sqlx::query("DELETE FROM login_flows WHERE expires_at <= ?")
         .bind(now)
         .execute(&mut *tx)
         .await?

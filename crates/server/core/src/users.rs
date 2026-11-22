@@ -13,7 +13,7 @@
 use sqlx::FromRow;
 
 use crate::{
-    db::{self, Pool},
+    db::{self, Flag, Pool, Text},
     error::{Error, Result},
     types::Username,
 };
@@ -56,13 +56,15 @@ pub struct User {
     /// Numeric id; also names the user's storage directories.
     pub id: i64,
     /// Login name.
-    #[sqlx(try_from = "String")]
+    #[sqlx(try_from = "Text")]
     pub username: Username,
     /// Name shown in clients.
     pub display_name: String,
     /// Whether the account may sign in.
+    #[sqlx(try_from = "Flag")]
     pub enabled: bool,
     /// Whether the account may use the web admin UI.
+    #[sqlx(try_from = "Flag")]
     pub is_admin: bool,
     /// Creation time, UNIX seconds.
     pub created_at: i64,
@@ -75,6 +77,14 @@ impl TryFrom<String> for Username {
 
     fn try_from(value: String) -> Result<Self> {
         Self::new(value)
+    }
+}
+
+impl TryFrom<Text> for Username {
+    type Error = Error;
+
+    fn try_from(value: Text) -> Result<Self> {
+        Self::new(value.0)
     }
 }
 
@@ -155,21 +165,24 @@ pub async fn create(
 async fn insert(tx: &mut db::Tx, user: &NewUser<'_>) -> Result<i64> {
     let now = db::unix_now();
     let retired: Option<i64> =
-        sqlx::query_scalar("SELECT 1 FROM retired_usernames WHERE username = ?1")
+        sqlx::query_scalar("SELECT 1 FROM retired_usernames WHERE username = ?")
             .bind(user.username.as_str())
             .fetch_optional(&mut **tx)
             .await?;
     if retired.is_some() {
         return Err(Error::UsernameRetired(user.username.clone()));
     }
-    let result = sqlx::query(
-        "INSERT INTO users (username, display_name, password_hash, enabled, is_admin, \
-         created_at, updated_at) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?5)",
+    let id = db::next_id(tx, "users").await?;
+    sqlx::query(
+        "INSERT INTO users (id, username, display_name, password_hash, enabled, is_admin, \
+         created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
     )
+    .bind(id)
     .bind(user.username.as_str())
     .bind(user.display_name)
     .bind(user.password_hash)
     .bind(user.is_admin)
+    .bind(now)
     .bind(now)
     .execute(&mut **tx)
     .await
@@ -177,7 +190,7 @@ async fn insert(tx: &mut db::Tx, user: &NewUser<'_>) -> Result<i64> {
         Some(db_err) if db_err.is_unique_violation() => Error::UserExists(user.username.clone()),
         _ => Error::Database(err),
     })?;
-    Ok(result.last_insert_rowid())
+    Ok(id)
 }
 
 /// Returns every account, ordered by username.
@@ -190,7 +203,7 @@ pub async fn list(pool: &Pool) -> Result<Vec<User>> {
 
 /// Looks an account up by name.
 pub async fn find(pool: &Pool, username: &Username) -> Result<Option<User>> {
-    let sql = format!("SELECT {USER_COLUMNS} FROM users WHERE username = ?1");
+    let sql = format!("SELECT {USER_COLUMNS} FROM users WHERE username = ?");
     Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(username.as_str())
         .fetch_optional(pool)
@@ -207,7 +220,7 @@ struct CredentialsRow {
 /// Looks an account up by name together with its web login password hash, for signing in.
 /// Verify the password with [`crate::password::verify`].
 pub async fn credentials(pool: &Pool, username: &Username) -> Result<Option<(User, String)>> {
-    let sql = format!("SELECT {USER_COLUMNS}, password_hash FROM users WHERE username = ?1");
+    let sql = format!("SELECT {USER_COLUMNS}, password_hash FROM users WHERE username = ?");
     let row: Option<CredentialsRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(username.as_str())
         .fetch_optional(pool)
@@ -227,8 +240,9 @@ pub async fn get(pool: &Pool, username: &Username) -> Result<User> {
 async fn keep_an_admin(tx: &mut db::Tx, username: &Username) -> Result<()> {
     let others: Option<i64> = sqlx::query_scalar(
         "SELECT (SELECT COUNT(*) FROM users WHERE is_admin = 1 AND enabled = 1 \
-         AND username <> ?1) FROM users WHERE username = ?1 AND is_admin = 1 AND enabled = 1",
+         AND username <> ?) FROM users WHERE username = ? AND is_admin = 1 AND enabled = 1",
     )
+    .bind(username.as_str())
     .bind(username.as_str())
     .fetch_optional(&mut **tx)
     .await?;
@@ -245,19 +259,36 @@ async fn keep_an_admin(tx: &mut db::Tx, username: &Username) -> Result<()> {
 pub async fn delete(pool: &Pool, username: &Username) -> Result<User> {
     let mut tx = db::begin_immediate(pool).await?;
     keep_an_admin(&mut tx, username).await?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO retired_usernames (username, retired_at)          SELECT username, ?2 FROM users WHERE username = ?1          AND EXISTS (SELECT 1 FROM devices WHERE devices.user_id = users.id)",
-    )
-    .bind(username.as_str())
-    .bind(db::unix_now())
-    .execute(&mut *tx)
-    .await?;
-    let sql = format!("DELETE FROM users WHERE username = ?1 RETURNING {USER_COLUMNS}");
+    let sql = format!("SELECT {USER_COLUMNS} FROM users WHERE username = ?");
     let user: Option<User> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(username.as_str())
         .fetch_optional(&mut *tx)
         .await?;
     let user = user.ok_or_else(|| Error::UserNotFound(username.clone()))?;
+    sqlx::query(tx.backend().pick(
+        "INSERT OR IGNORE INTO retired_usernames (username, retired_at) \
+         SELECT username, ? FROM users WHERE id = ? \
+         AND EXISTS (SELECT 1 FROM devices WHERE devices.user_id = users.id)",
+        "INSERT INTO retired_usernames (username, retired_at) \
+         SELECT username, ? FROM users WHERE id = ? \
+         AND EXISTS (SELECT 1 FROM devices WHERE devices.user_id = users.id) \
+         ON DUPLICATE KEY UPDATE retired_usernames.username = retired_usernames.username",
+    ))
+    .bind(db::unix_now())
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+    // The devices go first: their credentials are app passwords that the account's deletion
+    // removes as well, and InnoDB checks the devices' reference to them row by row, where
+    // SQLite checks it at the end of the statement.
+    sqlx::query("DELETE FROM devices WHERE user_id = ?")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(user)
 }
@@ -270,10 +301,10 @@ pub async fn set_password_hash(
 ) -> Result<()> {
     let mut tx = db::begin_immediate(pool).await?;
     let result =
-        sqlx::query("UPDATE users SET password_hash = ?2, updated_at = ?3 WHERE username = ?1")
-            .bind(username.as_str())
+        sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ?")
             .bind(password_hash)
             .bind(db::unix_now())
+            .bind(username.as_str())
             .execute(&mut *tx)
             .await?;
     if result.rows_affected() == 0 {
@@ -290,10 +321,10 @@ pub async fn set_enabled(pool: &Pool, username: &Username, enabled: bool) -> Res
     if !enabled {
         keep_an_admin(&mut tx, username).await?;
     }
-    let result = sqlx::query("UPDATE users SET enabled = ?2, updated_at = ?3 WHERE username = ?1")
-        .bind(username.as_str())
+    let result = sqlx::query("UPDATE users SET enabled = ?, updated_at = ? WHERE username = ?")
         .bind(enabled)
         .bind(db::unix_now())
+        .bind(username.as_str())
         .execute(&mut *tx)
         .await?;
     if result.rows_affected() == 0 {
@@ -314,10 +345,10 @@ pub async fn set_admin(pool: &Pool, username: &Username, is_admin: bool) -> Resu
     if !is_admin {
         keep_an_admin(&mut tx, username).await?;
     }
-    let result = sqlx::query("UPDATE users SET is_admin = ?2, updated_at = ?3 WHERE username = ?1")
-        .bind(username.as_str())
+    let result = sqlx::query("UPDATE users SET is_admin = ?, updated_at = ? WHERE username = ?")
         .bind(is_admin)
         .bind(db::unix_now())
+        .bind(username.as_str())
         .execute(&mut *tx)
         .await?;
     if result.rows_affected() == 0 {
@@ -337,10 +368,10 @@ pub async fn set_display_name(
     let display_name = validate_display_name(display_name)?;
     let mut tx = db::begin_immediate(pool).await?;
     let result =
-        sqlx::query("UPDATE users SET display_name = ?2, updated_at = ?3 WHERE username = ?1")
-            .bind(username.as_str())
+        sqlx::query("UPDATE users SET display_name = ?, updated_at = ? WHERE username = ?")
             .bind(&display_name)
             .bind(db::unix_now())
+            .bind(username.as_str())
             .execute(&mut *tx)
             .await?;
     if result.rows_affected() == 0 {

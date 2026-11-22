@@ -3,8 +3,7 @@
 
 use gono_server_core::{
     Error, Permission, RelPath, Username, app_passwords,
-    config::DbConfig,
-    db::{self, OpenMode, Pool},
+    db::{self, Pool},
     meta::{DiskStat, MetaStore},
     s3::{self, Anonymous, BucketName, Grant},
     sealing::Key,
@@ -21,15 +20,7 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let config = DbConfig {
-        path: dir.path().join("gono-cloud.db"),
-        max_connections: 4,
-        busy_timeout_secs: 5,
-    };
-    let pool = db::connect(&config, OpenMode::CreateIfMissing)
-        .await
-        .unwrap();
-    db::migrate(&pool).await.unwrap();
+    let pool = db::testing::database(dir.path()).await;
     Fixture {
         _dir: dir,
         meta: MetaStore::new(pool.clone()),
@@ -283,7 +274,7 @@ async fn keys_sign_with_their_sealed_secret() {
 
     // The stored secret is not the secret.
     let stored: Vec<u8> =
-        sqlx::query_scalar("SELECT secret_sealed FROM app_passwords WHERE id = ?1")
+        sqlx::query_scalar("SELECT secret_sealed FROM app_passwords WHERE id = ?")
             .bind(key.id)
             .fetch_one(&f.pool)
             .await
@@ -389,7 +380,7 @@ async fn keys_stop_signing_when_they_expire_or_the_account_is_disabled() {
     };
     assert!(signs(99).await);
     assert!(!signs(100).await);
-    sqlx::query("UPDATE app_passwords SET expires_at = NULL WHERE id = ?1")
+    sqlx::query("UPDATE app_passwords SET expires_at = NULL WHERE id = ?")
         .bind(key.id)
         .execute(&f.pool)
         .await

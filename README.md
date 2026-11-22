@@ -36,6 +36,10 @@ service on `127.0.0.1:16102`. Then put a reverse proxy with HTTPS in front of it
 `https://cloud.example.com`. [`docs/deployment.md`](docs/deployment.md) covers manual
 installation, accounts, upgrades, backups and uninstalling.
 
+The metadata (accounts, app passwords, file ids, ETags, locks) is kept in SQLite, which is built
+in, or in MySQL 5.7.44 or later, chosen in the configuration
+([choosing the database](docs/deployment.md#choosing-the-database)).
+
 To build from source instead (Rust 1.100 or newer):
 
 ```sh

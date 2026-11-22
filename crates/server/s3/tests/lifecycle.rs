@@ -3,9 +3,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use gono_server_core::{
-    RelPath, Username,
-    config::DbConfig,
-    db::{self, OpenMode},
+    RelPath, Username, db,
     locks::LockStore,
     meta::{MetaStore, ObjectMeta},
     s3, sealing, settings,
@@ -29,17 +27,7 @@ async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let layout = DataLayout::new(dir.path().join("data"));
     layout.create().unwrap();
-    let pool = db::connect(
-        &DbConfig {
-            path: dir.path().join("gono-cloud.db"),
-            max_connections: 4,
-            busy_timeout_secs: 5,
-        },
-        OpenMode::CreateIfMissing,
-    )
-    .await
-    .unwrap();
-    db::migrate(&pool).await.unwrap();
+    let pool = db::testing::database(dir.path()).await;
     let username = Username::new("alice").unwrap();
     let owner = users::create(
         &pool,
@@ -127,9 +115,9 @@ impl Fixture {
             )
             .await
             .unwrap();
-        sqlx::query("UPDATE object_meta SET written_at = ?2 WHERE file_id = ?1")
-            .bind(entry.file_id.unwrap())
+        sqlx::query("UPDATE object_meta SET written_at = ? WHERE file_id = ?")
             .bind(db::unix_now() - days_ago * DAY)
+            .bind(entry.file_id.unwrap())
             .execute(self.state.pool())
             .await
             .unwrap();
@@ -162,9 +150,9 @@ impl Fixture {
             .await
             .unwrap()
             .unwrap();
-        sqlx::query("UPDATE s3_buckets SET lifecycle = ?2 WHERE id = ?1")
-            .bind(bucket.id)
+        sqlx::query("UPDATE s3_buckets SET lifecycle = ? WHERE id = ?")
             .bind(xml)
+            .bind(bucket.id)
             .execute(self.state.pool())
             .await
             .unwrap();
@@ -252,7 +240,7 @@ async fn expiration_headers_count_from_the_s3_write() {
         .unwrap()
         .unwrap();
     // Written at 2025-11-16 10:00 UTC.
-    sqlx::query("UPDATE object_meta SET written_at = 1763287200 WHERE file_id = ?1")
+    sqlx::query("UPDATE object_meta SET written_at = 1763287200 WHERE file_id = ?")
         .bind(object.id)
         .execute(f.state.pool())
         .await

@@ -9,8 +9,8 @@
 use sqlx::FromRow;
 
 use crate::{
-    db::{self, Pool, Tx},
-    error::Result,
+    db::{self, Flag, Pool, Text, Tx},
+    error::{Error, Result},
     meta::descendant_bounds,
     path::RelPath,
 };
@@ -40,12 +40,16 @@ pub struct Lock {
 
 #[derive(FromRow)]
 struct Row {
+    #[sqlx(try_from = "Text")]
     token: String,
     owner_id: i64,
+    #[sqlx(try_from = "Text")]
     rel_path: String,
     principal: Option<String>,
     owner_xml: Option<Vec<u8>>,
+    #[sqlx(try_from = "Flag")]
     shared: bool,
+    #[sqlx(try_from = "Flag")]
     deep: bool,
     created_at: i64,
     timeout_at: i64,
@@ -87,8 +91,15 @@ impl LockStore {
     /// The check and the insert share one `BEGIN IMMEDIATE` transaction, which also purges
     /// expired locks.
     pub async fn try_lock(&self, lock: Lock, now: i64) -> Result<std::result::Result<Lock, Lock>> {
+        // Stored on every backend, or on none.
+        lock.rel_path
+            .check_length()
+            .map_err(|source| Error::InvalidPath {
+                path: lock.rel_path.to_string(),
+                source,
+            })?;
         let mut tx = db::begin_immediate(&self.pool).await?;
-        sqlx::query("DELETE FROM locks WHERE timeout_at <= ?1")
+        sqlx::query("DELETE FROM locks WHERE timeout_at <= ?")
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -104,7 +115,7 @@ impl LockStore {
         }
         sqlx::query(
             "INSERT INTO locks (token, owner_id, rel_path, principal, owner_xml, shared, deep, \
-             created_at, timeout_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             created_at, timeout_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&lock.token)
         .bind(lock.owner_id)
@@ -161,7 +172,7 @@ impl LockStore {
     /// Releases a lock.
     pub async fn remove(&self, token: &str) -> Result<bool> {
         let mut tx = db::begin_immediate(&self.pool).await?;
-        let result = sqlx::query("DELETE FROM locks WHERE token = ?1")
+        let result = sqlx::query("DELETE FROM locks WHERE token = ?")
             .bind(token)
             .execute(&mut *tx)
             .await?;
@@ -172,9 +183,9 @@ impl LockStore {
     /// Moves the expiry of a lock.
     pub async fn refresh(&self, token: &str, timeout_at: i64) -> Result<()> {
         let mut tx = db::begin_immediate(&self.pool).await?;
-        sqlx::query("UPDATE locks SET timeout_at = ?2 WHERE token = ?1")
-            .bind(token)
+        sqlx::query("UPDATE locks SET timeout_at = ? WHERE token = ?")
             .bind(timeout_at)
+            .bind(token)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -187,8 +198,8 @@ impl LockStore {
         match descendant_bounds(rel.as_str()) {
             Some((lower, upper)) => {
                 sqlx::query(
-                    "DELETE FROM locks WHERE owner_id = ?1 \
-                     AND (rel_path = ?2 OR (rel_path >= ?3 AND rel_path < ?4))",
+                    "DELETE FROM locks WHERE owner_id = ? \
+                     AND (rel_path = ? OR (rel_path >= ? AND rel_path < ?))",
                 )
                 .bind(owner)
                 .bind(rel.as_str())
@@ -198,7 +209,7 @@ impl LockStore {
                 .await?;
             }
             None => {
-                sqlx::query("DELETE FROM locks WHERE owner_id = ?1")
+                sqlx::query("DELETE FROM locks WHERE owner_id = ?")
                     .bind(owner)
                     .execute(&mut *tx)
                     .await?;
@@ -211,7 +222,7 @@ impl LockStore {
     /// Deletes expired locks. Returns how many were removed.
     pub async fn purge_expired(&self, now: i64) -> Result<u64> {
         let mut tx = db::begin_immediate(&self.pool).await?;
-        let result = sqlx::query("DELETE FROM locks WHERE timeout_at <= ?1")
+        let result = sqlx::query("DELETE FROM locks WHERE timeout_at <= ?")
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -229,7 +240,7 @@ async fn below(tx: &mut Tx, owner: i64, rel: &RelPath, now: i64) -> Result<Vec<L
 }
 
 async fn covering_on(
-    conn: &mut sqlx::SqliteConnection,
+    conn: &mut sqlx::AnyConnection,
     owner: i64,
     rel: &RelPath,
     now: i64,
@@ -260,7 +271,7 @@ async fn covering_on(
 }
 
 async fn below_on(
-    conn: &mut sqlx::SqliteConnection,
+    conn: &mut sqlx::AnyConnection,
     owner: i64,
     rel: &RelPath,
     now: i64,
@@ -268,8 +279,8 @@ async fn below_on(
     let rows: Vec<Row> = match descendant_bounds(rel.as_str()) {
         Some((lower, upper)) => {
             let sql = format!(
-                "SELECT {COLUMNS} FROM locks WHERE owner_id = ?1 AND timeout_at > ?2 \
-                 AND rel_path >= ?3 AND rel_path < ?4"
+                "SELECT {COLUMNS} FROM locks WHERE owner_id = ? AND timeout_at > ? \
+                 AND rel_path >= ? AND rel_path < ?"
             );
             sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(owner)
@@ -281,7 +292,7 @@ async fn below_on(
         }
         None => {
             let sql = format!(
-                "SELECT {COLUMNS} FROM locks WHERE owner_id = ?1 AND timeout_at > ?2 \
+                "SELECT {COLUMNS} FROM locks WHERE owner_id = ? AND timeout_at > ? \
                  AND rel_path <> ''"
             );
             sqlx::query_as(sqlx::AssertSqlSafe(sql))

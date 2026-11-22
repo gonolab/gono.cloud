@@ -7,10 +7,10 @@
 
 use std::net::IpAddr;
 
-use sqlx::{FromRow, SqliteExecutor};
+use sqlx::FromRow;
 
 use crate::{
-    db::{self, Pool},
+    db::{self, Pool, Tx},
     devices::EndpointId,
     error::Result,
 };
@@ -156,16 +156,23 @@ impl From<EntryRow> for Entry {
     }
 }
 
-/// Writes `record` at `now`, inside a transaction or on its own.
-pub async fn record<'c>(
-    executor: impl SqliteExecutor<'c>,
-    record: &Record,
-    now: i64,
-) -> Result<()> {
+/// Writes `record` at `now` in a write transaction of its own. Inside a write transaction, use
+/// [`record_in`]: this would wait for that transaction to end.
+pub async fn record(pool: &Pool, record: &Record, now: i64) -> Result<()> {
+    let mut tx = db::begin_immediate(pool).await?;
+    record_in(&mut tx, record, now).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Writes `record` at `now` inside the write transaction `tx`.
+pub async fn record_in(tx: &mut Tx, record: &Record, now: i64) -> Result<()> {
+    let id = db::next_id(tx, "audit_log").await?;
     sqlx::query(
-        "INSERT INTO audit_log (user_id, at, kind, actor, device, peer, client_ip, details) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO audit_log (id, user_id, at, kind, actor, device, peer, client_ip, details) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
+    .bind(id)
     .bind(record.user_id)
     .bind(now)
     .bind(record.kind)
@@ -174,7 +181,7 @@ pub async fn record<'c>(
     .bind(record.peer.map(|id| id.0.to_vec()))
     .bind(record.client_ip.map(|ip| ip.to_canonical().to_string()))
     .bind(record.details.to_string())
-    .execute(executor)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -189,10 +196,12 @@ pub async fn list(
 ) -> Result<Vec<Entry>> {
     let rows: Vec<EntryRow> = sqlx::query_as(
         "SELECT id, user_id, at, kind, actor, device, peer, client_ip, details FROM audit_log \
-         WHERE (?1 IS NULL OR user_id = ?1) AND (?2 IS NULL OR id < ?2) \
-         ORDER BY id DESC LIMIT ?3",
+         WHERE (? IS NULL OR user_id = ?) AND (? IS NULL OR id < ?) \
+         ORDER BY id DESC LIMIT ?",
     )
     .bind(user_id)
+    .bind(user_id)
+    .bind(before)
     .bind(before)
     .bind(limit)
     .fetch_all(pool)
@@ -202,23 +211,30 @@ pub async fn list(
 
 /// The newest `limit` records of any account whose kind is one of `kinds`, newest first: what
 /// the admin UI shows of one subject, such as the sessions devices reported.
+///
+/// `kinds` is a short list written in the code (at most [`db::MAX_LIST`] kinds).
 pub async fn list_kinds(pool: &Pool, kinds: &[&str], limit: i64) -> Result<Vec<Entry>> {
-    let kinds = serde_json::Value::from(kinds.to_vec()).to_string();
-    let rows: Vec<EntryRow> = sqlx::query_as(
+    if kinds.is_empty() {
+        return Ok(Vec::new());
+    }
+    debug_assert!(kinds.len() <= db::MAX_LIST);
+    let sql = format!(
         "SELECT id, user_id, at, kind, actor, device, peer, client_ip, details FROM audit_log \
-         WHERE kind IN (SELECT value FROM json_each(?1)) ORDER BY id DESC LIMIT ?2",
-    )
-    .bind(kinds)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+         WHERE kind IN ({}) ORDER BY id DESC LIMIT ?",
+        db::placeholders(kinds.len())
+    );
+    let mut query = sqlx::query_as::<_, EntryRow>(sqlx::AssertSqlSafe(sql));
+    for kind in kinds {
+        query = query.bind(*kind);
+    }
+    let rows = query.bind(limit).fetch_all(pool).await?;
     Ok(rows.into_iter().map(Entry::from).collect())
 }
 
 /// Removes every record written before `before`. Returns how many there were.
 pub async fn purge(pool: &Pool, before: i64) -> Result<u64> {
     let mut tx = db::begin_immediate(pool).await?;
-    let purged = sqlx::query("DELETE FROM audit_log WHERE at < ?1")
+    let purged = sqlx::query("DELETE FROM audit_log WHERE at < ?")
         .bind(before)
         .execute(&mut *tx)
         .await?

@@ -101,9 +101,16 @@ serde_json = "1.0.154"
 # SHA-1 of file contents, which rclone's Nextcloud backend asks for; the version s3s uses.
 sha1 = "0.11.0"
 sha2 = "0.11.1"
+# The database is SQLite (compiled in) or MySQL, reached through sqlx's `Any` driver (see
+# crates/server/core/src/db.rs). TLS to a remote MySQL server uses rustls with ring, the provider
+# rustls uses everywhere else, and the webpki roots. `mysql-rsa` (the RSA password exchange of
+# `caching_sha2_password` without TLS) stays off, so the `rsa` crate stays out of the build.
 sqlx = { version = "0.9.0", default-features = false, features = [
   "runtime-tokio",
+  "any",
   "sqlite-bundled",
+  "mysql",
+  "tls-rustls-ring-webpki",
   "migrate",
   "macros",
 ] }
