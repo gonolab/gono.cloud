@@ -20,6 +20,7 @@ mod qr;
 mod ratelimit;
 mod request_log;
 mod s3;
+mod service_view;
 mod shutdown;
 mod site;
 mod web;

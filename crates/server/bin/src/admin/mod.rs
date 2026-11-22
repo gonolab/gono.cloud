@@ -1,4 +1,4 @@
-//! The web admin UI, served under `admin.path` (default `/apps/manage`) when `admin.enabled`.
+//! The web admin UI, served under `admin.path` (default `/manage`) when `admin.enabled`.
 //!
 //! | Request | Page or action |
 //! |---|---|
@@ -66,7 +66,9 @@ use gono_server_core::{
     app_passwords::{self, Scope},
     audit, db,
     devices::{self, Device, EndpointId, RevokedBy},
-    password, stats,
+    password,
+    services::Services,
+    stats,
     users::{self, NewUser, User},
     web_sessions::{self, SessionUser},
 };
@@ -90,7 +92,7 @@ use crate::{
     app::AppState,
     client_ip::client_ip,
     i18n::{Text, ago, count, duration, fill},
-    site,
+    service_view, site,
     web::{self, CSRF_COOKIE, Chrome, Nav, SESSION_COOKIE, Verified},
 };
 
@@ -248,6 +250,7 @@ pub fn routes(prefix: &str) -> Router<AppState> {
         .route(&format!("{p}/new-user"), get(new_user_page))
         .route(&format!("{p}/users/{{name}}"), get(user_page))
         .route(&format!("{p}/users/{{name}}/enable"), post(enable))
+        .route(&format!("{p}/users/{{name}}/services"), post(set_services))
         .route(&format!("{p}/users/{{name}}/disable"), post(disable))
         .route(&format!("{p}/users/{{name}}/promote"), post(promote))
         .route(&format!("{p}/users/{{name}}/demote"), post(demote))
@@ -1122,6 +1125,7 @@ async fn users_page(
                 app_passwords: counts.app_passwords,
                 storage: format_bytes(counts.storage_used),
                 created: pages::date(user.created_at),
+                services: service_view::summary(t, user.services),
             }
         })
         .collect();
@@ -1249,7 +1253,7 @@ async fn create_user(
             display_name: &display_name,
             password_hash: &hash,
             is_admin,
-            services: gono_server_core::services::Services::NONE,
+            services: Services::NONE,
         },
         |id| layout.create_user(id),
     )
@@ -1377,6 +1381,7 @@ async fn user_page_response(
                 None => t.a_tf_off.to_owned(),
             },
             two_factor_on: two_factor_status.is_some(),
+            services: service_view::rows(t, state, user.services),
         },
         is_self: user.id == session.user.user_id,
         delete_label: fill(t.a_delete_named, &[user.username.as_str()]),
@@ -1636,6 +1641,7 @@ async fn user_page(
     let notice = match done.done.as_deref() {
         Some("created") => Some(fill(t.a_notice_created, &[name])),
         Some("enabled") => Some(t.a_notice_enabled.to_owned()),
+        Some("services") => Some(t.a_notice_services.to_owned()),
         Some("disabled") => Some(t.a_notice_disabled.to_owned()),
         Some("promoted") => Some(fill(t.a_notice_promoted, &[name])),
         Some("demoted") => Some(fill(t.a_notice_demoted, &[name])),
@@ -1692,6 +1698,69 @@ async fn disable(
     form: Form<CsrfForm>,
 ) -> Response {
     set_enabled(state, headers, name, form, false).await
+}
+
+/// The form of `POST <admin>/users/<name>/services`: a checkbox per service, present when on.
+#[derive(Deserialize)]
+struct ServicesForm {
+    #[serde(default)]
+    csrf: String,
+    #[serde(default)]
+    files: Option<String>,
+    #[serde(default)]
+    webdav: Option<String>,
+    #[serde(default)]
+    s3: Option<String>,
+    #[serde(default)]
+    direct: Option<String>,
+    #[serde(default)]
+    relay: Option<String>,
+}
+
+/// `POST <admin>/users/<name>/services`: sets the services of an account. Admins may change
+/// their own too, which is how the first admin gets any. The relay brings direct connections
+/// along. Every switch takes effect at the account's next request; the control channel and the
+/// relay hear of it at once (`account_changed`).
+async fn set_services(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<ServicesForm>,
+) -> Response {
+    let admin = match admin(&state) {
+        Ok(admin) => admin,
+        Err(halt) => return *halt,
+    };
+    let session = match form_session(&state, &admin, &headers, &form.csrf).await {
+        Ok(session) => session,
+        Err(halt) => return *halt,
+    };
+    let user = match find_user(&state, &admin, &session, &name).await {
+        Ok(user) => user,
+        Err(halt) => return *halt,
+    };
+    let services = Services {
+        files: form.files.is_some(),
+        webdav: form.webdav.is_some(),
+        s3: form.s3.is_some(),
+        direct: form.direct.is_some(),
+        relay: form.relay.is_some(),
+    };
+    let stored = match users::set_services(&state.db, &user.username, services).await {
+        Ok(stored) => stored,
+        Err(err) => return internal_error(&session.chrome, &err),
+    };
+    account_changed(&state, user.id);
+    tracing::info!(
+        by = %session.user.username,
+        user = %user.username,
+        services = %stored,
+        "admin changed the services of an account"
+    );
+    see_other(&format!(
+        "{}?done=services",
+        admin.user_url(user.username.as_str())
+    ))
 }
 
 async fn set_enabled(

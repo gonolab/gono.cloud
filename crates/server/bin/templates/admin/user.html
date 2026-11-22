@@ -140,6 +140,19 @@
     {%- endif %}
   </div>
   <div class="stack">
+    <div class="panel" id="services"><div class="panel-body">
+      <h2>{{ chrome.t.a_services }}</h2>
+      <p class="muted small">{{ chrome.t.a_services_note }}</p>
+      <form method="post" action="{{ base }}/services">
+        <input type="hidden" name="csrf" value="{{ frame.csrf }}">
+        <div class="choices">
+          {%- for service in user.services %}
+          <label class="choice" for="svc-{{ service.id }}"><input id="svc-{{ service.id }}" type="checkbox" name="{{ service.id }}" value="on"{% if service.on %} checked{% endif %}><span><b>{{ service.name }}</b><span>{{ service.note }}</span>{% if !service.offered %}<span class="badge off">{{ chrome.t.svc_server_off }}</span>{% endif %}</span></label>
+          {%- endfor %}
+        </div>
+        <button class="btn primary block mt-18" type="submit">{{ chrome.t.a_services_save }}</button>
+      </form>
+    </div></div>
     <div class="panel"><div class="panel-body">
       <h2>{{ chrome.t.a_account }}</h2>
       <dl class="facts mt-18"><dt>{{ chrome.t.a_user_id }}</dt><dd class="mono">{{ user.id }}</dd><dt>{{ chrome.t.a_created }}</dt><dd>{{ user.created }}</dd><dt>{{ chrome.t.a_changed }}</dt><dd>{{ user.updated }}</dd><dt>{{ chrome.t.a_storage_used }}</dt><dd>{{ user.storage }}</dd><dt>{{ chrome.t.tf_title }}</dt><dd>{{ user.two_factor }}</dd></dl>

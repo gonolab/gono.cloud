@@ -50,6 +50,9 @@ compatible within a major version: released clients keep working with newer serv
 
 ### Changed
 
+- **The admin UI moved to `/manage/`** (`admin.path`; `/apps/manage` is refused now, like every
+  path below `/apps`, which holds the pages of every account). Its user page has the
+  account's services as switches, an admin's own included, and the list of users shows them.
 - **The database schema changed in place and starts anew**: a database created by 2.0.x is
   refused (its migration checksum differs); create the installation again as after "Upgrading
   from 1.x" in `docs/deployment.md`. Ids now come from a table of sequences instead of

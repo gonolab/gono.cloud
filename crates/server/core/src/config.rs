@@ -423,7 +423,7 @@ pub struct AdminConfig {
     /// cannot access it.
     pub enabled: bool,
 
-    /// URL path of the admin UI, for example `/apps/manage`.
+    /// URL path of the admin UI, for example `/manage`.
     pub path: String,
 }
 
@@ -672,31 +672,30 @@ pub fn is_endpoint_id(id: &str) -> bool {
     id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Default of `admin.path`, next to the web file UI (`/apps/files/`) and the account page
-/// (`/apps/account/`).
-pub const DEFAULT_ADMIN_PATH: &str = "/apps/manage";
+/// Default of `admin.path`: a path of its own, apart from the pages of every account (the web
+/// file UI below `/apps/`, the account page at `/account/`).
+pub const DEFAULT_ADMIN_PATH: &str = "/manage";
 
-/// First path segments the server uses itself; `admin.path` must not start with one of them,
-/// except that it may be [`DEFAULT_ADMIN_PATH`].
+/// First path segments the server uses itself; `admin.path` must not start with one of them.
 const RESERVED_SEGMENTS: &[&str] = &[
     "204",
+    "account",
     "apps",
+    "gono",
     "healthz",
     "index.php",
     "login",
+    "logout",
     "ocs",
     "push",
+    "q",
     "remote.php",
     "status.php",
 ];
 
 /// `admin.path` is `/` followed by one or more segments of unreserved URL characters, without a
-/// trailing slash, and outside the paths the server serves itself. The default lies below
-/// `/apps`, which is otherwise reserved: the server serves nothing else under `/apps/manage`.
+/// trailing slash, and outside the paths the server serves itself.
 fn check_admin_path(path: &str) -> Result<(), String> {
-    if path == DEFAULT_ADMIN_PATH {
-        return Ok(());
-    }
     let Some(rest) = path.strip_prefix('/') else {
         return Err("must start with '/'".to_owned());
     };
@@ -1423,7 +1422,7 @@ mod tests {
         assert!(config.notify_push.enabled);
         assert!(config.admin.enabled);
         assert!(config.files_ui.enabled);
-        assert_eq!(config.admin.path, "/apps/manage");
+        assert_eq!(config.admin.path, "/manage");
         assert!(config.warnings().is_empty());
     }
 
@@ -1722,13 +1721,7 @@ mod tests {
 
     #[test]
     fn admin_path_is_validated() {
-        for good in [
-            "/apps/manage",
-            "/gono-admin",
-            "/admin",
-            "/ops/admin",
-            "/a.b_c~d",
-        ] {
+        for good in ["/manage", "/gono-admin", "/admin", "/ops/admin", "/a.b_c~d"] {
             let raw = format!("{MINIMAL}\n[admin]\npath = \"{good}\"");
             assert!(issue_keys(&parse(&raw)).is_empty(), "{good}");
         }
@@ -1746,11 +1739,15 @@ mod tests {
             "/remote.php",
             "/Index.php",
             "/login",
-            // Only the default itself may lie below /apps.
+            "/logout",
+            "/account",
+            "/gono/v1",
+            "/q",
+            // Nothing below /apps, the pages of every account.
             "/apps",
             "/apps/files",
             "/apps/assets",
-            "/apps/manage/x",
+            "/apps/manage",
             "/Apps/manage",
         ] {
             let raw = format!("{MINIMAL}\n[admin]\npath = \"{bad}\"");

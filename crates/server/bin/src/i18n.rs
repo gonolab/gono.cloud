@@ -369,6 +369,24 @@ texts! {
     js_leave: "Uploads are still running. Leave the page?", "还有文件正在上传，确定离开页面吗？";
     js_left: "{} left", "剩余 {}";
 
+    // Services
+    svc_files: "Web files", "网页文件";
+    svc_files_note: "The file browser at /apps/files/: browse, upload, download and favorites.", "/apps/files/ 的文件浏览器：浏览、上传、下载和收藏。";
+    svc_webdav: "WebDAV", "WebDAV";
+    svc_webdav_note: "Nextcloud apps and other WebDAV clients, with app passwords.", "Nextcloud 应用和其它 WebDAV 客户端，使用应用密码。";
+    svc_s3: "S3", "S3";
+    svc_s3_note: "The S3-compatible API with access keys, and public buckets.", "兼容 S3 的接口，使用访问密钥；以及公开存储桶。";
+    svc_direct: "Direct connections", "远程直连";
+    svc_direct_note: "Remote access for devices: they find each other through this server and connect directly; the relay only helps them set it up.", "设备的远程访问：通过本服务器找到彼此并直接连接；中转只用来协助建立连接。";
+    svc_relay: "Relay", "中转";
+    svc_relay_note: "Devices that cannot connect directly relay their traffic through this server at full speed. Needs direct connections.", "无法直连的设备经本服务器全速转发流量。需要先开通远程直连。";
+    svc_none: "None", "无";
+    svc_server_off: "Not offered by this server", "本服务器未提供";
+    a_services: "Services", "服务";
+    a_services_note: "What this account may use. New accounts have none.", "这个账号可以使用的服务。新账号默认都不开通。";
+    a_services_save: "Save services", "保存服务";
+    a_notice_services: "Services saved.", "服务已保存。";
+
     // Account
     account_title: "Account", "账号";
     profile: "Profile", "个人信息";

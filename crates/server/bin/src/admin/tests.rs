@@ -34,7 +34,7 @@ use crate::{
     web::{self, Web},
 };
 
-const PREFIX: &str = "/apps/manage";
+const PREFIX: &str = "/manage";
 const ROOT_PASSWORD: &str = "root password";
 const ALICE_PASSWORD: &str = "alice password";
 
@@ -656,6 +656,68 @@ async fn admins_cannot_lock_themselves_out() {
         "{} / {} (ops = {ops})",
         first.status, second.status
     );
+}
+
+#[tokio::test]
+async fn admins_switch_the_services_of_accounts_and_their_own() {
+    use gono_server_core::services::Services;
+    let f = fixture().await;
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.root().await;
+    let carol = add_user(&f.state.db, &f.layout, "carol", "carol password", false).await;
+    let page = browser.get(&path("/users/carol")).await;
+    assert!(
+        page.body.contains(r#"name="relay" value="on""#),
+        "{}",
+        page.body
+    );
+    // The relay brings direct connections along.
+    let saved = browser
+        .post(
+            &path("/users/carol/services"),
+            &[("csrf", &csrf), ("webdav", "on"), ("relay", "on")],
+        )
+        .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER);
+    assert_eq!(saved.header("location"), path("/users/carol?done=services"));
+    let stored = users::by_id(&f.state.db, carol).await.unwrap().unwrap();
+    assert_eq!(
+        stored.services,
+        Services {
+            webdav: true,
+            direct: true,
+            relay: true,
+            ..Services::NONE
+        }
+    );
+    let page = browser.get(&path("/users/carol?done=services")).await;
+    assert!(page.body.contains("Services saved."), "{}", page.body);
+    assert!(page.body.contains(r#"name="direct" value="on" checked>"#));
+    let list = browser.get(&path("/users")).await;
+    assert!(
+        list.body.contains("WebDAV, Direct connections, Relay"),
+        "{}",
+        list.body
+    );
+
+    // An admin turns on their own services, which is how the first one gets any.
+    let own = browser
+        .post(
+            &path("/users/root/services"),
+            &[("csrf", &csrf), ("files", "on")],
+        )
+        .await;
+    assert_eq!(own.status, StatusCode::SEE_OTHER);
+    let root = users::by_id(&f.state.db, f.root).await.unwrap().unwrap();
+    assert!(root.services.files && !root.services.webdav);
+
+    // Like every form, it needs the session's token.
+    let forged = browser
+        .post(&path("/users/carol/services"), &[("csrf", "nope")])
+        .await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    let unchanged = users::by_id(&f.state.db, carol).await.unwrap().unwrap();
+    assert_eq!(unchanged.services, stored.services);
 }
 
 #[tokio::test]
@@ -1436,12 +1498,13 @@ async fn admins_see_revoke_and_remove_the_s3_keys_and_buckets_of_an_account() {
     .await
     .unwrap();
 
-    // Nothing of S3 while the S3 API is off.
+    // No S3 panel while the S3 API is off; its service switch says that it is not offered.
     let mut browser = Browser::new(&f.state);
     let csrf = browser.root().await;
     let page = browser.get(&path("/users/alice")).await;
     assert_eq!(page.status, StatusCode::OK);
-    assert!(!web::mentions(&page.body, "S3"), "{}", page.body);
+    assert!(!page.body.contains(r#"id="s3""#), "{}", page.body);
+    assert!(page.body.contains("Not offered by this server"), "{}", page.body);
     let off = browser
         .post(
             &path(&format!("/users/alice/s3/keys/{}/delete", key.id)),

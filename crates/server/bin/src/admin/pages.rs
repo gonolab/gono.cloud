@@ -29,7 +29,7 @@ page!(
 /// What every page of the signed-in admin UI shows around its content.
 #[derive(Debug, Clone)]
 pub struct Frame {
-    /// The admin path, for example `/apps/manage`.
+    /// The admin path, for example `/manage`.
     pub prefix: String,
     /// Highlight "Overview" in the navigation.
     pub on_overview: bool,
@@ -210,6 +210,8 @@ pub struct UserRow {
     pub app_passwords: i64,
     pub storage: String,
     pub created: String,
+    /// The services it has, by name, or "None".
+    pub services: String,
 }
 
 /// `admin/users.html`.
@@ -249,6 +251,8 @@ pub struct UserView {
     /// "On since …" or "Off".
     pub two_factor: String,
     pub two_factor_on: bool,
+    /// The five services, with the switch of each.
+    pub services: Vec<crate::service_view::ServiceRow>,
 }
 
 /// One mount of an app password, as text.

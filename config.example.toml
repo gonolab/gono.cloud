@@ -115,8 +115,8 @@ enabled = true
 
 # URL path of the admin UI. Letters, digits, "-", ".", "_" and "~" only, without a trailing
 # slash; paths the server uses itself (/remote.php, /ocs, /index.php, /push, /apps, ...) are
-# refused, apart from the default. Default: "/apps/manage".
-path = "/apps/manage"
+# refused. Default: "/manage".
+path = "/manage"
 
 [files_ui]
 # Serve the web file UI at /apps/files/ (browse, search, preview, upload, download, organize

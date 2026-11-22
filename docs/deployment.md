@@ -237,7 +237,7 @@ never opened as web pages: downloads are attachments, and only images, video, au
 previewed. App passwords cannot sign in to the browser, and the browser session cannot be used
 for WebDAV.
 
-The **web admin UI** at `https://cloud.example.com/apps/manage/` (`admin.path`) shows this server
+The **web admin UI** at `https://cloud.example.com/manage/` (`admin.path`) shows this server
 and manages accounts and app passwords. Only accounts with the admin flag can sign in; for them,
 the file UI links to it. The configuration written by the install script of 1.0 to 1.2 sets
 `path = "/gono-admin"`, so the admin UI stays there until that line is changed or removed.
@@ -282,8 +282,10 @@ gono user services alice --enable webdav,files
 gono user services alice --enable all --disable s3
 ```
 
-A running server applies a change to the next request, and to open control channels and
-relay connections within 30 seconds.
+The admin UI switches them too, on the page of each account (`/manage/users/<name>`), an
+admin's own included. A running server applies a change to the next request; open control
+channels and relay connections follow at once after a change in the admin UI, and within 30
+seconds after one made with the command line.
 
 Run as root (`sudo gono-cloud ...`), the commands refuse to touch an installation that belongs to
 the service user: files they would create, such as the database's write-ahead log or a new
@@ -567,7 +569,7 @@ For the relay's host name, and for `base_url`'s, this means:
 - The admin UI's overview shows the relay's host name, the allowed devices connected now, the
   traffic it relayed and the connections it refused, or "no address discovery" while QAD is
   off.
-- The admin UI's **Relay** page (`/apps/manage/relay`) shows more:
+- The admin UI's **Relay** page (`/manage/relay`) shows more:
   - its settings: who may connect, address discovery, the certificate and the rate limit;
   - its counters;
   - the devices connected right now, with their accounts and whether their control channel
@@ -720,7 +722,7 @@ over:
    new ids.
 
 Configurations written by the install script of 1.0 to 1.2 set `admin.path = "/gono-admin"`;
-the admin UI now lives at `/apps/manage/` by default (see the changelog).
+the admin UI now lives at `/manage/` by default (see the changelog).
 
 ## Backup and restore
 
