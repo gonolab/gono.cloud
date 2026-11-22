@@ -40,7 +40,7 @@ use gono_server_core::{
     devices::{self, Device, EndpointId, NewDevice, Registration},
     login_flows::{self, DevicePoll},
 };
-use gono_server_relay::{Admission, RelayStatus};
+use gono_server_relay::{Admission, RelayStatus, Tier};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 use url::Url;
@@ -669,8 +669,11 @@ impl Directory {
 }
 
 impl Admission for Directory {
-    fn admits(&self, device: &iroh_base::EndpointId) -> bool {
+    /// Every device the directory admits gets full relay access until accounts have service
+    /// permissions.
+    fn tier(&self, device: &iroh_base::EndpointId) -> Option<Tier> {
         self.admits_key(&EndpointId(*device.as_bytes()))
+            .then_some(Tier::Full)
     }
 
     fn count(&self) -> usize {

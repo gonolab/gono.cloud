@@ -4,35 +4,39 @@
 //! each other directly, iroh sends their QUIC packets through a relay; the packets are
 //! encrypted end to end between the devices, so the relay never sees their content. The relay
 //! also tells devices the public address it sees them at (QUIC address discovery, QAD), which
-//! they need to punch holes through NAT and connect directly. This crate runs that relay,
-//! [`iroh_relay::server`], as part of Gono Cloud, configured by the `[relay]` table:
+//! they need to punch holes through NAT and connect directly. This crate runs that relay, the
+//! protocol of [`iroh_relay::server`], as part of Gono Cloud, configured by the `[relay]` table:
 //!
 //! - **Plain HTTP behind the reverse proxy** on `relay.bind`, a loopback address. The proxy
 //!   terminates TLS for the relay's own host name (`relay.public_url`) and forwards the relay's
-//!   WebSocket (`/relay`) and its probes (`/ping`, `/generate_204`) to it.
-//! - **QAD on a public UDP socket**, `relay.qad_bind`. QUIC needs a certificate of its own: the
-//!   relay reads the certificate of its host name from `relay.tls_cert` and `relay.tls_key`
-//!   and reads them again every `relay.tls_reload_interval_secs`, so that a renewal takes
-//!   effect without a restart (`tls.rs`: a new pair is served only once the key belongs to the
-//!   certificate).
+//!   WebSocket (`/relay`) and its probes (`/ping`, `/generate_204`) to it. The listener is this
+//!   crate's own (`listener.rs`), so that each device is read at the rate of its tier.
+//! - **QAD on a public UDP socket**, `relay.qad_bind`, served by iroh-relay's server. QUIC
+//!   needs a certificate of its own: the relay reads the certificate of its host name from
+//!   `relay.tls_cert` and `relay.tls_key` and reads them again every
+//!   `relay.tls_reload_interval_secs`, so that a renewal takes effect without a restart
+//!   (`tls.rs`: a new pair is served only once the key belongs to the certificate).
 //! - **Access control**: only the devices of `relay.allowed_endpoints` and those an
-//!   [`Admission`] admits may connect (the allowlist in `access.rs`). `serve` passes the device
-//!   directory, and disconnects a device through [`RelayStatus::disconnect`] once it may no
-//!   longer use the relay.
-//! - **A rate limit** per connection, `relay.max_client_bytes_per_sec`.
+//!   [`Admission`] admits may connect (the allowlist in `access.rs`), each at a [`Tier`].
+//!   `serve` passes the device directory, and disconnects a device through
+//!   [`RelayStatus::disconnect`] once it may no longer use the relay.
+//! - **A rate limit** per connection, by tier (`limit.rs`): `relay.limited_bytes_per_sec` for
+//!   [`Tier::Limited`], `relay.max_client_bytes_per_sec` for [`Tier::Full`].
 //!
 //! The relay serves no metrics endpoint of its own; [`RelayStatus`] hands its counters to the
 //! admin UI.
 
 mod access;
+mod limit;
+mod listener;
 mod tls;
 
-pub use access::Admission;
+pub use access::{Admission, Tier};
 
 use std::{
+    collections::HashSet,
     future::Future,
     net::SocketAddr,
-    num::NonZeroU32,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -44,20 +48,23 @@ use std::{
 use anyhow::{Context, anyhow, bail};
 use gono_server_core::config::RelayConfig;
 use iroh_base::EndpointId;
-use iroh_relay::server::{
-    ClientRateLimit, QuicConfig, RelayMetrics, Server, ServerConfig, clients::Clients,
-};
+use iroh_relay::server::{QuicConfig, RelayMetrics, Server, ServerConfig, clients::Clients};
+use tokio::net::TcpListener;
 use url::Url;
 
 use self::{
-    access::Allowlist,
+    access::{Allowlist, Stale},
+    limit::Limits,
+    listener::{Listener, State},
     tls::{CertificateFiles, ReloadTask},
 };
 
 /// The running relay.
 #[derive(Debug)]
 pub struct Relay {
-    server: Server,
+    listener: Listener,
+    /// iroh-relay's server, running QAD only, when QAD is on.
+    qad: Option<Server>,
     status: RelayStatus,
     /// Reads the certificate of QAD again; stops when the relay is dropped.
     _certificate_reloads: Option<ReloadTask>,
@@ -76,12 +83,13 @@ impl Relay {
             .clone()
             .context("relay.public_url is not set")?;
         let access = Arc::new(Allowlist::parse(&config.allowed_endpoints, admission)?);
+        let limits = Limits::from_config(config)?;
 
-        let mut relay = iroh_relay::server::RelayConfig::new(config.bind);
-        relay.access = access.clone();
-        relay.limits.client_rx = client_rate_limit(config);
+        let start = || format!("start the relay on {}", config.bind);
+        let http = TcpListener::bind(config.bind).await.with_context(start)?;
+        let http_addr = http.local_addr().with_context(start)?;
 
-        let (quic, certificate_reloads) = match config.qad_bind {
+        let (qad, certificate_reloads) = match config.qad_bind {
             Some(bind) => {
                 let (Some(cert), Some(key)) = (&config.tls_cert, &config.tls_key) else {
                     bail!("relay.qad_bind needs relay.tls_cert and relay.tls_key");
@@ -100,32 +108,38 @@ impl Relay {
                     files.spawn_reloads(Duration::from_secs(config.tls_reload_interval_secs));
                 let mut quic = QuicConfig::new(bind);
                 quic.server_config = Some(qad_tls_config(provider, files)?);
-                (Some(quic), Some(reloads))
+                let mut server_config = ServerConfig::default();
+                server_config.quic = Some(quic);
+                let server = Server::spawn(server_config)
+                    .await
+                    .with_context(|| format!("start QUIC address discovery on {bind}"))?;
+                (Some(server), Some(reloads))
             }
             None => (None, None),
         };
+        // One set of counters: the relay's connections count in QAD's metrics.
+        let metrics = qad
+            .as_ref()
+            .map_or_else(RelayMetrics::default, |server| server.metrics().clone());
 
-        let mut server_config = ServerConfig::default();
-        server_config.relay = Some(relay);
-        server_config.quic = quic;
-        let server = Server::spawn(server_config)
-            .await
-            .with_context(|| format!("start the relay on {}", config.bind))?;
-
+        let state = Arc::new(State::new(
+            Arc::clone(&access),
+            limits,
+            Arc::clone(&metrics.server),
+        ));
         let status = RelayStatus(Arc::new(Shared {
-            metrics: server.metrics().clone(),
-            clients: server
-                .relay_service()
-                .map(|service| service.clients().clone()),
+            metrics,
+            clients: state.clients().clone(),
             access,
             public_url,
-            http_addr: server.http_addr().unwrap_or(config.bind),
-            qad_addr: server.quic_addr(),
+            http_addr,
+            qad_addr: qad.as_ref().and_then(Server::quic_addr),
             tls_cert: config.qad_bind.and(config.tls_cert.clone()),
             tls_reload_interval_secs: config.tls_reload_interval_secs,
             client_rate_limit: config.max_client_bytes_per_sec,
             running: AtomicBool::new(true),
         }));
+        let listener = Listener::spawn(http, state);
         tracing::info!(
             public_url = %status.0.public_url,
             address = %status.0.http_addr,
@@ -134,7 +148,8 @@ impl Relay {
             "relay listening"
         );
         Ok(Self {
-            server,
+            listener,
+            qad,
             status,
             _certificate_reloads: certificate_reloads,
         })
@@ -156,27 +171,49 @@ impl Relay {
 
     async fn serve_until(mut self, stop: impl Future<Output = ()>) -> anyhow::Result<()> {
         let failed = {
-            let joined = self.server.join();
-            tokio::pin!(joined);
+            let (listener, qad) = (&mut self.listener, &mut self.qad);
+            let listener = listener.stopped();
+            let qad = async move {
+                match qad {
+                    Some(server) => server.join().await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
-                result = &mut joined => Some(result),
+                result = listener => Some(match result {
+                    Ok(()) => Err(anyhow!("the relay stopped unexpectedly")),
+                    Err(err) => Err(err).context("the relay task failed"),
+                }),
+                result = qad => Some(match result {
+                    Ok(Ok(())) => Err(anyhow!("QUIC address discovery stopped unexpectedly")),
+                    Ok(Err(err)) => {
+                        Err(anyhow!("{err}")).context("QUIC address discovery failed")
+                    }
+                    Err(err) => Err(err).context("the QUIC address discovery task failed"),
+                }),
                 () = stop => None,
             }
         };
-        match failed {
-            None => {
-                self.server
-                    .shutdown()
-                    .await
-                    .map_err(|err| anyhow!("{err}"))
-                    .context("stop the relay")?;
-                tracing::info!("relay stopped");
-                Ok(())
-            }
-            Some(Ok(Ok(()))) => bail!("the relay stopped unexpectedly"),
-            Some(Ok(Err(err))) => Err(anyhow!("{err}")).context("the relay failed"),
-            Some(Err(err)) => Err(err).context("the relay task failed"),
+        // Whatever stopped, the rest goes too, and the devices are disconnected, as iroh-relay's
+        // server does when one of its parts fails.
+        let closed = self.listener.shutdown().await;
+        let qad_stopped = match self.qad {
+            // After a failure the server is dropped instead, which aborts it: one that failed
+            // has ended, and must not be awaited again.
+            Some(server) if failed.is_none() => server
+                .shutdown()
+                .await
+                .map_err(|err| anyhow!("{err}"))
+                .context("stop QUIC address discovery"),
+            _ => Ok(()),
+        };
+        if let Some(failure) = failed {
+            return failure;
         }
+        closed.context("stop the relay")?;
+        qad_stopped?;
+        tracing::info!("relay stopped");
+        Ok(())
     }
 }
 
@@ -188,7 +225,7 @@ pub struct RelayStatus(Arc<Shared>);
 struct Shared {
     metrics: RelayMetrics,
     /// The registry of connected devices, through which they are disconnected.
-    clients: Option<Clients>,
+    clients: Clients,
     access: Arc<Allowlist>,
     public_url: Url,
     http_addr: SocketAddr,
@@ -256,32 +293,49 @@ impl RelayStatus {
     /// Disconnects every connection of `device` at once. Returns `false` if it had none. A
     /// device that the allowlist no longer admits cannot connect again.
     pub fn disconnect(&self, device: &EndpointId) -> bool {
-        let disconnected = self
-            .0
-            .clients
-            .as_ref()
-            .is_some_and(|clients| clients.disconnect(*device, None));
+        let disconnected = self.0.clients.disconnect(*device, None);
         if disconnected {
             tracing::info!(device = %device.fmt_short(), "relay connections closed");
         }
         disconnected
     }
 
-    /// Disconnects every device that holds a connection although the allowlist no longer
-    /// admits it, and returns how many there were.
+    /// Disconnects every connection whose device the allowlist no longer admits, or admits at
+    /// another tier than the connection was admitted at, so that the device comes back at its
+    /// new rate. Returns how many devices lost connections.
     ///
     /// [`RelayStatus::disconnect`] cannot reach a connection that was admitted but is not yet
     /// registered with the relay, and a caller may miss a change of the admission; sweeping
     /// regularly ends such connections too.
     pub fn sweep(&self) -> usize {
-        let stale = self.0.access.no_longer_admitted();
-        for device in &stale {
-            self.disconnect(device);
+        let mut devices = HashSet::new();
+        for Stale {
+            device,
+            connection,
+            was,
+            now,
+        } in self.0.access.stale()
+        {
+            if self.0.clients.disconnect(device, Some(connection)) {
+                match now {
+                    None => tracing::info!(
+                        device = %device.fmt_short(),
+                        "relay connection closed: the device is no longer admitted"
+                    ),
+                    Some(now) => tracing::info!(
+                        device = %device.fmt_short(),
+                        ?was,
+                        ?now,
+                        "relay connection closed, to come back at the device's new tier"
+                    ),
+                }
+            }
+            devices.insert(device);
         }
-        stale.len()
+        devices.len()
     }
 
-    /// `relay.max_client_bytes_per_sec`.
+    /// `relay.max_client_bytes_per_sec`, the rate limit of [`Tier::Full`].
     pub fn client_rate_limit(&self) -> Option<u32> {
         self.0.client_rate_limit
     }
@@ -318,18 +372,12 @@ pub struct RelaySnapshot {
     pub bytes_sent: u64,
     /// Packets that could not be delivered, mostly because the receiver was not connected.
     pub packets_dropped: u64,
-    /// Bytes held back by `relay.max_client_bytes_per_sec`.
+    /// Bytes of frames that a device sent faster than its tier's rate limit allows
+    /// (`relay.limited_bytes_per_sec` or `relay.max_client_bytes_per_sec`); the relay read on
+    /// only once the device was back within it.
     pub bytes_rate_limited: u64,
     /// QAD connections accepted.
     pub qad_connections: u64,
-}
-
-/// The per-connection rate limit of `relay.max_client_bytes_per_sec`.
-fn client_rate_limit(config: &RelayConfig) -> Option<ClientRateLimit> {
-    let bytes_per_second = NonZeroU32::new(config.max_client_bytes_per_sec?)?;
-    let mut limit = ClientRateLimit::new(bytes_per_second);
-    limit.max_burst_bytes = config.max_client_burst_bytes.and_then(NonZeroU32::new);
-    Some(limit)
 }
 
 /// The TLS configuration of the QAD socket: TLS 1.3 (QUIC needs it) with the certificate that

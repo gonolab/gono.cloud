@@ -2,16 +2,16 @@
 //! a relay started from a `[relay]` table.
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     net::SocketAddr,
     path::Path,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use gono_server_core::config::RelayConfig;
-use gono_server_relay::{Admission, Relay, RelaySnapshot};
+use gono_server_relay::{Admission, Relay, RelaySnapshot, Tier};
 use iroh_base::{EndpointId, RelayUrl, SecretKey};
 use iroh_dns::dns::DnsResolver;
 use iroh_relay::{
@@ -19,6 +19,10 @@ use iroh_relay::{
     protos::relay::{ClientToRelayMsg, Datagrams, RelayToClientMsg},
     quic::QuicClient,
     tls::{CaTlsConfig, default_provider},
+};
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::TcpStream,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -69,6 +73,54 @@ async fn receive(client: &mut Client) -> (EndpointId, Vec<u8>) {
     })
     .await
     .expect("datagrams within the timeout")
+}
+
+/// Waits until the relay closes `client`'s connection, answering its pings meanwhile.
+async fn closed(client: &mut Client) {
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match client.next().await {
+                None | Some(Err(_)) => break,
+                Some(Ok(RelayToClientMsg::Ping(payload))) => {
+                    let _ = client.send(ClientToRelayMsg::Pong(payload)).await;
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .expect("the connection ends");
+}
+
+/// Sends `count` datagrams of `size` bytes from `from` to `to` through the relay, and returns
+/// how long it took until `to` had them all.
+async fn relay_datagrams(
+    from: &mut Client,
+    to: &mut Client,
+    to_id: EndpointId,
+    count: usize,
+    size: usize,
+) -> Duration {
+    let payload = vec![7; size];
+    let start = Instant::now();
+    let send = async {
+        for _ in 0..count {
+            from.send(ClientToRelayMsg::Datagrams {
+                dst_endpoint_id: to_id,
+                datagrams: Datagrams::from(&payload),
+            })
+            .await
+            .unwrap();
+        }
+    };
+    let arrive = async {
+        let mut received = 0;
+        while received < count * size {
+            received += receive(to).await.1.len();
+        }
+    };
+    tokio::join!(send, arrive);
+    start.elapsed()
 }
 
 /// Polls `relay`'s counters until `done` holds.
@@ -160,16 +212,27 @@ async fn run_until_shuts_the_relay_down() {
     assert!(connect(status.http_addr(), &alice).await.is_err());
 }
 
-/// An admission whose devices the test changes, as the device directory does.
+/// An admission whose devices and tiers the test changes, as the device directory does.
 #[derive(Debug, Default)]
 struct Directory {
-    admitted: Mutex<HashSet<EndpointId>>,
+    admitted: Mutex<HashMap<EndpointId, Tier>>,
     refused: Mutex<Vec<EndpointId>>,
 }
 
+impl Directory {
+    /// Admits `device` at `tier`, or no longer with `None`.
+    fn set(&self, device: &SecretKey, tier: Option<Tier>) {
+        let mut admitted = self.admitted.lock().unwrap();
+        match tier {
+            Some(tier) => admitted.insert(device.public(), tier),
+            None => admitted.remove(&device.public()),
+        };
+    }
+}
+
 impl Admission for Directory {
-    fn admits(&self, device: &EndpointId) -> bool {
-        self.admitted.lock().unwrap().contains(device)
+    fn tier(&self, device: &EndpointId) -> Option<Tier> {
+        self.admitted.lock().unwrap().get(device).copied()
     }
 
     fn count(&self) -> usize {
@@ -185,7 +248,7 @@ impl Admission for Directory {
 async fn an_admission_admits_devices_and_disconnect_ends_their_connections() {
     let (alice, bob) = (device(6), device(7));
     let directory = Arc::new(Directory::default());
-    directory.admitted.lock().unwrap().insert(alice.public());
+    directory.set(&alice, Some(Tier::Full));
     let relay = Relay::spawn(&relay_config(&[]), Some(directory.clone()))
         .await
         .unwrap();
@@ -199,21 +262,9 @@ async fn an_admission_admits_devices_and_disconnect_ends_their_connections() {
     wait_for(&status, |snapshot| snapshot.connections == 1).await;
 
     // The directory no longer admits Alice: disconnect her, and she cannot come back.
-    directory.admitted.lock().unwrap().clear();
+    directory.set(&alice, None);
     assert!(status.disconnect(&alice.public()));
-    tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match client.next().await {
-                None | Some(Err(_)) => break,
-                Some(Ok(RelayToClientMsg::Ping(payload))) => {
-                    let _ = client.send(ClientToRelayMsg::Pong(payload)).await;
-                }
-                Some(Ok(_)) => {}
-            }
-        }
-    })
-    .await
-    .expect("the connection ends");
+    closed(&mut client).await;
     wait_for(&status, |snapshot| snapshot.connections == 0).await;
     assert!(connect(addr, &alice).await.is_err());
     assert!(!status.disconnect(&alice.public()), "nothing left to close");
@@ -223,11 +274,8 @@ async fn an_admission_admits_devices_and_disconnect_ends_their_connections() {
 async fn a_sweep_ends_the_connections_of_devices_no_longer_admitted() {
     let (alice, bob) = (device(8), device(9));
     let directory = Arc::new(Directory::default());
-    directory
-        .admitted
-        .lock()
-        .unwrap()
-        .extend([alice.public(), bob.public()]);
+    directory.set(&alice, Some(Tier::Full));
+    directory.set(&bob, Some(Tier::Limited));
     let relay = Relay::spawn(&relay_config(&[]), Some(directory.clone()))
         .await
         .unwrap();
@@ -246,23 +294,181 @@ async fn a_sweep_ends_the_connections_of_devices_no_longer_admitted() {
     );
 
     // The directory drops Alice without anyone calling `disconnect` for her.
-    directory.admitted.lock().unwrap().remove(&alice.public());
+    directory.set(&alice, None);
     assert_eq!(status.sweep(), 1);
-    tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match alices.next().await {
-                None | Some(Err(_)) => break,
-                Some(Ok(RelayToClientMsg::Ping(payload))) => {
-                    let _ = alices.send(ClientToRelayMsg::Pong(payload)).await;
-                }
-                Some(Ok(_)) => {}
-            }
-        }
-    })
-    .await
-    .expect("the connection ends");
+    closed(&mut alices).await;
     wait_for(&status, |snapshot| snapshot.connections == 1).await;
     assert_eq!(status.sweep(), 0, "Bob stays");
+}
+
+#[tokio::test]
+async fn a_limited_device_is_read_at_the_limited_rate_and_a_full_one_is_not() {
+    let (limited, full, receiver, stranger) = (device(10), device(11), device(12), device(13));
+    let directory = Arc::new(Directory::default());
+    directory.set(&limited, Some(Tier::Limited));
+    directory.set(&full, Some(Tier::Full));
+    // 20 000 bytes per second after a burst of 4 000, unlike the defaults; full relay access
+    // stays unlimited (relay.max_client_bytes_per_sec unset).
+    let config = RelayConfig {
+        limited_bytes_per_sec: 20_000,
+        limited_burst_bytes: 4_000,
+        ..relay_config(&[&receiver])
+    };
+    let relay = Relay::spawn(&config, Some(directory.clone()))
+        .await
+        .unwrap();
+    let status = relay.status();
+    let addr = status.http_addr();
+    let mut limiteds = connect(addr, &limited).await.unwrap();
+    let mut fulls = connect(addr, &full).await.unwrap();
+    let mut receivers = connect(addr, &receiver).await.unwrap();
+    wait_for(&status, |snapshot| snapshot.connections == 3).await;
+
+    // 40 datagrams of 1 000 bytes: the frames hold a little more, the burst takes 4 000 bytes
+    // of them, and the remaining 36 000 at least take 1.8 s at the limited rate.
+    let (count, size) = (40, 1_000);
+    let at_limited_rate = Duration::from_millis(1_800);
+
+    let full_took =
+        relay_datagrams(&mut fulls, &mut receivers, receiver.public(), count, size).await;
+    assert!(full_took < at_limited_rate / 4, "full: {full_took:?}");
+    assert_eq!(status.snapshot().bytes_rate_limited, 0);
+
+    let limited_took = relay_datagrams(
+        &mut limiteds,
+        &mut receivers,
+        receiver.public(),
+        count,
+        size,
+    )
+    .await;
+    // The bucket refills every 100 ms, so the limit may let a refill through early.
+    assert!(
+        limited_took >= at_limited_rate - Duration::from_millis(100),
+        "limited: {limited_took:?}"
+    );
+    // Near the limited rate, not held back further: the frame headers add 4% at most.
+    assert!(
+        limited_took < at_limited_rate + Duration::from_millis(1_500),
+        "limited: {limited_took:?}"
+    );
+    assert!(status.snapshot().bytes_rate_limited > 0);
+
+    // A key that neither the list nor the directory admits is still refused.
+    assert!(connect(addr, &stranger).await.is_err());
+    assert_eq!(*directory.refused.lock().unwrap(), [stranger.public()]);
+}
+
+#[tokio::test]
+async fn a_sweep_moves_a_device_whose_tier_changed_to_its_new_rate() {
+    let (alice, bob) = (device(14), device(15));
+    let directory = Arc::new(Directory::default());
+    directory.set(&alice, Some(Tier::Limited));
+    directory.set(&bob, Some(Tier::Full));
+    let relay = Relay::spawn(&relay_config(&[]), Some(directory.clone()))
+        .await
+        .unwrap();
+    let status = relay.status();
+    let addr = status.http_addr();
+    let mut old = connect(addr, &alice).await.unwrap();
+    let mut bobs = connect(addr, &bob).await.unwrap();
+    wait_for(&status, |snapshot| snapshot.connections == 2).await;
+    assert_eq!(status.sweep(), 0, "both are at the tiers they connected at");
+
+    // Alice's account gains relaying, and she connects again before the next sweep: the sweep
+    // ends only the connection admitted at the limited tier.
+    directory.set(&alice, Some(Tier::Full));
+    let mut new = connect(addr, &alice).await.unwrap();
+    wait_for(&status, |snapshot| snapshot.connections == 3).await;
+    assert_eq!(status.sweep(), 1);
+    closed(&mut old).await;
+    wait_for(&status, |snapshot| snapshot.connections == 2).await;
+    assert_eq!(status.sweep(), 0, "the new connection is at the new tier");
+    assert_eq!(
+        status
+            .connected_devices()
+            .iter()
+            .map(|(_, n)| n)
+            .sum::<usize>(),
+        2
+    );
+
+    // The new connection carries Alice's traffic.
+    bobs.send(ClientToRelayMsg::Datagrams {
+        dst_endpoint_id: alice.public(),
+        datagrams: Datagrams::from(b"at full rate"),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        receive(&mut new).await,
+        (bob.public(), b"at full rate".to_vec())
+    );
+
+    // Back to the limited tier: the sweep ends the full connection too.
+    directory.set(&alice, Some(Tier::Limited));
+    assert_eq!(status.sweep(), 1);
+    closed(&mut new).await;
+    wait_for(&status, |snapshot| snapshot.connections == 1).await;
+    assert_eq!(status.sweep(), 0, "Bob stays");
+}
+
+/// Sends a GET for `path` with `headers` (lines ending in CRLF) to the relay at `addr`, and
+/// returns the response with its header names in lower case, as HTTP/1.1 sends them here.
+async fn get(addr: SocketAddr, path: &str, headers: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: relay.example.com\r\n{headers}Connection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(TIMEOUT, stream.read_to_string(&mut response))
+        .await
+        .expect("a response within the timeout")
+        .unwrap();
+    response
+}
+
+#[tokio::test]
+async fn the_probes_answer_as_iroh_relay_does() {
+    let relay = Relay::spawn(&relay_config(&[]), None).await.unwrap();
+    let addr = relay.status().http_addr();
+
+    let ping = get(addr, "/ping", "").await;
+    assert!(ping.starts_with("HTTP/1.1 200"), "{ping}");
+    assert!(ping.contains("access-control-allow-origin: *"), "{ping}");
+    assert!(ping.contains("strict-transport-security: "), "{ping}");
+
+    let captive = get(addr, "/generate_204", "X-Iroh-Challenge: gono-ci-204\r\n").await;
+    assert!(captive.starts_with("HTTP/1.1 204"), "{captive}");
+    assert!(
+        captive.contains("x-iroh-response: response gono-ci-204"),
+        "{captive}"
+    );
+    let unanswered = get(addr, "/generate_204", "X-Iroh-Challenge: not/this\r\n").await;
+    assert!(unanswered.starts_with("HTTP/1.1 204"), "{unanswered}");
+    assert!(!unanswered.contains("x-iroh-response"), "{unanswered}");
+
+    let health = get(addr, "/healthz", "").await;
+    assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    assert!(health.contains("\"status\":\"ok\""), "{health}");
+    assert!(get(addr, "/robots.txt", "").await.contains("Disallow: /"));
+    assert!(get(addr, "/nothing", "").await.starts_with("HTTP/1.1 404"));
+
+    // What docs/reverse-proxy.md checks through the proxy: an upgrade without the relay
+    // protocol is refused with 400.
+    let upgrade = get(
+        addr,
+        "/relay",
+        "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+    )
+    .await;
+    assert!(upgrade.starts_with("HTTP/1.1 400"), "{upgrade}");
+    assert!(
+        upgrade.contains("missing header: sec-websocket-protocol"),
+        "{upgrade}"
+    );
 }
 
 /// Writes a self-signed certificate for `localhost` into `dir`.

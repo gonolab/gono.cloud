@@ -19,7 +19,7 @@ use gono_server_core::{
     login_flows,
     users::{self, NewUser},
 };
-use gono_server_relay::Admission as _;
+use gono_server_relay::{Admission as _, Tier};
 use iroh_base::SecretKey;
 use secrecy::SecretString;
 
@@ -707,7 +707,11 @@ async fn remote_access_needs_no_two_step_verification_unless_required() {
     let directory = f.connect.directory();
     directory.refresh().await.unwrap();
     for seed in [1, 2] {
-        assert!(directory.admits(&key(seed).public()), "device {seed}");
+        assert_eq!(
+            directory.tier(&key(seed).public()),
+            Some(Tier::Full),
+            "device {seed}"
+        );
     }
 }
 

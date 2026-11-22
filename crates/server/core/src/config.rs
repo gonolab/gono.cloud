@@ -530,12 +530,24 @@ pub struct RelayConfig {
     /// Every other device is refused.
     pub allowed_endpoints: Vec<String>,
 
-    /// Most bytes per second the relay reads from one device connection. Unlimited when unset.
+    /// Most bytes per second the relay reads from one connection of a device with full relay
+    /// access (the full tier, which the devices of `allowed_endpoints` have). Unlimited when
+    /// unset.
     pub max_client_bytes_per_sec: Option<u32>,
 
-    /// Largest burst the relay reads from one device connection at once, in bytes. Needs
-    /// `max_client_bytes_per_sec`.
+    /// Largest burst the relay reads at once from one connection of a device with full relay
+    /// access, in bytes. Needs `max_client_bytes_per_sec`.
     pub max_client_burst_bytes: Option<u32>,
+
+    /// Most bytes per second the relay reads from one connection of a device that may connect
+    /// directly but not relay (the limited tier): enough for the handshakes and the
+    /// hole-punching coordination that set up a direct connection. At most
+    /// `max_client_bytes_per_sec`.
+    pub limited_bytes_per_sec: u32,
+
+    /// Largest burst the relay reads at once from one connection of a device of the limited
+    /// tier, in bytes. At most `max_client_burst_bytes`.
+    pub limited_burst_bytes: u32,
 }
 
 impl Default for RelayConfig {
@@ -551,6 +563,8 @@ impl Default for RelayConfig {
             allowed_endpoints: Vec::new(),
             max_client_bytes_per_sec: None,
             max_client_burst_bytes: None,
+            limited_bytes_per_sec: 16_384,
+            limited_burst_bytes: 32_768,
         }
     }
 }
@@ -1000,6 +1014,43 @@ impl Config {
             reject(
                 "relay.max_client_burst_bytes",
                 "needs relay.max_client_bytes_per_sec".to_owned(),
+            );
+        }
+
+        // The relay refills a connection's allowance every tenth of a second, a byte at least.
+        if relay.limited_bytes_per_sec < 10 {
+            reject(
+                "relay.limited_bytes_per_sec",
+                "must be at least 10".to_owned(),
+            );
+        } else if let Some(full) = relay
+            .max_client_bytes_per_sec
+            // 0 is refused above already.
+            .filter(|full| *full > 0 && relay.limited_bytes_per_sec > *full)
+        {
+            reject(
+                "relay.limited_bytes_per_sec",
+                format!(
+                    "must not exceed relay.max_client_bytes_per_sec ({full}): the limited tier \
+                     cannot get more than full relay access"
+                ),
+            );
+        }
+        if relay.limited_burst_bytes == 0 {
+            reject(
+                "relay.limited_burst_bytes",
+                "must be greater than 0".to_owned(),
+            );
+        } else if let Some(full) = relay
+            .max_client_burst_bytes
+            .filter(|full| *full > 0 && relay.limited_burst_bytes > *full)
+        {
+            reject(
+                "relay.limited_burst_bytes",
+                format!(
+                    "must not exceed relay.max_client_burst_bytes ({full}): the limited tier \
+                     cannot get more than full relay access"
+                ),
             );
         }
     }
@@ -1769,6 +1820,8 @@ mod tests {
         assert_eq!(relay.tls_reload_interval_secs, 3600);
         assert!(relay.allowed_endpoints.is_empty());
         assert_eq!(relay.max_client_bytes_per_sec, None);
+        assert_eq!(relay.limited_bytes_per_sec, 16_384);
+        assert_eq!(relay.limited_burst_bytes, 32_768);
     }
 
     #[test]
@@ -1897,6 +1950,36 @@ mod tests {
 
         let too_large = format!("{MINIMAL}\n[relay]\nmax_client_bytes_per_sec = 4294967296");
         assert!(Config::from_toml(&too_large).is_err());
+    }
+
+    #[test]
+    fn limited_rate_limits_are_checked() {
+        let ok = complete_relay("limited_bytes_per_sec = 4096\nlimited_burst_bytes = 8192");
+        assert!(issue_keys(&ok).is_empty());
+        // The defaults stay below the limits of full relay access.
+        let below =
+            complete_relay("max_client_bytes_per_sec = 1048576\nmax_client_burst_bytes = 65536");
+        assert!(issue_keys(&below).is_empty());
+
+        let zero = complete_relay("limited_bytes_per_sec = 0\nlimited_burst_bytes = 0");
+        assert_eq!(
+            issue_keys(&zero),
+            ["relay.limited_bytes_per_sec", "relay.limited_burst_bytes"]
+        );
+        let too_slow = complete_relay("limited_bytes_per_sec = 9");
+        assert_eq!(issue_keys(&too_slow), ["relay.limited_bytes_per_sec"]);
+
+        let above =
+            complete_relay("max_client_bytes_per_sec = 8192\nmax_client_burst_bytes = 16384");
+        assert_eq!(
+            issue_keys(&above),
+            ["relay.limited_bytes_per_sec", "relay.limited_burst_bytes"]
+        );
+        let equal = complete_relay(
+            "max_client_bytes_per_sec = 8192\nmax_client_burst_bytes = 16384\n\
+             limited_bytes_per_sec = 8192\nlimited_burst_bytes = 16384",
+        );
+        assert!(issue_keys(&equal).is_empty());
     }
 
     #[test]

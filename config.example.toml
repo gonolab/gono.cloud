@@ -168,6 +168,13 @@ allowed_endpoints = []
 # max_client_bytes_per_sec = 2097152
 # max_client_burst_bytes = 262144
 
+# The same for devices that may connect directly but not relay (the limited tier): enough for
+# the handshakes and the hole punching that set up a direct connection, far too little to relay
+# a session. The limits above apply to every other device, those of allowed_endpoints among
+# them, and these may not exceed them. Default: 16384 and 32768.
+# limited_bytes_per_sec = 16384
+# limited_burst_bytes = 32768
+
 [connect]
 # Remote access of devices, served by `serve` while the relay is enabled (docs/deployment.md,
 # "Remote access").

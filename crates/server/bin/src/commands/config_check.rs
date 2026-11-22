@@ -188,5 +188,12 @@ fn relay_settings(relay: &RelayConfig) -> Vec<(&'static str, String)> {
                 (Some(rate), Some(burst)) => format!("{rate} (bursts of {burst} bytes)"),
             },
         ),
+        (
+            "relay.limited_bytes_per_sec",
+            format!(
+                "{} (bursts of {} bytes)",
+                relay.limited_bytes_per_sec, relay.limited_burst_bytes
+            ),
+        ),
     ]
 }
