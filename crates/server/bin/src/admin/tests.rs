@@ -125,6 +125,8 @@ async fn fixture() -> Fixture {
         mailer: None,
         wechat: None,
         oauth: None,
+        terms_url: None,
+        restores: Default::default(),
     };
     Fixture {
         _dir: dir,
@@ -1977,4 +1979,82 @@ async fn the_admin_ui_takes_third_party_sign_ins_of_admins_only() {
     assert_eq!(callback.status, StatusCode::SEE_OTHER);
     assert_eq!(callback.location(), path("/"));
     assert_eq!(overview.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn self_service_accounts_are_marked_filtered_and_their_deletion_undone() {
+    use gono_server_core::{
+        identities::Claims,
+        users::{SignedUp, sign_up},
+    };
+    let f = fixture().await;
+    let SignedUp::Created(user, _) = sign_up(
+        &f.state.db,
+        &Claims::wechat("wxd930ea5d5a258f4f", "oNew", None),
+        &Username::new("wxnewcomer").unwrap(),
+        "新用户",
+        None,
+        None,
+        db::unix_now(),
+        |_| Ok(()),
+    )
+    .await
+    .unwrap() else {
+        panic!("not created");
+    };
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.root().await;
+    let all = browser.get(&path("/users")).await;
+    assert!(all.body.contains("Self-service: WeChat"), "{}", all.body);
+    assert!(all.body.contains("alice"), "{}", all.body);
+    let filtered = browser.get(&path("/users?filter=self-service")).await;
+    assert!(filtered.body.contains("wxnewcomer"), "{}", filtered.body);
+    assert!(
+        !filtered.body.contains("<span class=\"mono\">alice</span>"),
+        "{}",
+        filtered.body
+    );
+    let page = browser.get(&path("/users/wxnewcomer")).await;
+    assert!(
+        page.body
+            .contains("<dt>Created</dt><dd>Self-service: WeChat</dd>"),
+        "{}",
+        page.body
+    );
+    let alice = browser.get(&path("/users/alice")).await;
+    assert!(
+        alice.body.contains("<dt>Created</dt><dd>Admin UI</dd>"),
+        "{}",
+        alice.body
+    );
+
+    users::request_deletion(
+        &f.state.db,
+        user.id,
+        gono_server_core::audit::Actor::User,
+        None,
+        db::unix_now(),
+    )
+    .await
+    .unwrap();
+    let page = browser.get(&path("/users/wxnewcomer")).await;
+    assert!(
+        page.body
+            .contains(&path("/users/wxnewcomer/deletion/cancel")),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains(EN.a_delete_now), "{}", page.body);
+    let undone = browser
+        .post(
+            &path("/users/wxnewcomer/deletion/cancel"),
+            &[("csrf", &csrf)],
+        )
+        .await;
+    assert_eq!(
+        undone.location(),
+        format!("{}?done=restored", path("/users/wxnewcomer"))
+    );
+    let back = users::by_id(&f.state.db, user.id).await.unwrap().unwrap();
+    assert!(back.enabled && back.deleting_at.is_none());
 }

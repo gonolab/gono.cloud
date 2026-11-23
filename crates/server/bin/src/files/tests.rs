@@ -96,6 +96,8 @@ async fn fixture_with(files: bool) -> Fixture {
         mailer: None,
         wechat: None,
         oauth: None,
+        terms_url: None,
+        restores: Default::default(),
     };
     Fixture {
         _dir: dir,

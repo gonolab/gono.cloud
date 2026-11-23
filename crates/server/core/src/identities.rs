@@ -359,8 +359,13 @@ pub enum SignedIn {
     Account(Box<User>),
     /// It is bound to a disabled account.
     Disabled,
-    /// It is bound to an account that waits for its deletion, until then.
-    DeletionPending(i64),
+    /// It is bound to an account that waits for its deletion `until` then.
+    DeletionPending {
+        /// The account.
+        user_id: i64,
+        /// When it is deleted.
+        until: i64,
+    },
     /// It is bound to no account.
     Unbound,
 }
@@ -380,7 +385,10 @@ async fn user_in(tx: &mut Tx, user_id: i64) -> Result<Option<User>> {
 /// What [`SignedIn`] says of an account that the identity is bound to.
 fn signed_in(user: User) -> SignedIn {
     match user.deleting_at {
-        Some(until) => SignedIn::DeletionPending(until),
+        Some(until) => SignedIn::DeletionPending {
+            user_id: user.id,
+            until,
+        },
         None if !user.enabled => SignedIn::Disabled,
         None => SignedIn::Account(Box::new(user)),
     }

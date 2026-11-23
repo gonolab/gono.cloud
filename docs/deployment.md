@@ -560,6 +560,7 @@ verify_file = "/etc/gono-cloud/AbCdEf1234.txt"
 | `app_id` | The mini program's AppID, `wx` and 16 letters or digits, as its console shows it. Changing it later starts over: the bindings and sessions of the previous AppID no longer count, although the admin UI still lists those bindings on each account's page. |
 | `secret_file` | The file that holds the AppSecret (the first line; relative paths start in the directory of `config.toml`). The AppSecret never goes into `config.toml`; `config check` names the file and whether it exists, never the secret, and `serve` reads it when it starts and refuses to start without it or with an empty one. It warns when others can read the file. |
 | `qr_url_prefix` | The prefix of the QR links, exactly as the console's rule has it: an `https://` URL ending in `/`, without credentials, query or fragment, at most 200 bytes. Binding links are `<prefix>bind/<ticket>`. Its host may differ from `base_url`'s. |
+| `allow_signup` | Optional, `false` by default. A WeChat bound to no account may create one in the mini program (`signup`): a generated username (`wx` and 8 letters and digits), no web login password and no service; the same limits and deletion as for Google and GitHub sign-ups ("Google and GitHub sign-in" below). |
 | `web_sign_in` | Optional, `false` by default. The sign-in pages (`/login`, the Login Flow v2 page, `/manage/login`) offer "Scan with WeChat": a QR code that the mini program scans and confirms, after which the phone shows 6 digits that the user types into the browser. Turn it on once the mini program has its page that confirms web sign-ins ([wechat-miniprogram.md](wechat-miniprogram.md#signing-in-on-the-web-scan-confirm-deny-flow)). |
 | `verify_file` | Optional. WeChat's verification file for the rule, served at `/<its file name>` with its exact content as `text/plain`, and nowhere else. Its name must be letters, digits, `-`, `_` and `.`, ending in `.txt`, as WeChat names it; it is read when `serve` starts (at most 4 KiB). Leave it unset to serve the file another way. |
 
@@ -668,6 +669,25 @@ What users see:
   sign-in of a bound Google or GitHub account, and an account without a web login password sets
   one there after such a sign-in.
 - **The admin UI** takes the same sign-ins; only admin accounts get a session.
+- **Sign-up** (`allow_signup = true` in a provider's table, off by default). An identity bound to
+  no account may then create one ("Create an account"): a generated username (`gg` or `gh` and 8
+  random letters and digits, changeable on the account page until a device or app signs in, once
+  a day), the provider's name as the display name, no web login password and no service, like
+  every account. A network signs up 5 accounts a day at most, the server 200. With
+  `[sign_in] terms_url`, the page links the terms and asks to accept them. The admin UI marks
+  such accounts ("Self-service: Google") and lists them under "Self-service"; administrators get
+  no notice. An account without a password deletes itself on the account page: it is disabled at
+  once, a sign-in within 7 days undoes it, and then the server deletes it with its files and
+  devices as an administrator would. The admin UI shows the pending deletion and undoes it or
+  deletes at once.
+
+```toml
+[oauth.google]
+allow_signup = true
+
+[sign_in]
+terms_url = "https://cloud.example.com/terms.html"
+```
 
 Security notes:
 

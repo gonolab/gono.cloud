@@ -283,6 +283,9 @@ pub enum SignIn {
     },
     /// The openid is bound to a disabled account; nothing was made.
     Disabled,
+    /// The openid is bound to an account that waits for its deletion, until then; nothing was
+    /// made.
+    DeletionPending(i64),
 }
 
 /// Signs in the WeChat user `openid` of AppID `app_id`, as WeChat's `jscode2session` reported
@@ -302,6 +305,14 @@ pub async fn sign_in(
             // The cascade removes the identity with its account.
             return Ok(SignIn::Disabled);
         };
+        let deleting: Option<i64> =
+            sqlx::query_scalar("SELECT deleting_at FROM users WHERE id = ?")
+                .bind(identity.user_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if let Some(until) = deleting {
+            return Ok(SignIn::DeletionPending(until));
+        }
         if !row.enabled {
             return Ok(SignIn::Disabled);
         }
@@ -316,6 +327,49 @@ pub async fn sign_in(
         identities::create_pending_in(&mut tx, Holder::MiniProgram, &claims, now).await?;
     tx.commit().await?;
     Ok(SignIn::Unbound { token, expires_at })
+}
+
+/// Opens a mini program session with WeChat identity `identity_id` (after a sign-up or an
+/// undone deletion), with what it reads of the identity's account.
+pub async fn open_session_of(
+    pool: &Pool,
+    identity_id: i64,
+    now: i64,
+) -> Result<Option<(NewSession, Account)>> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let user_id: Option<i64> =
+        sqlx::query_scalar("SELECT user_id FROM external_identities WHERE id = ?")
+            .bind(identity_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(user_id) = user_id else {
+        return Ok(None);
+    };
+    let Some(row) = account_in(&mut tx, user_id)
+        .await?
+        .filter(|row| row.enabled)
+    else {
+        return Ok(None);
+    };
+    let session = open_session(&mut tx, identity_id, now).await?;
+    let account = row.into_account()?;
+    tx.commit().await?;
+    Ok(Some((session, account)))
+}
+
+/// What a mini program session reads of account `user_id`, if it is enabled.
+pub async fn account(pool: &Pool, user_id: i64) -> Result<Option<Account>> {
+    let sql = format!(
+        "SELECT id, username, display_name, enabled, {} FROM users WHERE id = ?",
+        crate::services::COLUMNS
+    );
+    let row: Option<AccountRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    row.filter(|row| row.enabled)
+        .map(AccountRow::into_account)
+        .transpose()
 }
 
 /// Outcome of [`bind`].

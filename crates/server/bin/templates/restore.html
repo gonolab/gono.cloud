@@ -1,0 +1,10 @@
+{%- extends "card.html" -%}
+{%- block title %}{{ chrome.t.deletion_pending_title }}{% endblock -%}
+{%- block card %}
+<h1>{{ chrome.t.deletion_pending_title }}</h1>
+<p class="mt-6">{{ lead }}</p>
+<form method="post" action="/login/restore" class="mt-20">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <button class="btn primary block" type="submit">{{ chrome.t.deletion_cancel }}</button>
+</form>
+{%- endblock %}

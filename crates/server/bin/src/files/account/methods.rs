@@ -194,6 +194,9 @@ pub(super) fn notice(t: &'static Text, done: &str) -> Option<String> {
         "confirmed" => t.notice_confirmed.to_owned(),
         "cancelled" => t.oauth_cancelled_lead.to_owned(),
         "password-set" => t.notice_password_set.to_owned(),
+        "signed-up" => t.notice_signed_up.to_owned(),
+        "restored" => t.notice_restored.to_owned(),
+        "username" => t.notice_username_changed.to_owned(),
         done => {
             if let Some(key) = done.strip_prefix("unbound-") {
                 fill(

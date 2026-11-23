@@ -198,6 +198,33 @@ Ends the session. `Authorization: Bearer <session>`; a body is ignored (at most 
 `204 No Content`, also for a session that expired. Errors: `not_signed_in` (no such session),
 `rate_limited`, `unavailable`. Forget the session in any case.
 
+### Accounts made in the mini program: `signup`, `PATCH account`, `account/delete`, `account/restore`
+
+With `wechat.allow_signup` (off by default), `session` answers a WeChat bound to no account with
+`"signup": true` beside its signup token, and the mini program may offer 新建账号:
+
+- `POST /gono/v1/wechat/signup {"signup_token", "terms_version", "scene", "platform"}` creates the
+  account: username `wx` and 8 random lower-case letters and digits, display name 新用户, no web
+  login password, no service (an administrator turns them on), and binds the WeChat to it. The
+  answer is a bound `session`'s, `{"session", "expires_at", "account"}`. `terms_version` (at most
+  64 characters) names the terms the user accepted, and is required when the server has terms
+  (`[sign_in] terms_url`). Errors: `signup_closed` (403) without `allow_signup`,
+  `session_expired` (401) for a token that is gone, `account_exists` (409), `signup_limited`
+  (429: 5 accounts a day per network, 200 for the server), and the scene and platform rules of
+  `session`.
+- `PATCH /gono/v1/wechat/account {"username"}` (Bearer) changes the username of an account made
+  by a sign-up, until an app password or a device signed in to it (their statements name the
+  account by its username), once a day: `200` with the account; `username_taken` (409),
+  `username_locked` (409), `rate_limited` (429, `Retry-After` a day).
+- `POST /gono/v1/wechat/account/delete {"code", "platform", "confirm"}` (Bearer, a fresh code of
+  the session's WeChat, `confirm` the username) asks for the deletion of an account without a web
+  login password: `204`. The account is disabled at once, its sessions end, and the server deletes
+  it 7 days later. Until then `session` answers `409 {"error": "deletion_pending", "until"}`.
+  `not_permitted` (403) for an account with a password or another WeChat's code.
+- `POST /gono/v1/wechat/account/restore {"code", "platform"}` (no session: the code names the
+  WeChat) undoes it within the 7 days and opens a session: `{"session", "expires_at",
+  "account"}`; `not_pending` (409) when nothing waits.
+
 ### Signing in on the web: `scan`, `confirm`, `deny`, `flow`
 
 With `wechat.web_sign_in`, the server's sign-in pages (`/login`, the Login Flow v2 page,
@@ -244,7 +271,8 @@ WeChat of the code locks the sign-in, and the answer says what to show:
   accounts only) or `reauth` (the account page confirms it is its user, with the WeChat bound to
   it). `same_network` compares the phone's network with the browser's (the /24 of an IPv4
   address, the /64 of an IPv6 one). The page states it either way: the digits are always asked.
-- A WeChat bound to no account gets `"account": null` and locks nothing: show how to bind it.
+- A WeChat bound to no account gets `"account": null` and locks nothing: show how to bind it,
+  and 新建账号 when `"signup": true`; after the sign-up, `scan` again.
 - Refusals: `ticket_expired` (410: unknown, ended or 2 minutes passed; the browser shows a new
   one), `ticket_taken` (409: another WeChat scanned it first), `account_disabled` (403),
   `deletion_pending` (409, with `until`), `not_permitted` (403: a non-admin account on the admin
@@ -284,6 +312,11 @@ are limited like `bind`.
 | `not_permitted` | 403 | A web sign-in this WeChat may not confirm: of the admin UI for a non-admin account, of another account, or locked by another WeChat (`confirm`, `deny`). |
 | `account_exists` | 409 | The WeChat is bound to another account. |
 | `ticket_taken` | 409 | Another WeChat scanned the sign-in's QR code first. |
+| `signup_closed` | 403 | The server lets no WeChat sign up (`allow_signup` is off). |
+| `username_taken` | 409 | The username is in use or retired. |
+| `username_locked` | 409 | The username can no longer change: an app password or a device uses it. |
+| `not_pending` | 409 | `account/restore`: the account waits for no deletion. |
+| `signup_limited` | 429 | Too many accounts were made today, from this network or on the server. |
 | `deletion_pending` | 409 | The account waits for its deletion (`until`). |
 | `bind_failed` | 409 | The account has another WeChat of this AppID. |
 | `ticket_expired` | 410 | The QR code's ticket is expired, used or replaced. |

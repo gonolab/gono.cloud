@@ -26,6 +26,7 @@ mod request_log;
 mod s3;
 mod service_view;
 mod shutdown;
+mod signup;
 mod site;
 mod web;
 mod wechat;

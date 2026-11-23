@@ -155,7 +155,12 @@
     </div></div>
     <div class="panel"><div class="panel-body">
       <h2>{{ chrome.t.a_account }}</h2>
-      <dl class="facts mt-18"><dt>{{ chrome.t.a_user_id }}</dt><dd class="mono">{{ user.id }}</dd><dt>{{ chrome.t.a_created }}</dt><dd>{{ user.created }}</dd><dt>{{ chrome.t.a_changed }}</dt><dd>{{ user.updated }}</dd><dt>{{ chrome.t.a_storage_used }}</dt><dd>{{ user.storage }}</dd><dt>{{ chrome.t.email_title }}</dt><dd>{{ user.email }}</dd><dt>{{ chrome.t.web_password }}</dt><dd>{% if user.has_password %}{{ chrome.t.a_password_set }}{% else %}{{ chrome.t.a_password_none }}{% endif %}</dd><dt>{{ chrome.t.tf_title }}</dt><dd>{{ user.two_factor }}</dd></dl>
+      <dl class="facts mt-18"><dt>{{ chrome.t.a_user_id }}</dt><dd class="mono">{{ user.id }}</dd><dt>{{ chrome.t.a_created }}</dt><dd>{{ user.created }}</dd><dt>{{ chrome.t.a_changed }}</dt><dd>{{ user.updated }}</dd><dt>{{ chrome.t.a_storage_used }}</dt><dd>{{ user.storage }}</dd><dt>{{ chrome.t.email_title }}</dt><dd>{{ user.email }}</dd><dt>{{ chrome.t.a_created_via }}</dt><dd>{{ user.created_via }}</dd><dt>{{ chrome.t.web_password }}</dt><dd>{% if user.has_password %}{{ chrome.t.a_password_set }}{% else %}{{ chrome.t.a_password_none }}{% endif %}</dd><dt>{{ chrome.t.tf_title }}</dt><dd>{{ user.two_factor }}</dd></dl>
+      {%- if let Some(deleting) = user.deleting %}
+      <div class="flash warn mt-18" role="status">{{ deleting }}</div>
+      <form method="post" action="{{ base }}/deletion/cancel" class="mt-6"><input type="hidden" name="csrf" value="{{ frame.csrf }}"><button class="btn block" type="submit">{{ chrome.t.a_deletion_cancel }}</button></form>
+      <a class="btn danger block mt-6" href="{{ base }}/delete">{{ chrome.t.a_delete_now }}</a>
+      {%- endif %}
       {%- if user.two_factor_on %}
       <form method="post" action="{{ base }}/two-factor/reset" class="mt-18"><input type="hidden" name="csrf" value="{{ frame.csrf }}"><button class="btn danger block" type="submit">{{ chrome.t.a_tf_reset }}</button></form>
       {%- endif %}

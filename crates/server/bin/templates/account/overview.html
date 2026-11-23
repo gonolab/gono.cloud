@@ -117,6 +117,17 @@
       <p class="muted">{{ chrome.t.tf_unavailable }}</p>
       {%- endif %}
     </div></section>
+    {%- if rename %}
+    <section class="panel" id="username"><div class="panel-body">
+      <h2>{{ chrome.t.username_change }}</h2>
+      <p class="muted small">{{ chrome.t.username_note }}</p>
+      <form method="post" action="/account/username">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <label class="field" for="un-name"><span>{{ chrome.t.username }}</span><input id="un-name" type="text" name="username" value="{{ frame.username }}" autocapitalize="none" spellcheck="false" maxlength="64" required></label>
+        <button class="btn block" type="submit">{{ chrome.t.save }}</button>
+      </form>
+    </div></section>
+    {%- endif %}
     <section class="panel"><div class="panel-body">
       <h2>{{ chrome.t.profile }}</h2>
       <p class="muted small">{{ chrome.t.display_name_note }}</p>
@@ -155,6 +166,21 @@
       {%- endif %}
       {%- endif %}
     </div></section>
+    {%- if deletable %}
+    <section class="panel danger" id="delete"><div class="panel-body">
+      <h2>{{ chrome.t.account_delete_title }}</h2>
+      <p class="muted small">{{ chrome.t.delete_note }}</p>
+      {%- if confirm.confirmed %}
+      <form method="post" action="/account/delete">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <label class="field" for="delete-confirm"><span>{{ chrome.t.delete_confirm_name }}</span><input id="delete-confirm" type="text" name="confirm" autocapitalize="none" spellcheck="false" autocomplete="off" required></label>
+        <button class="btn danger block" type="submit">{{ chrome.t.delete_button }}</button>
+      </form>
+      {%- else %}
+      <a class="btn block" href="/account/confirm?next=%2Faccount%2F%23delete">{{ chrome.t.confirm_title }}</a>
+      {%- endif %}
+    </div></section>
+    {%- endif %}
   </div>
 </div>
 {%- endblock %}

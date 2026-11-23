@@ -12,6 +12,22 @@ compatible within a major version: released clients keep working with newer serv
 
 ### Added
 
+- **Sign-up with a third-party identity** (`allow_signup` in `[oauth.google]`, `[oauth.github]` and
+  `[wechat]`, off by default). An identity bound to no account may create one: on the web after
+  Google or GitHub ("Create an account", `/login/signup`), in the mini program with `POST
+  /gono/v1/wechat/signup`. The account gets a generated username (`gg`, `gh` or `wx` and 8 random
+  letters and digits, never a retired one), the provider's name (or 新用户) as display name, no web
+  login password and no service; `created_via` names the provider, and the audit log records
+  `account.created` and `identity.bound` with `how: "signup"`. 5 sign-ups a day per network and 200
+  for the server. `[sign_in] terms_url` adds terms to accept. The username can be changed (account
+  page, `PATCH /gono/v1/wechat/account`) once a day until an app password or a device uses it
+  (`account.renamed`). An account without a password deletes itself (account page, `POST
+  /gono/v1/wechat/account/delete`): disabled at once, undone by a sign-in within 7 days
+  (`/login/restore`, `account/restore`; `account.deletion_requested`, `account.deletion_cancelled`),
+  then deleted with its files and devices by the server. The admin UI marks self-service accounts,
+  filters them (`/manage/users?filter=self-service`), shows how every account was made and a pending
+  deletion, which it undoes or carries out at once.
+
 - **WeChat sign-in on the web** (`[wechat] web_sign_in`, off by default). The sign-in pages
   (`/login`, the Login Flow v2 page, `/manage/login`) offer "Scan with WeChat": a QR code of
   `{qr_url_prefix}<ticket>` for this browser (2 minutes, renewed while the page is open, bound to it

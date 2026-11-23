@@ -771,3 +771,193 @@ async fn the_login_flow_page_comes_back_to_its_consent_after_a_provider() {
         consent.text()
     );
 }
+
+/// The fixture with Google allowing sign-up, and the terms of `terms`.
+async fn with_signup(terms: Option<&str>) -> (Fixture, Mock) {
+    let mut f = fixture().await;
+    let mock = Mock::start().await;
+    let oauth = OAuth::new(
+        &f.state.base_url,
+        Some(mock.google().with_signup(true)),
+        Some(mock.github()),
+    )
+    .unwrap();
+    f.state.oauth = Some(Arc::new(oauth));
+    f.state.terms_url = terms.map(|url| Arc::new(url::Url::parse(url).unwrap()));
+    (f, mock)
+}
+
+#[tokio::test]
+async fn an_unbound_identity_signs_up_for_an_account_without_services() {
+    let (f, mock) = with_signup(Some("https://cloud.example.com/terms")).await;
+    let mut browser = Browser::new(&f.state);
+    let person = Person::new("300", "new@gmail.com");
+    let callback = sign_in(&mut browser, &mock, "google", &person).await;
+    let unbound = browser.get(callback.location()).await.text();
+    assert!(
+        unbound.contains("href=\"/login/signup?next=%2Fapps%2Ffiles%2F\""),
+        "{unbound}"
+    );
+    let page = browser.get("/login/signup?next=%2Fapps%2Ffiles%2F").await;
+    let text = page.text();
+    let username = page.field("name=\"username\" value=\"");
+    assert!(
+        username.starts_with("gg") && username.len() == 10,
+        "{username}"
+    );
+    assert!(text.contains("value=\"Alice Example\""), "{text}");
+    assert!(
+        text.contains("href=\"https://cloud.example.com/terms\""),
+        "{text}"
+    );
+    let csrf = page.field("name=\"csrf\" value=\"");
+    // The terms must be accepted, and the name must be free.
+    let fields = |name: &'static str, terms: bool| {
+        let mut fields = vec![
+            ("csrf", csrf.clone()),
+            ("username", name.to_owned()),
+            ("display_name", "Nova".to_owned()),
+            ("next", "/apps/files/".to_owned()),
+        ];
+        if terms {
+            fields.push(("terms", "1".to_owned()));
+        }
+        fields
+    };
+    let no_terms = fields("nova", false);
+    let pairs: Vec<(&str, &str)> = no_terms.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let refused = browser.post("/login/signup", &pairs).await;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(refused.text().contains(t().signup_terms_needed));
+    let taken = fields("alice", true);
+    let pairs: Vec<(&str, &str)> = taken.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    assert_eq!(
+        browser.post("/login/signup", &pairs).await.status,
+        StatusCode::CONFLICT
+    );
+    let good = fields("nova", true);
+    let pairs: Vec<(&str, &str)> = good.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let created = browser.post("/login/signup", &pairs).await;
+    assert_eq!(
+        created.location(),
+        "/account/?done=signed-up",
+        "{}",
+        created.text()
+    );
+    let page = browser.get(created.location()).await.text();
+    assert!(page.contains(t().notice_signed_up), "{page}");
+    assert!(
+        page.contains("action=\"/account/password/set\""),
+        "a fresh sign-up confirms: {page}"
+    );
+    let user = users::get(&f.state.db, &Username::new("nova").unwrap())
+        .await
+        .unwrap();
+    assert!(!user.has_password && user.services == gono_server_core::services::Services::NONE);
+    assert_eq!(user.created_via, users::CreatedVia::Google);
+    assert_eq!(user.display_name, "Nova");
+    // GitHub does not allow sign-up here.
+    let mut other = Browser::new(&f.state);
+    let callback = sign_in(
+        &mut other,
+        &mock,
+        "github",
+        &Person::new("301", "x@example.com"),
+    )
+    .await;
+    let unbound = other.get(callback.location()).await.text();
+    assert!(!unbound.contains("/login/signup"), "{unbound}");
+    assert_eq!(
+        other.get("/login/signup").await.location(),
+        "/login?next=%2Fapps%2Ffiles%2F"
+    );
+}
+
+#[tokio::test]
+async fn an_account_without_a_password_deletes_itself_and_undoes_it_by_signing_in() {
+    let (f, mock, _) = with_oauth().await;
+    let person = Person::new("108", "alice@gmail.com");
+    bind_google(&f, &person).await;
+    let user = alice(&f).await;
+    sqlx::query("UPDATE users SET password_hash = NULL WHERE id = ?")
+        .bind(user.id)
+        .execute(&f.state.db)
+        .await
+        .unwrap();
+    let mut browser = Browser::new(&f.state);
+    sign_in(&mut browser, &mock, "google", &person).await;
+    let page = browser.get("/account/").await;
+    assert!(
+        page.text().contains("action=\"/account/delete\""),
+        "{}",
+        page.text()
+    );
+    let csrf = page.csrf();
+    let wrong = browser
+        .post("/account/delete", &[("csrf", &csrf), ("confirm", "bob")])
+        .await;
+    assert_eq!(wrong.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let deleted = browser
+        .post("/account/delete", &[("csrf", &csrf), ("confirm", "alice")])
+        .await;
+    assert_eq!(deleted.status, StatusCode::OK);
+    assert!(deleted.text().contains(t().deleted_title));
+    let waiting = alice(&f).await;
+    assert!(!waiting.enabled && waiting.deleting_at.is_some());
+    assert_eq!(
+        browser.get("/account/").await.status,
+        StatusCode::SEE_OTHER,
+        "signed out"
+    );
+
+    // A sign-in leads to the page that undoes it, and only that browser can.
+    let mut again = Browser::new(&f.state);
+    let pending = sign_in(&mut again, &mock, "google", &person).await;
+    assert_eq!(pending.status, StatusCode::FORBIDDEN);
+    assert!(
+        pending.text().contains(t().deletion_cancel),
+        "{}",
+        pending.text()
+    );
+    let csrf = pending.field("name=\"csrf\" value=\"");
+    let mut stranger = Browser::new(&f.state);
+    let stranger_csrf = login_csrf(&mut stranger, "/login").await;
+    let refused = stranger
+        .post("/login/restore", &[("csrf", &stranger_csrf)])
+        .await;
+    assert_eq!(refused.status, StatusCode::NOT_FOUND);
+    let restored = again.post("/login/restore", &[("csrf", &csrf)]).await;
+    assert_eq!(restored.location(), "/account/?done=restored");
+    assert!(alice(&f).await.enabled);
+    assert_eq!(again.get("/account/").await.status, StatusCode::OK);
+
+    // Due, the janitor deletes it with its files.
+    users::request_deletion(
+        &f.state.db,
+        user.id,
+        audit::Actor::User,
+        None,
+        db::unix_now(),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE users SET deleting_at = 1 WHERE id = ?")
+        .bind(user.id)
+        .execute(&f.state.db)
+        .await
+        .unwrap();
+    crate::janitor::Janitor {
+        db: f.state.db.clone(),
+        uploads: f.state.uploads.clone(),
+        s3: None,
+        layout: f.state.dav.fs().layout().clone(),
+    }
+    .run_once()
+    .await;
+    assert!(
+        users::find(&f.state.db, &Username::new("alice").unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

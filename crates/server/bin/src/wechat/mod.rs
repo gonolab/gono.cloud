@@ -7,6 +7,10 @@
 //! | `POST /gono/v1/wechat/bind` | Binds the openid of a signup token to the account of a bind ticket from the account page, and opens a session. |
 //! | `GET /gono/v1/wechat/account` | The name and services of the session's account (`Authorization: Bearer <session>`). |
 //! | `POST /gono/v1/wechat/logout` | Ends the session. |
+//! | `POST /gono/v1/wechat/signup` | With `[wechat] allow_signup`: creates an account (no service, no password, a generated username) for the WeChat of a signup token, and opens a session. |
+//! | `PATCH /gono/v1/wechat/account` | Changes the username of an account made by a sign-up, until a device or app signed in to it. |
+//! | `POST /gono/v1/wechat/account/delete` | An account without a web password asks for its deletion (a fresh code of its WeChat): disabled at once, deleted after 7 days. |
+//! | `POST /gono/v1/wechat/account/restore` | Undoes that within the 7 days (a fresh code names the WeChat), and opens a session. |
 //! | `POST /gono/v1/wechat/scan` | With `[wechat] web_sign_in`: the WeChat that scanned the QR code of a sign-in page (`{qr_url_prefix}<ticket>`) locks the sign-in, and learns which account and browser it is for. |
 //! | `POST /gono/v1/wechat/confirm` | The same WeChat confirms: the answer holds the 6 digits to type into the browser. |
 //! | `POST /gono/v1/wechat/deny` | The same WeChat cancels the sign-in. |
@@ -178,6 +182,8 @@ pub struct WeChat {
     shown: Mutex<HashMap<i64, Shown>>,
     /// `[wechat] web_sign_in`: the sign-in pages offer scanning.
     web_sign_in: bool,
+    /// `[wechat] allow_signup`: a WeChat bound to no account may create one (`signup`).
+    allow_signup: bool,
     /// The sign-in tickets the browsers show.
     sign_ins: sign_in::Shown,
 }
@@ -211,6 +217,7 @@ impl WeChat {
             verify,
             shown: Mutex::new(HashMap::new()),
             web_sign_in: false,
+            allow_signup: false,
             sign_ins: sign_in::Shown::default(),
         }
     }
@@ -219,6 +226,13 @@ impl WeChat {
     #[must_use]
     pub fn with_web_sign_in(mut self, on: bool) -> Self {
         self.web_sign_in = on;
+        self
+    }
+
+    /// The same, letting a WeChat bound to no account sign up when `allow`.
+    #[must_use]
+    pub fn with_signup(mut self, allow: bool) -> Self {
+        self.allow_signup = allow;
         self
     }
 
@@ -258,7 +272,9 @@ impl WeChat {
             .as_deref()
             .map(VerifyFile::read)
             .transpose()?;
-        Ok(Self::new(app_id, prefix, Arc::new(api), verify).with_web_sign_in(config.web_sign_in))
+        Ok(Self::new(app_id, prefix, Arc::new(api), verify)
+            .with_web_sign_in(config.web_sign_in)
+            .with_signup(config.allow_signup))
     }
 
     /// The mini program's AppID.
@@ -373,7 +389,19 @@ pub fn routes(wechat: Option<&WeChat>) -> Router<AppState> {
             .route(&format!("{API_PATH}/bind"), post(bind).fallback(not_found))
             .route(
                 &format!("{API_PATH}/account"),
-                get(account).fallback(not_found),
+                get(account).patch(rename).fallback(not_found),
+            )
+            .route(
+                &format!("{API_PATH}/signup"),
+                post(signup).fallback(not_found),
+            )
+            .route(
+                &format!("{API_PATH}/account/delete"),
+                post(delete_account).fallback(not_found),
+            )
+            .route(
+                &format!("{API_PATH}/account/restore"),
+                post(restore).fallback(not_found),
             )
             .route(
                 &format!("{API_PATH}/logout"),
@@ -585,9 +613,11 @@ async fn sign_in(
             &serde_json::json!({
                 "signup_token": token.expose_secret(),
                 "expires_at": expires_at,
+                "signup": wechat.allow_signup,
             }),
         ),
         Ok(SignIn::Disabled) => error(StatusCode::FORBIDDEN, "account_disabled"),
+        Ok(SignIn::DeletionPending(until)) => deletion_pending(until),
         Err(err) => {
             tracing::error!(error = %err, "cannot sign a WeChat mini program in");
             unavailable()
@@ -869,6 +899,7 @@ async fn scan_with(
                 "kind": kind,
                 "admin": ticket.purpose == Purpose::Admin,
                 "account": null,
+                "signup": wechat.allow_signup,
                 "browser": browser,
                 "expires_at": ticket.expires_at,
             }),
@@ -880,10 +911,7 @@ async fn scan_with(
         Err(err) => return failed(&err),
     };
     if let Some(until) = user.deleting_at {
-        return json(
-            StatusCode::CONFLICT,
-            &serde_json::json!({ "error": "deletion_pending", "until": until }),
-        );
+        return deletion_pending(until);
     }
     if !user.enabled {
         return error(StatusCode::FORBIDDEN, "account_disabled");
@@ -1057,6 +1085,365 @@ pub async fn flow(
         Ok(None) => wechat.charge(client, error(StatusCode::GONE, "ticket_expired")),
         Err(err) => failed(&err),
     }
+}
+
+/// `409 {"error": "deletion_pending", "until": <unix>}`.
+fn deletion_pending(until: i64) -> Response {
+    json(
+        StatusCode::CONFLICT,
+        &serde_json::json!({ "error": "deletion_pending", "until": until }),
+    )
+}
+
+/// The display name of accounts made in the mini program, until the user changes it.
+const NEW_USER: &str = "新用户";
+
+/// Tries at a generated username that is free.
+const NAME_TRIES: usize = 5;
+
+#[derive(Deserialize)]
+struct SignupRequest {
+    signup_token: String,
+    #[serde(default)]
+    terms_version: Option<String>,
+    scene: u32,
+    platform: String,
+}
+
+/// `POST /gono/v1/wechat/signup`.
+pub async fn signup(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let wechat = match wechat_of(&state) {
+        Ok(wechat) => wechat,
+        Err(response) => return *response,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    if let Err(response) = wechat.admit(client) {
+        return *response;
+    }
+    let response = signup_with(&state, &wechat, client, body).await;
+    wechat.charge(client, response)
+}
+
+async fn signup_with(
+    state: &AppState,
+    wechat: &WeChat,
+    client: IpAddr,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let request: SignupRequest = match parse(body) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    if !store::is_token(&request.signup_token)
+        || request
+            .terms_version
+            .as_deref()
+            .is_some_and(|terms| terms.len() > 64 || terms.chars().any(char::is_control))
+    {
+        return bad_request();
+    }
+    if let Err(response) = check_client(request.scene, &request.platform) {
+        return *response;
+    }
+    if !wechat.allow_signup {
+        return error(StatusCode::FORBIDDEN, "signup_closed");
+    }
+    // With terms, the user must have accepted a version of them.
+    let terms = request.terms_version.filter(|terms| !terms.is_empty());
+    if state.terms_url.is_some() && terms.is_none() {
+        return bad_request();
+    }
+    let now = db::unix_now();
+    let pending = identities::pending(
+        &state.db,
+        identities::Holder::MiniProgram,
+        &request.signup_token,
+        now,
+    )
+    .await;
+    let pending = match pending {
+        Ok(Some(pending))
+            if pending.claims.provider == Provider::WeChat
+                && pending.claims.realm == wechat.app_id =>
+        {
+            pending
+        }
+        Ok(_) => return not_signed_in("session_expired"),
+        Err(err) => return failed(&err),
+    };
+    let layout = state.dav.fs().layout().clone();
+    for _ in 0..NAME_TRIES {
+        let username = users::generated_username(users::CreatedVia::WeChat);
+        let created = users::sign_up(
+            &state.db,
+            &pending.claims,
+            &username,
+            NEW_USER,
+            terms.as_deref(),
+            Some(client),
+            now,
+            |id| layout.create_user(id),
+        )
+        .await;
+        match created {
+            Ok(users::SignedUp::Created(user, identity)) => {
+                if let Err(err) = identities::end_pending(
+                    &state.db,
+                    identities::Holder::MiniProgram,
+                    &request.signup_token,
+                )
+                .await
+                {
+                    tracing::warn!(error = %err, "cannot end a signup token");
+                }
+                tracing::info!(%client, user = %user.username, "account created by sign-up in the mini program");
+                return match store::open_session_of(&state.db, identity.id, now).await {
+                    Ok(Some((session, account))) => signed_in(&session, &account),
+                    Ok(None) => unavailable(),
+                    Err(err) => failed(&err),
+                };
+            }
+            Ok(users::SignedUp::UsernameTaken) => {}
+            Ok(users::SignedUp::AlreadyBound) => {
+                return error(StatusCode::CONFLICT, "account_exists");
+            }
+            Ok(users::SignedUp::Limited) => {
+                tracing::warn!(%client, "sign-up refused: the daily cap is reached");
+                return error(StatusCode::TOO_MANY_REQUESTS, "signup_limited");
+            }
+            Err(err) => return failed(&err),
+        }
+    }
+    unavailable()
+}
+
+#[derive(Deserialize)]
+struct RenameRequest {
+    username: String,
+}
+
+/// `PATCH /gono/v1/wechat/account`: a new username.
+pub async fn rename(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let wechat = match wechat_of(&state) {
+        Ok(wechat) => wechat,
+        Err(response) => return *response,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    let token = match bearer(&headers) {
+        Ok(Some(token)) => token,
+        Ok(None) => return not_signed_in("not_signed_in"),
+        Err(()) => return wechat.refused(client),
+    };
+    let now = db::unix_now();
+    let account = match store::lookup(&state.db, &wechat.app_id, token, now).await {
+        Ok(Lookup::Live(account)) => account,
+        Ok(Lookup::Expired) => return not_signed_in("session_expired"),
+        Ok(Lookup::Disabled) => return error(StatusCode::FORBIDDEN, "account_disabled"),
+        Ok(Lookup::Unknown) => return wechat.refused(client),
+        Err(err) => return failed(&err),
+    };
+    let request: RenameRequest = match parse(body) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    let Ok(username) = gono_server_core::Username::new(request.username.trim()) else {
+        return bad_request();
+    };
+    match users::rename(
+        &state.db,
+        account.user_id,
+        &username,
+        gono_server_core::audit::Actor::User,
+        Some(client),
+        now,
+    )
+    .await
+    {
+        Ok(users::Renamed::Done) => match store::account(&state.db, account.user_id).await {
+            Ok(Some(account)) => json(StatusCode::OK, &account_json(&account)),
+            Ok(None) => error(StatusCode::FORBIDDEN, "account_disabled"),
+            Err(err) => failed(&err),
+        },
+        Ok(users::Renamed::Taken) => error(StatusCode::CONFLICT, "username_taken"),
+        Ok(users::Renamed::Locked) => error(StatusCode::CONFLICT, "username_locked"),
+        Ok(users::Renamed::TooSoon) => rate_limited(Duration::from_secs(
+            users::RENAME_INTERVAL_SECS.unsigned_abs(),
+        )),
+        Err(err) => failed(&err),
+    }
+}
+
+#[derive(Deserialize)]
+struct CodeRequest {
+    code: String,
+    platform: String,
+    #[serde(default)]
+    confirm: Option<String>,
+}
+
+/// The identity of the fresh code of `request` and its account, or the answer to refuse
+/// with: the phone rule, and WeChat's refusals as in `session`.
+async fn fresh_identity(
+    state: &AppState,
+    wechat: &WeChat,
+    client: IpAddr,
+    request: &CodeRequest,
+) -> Result<identities::Identity, Box<Response>> {
+    if !is_code(&request.code) {
+        return Err(Box::new(bad_request()));
+    }
+    if !PLATFORMS.contains(&request.platform.as_str()) {
+        return Err(Box::new(error(StatusCode::FORBIDDEN, "desktop_client")));
+    }
+    let openid = match wechat.api.code_to_session(&request.code).await {
+        Ok(login) => login.openid,
+        Err(ApiError::InvalidCode) => {
+            return Err(Box::new(error(StatusCode::BAD_REQUEST, "code_invalid")));
+        }
+        Err(ApiError::RiskyUser) => {
+            return Err(Box::new(error(StatusCode::FORBIDDEN, "risky_user")));
+        }
+        Err(ApiError::RateLimited) => return Err(Box::new(rate_limited(WECHAT_RETRY_AFTER))),
+        Err(ApiError::Failed(why)) => {
+            tracing::warn!(%client, error = %why, "cannot exchange a mini program's sign-in code with WeChat");
+            return Err(Box::new(unavailable()));
+        }
+    };
+    match identities::find(&state.db, Provider::WeChat, &wechat.app_id, &openid).await {
+        Ok(Some(identity)) => Ok(identity),
+        Ok(None) => Err(Box::new(error(StatusCode::FORBIDDEN, "not_permitted"))),
+        Err(err) => Err(Box::new(failed(&err))),
+    }
+}
+
+/// `POST /gono/v1/wechat/account/delete`.
+pub async fn delete_account(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let wechat = match wechat_of(&state) {
+        Ok(wechat) => wechat,
+        Err(response) => return *response,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    let token = match bearer(&headers) {
+        Ok(Some(token)) => token,
+        Ok(None) => return not_signed_in("not_signed_in"),
+        Err(()) => return wechat.refused(client),
+    };
+    let now = db::unix_now();
+    let account = match store::lookup(&state.db, &wechat.app_id, token, now).await {
+        Ok(Lookup::Live(account)) => account,
+        Ok(Lookup::Expired) => return not_signed_in("session_expired"),
+        Ok(Lookup::Disabled) => return error(StatusCode::FORBIDDEN, "account_disabled"),
+        Ok(Lookup::Unknown) => return wechat.refused(client),
+        Err(err) => return failed(&err),
+    };
+    if let Err(response) = wechat.admit(client) {
+        return *response;
+    }
+    let response = async {
+        let request: CodeRequest = match parse(body) {
+            Ok(request) => request,
+            Err(response) => return *response,
+        };
+        if request.confirm.as_deref() != Some(account.username.as_str()) {
+            return bad_request();
+        }
+        let identity = match fresh_identity(&state, &wechat, client, &request).await {
+            Ok(identity) => identity,
+            Err(response) => return *response,
+        };
+        if identity.user_id != account.user_id {
+            return error(StatusCode::FORBIDDEN, "not_permitted");
+        }
+        match users::request_deletion(
+            &state.db,
+            account.user_id,
+            gono_server_core::audit::Actor::User,
+            Some(client),
+            now,
+        )
+        .await
+        {
+            Ok(Some(_)) => {
+                tracing::info!(%client, user = %account.username, "account deletion requested in the mini program");
+                if let Some(connect) = &state.connect {
+                    connect.poke();
+                }
+                StatusCode::NO_CONTENT.into_response()
+            }
+            // An account with a web password (or an admin) is deleted by an administrator.
+            Ok(None) => error(StatusCode::FORBIDDEN, "not_permitted"),
+            Err(err) => failed(&err),
+        }
+    }
+    .await;
+    wechat.charge(client, response)
+}
+
+/// `POST /gono/v1/wechat/account/restore`.
+pub async fn restore(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let wechat = match wechat_of(&state) {
+        Ok(wechat) => wechat,
+        Err(response) => return *response,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    if let Err(response) = wechat.admit(client) {
+        return *response;
+    }
+    let response = async {
+        let request: CodeRequest = match parse(body) {
+            Ok(request) => request,
+            Err(response) => return *response,
+        };
+        let identity = match fresh_identity(&state, &wechat, client, &request).await {
+            Ok(identity) => identity,
+            Err(response) => return *response,
+        };
+        let now = db::unix_now();
+        match users::cancel_deletion(
+            &state.db,
+            identity.user_id,
+            gono_server_core::audit::Actor::User,
+            Some(client),
+            now,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => return error(StatusCode::CONFLICT, "not_pending"),
+            Err(err) => return failed(&err),
+        }
+        tracing::info!(%client, "account deletion undone in the mini program");
+        if let Some(connect) = &state.connect {
+            connect.poke();
+        }
+        match store::open_session_of(&state.db, identity.id, now).await {
+            Ok(Some((session, account))) => signed_in(&session, &account),
+            Ok(None) => error(StatusCode::FORBIDDEN, "account_disabled"),
+            Err(err) => failed(&err),
+        }
+    }
+    .await;
+    wechat.charge(client, response)
 }
 
 /// `GET /q/...`: the page for whoever opens a QR link in a browser, whatever the path below

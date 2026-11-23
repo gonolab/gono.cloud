@@ -79,7 +79,7 @@ use crate::{
     ratelimit::RateLimiter,
     recovery, request_log,
     s3::S3Ui,
-    site,
+    signup, site,
     web::{self, Web},
     wechat,
 };
@@ -123,6 +123,11 @@ pub struct AppState {
     pub wechat: Option<Arc<wechat::WeChat>>,
     /// Sign-in with Google and GitHub, when one of `[oauth.*]` is enabled ([`crate::oauth`]).
     pub oauth: Option<Arc<oauth::OAuth>>,
+    /// The terms a sign-up accepts (`[sign_in] terms_url`), if the server has terms.
+    pub terms_url: Option<Arc<Url>>,
+    /// The accounts that may undo their deletion in the browser that signed them in
+    /// ([`crate::signup`]).
+    pub restores: Arc<signup::Restores>,
 }
 
 impl AppState {
@@ -284,6 +289,9 @@ pub fn router(state: AppState) -> Router {
             post(oauth::cancel_unbound),
         )
         .route(oauth::LINK_PATH, get(oauth::link_page).post(oauth::link))
+        // Without `allow_signup` the sign-up page goes back to the sign-in page.
+        .route(signup::SIGNUP_PATH, get(signup::page).post(signup::signup))
+        .route(signup::RESTORE_PATH, post(signup::restore))
         // Without `[wechat] web_sign_in` these answer 404.
         .route(
             wechat::sign_in::PATH,
@@ -642,6 +650,8 @@ mod tests {
             mailer: None,
             wechat: None,
             oauth: None,
+            terms_url: None,
+            restores: Default::default(),
         };
         Fixture {
             dir,
@@ -2356,6 +2366,7 @@ mod tests {
             db: f.state.db.clone(),
             uploads: f.state.uploads.clone(),
             s3: None,
+            layout: f.state.dav.fs().layout().clone(),
         }
         .run_once()
         .await;

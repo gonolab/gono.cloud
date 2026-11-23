@@ -273,12 +273,24 @@ impl ProviderClient {
 #[derive(Debug)]
 pub struct OAuthProvider {
     client: ProviderClient,
+    /// `allow_signup`: an identity bound to no account may create one ([`crate::signup`]).
+    pub allow_signup: bool,
 }
 
 impl OAuthProvider {
     /// The provider `client`.
     pub fn new(client: ProviderClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            allow_signup: false,
+        }
+    }
+
+    /// The same, letting identities bound to no account sign up when `allow`.
+    #[must_use]
+    pub fn with_signup(mut self, allow: bool) -> Self {
+        self.allow_signup = allow;
+        self
     }
 }
 
@@ -395,7 +407,10 @@ impl OAuth {
                         client_id,
                         secret,
                     );
-                    google = Some(OAuthProvider::new(ProviderClient::Google(client)));
+                    google = Some(
+                        OAuthProvider::new(ProviderClient::Google(client))
+                            .with_signup(provider.allow_signup),
+                    );
                 }
                 _ => {
                     let client = github::Client::new(
@@ -404,7 +419,10 @@ impl OAuth {
                         client_id,
                         secret,
                     );
-                    github = Some(OAuthProvider::new(ProviderClient::GitHub(client)));
+                    github = Some(
+                        OAuthProvider::new(ProviderClient::GitHub(client))
+                            .with_signup(provider.allow_signup),
+                    );
                 }
             }
         }
@@ -851,7 +869,11 @@ async fn signed_in(
         Ok(SignedIn::Account(user)) => {
             return open_session(state, headers, client, provider, &user, next, admin, None).await;
         }
-        Ok(SignedIn::Disabled | SignedIn::DeletionPending(_)) => {
+        Ok(SignedIn::DeletionPending { user_id, until }) => {
+            tracing::info!(%client, provider = provider.as_str(), "third-party sign-in of an account waiting for its deletion");
+            return crate::signup::deletion_pending(state, headers, user_id, until);
+        }
+        Ok(SignedIn::Disabled) => {
             tracing::info!(%client, provider = provider.as_str(), "third-party sign-in of an account that cannot sign in");
             return cannot_sign_in(headers);
         }
@@ -1175,8 +1197,8 @@ pub async fn unbound_page(
         title: fill(t.unbound_title, &[provider.name()]),
         label: shown_label(&pending.claims),
         sign_in: sign_in_page(&state, &next),
-        // Signing up comes with `allow_signup`; until then an unbound identity only binds.
-        signup: None,
+        signup: crate::signup::offered(&state, provider)
+            .then(|| format!("{}?next={}", crate::signup::SIGNUP_PATH, encode(&next))),
         next,
         csrf,
         chrome,

@@ -578,6 +578,268 @@ async fn signing_in_finds_the_account_and_binds_by_a_verified_address() {
         .unwrap();
     assert_eq!(
         identities::sign_in(&pool, &bobs, NOW).await.unwrap(),
-        SignedIn::DeletionPending(NOW + 100)
+        SignedIn::DeletionPending {
+            user_id: bob,
+            until: NOW + 100
+        }
     );
+}
+
+#[tokio::test]
+async fn sign_ups_make_accounts_without_password_or_service_within_their_caps() {
+    use gono_server_core::users::{SIGNUPS_PER_NET_PER_DAY, SignedUp};
+
+    let (_dir, pool, _, _) = fixture().await;
+    let generated = users::generated_username(CreatedVia::Google);
+    assert!(generated.as_str().starts_with("gg") && generated.as_str().len() == 10);
+    assert!(
+        users::generated_username(CreatedVia::WeChat)
+            .as_str()
+            .starts_with("wx")
+    );
+    let ip: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+    let username = Username::new("newcomer").unwrap();
+    let claims = google("200", "new@gmail.com");
+    let SignedUp::Created(user, identity) = users::sign_up(
+        &pool,
+        &claims,
+        &username,
+        "New Comer",
+        Some("2026-11"),
+        Some(ip),
+        NOW,
+        |_| Ok(()),
+    )
+    .await
+    .unwrap() else {
+        panic!("not created");
+    };
+    assert_eq!(
+        (
+            user.has_password,
+            user.services,
+            user.created_via,
+            user.display_name.as_str()
+        ),
+        (false, Services::NONE, CreatedVia::Google, "New Comer")
+    );
+    assert_eq!(identity.user_id, user.id);
+    let kinds: Vec<(String, String)> = audit::list(&pool, Some(user.id), None, 5)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.kind, entry.details))
+        .collect();
+    assert_eq!(kinds[0].0, "identity.bound");
+    assert!(kinds[0].1.contains("\"how\":\"signup\""));
+    assert_eq!(kinds[1].0, "account.created");
+    assert!(kinds[1].1.contains("\"via\":\"google\"") && kinds[1].1.contains("2026-11"));
+    // The identity signs up once; a name in use is refused.
+    let again = users::sign_up(
+        &pool,
+        &claims,
+        &Username::new("other").unwrap(),
+        "x",
+        None,
+        Some(ip),
+        NOW,
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again, SignedUp::AlreadyBound);
+    let taken = users::sign_up(
+        &pool,
+        &google("201", "x"),
+        &Username::new("alice").unwrap(),
+        "x",
+        None,
+        Some(ip),
+        NOW,
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(taken, SignedUp::UsernameTaken);
+    // The cap per network: this /24 made one already.
+    for index in 1..SIGNUPS_PER_NET_PER_DAY {
+        let name = Username::new(format!("n{index}")).unwrap();
+        let other: std::net::IpAddr = format!("192.0.2.{}", 100 + index).parse().unwrap();
+        let made = users::sign_up(
+            &pool,
+            &github(&index.to_string(), "x"),
+            &name,
+            "x",
+            None,
+            Some(other),
+            NOW,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(made, SignedUp::Created(..)), "{index}: {made:?}");
+    }
+    let limited = users::sign_up(
+        &pool,
+        &github("99", "x"),
+        &Username::new("n99").unwrap(),
+        "x",
+        None,
+        Some(ip),
+        NOW,
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(limited, SignedUp::Limited);
+    let elsewhere: std::net::IpAddr = "198.51.100.1".parse().unwrap();
+    let made = users::sign_up(
+        &pool,
+        &github("99", "x"),
+        &Username::new("n99").unwrap(),
+        "x",
+        None,
+        Some(elsewhere),
+        NOW,
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(made, SignedUp::Created(..)));
+    // A day later the network may again.
+    let later = users::sign_up(
+        &pool,
+        &github("98", "x"),
+        &Username::new("n98").unwrap(),
+        "x",
+        None,
+        Some(ip),
+        NOW + 86_401,
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(later, SignedUp::Created(..)));
+}
+
+#[tokio::test]
+async fn self_service_accounts_rename_until_used_and_delete_after_a_cooling_off() {
+    use gono_server_core::users::{DELETION_DELAY_SECS, Renamed, SignedUp};
+
+    let (_dir, pool, alice, _) = fixture().await;
+    let SignedUp::Created(user, _) = users::sign_up(
+        &pool,
+        &Claims::wechat("wxd930ea5d5a258f4f", "oNew", None),
+        &Username::new("wxabcd1234").unwrap(),
+        "新用户",
+        None,
+        None,
+        NOW,
+        |_| Ok(()),
+    )
+    .await
+    .unwrap() else {
+        panic!("not created");
+    };
+    let rename = |name: &str, at: i64| {
+        let pool = pool.clone();
+        let name = Username::new(name).unwrap();
+        let id = user.id;
+        async move {
+            users::rename(&pool, id, &name, Actor::User, None, at)
+                .await
+                .unwrap()
+        }
+    };
+    assert!(users::can_rename(&pool, user.id).await.unwrap());
+    assert!(
+        !users::can_rename(&pool, alice).await.unwrap(),
+        "made by an admin"
+    );
+    assert_eq!(rename("alice", NOW).await, Renamed::Taken);
+    assert_eq!(rename("wanda", NOW).await, Renamed::Done);
+    assert!(
+        users::find(&pool, &Username::new("wanda").unwrap())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        users::find(&pool, &Username::new("wxabcd1234").unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(rename("wanda2", NOW + 60).await, Renamed::TooSoon);
+    assert_eq!(rename("wanda2", NOW + 86_401).await, Renamed::Done);
+    // An app password locks the name: devices and apps sign in with it.
+    gono_server_core::app_passwords::create(&pool, user.id, "phone", Vec::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(rename("wanda3", NOW + 200_000).await, Renamed::Locked);
+    assert!(!users::can_rename(&pool, user.id).await.unwrap());
+
+    // Deletion: only without a password, disabled at once, undone in time, due after 7 days.
+    assert_eq!(
+        users::request_deletion(&pool, alice, Actor::User, None, NOW)
+            .await
+            .unwrap(),
+        None
+    );
+    let until = users::request_deletion(&pool, user.id, Actor::User, None, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(until, NOW + DELETION_DELAY_SECS);
+    let waiting = users::by_id(&pool, user.id).await.unwrap().unwrap();
+    assert!(!waiting.enabled && waiting.deleting_at == Some(until));
+    assert_eq!(
+        users::request_deletion(&pool, user.id, Actor::User, None, NOW)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        users::due_deletions(&pool, until - 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        users::cancel_deletion(&pool, user.id, Actor::User, None, NOW + 10)
+            .await
+            .unwrap()
+    );
+    let back = users::by_id(&pool, user.id).await.unwrap().unwrap();
+    assert!(back.enabled && back.deleting_at.is_none());
+    assert!(
+        !users::cancel_deletion(&pool, user.id, Actor::User, None, NOW + 11)
+            .await
+            .unwrap()
+    );
+    let until = users::request_deletion(&pool, user.id, Actor::User, None, NOW + 20)
+        .await
+        .unwrap()
+        .unwrap();
+    // Too late to undo once due; an admin enabling it undoes it as well.
+    assert!(
+        !users::cancel_deletion(&pool, user.id, Actor::User, None, until)
+            .await
+            .unwrap()
+    );
+    let due = users::due_deletions(&pool, until).await.unwrap();
+    assert_eq!(due.len(), 1);
+    users::set_enabled(&pool, &due[0].username, true)
+        .await
+        .unwrap();
+    assert!(users::due_deletions(&pool, until).await.unwrap().is_empty());
+    let kinds: Vec<String> = audit::list(&pool, Some(user.id), None, 20)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.kind)
+        .collect();
+    assert!(kinds.contains(&"account.deletion_requested".to_owned()));
+    assert!(kinds.contains(&"account.deletion_cancelled".to_owned()));
+    assert!(kinds.contains(&"account.renamed".to_owned()));
 }

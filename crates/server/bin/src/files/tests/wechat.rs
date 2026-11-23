@@ -1604,3 +1604,219 @@ async fn an_account_confirms_it_is_you_with_a_scan() {
     let page = other.get("/account/identities/wechat/unbind").await.text();
     assert!(!page.contains("/login/wechat?purpose=reauth"), "{page}");
 }
+
+#[tokio::test]
+async fn the_mini_program_signs_up_renames_and_deletes_an_account() {
+    let mut f = fixture().await;
+    let api = Arc::new(FakeApi::default());
+    let closed = Arc::new(WeChat::new(
+        APP_ID,
+        Url::parse(PREFIX).unwrap(),
+        api.clone(),
+        None,
+    ));
+    f.state.wechat = Some(closed);
+    let mini = Mini::new(&f);
+    api.accept("s0", "oNew");
+    let answer = mini.session("s0").await.json();
+    assert_eq!(answer["signup"], false);
+    let token = answer["signup_token"].as_str().unwrap().to_owned();
+    let refused = mini
+        .post(
+            "/gono/v1/wechat/signup",
+            &json!({ "signup_token": token, "scene": 1011, "platform": "ios" }),
+        )
+        .await;
+    assert_eq!(
+        refused.error(),
+        (StatusCode::FORBIDDEN, "signup_closed".to_owned())
+    );
+
+    let open = Arc::new(
+        WeChat::new(APP_ID, Url::parse(PREFIX).unwrap(), api.clone(), None).with_signup(true),
+    );
+    f.state.wechat = Some(open);
+    let mini = Mini::new(&f);
+    let token = mini.signup(&api, "s1", "oNew").await;
+    let created = mini
+        .post(
+            "/gono/v1/wechat/signup",
+            &json!({ "signup_token": token, "scene": 1011, "platform": "ios" }),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.json());
+    let body = created.json();
+    let session = body["session"].as_str().unwrap().to_owned();
+    let username = body["account"]["username"].as_str().unwrap().to_owned();
+    assert!(
+        username.starts_with("wx") && username.len() == 10,
+        "{username}"
+    );
+    assert_eq!(body["account"]["display_name"], "新用户");
+    assert_eq!(body["account"]["services"]["files"], false);
+    assert_eq!(body["account"]["services"]["direct"], false);
+    let user = users::get(&f.state.db, &Username::new(username.clone()).unwrap())
+        .await
+        .unwrap();
+    assert!(!user.has_password);
+    assert_eq!(user.created_via, users::CreatedVia::WeChat);
+    // The token is used up.
+    let again = mini
+        .post(
+            "/gono/v1/wechat/signup",
+            &json!({ "signup_token": token, "scene": 1011, "platform": "ios" }),
+        )
+        .await;
+    assert_eq!(
+        again.error(),
+        (StatusCode::UNAUTHORIZED, "session_expired".to_owned())
+    );
+
+    // Renaming, with the session.
+    let rename = |name: &str| {
+        let body = json!({ "username": name }).to_string();
+        let bearer = format!("Bearer {session}");
+        let mini = &mini;
+        async move {
+            mini.send(
+                "PATCH",
+                "/gono/v1/wechat/account",
+                &[
+                    ("Authorization", &bearer),
+                    ("Content-Type", "application/json"),
+                ],
+                Body::from(body),
+            )
+            .await
+        }
+    };
+    assert_eq!(
+        rename("alice").await.error(),
+        (StatusCode::CONFLICT, "username_taken".to_owned())
+    );
+    let renamed = rename("wanda").await;
+    assert_eq!(renamed.status, StatusCode::OK, "{}", renamed.json());
+    assert_eq!(renamed.json()["username"], "wanda");
+    assert_eq!(rename("wanda2").await.status, StatusCode::TOO_MANY_REQUESTS);
+
+    // Deleting needs a fresh code of the same WeChat and the username.
+    let delete = |code: &str, confirm: &str| {
+        let body = json!({ "code": code, "platform": "ios", "confirm": confirm }).to_string();
+        let bearer = format!("Bearer {session}");
+        let mini = &mini;
+        async move {
+            mini.send(
+                "POST",
+                "/gono/v1/wechat/account/delete",
+                &[
+                    ("Authorization", &bearer),
+                    ("Content-Type", "application/json"),
+                ],
+                Body::from(body),
+            )
+            .await
+        }
+    };
+    api.accept("d0", "oNew");
+    assert_eq!(
+        delete("d0", "wrong").await.error(),
+        (StatusCode::BAD_REQUEST, "bad_request".to_owned())
+    );
+    api.accept("d1", BOB_OPENID);
+    insert_identity(&f, add_user(&f, "bob").await, BOB_OPENID).await;
+    assert_eq!(
+        delete("d1", "wanda").await.error(),
+        (StatusCode::FORBIDDEN, "not_permitted".to_owned())
+    );
+    api.accept("d2", "oNew");
+    assert_eq!(delete("d2", "wanda").await.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        mini.account(&session).await.error(),
+        (StatusCode::UNAUTHORIZED, "not_signed_in".to_owned()),
+        "its sessions ended"
+    );
+    api.accept("s2", "oNew");
+    let pending = mini.session("s2").await;
+    assert_eq!(pending.status, StatusCode::CONFLICT);
+    assert_eq!(pending.json()["error"], "deletion_pending");
+    assert!(pending.json()["until"].as_i64().unwrap() > db::unix_now());
+    // Undone within the 7 days: a session again.
+    api.accept("r1", "oNew");
+    let restored = mini
+        .post(
+            "/gono/v1/wechat/account/restore",
+            &json!({ "code": "r1", "platform": "ios" }),
+        )
+        .await;
+    assert_eq!(restored.status, StatusCode::OK, "{}", restored.json());
+    assert_eq!(restored.json()["account"]["username"], "wanda");
+    let entries = audit::list(&f.state.db, Some(user.id), None, 10)
+        .await
+        .unwrap();
+    let kinds: Vec<&str> = entries.iter().map(|entry| entry.kind.as_str()).collect();
+    assert_eq!(
+        kinds[..5],
+        [
+            "account.deletion_cancelled",
+            "account.deletion_requested",
+            "account.renamed",
+            "identity.bound",
+            "account.created"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_account_page_renames_a_self_service_account_until_it_is_used() {
+    let f = fixture().await;
+    let mut browser = Browser::new(&f.state);
+    browser.sign_in().await;
+    assert!(
+        !browser
+            .get("/account/")
+            .await
+            .text()
+            .contains("action=\"/account/username\""),
+        "made by an admin"
+    );
+    sqlx::query("UPDATE users SET created_via = 'google' WHERE username = 'alice'")
+        .execute(&f.state.db)
+        .await
+        .unwrap();
+    // alice has an app password: her username is in use.
+    assert!(
+        !browser
+            .get("/account/")
+            .await
+            .text()
+            .contains("action=\"/account/username\"")
+    );
+    sqlx::query("DELETE FROM app_passwords")
+        .execute(&f.state.db)
+        .await
+        .unwrap();
+    let page = browser.get("/account/").await;
+    assert!(
+        page.text().contains("action=\"/account/username\""),
+        "{}",
+        page.text()
+    );
+    let csrf = page.csrf();
+    let renamed = browser
+        .post(
+            "/account/username",
+            &[("csrf", &csrf), ("username", "alicia")],
+        )
+        .await;
+    assert_eq!(renamed.location(), "/account/?done=username");
+    let page = browser.get("/account/?done=username").await.text();
+    assert!(page.contains(t().notice_username_changed), "{page}");
+    let soon = browser
+        .post(
+            "/account/username",
+            &[("csrf", &csrf), ("username", "alicia2")],
+        )
+        .await;
+    assert_eq!(soon.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(soon.text().contains(t().err_username_soon));
+}

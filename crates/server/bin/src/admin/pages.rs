@@ -215,6 +215,8 @@ pub struct UserRow {
     pub created: String,
     /// The services it has, by name, or "None".
     pub services: String,
+    /// "Self-service: WeChat", for an account its user made.
+    pub self_service: Option<String>,
 }
 
 /// `admin/users.html`.
@@ -226,6 +228,8 @@ pub struct UsersPage {
     pub notice: Option<String>,
     pub summary: String,
     pub users: Vec<UserRow>,
+    /// Only the accounts their users made are listed.
+    pub self_service_only: bool,
 }
 
 /// `admin/new_user.html`.
@@ -258,6 +262,10 @@ pub struct UserView {
     pub email: String,
     /// It has a web login password.
     pub has_password: bool,
+    /// How it was made: "Admin UI", "Command line", "Self-service: Google".
+    pub created_via: String,
+    /// "Deleted on …, as its user asked", while it waits for its deletion.
+    pub deleting: Option<String>,
     /// Its third-party identities.
     pub identities: Vec<IdentityRow>,
     /// The five services, with the switch of each.

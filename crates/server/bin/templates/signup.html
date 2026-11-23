@@ -1,0 +1,23 @@
+{%- extends "card.html" -%}
+{%- block title %}{{ chrome.t.signup_title }}{% endblock -%}
+{%- block card %}
+<h1>{{ chrome.t.signup_title }}</h1>
+<p class="muted mt-6">{{ lead }}</p>
+{%- if let Some(error) = error %}
+<div class="flash bad" role="alert">{{ error }}</div>
+{%- endif %}
+<form method="post" action="/login/signup" class="mt-18">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="next" value="{{ next }}">
+  <label class="field" for="signup-username"><span>{{ chrome.t.username }}</span>
+    <input id="signup-username" type="text" name="username" value="{{ username }}" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="64" required></label>
+  <p class="muted small">{{ chrome.t.signup_username_note }}</p>
+  <label class="field mt-18" for="signup-name"><span>{{ chrome.t.display_name }}</span>
+    <input id="signup-name" type="text" name="display_name" value="{{ display_name }}" maxlength="255" required></label>
+  <p class="muted small mt-18">{{ chrome.t.unbound_signup_note }}</p>
+  {%- if let Some(terms) = terms %}
+  <label class="choice mt-18" for="signup-terms"><input id="signup-terms" type="checkbox" name="terms" value="1" required><span>{{ chrome.t.signup_terms }} <a href="{{ terms }}" rel="noopener noreferrer" target="_blank">{{ chrome.t.signup_terms_link }}</a></span></label>
+  {%- endif %}
+  <button class="btn primary block mt-20" type="submit">{{ chrome.t.unbound_signup }}</button>
+</form>
+{%- endblock %}

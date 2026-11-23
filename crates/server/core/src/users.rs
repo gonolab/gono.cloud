@@ -493,12 +493,17 @@ pub async fn set_enabled(pool: &Pool, username: &Username, enabled: bool) -> Res
     if !enabled {
         keep_an_admin(&mut tx, username).await?;
     }
-    let result = sqlx::query("UPDATE users SET enabled = ?, updated_at = ? WHERE username = ?")
-        .bind(enabled)
-        .bind(db::unix_now())
-        .bind(username.as_str())
-        .execute(&mut *tx)
-        .await?;
+    // Enabling an account also undoes a deletion it waits for: a disabled account is what
+    // waiting for one means.
+    let result = sqlx::query(
+        "UPDATE users SET enabled = ?, updated_at = ?,          deleting_at = CASE WHEN ? = 1 THEN NULL ELSE deleting_at END WHERE username = ?",
+    )
+    .bind(enabled)
+    .bind(db::unix_now())
+    .bind(enabled)
+    .bind(username.as_str())
+    .execute(&mut *tx)
+    .await?;
     if result.rows_affected() == 0 {
         return Err(Error::UserNotFound(username.clone()));
     }
@@ -600,6 +605,368 @@ pub async fn set_display_name(
     }
     tx.commit().await?;
     Ok(display_name)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Self-service accounts: sign-up, renaming and deletion with a cooling-off period
+// (`plan/third-party-sign-in-design.md`, 4.5 and 4.6)
+// ---------------------------------------------------------------------------------------------
+
+/// Random characters of a generated username, after its provider's prefix.
+pub const GENERATED_CHARS: usize = 8;
+
+/// How long an account waits for its deletion after asking for it, in seconds (7 days).
+pub const DELETION_DELAY_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// How often an account may change its username, in seconds (once a day).
+pub const RENAME_INTERVAL_SECS: i64 = 24 * 60 * 60;
+
+/// Accounts one client network may sign up for in a day.
+pub const SIGNUPS_PER_NET_PER_DAY: usize = 5;
+
+/// Accounts the whole server takes by sign-up in a day.
+pub const SIGNUPS_PER_DAY: i64 = 200;
+
+/// The prefix of the usernames generated for sign-ups with `via`: `wx`, `gg`, `gh`.
+fn prefix(via: CreatedVia) -> &'static str {
+    match via {
+        CreatedVia::WeChat => "wx",
+        CreatedVia::Google => "gg",
+        CreatedVia::GitHub => "gh",
+        CreatedVia::Admin | CreatedVia::Cli => "u",
+    }
+}
+
+/// A generated username for a sign-up with `via`: its prefix and [`GENERATED_CHARS`] random
+/// lower-case letters and digits.
+pub fn generated_username(via: CreatedVia) -> Username {
+    use rand::RngExt as _;
+    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::rng();
+    let tail: String = (0..GENERATED_CHARS)
+        .map(|_| char::from(CHARS[rng.random_range(0..CHARS.len())]))
+        .collect();
+    Username::new(format!("{}{tail}", prefix(via))).expect("a valid username")
+}
+
+/// Outcome of [`sign_up`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignedUp {
+    /// The account, enabled, with no service and no password, and its identity.
+    Created(Box<User>, crate::identities::Identity),
+    /// The username is taken or retired.
+    UsernameTaken,
+    /// The identity is bound to an account already.
+    AlreadyBound,
+    /// The daily cap of the client's network or of the server is reached.
+    Limited,
+}
+
+/// Creates the account of a sign-up with the identity of `claims`: `username`, `display_name`,
+/// no web login password, no service (every account starts with none), created via the
+/// identity's provider. Binds the identity to it (`how: "signup"`) and records
+/// `account.created` with `via`, in one transaction. `client_net` is the network of the client
+/// (`crate::email::client_net`), for the daily caps; `terms` the version of the terms the user
+/// accepted, if the server has terms. `prepare_storage` runs with the new id before the commit.
+#[allow(clippy::too_many_arguments)]
+pub async fn sign_up(
+    pool: &Pool,
+    claims: &crate::identities::Claims,
+    username: &Username,
+    display_name: &str,
+    terms: Option<&str>,
+    client_ip: Option<std::net::IpAddr>,
+    now: i64,
+    prepare_storage: impl FnOnce(i64) -> Result<()>,
+) -> Result<SignedUp> {
+    let display_name = validate_display_name(display_name)?;
+    let via = claims.provider.created_via();
+    let mut tx = db::begin_immediate(pool).await?;
+    // The caps: per day for the server, and per client network.
+    let since = now - 24 * 60 * 60;
+    let recent: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT client_ip FROM audit_log WHERE kind = 'account.created' AND at > ? \
+         ORDER BY id DESC LIMIT ?",
+    )
+    .bind(since)
+    .bind(SIGNUPS_PER_DAY)
+    .fetch_all(&mut *tx)
+    .await?;
+    if i64::try_from(recent.len()).unwrap_or(i64::MAX) >= SIGNUPS_PER_DAY {
+        return Ok(SignedUp::Limited);
+    }
+    if let Some(ip) = client_ip {
+        let net = crate::email::client_net(ip);
+        let same = recent
+            .iter()
+            .flatten()
+            .filter_map(|ip| ip.parse::<std::net::IpAddr>().ok())
+            .filter(|ip| crate::email::client_net(*ip) == net)
+            .count();
+        if same >= SIGNUPS_PER_NET_PER_DAY {
+            return Ok(SignedUp::Limited);
+        }
+    }
+    if crate::identities::find_in(&mut tx, claims.provider, &claims.realm, &claims.subject)
+        .await?
+        .is_some()
+    {
+        return Ok(SignedUp::AlreadyBound);
+    }
+    let id = match insert_account(
+        &mut tx,
+        username,
+        &display_name,
+        None,
+        false,
+        Services::NONE,
+        via,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(Error::UserExists(_) | Error::UsernameRetired(_)) => {
+            return Ok(SignedUp::UsernameTaken);
+        }
+        Err(err) => return Err(err),
+    };
+    let mut details = serde_json::json!({ "via": via.as_str() });
+    if let Some(terms) = terms {
+        details["terms"] = serde_json::Value::from(terms);
+    }
+    audit::record_in(
+        &mut tx,
+        &Record::new(id, "account.created", Actor::User)
+            .client_ip(client_ip)
+            .details(details),
+        now,
+    )
+    .await?;
+    let identity = match crate::identities::bind_in(
+        &mut tx,
+        id,
+        claims,
+        crate::identities::How::Signup,
+        Actor::User,
+        client_ip,
+        now,
+    )
+    .await?
+    {
+        crate::identities::Bound::Bound(identity) => identity,
+        _ => return Ok(SignedUp::AlreadyBound),
+    };
+    let sql = format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?");
+    let user: User = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    prepare_storage(id)?;
+    tx.commit().await?;
+    Ok(SignedUp::Created(Box::new(user), identity))
+}
+
+/// Whether account `user_id` may still change its username: it was made by a sign-up, and
+/// has no app password and never registered a device (devices' pairing statements name the
+/// account by its username, protocol 8.3 and 8.4).
+pub async fn can_rename(pool: &Pool, user_id: i64) -> Result<bool> {
+    let row: Option<(Text, Flag)> = sqlx::query_as(
+        "SELECT created_via, (EXISTS (SELECT 1 FROM app_passwords a WHERE a.user_id = users.id) \
+         OR EXISTS (SELECT 1 FROM devices d WHERE d.user_id = users.id)) FROM users WHERE id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some_and(|(via, used)| {
+        CreatedVia::parse(&via.0).is_some_and(CreatedVia::is_self_service) && !used.0
+    }))
+}
+
+/// Outcome of [`rename`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Renamed {
+    /// Renamed.
+    Done,
+    /// The new name is in use or retired (`username_taken`).
+    Taken,
+    /// The account may not change its username any more (`username_locked`): not made by a
+    /// sign-up, or it has an app password or a device.
+    Locked,
+    /// It changed its username less than [`RENAME_INTERVAL_SECS`] ago.
+    TooSoon,
+}
+
+/// Changes the username of account `user_id`, made by a sign-up and never used by a device
+/// ([`can_rename`]), to `username`; at most once a day. Records `account.renamed`. The old
+/// name is free again.
+pub async fn rename(
+    pool: &Pool,
+    user_id: i64,
+    username: &Username,
+    actor: Actor,
+    client_ip: Option<std::net::IpAddr>,
+    now: i64,
+) -> Result<Renamed> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let row: Option<(Text, Text, Flag)> = sqlx::query_as(
+        "SELECT username, created_via, (EXISTS (SELECT 1 FROM app_passwords a \
+         WHERE a.user_id = users.id) OR EXISTS (SELECT 1 FROM devices d \
+         WHERE d.user_id = users.id)) FROM users WHERE id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((old, via, used)) = row else {
+        return Ok(Renamed::Locked);
+    };
+    if used.0 || !CreatedVia::parse(&via.0).is_some_and(CreatedVia::is_self_service) {
+        return Ok(Renamed::Locked);
+    }
+    if old.0 == username.as_str() {
+        return Ok(Renamed::Done);
+    }
+    let recent: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM audit_log WHERE user_id = ? AND kind = 'account.renamed' AND at > ? \
+         LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(now - RENAME_INTERVAL_SECS)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if recent.is_some() {
+        return Ok(Renamed::TooSoon);
+    }
+    let retired: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM retired_usernames WHERE username = ?")
+            .bind(username.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+    if retired.is_some() {
+        return Ok(Renamed::Taken);
+    }
+    let updated = sqlx::query("UPDATE users SET username = ?, updated_at = ? WHERE id = ?")
+        .bind(username.as_str())
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await;
+    match updated {
+        Ok(_) => {}
+        Err(err)
+            if err
+                .as_database_error()
+                .is_some_and(|e| e.is_unique_violation()) =>
+        {
+            return Ok(Renamed::Taken);
+        }
+        Err(err) => return Err(Error::Database(err)),
+    }
+    audit::record_in(
+        &mut tx,
+        &Record::new(user_id, "account.renamed", actor)
+            .client_ip(client_ip)
+            .details(serde_json::json!({ "from": old.0, "to": username.as_str() })),
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Renamed::Done)
+}
+
+/// Asks for the deletion of account `user_id`, which has no web login password: it is
+/// disabled at once (its mini program sessions end, its devices are refused; app passwords
+/// stay) and deleted [`DELETION_DELAY_SECS`] from `now` unless the request is undone. Records
+/// `account.deletion_requested` by `actor`. Returns when it will be deleted, or `None` if the
+/// account has a password, waits already or is an admin (nothing changed).
+pub async fn request_deletion(
+    pool: &Pool,
+    user_id: i64,
+    actor: Actor,
+    client_ip: Option<std::net::IpAddr>,
+    now: i64,
+) -> Result<Option<i64>> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let until = now.saturating_add(DELETION_DELAY_SECS);
+    let asked = sqlx::query(
+        "UPDATE users SET enabled = 0, deleting_at = ?, updated_at = ? WHERE id = ? \
+         AND password_hash IS NULL AND deleting_at IS NULL AND is_admin = 0",
+    )
+    .bind(until)
+    .bind(now)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if !asked {
+        return Ok(None);
+    }
+    sqlx::query(
+        "DELETE FROM mp_sessions WHERE identity_id IN \
+         (SELECT id FROM external_identities WHERE user_id = ?)",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM web_sessions WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    audit::record_in(
+        &mut tx,
+        &Record::new(user_id, "account.deletion_requested", actor)
+            .client_ip(client_ip)
+            .details(serde_json::json!({ "at": until })),
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Some(until))
+}
+
+/// Undoes the deletion request of account `user_id` before it is due: the account is enabled
+/// again. Records `account.deletion_cancelled` by `actor`. Returns `false` if it waits for no
+/// deletion, or the deletion is due (nothing changed).
+pub async fn cancel_deletion(
+    pool: &Pool,
+    user_id: i64,
+    actor: Actor,
+    client_ip: Option<std::net::IpAddr>,
+    now: i64,
+) -> Result<bool> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let cancelled = sqlx::query(
+        "UPDATE users SET enabled = 1, deleting_at = NULL, updated_at = ? WHERE id = ? \
+         AND deleting_at IS NOT NULL AND deleting_at > ?",
+    )
+    .bind(now)
+    .bind(user_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if cancelled {
+        audit::record_in(
+            &mut tx,
+            &Record::new(user_id, "account.deletion_cancelled", actor).client_ip(client_ip),
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+    }
+    Ok(cancelled)
+}
+
+/// The accounts whose deletion is due at `now`.
+pub async fn due_deletions(pool: &Pool, now: i64) -> Result<Vec<User>> {
+    let sql = format!(
+        "SELECT {USER_COLUMNS} FROM users WHERE deleting_at IS NOT NULL AND deleting_at <= ?"
+    );
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(now)
+        .fetch_all(pool)
+        .await?)
 }
 
 #[cfg(test)]

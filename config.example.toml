@@ -308,6 +308,10 @@ key_file = "two-factor.key"
 # confirms web sign-ins. Default: false.
 # web_sign_in = true
 
+# Let a WeChat bound to no account create one in the mini program: no password, no service until
+# an administrator turns them on. Default: false.
+# allow_signup = true
+
 [oauth.google]
 # Sign-in with Google (OpenID Connect, scopes "openid email profile") on the sign-in pages, the
 # Login Flow v2 page and /manage/login, and binding Google on the account page. Register the
@@ -319,6 +323,9 @@ key_file = "two-factor.key"
 # The file that holds the client secret (its first line; relative paths start in this file's
 # directory). The secret never goes into this file. Required when enabled.
 # client_secret_file = "google-secret"
+# Let a Google account bound to no account create one ("Create an account"): no password, no
+# service until an administrator turns them on. Default: false.
+# allow_signup = true
 
 [oauth.github]
 # Sign-in with GitHub (an OAuth app, scope "user:email"), as above. The app's callback URL is
@@ -326,3 +333,8 @@ key_file = "two-factor.key"
 # enabled = true
 # client_id = "Ov23liAbCdEf"
 # client_secret_file = "github-secret"
+
+[sign_in]
+# The terms of use a sign-up accepts: the sign-up pages link them with a box to tick, and the
+# mini program sends the version the user accepted. Default: none.
+# terms_url = "https://cloud.example.com/terms.html"

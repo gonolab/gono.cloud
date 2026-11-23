@@ -17,14 +17,18 @@
 //! - expired S3 multipart uploads with their parts, and part directories that belong to no
 //!   upload ([`gono_server_s3::multipart::purge`]), when the S3 API is on;
 //! - the lifecycle rules of S3 buckets ([`gono_server_s3::lifecycle::apply`]), when the S3 API
-//!   is on.
+//!   is on;
+//! - the accounts whose cooling-off period after asking for their deletion ended
+//!   ([`users::due_deletions`]): deleted as an administrator's deletion would, their files
+//!   moved to `deleted/`.
 //!
 //! Every pass is independent: a failure is logged and the next pass tries again.
 
 use std::time::Duration;
 
 use gono_server_core::{
-    db, direct_downloads, email, identities, login_flows, web_sessions, wechat,
+    db, direct_downloads, email, identities, login_flows, storage::DataLayout, users, web_sessions,
+    wechat,
 };
 use gono_server_nextcloud::chunking::ChunkedUploads;
 use gono_server_s3::S3State;
@@ -42,6 +46,8 @@ pub struct Janitor {
     pub uploads: ChunkedUploads,
     /// The S3 API, when it is on.
     pub s3: Option<S3State>,
+    /// The data directory, where the files of deleted accounts are moved away.
+    pub layout: DataLayout,
 }
 
 impl Janitor {
@@ -83,6 +89,7 @@ impl Janitor {
             Ok(removed) => tracing::debug!(removed, "removed expired pending identities"),
             Err(err) => tracing::warn!(error = %err, "cannot clean up pending identities"),
         }
+        self.delete_due_accounts(now).await;
         if let Some(s3) = &self.s3 {
             match gono_server_s3::multipart::purge(s3).await {
                 Ok(0) => {}
@@ -91,6 +98,37 @@ impl Janitor {
             }
             if let Err(err) = gono_server_s3::lifecycle::apply(s3, db::unix_now()).await {
                 tracing::warn!(error = %err, "cannot apply S3 lifecycle rules");
+            }
+        }
+    }
+
+    /// Deletes the accounts whose deletion is due at `now`.
+    async fn delete_due_accounts(&self, now: i64) {
+        let due = match users::due_deletions(&self.db, now).await {
+            Ok(due) => due,
+            Err(err) => {
+                tracing::warn!(error = %err, "cannot look for accounts to delete");
+                return;
+            }
+        };
+        for user in due {
+            match users::delete(&self.db, &user.username).await {
+                Ok(deleted) => {
+                    match self
+                        .layout
+                        .retire_user(deleted.id, deleted.username.as_str(), now)
+                    {
+                        Ok(files) => {
+                            tracing::info!(user = %deleted.username, files = ?files, "account deleted after its cooling-off period");
+                        }
+                        Err(err) => {
+                            tracing::warn!(user = %deleted.username, error = %err, "account deleted, but its files could not be moved to deleted/");
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(user = %user.username, error = %err, "cannot delete an account whose deletion is due");
+                }
             }
         }
     }

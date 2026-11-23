@@ -506,6 +506,8 @@ mod tests {
             mailer: None,
             wechat: None,
             oauth: None,
+            terms_url: None,
+            restores: Default::default(),
         };
         let app = crate::app::router(state.clone());
         tokio::spawn(async move {

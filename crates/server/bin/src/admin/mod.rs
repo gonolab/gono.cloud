@@ -5,13 +5,14 @@
 //! | `GET  <p>/login`, `POST <p>/login` | Sign in with the web login password (admins only). |
 //! | `POST <p>/logout` | Sign out. |
 //! | `GET  <p>/` | Overview of this server. |
-//! | `GET  <p>/users` | All accounts. |
+//! | `GET  <p>/users` | All accounts; `?filter=self-service` those their users made. |
 //! | `GET  <p>/new-user`, `POST <p>/users` | Create an account. |
 //! | `GET  <p>/users/<name>` | One account with its app passwords. |
 //! | `POST <p>/users/<name>/enable`, `.../disable` | Enable or disable the account. |
 //! | `POST <p>/users/<name>/promote`, `.../demote` | Grant or withdraw admin access. |
 //! | `POST <p>/users/<name>/display-name` | Change the display name. |
 //! | `POST <p>/users/<name>/password` | Set the web login password. |
+//! | `POST <p>/users/<name>/deletion/cancel` | Undo the deletion an account without a password asked for. |
 //! | `POST <p>/users/<name>/identities/<id>/unbind` | Unbind a third-party identity; refused for the last way in of an account without a password. |
 //! | `GET  <p>/users/<name>/delete`, `POST` the same | Confirm and delete the account. |
 //! | `POST <p>/users/<name>/app-passwords` | Create an app password, then show it once at `<p>/created`. |
@@ -263,6 +264,10 @@ pub fn routes(prefix: &str) -> Router<AppState> {
         .route(
             &format!("{p}/users/{{name}}/identities/{{id}}/unbind"),
             post(unbind_identity),
+        )
+        .route(
+            &format!("{p}/users/{{name}}/deletion/cancel"),
+            post(cancel_deletion),
         )
         .route(
             &format!("{p}/users/{{name}}/delete"),
@@ -1093,10 +1098,29 @@ async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Response
 // Users
 // ---------------------------------------------------------------------------------------------
 
+/// How an account was made, as the admin UI says it.
+fn created_via(t: &Text, via: users::CreatedVia) -> String {
+    use users::CreatedVia;
+    match via {
+        CreatedVia::Admin => t.a_via_admin.to_owned(),
+        CreatedVia::Cli => t.a_via_cli.to_owned(),
+        CreatedVia::WeChat => fill(t.a_via_self, &[t.provider_wechat]),
+        CreatedVia::Google => fill(t.a_via_self, &["Google"]),
+        CreatedVia::GitHub => fill(t.a_via_self, &["GitHub"]),
+    }
+}
+
+#[derive(Deserialize)]
+struct UsersQuery {
+    done: Option<String>,
+    /// `self-service`: only the accounts their users made.
+    filter: Option<String>,
+}
+
 async fn users_page(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(done): Query<Done>,
+    Query(done): Query<UsersQuery>,
 ) -> Response {
     let admin = match admin(&state) {
         Ok(admin) => admin,
@@ -1124,8 +1148,10 @@ async fn users_page(
         accounts.len(),
         &[&admins_text, &disabled.to_string()],
     );
+    let self_service_only = done.filter.as_deref() == Some("self-service");
     let rows = accounts
         .into_iter()
+        .filter(|user| !self_service_only || user.created_via.is_self_service())
         .map(|user| {
             let counts = counts.get(&user.id).copied().unwrap_or_default();
             UserRow {
@@ -1137,6 +1163,10 @@ async fn users_page(
                 storage: format_bytes(counts.storage_used),
                 created: pages::date(user.created_at),
                 services: service_view::summary(t, user.services),
+                self_service: user
+                    .created_via
+                    .is_self_service()
+                    .then(|| created_via(t, user.created_via)),
             }
         })
         .collect();
@@ -1150,6 +1180,7 @@ async fn users_page(
         notice,
         summary,
         users: rows,
+        self_service_only,
     };
     web::render(StatusCode::OK, &page)
 }
@@ -1402,6 +1433,10 @@ async fn user_page_response(
             two_factor_on: two_factor_status.is_some(),
             email: email.unwrap_or_else(|| t.a_email_none.to_owned()),
             has_password: user.has_password,
+            created_via: created_via(t, user.created_via),
+            deleting: user
+                .deleting_at
+                .map(|at| fill(t.a_deleting, &[&pages::time(at)])),
             // Every identity of the account, also of a WeChat mini program configured before:
             // an admin sees what a change of `wechat.app_id` left behind.
             identities: identities
@@ -1690,6 +1725,7 @@ async fn user_page(
         Some("renamed") => Some(t.a_notice_renamed.to_owned()),
         Some("password") => Some(t.a_notice_password.to_owned()),
         Some("unbound") => Some(t.a_notice_unbound.to_owned()),
+        Some("restored") => Some(t.a_notice_restored.to_owned()),
         Some("device-revoked") => Some(t.notice_device_revoked.to_owned()),
         Some("two-factor-reset") if state.remote_access_needs_two_factor() => {
             Some(t.a_notice_tf_reset.to_owned())
@@ -2017,6 +2053,50 @@ async fn set_password(
         "{}?done=password",
         admin.user_url(user.username.as_str())
     ))
+}
+
+/// `POST <admin>/users/<name>/deletion/cancel`: undoes the deletion an account asked for; it is
+/// enabled again.
+async fn cancel_deletion(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let admin = match admin(&state) {
+        Ok(admin) => admin,
+        Err(halt) => return *halt,
+    };
+    let session = match form_session(&state, &admin, &headers, &form.csrf).await {
+        Ok(session) => session,
+        Err(halt) => return *halt,
+    };
+    let user = match find_user(&state, &admin, &session, &name).await {
+        Ok(user) => user,
+        Err(halt) => return *halt,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    match users::cancel_deletion(
+        &state.db,
+        user.id,
+        audit::Actor::Admin,
+        Some(client),
+        db::unix_now(),
+    )
+    .await
+    {
+        Ok(true) => {
+            tracing::info!(by = %session.user.username, user = %user.username, "admin undid a deletion");
+            account_changed(&state, user.id);
+            see_other(&format!(
+                "{}?done=restored",
+                admin.user_url(user.username.as_str())
+            ))
+        }
+        Ok(false) => see_other(&admin.user_url(user.username.as_str())),
+        Err(err) => internal_error(&session.chrome, &err),
+    }
 }
 
 /// `POST <admin>/users/<name>/identities/<id>/unbind`: unbinds a third-party identity of the

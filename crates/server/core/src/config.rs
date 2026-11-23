@@ -92,6 +92,28 @@ pub struct Config {
     /// `[oauth.google]`, `[oauth.github]`: sign-in with Google and GitHub.
     #[serde(default)]
     pub oauth: OAuthConfig,
+    /// `[sign_in]`: what the sign-up pages show.
+    #[serde(default)]
+    pub sign_in: SignInConfig,
+}
+
+/// `[sign_in]` table: settings of every third-party sign-in.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SignInConfig {
+    /// The terms of use that a sign-up must accept: an `http(s)` URL the sign-up pages link to
+    /// (with a box to tick), and whose text the mini program shows. Unset (or empty): no terms.
+    #[serde(deserialize_with = "empty_url_is_none")]
+    pub terms_url: Option<Url>,
+}
+
+/// An optional URL where an empty string means none.
+fn empty_url_is_none<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Url>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(text) => Url::parse(text).map(Some).map_err(D::Error::custom),
+    }
 }
 
 /// `[server]` table.
@@ -747,6 +769,9 @@ pub struct WeChatConfig {
     /// with 6 digits typed into the browser (`plan/third-party-sign-in-design.md`, 5.3). It needs
     /// the mini program's page that confirms web sign-ins. Off by default.
     pub web_sign_in: bool,
+    /// Let a WeChat user bound to no account create one in the mini program (`signup`). Off by
+    /// default; the account starts with no service, like every account.
+    pub allow_signup: bool,
 }
 
 /// `[oauth.*]` tables: sign-in with Google (OpenID Connect) and GitHub (an OAuth app)
@@ -1142,6 +1167,16 @@ impl Config {
         // [oauth.*]
         validate_oauth(&self.oauth.google, "google", &mut reject);
         validate_oauth(&self.oauth.github, "github", &mut reject);
+
+        // [sign_in]
+        if let Some(url) = &self.sign_in.terms_url
+            && !matches!(url.scheme(), "http" | "https")
+        {
+            reject(
+                "sign_in.terms_url",
+                format!("must be an http or https URL, got {:?}", url.scheme()),
+            );
+        }
 
         if issues.is_empty() {
             Ok(())

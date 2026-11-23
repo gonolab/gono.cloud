@@ -8,11 +8,12 @@
   <div><h1>{{ chrome.t.a_users }}</h1><p class="sub">{{ summary }}</p></div>
   <div class="head-actions"><a class="btn primary" href="{{ frame.prefix }}/new-user">{{ chrome.t.a_new_user }}</a></div>
 </div>
+<nav class="tabs page-tabs"><a class="tabs__item" href="{{ frame.prefix }}/users"{% if !self_service_only %} aria-current="page"{% endif %}>{{ chrome.t.a_filter_all }}</a><a class="tabs__item" href="{{ frame.prefix }}/users?filter=self-service"{% if self_service_only %} aria-current="page"{% endif %}>{{ chrome.t.a_filter_self }}</a></nav>
 <div class="panel"><div class="table-wrap"><table>
   <thead><tr><th>{{ chrome.t.a_user }}</th><th>{{ chrome.t.a_role }}</th><th>{{ chrome.t.a_status }}</th><th>{{ chrome.t.a_services }}</th><th>{{ chrome.t.a_app_passwords }}</th><th>{{ chrome.t.a_storage }}</th><th>{{ chrome.t.a_created }}</th><th class="end"></th></tr></thead>
   <tbody>
   {%- for user in users %}
-    <tr><td><div class="who"><b>{{ user.display_name }}</b><span class="mono">{{ user.username }}</span></div></td>
+    <tr><td><div class="who"><b>{{ user.display_name }}</b><span class="mono">{{ user.username }}</span>{% if let Some(via) = user.self_service %}<span class="badge off">{{ via }}</span>{% endif %}</div></td>
       <td>{% if user.is_admin %}<span class="badge">{{ chrome.t.a_admin_badge }}</span>{% else %}<span class="badge off">{{ chrome.t.a_user_badge }}</span>{% endif %}</td>
       <td>{% if user.enabled %}<span class="badge ok dot">{{ chrome.t.a_enabled }}</span>{% else %}<span class="badge off dot">{{ chrome.t.a_disabled }}</span>{% endif %}</td>
       <td class="small">{{ user.services }}</td>

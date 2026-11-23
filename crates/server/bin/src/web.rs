@@ -935,6 +935,7 @@ impl Web {
                 OAUTH_COOKIE,
                 PENDING_COOKIE,
                 WECHAT_COOKIE,
+                crate::signup::RESTORE_COOKIE,
             ]
             .contains(&base)
         {
@@ -977,6 +978,17 @@ impl Web {
         self.cookie_header(WECHAT_COOKIE, value, "Strict", Some(SIGN_IN_COOKIE_SECS))
     }
 
+    /// The `Set-Cookie` value of the cookie that binds undoing a deletion to this browser
+    /// ([`crate::signup::RESTORE_COOKIE`]): `HttpOnly`, `SameSite=Strict`, 10 minutes.
+    pub fn restore_cookie(&self, value: &str) -> HeaderValue {
+        self.cookie_header(
+            crate::signup::RESTORE_COOKIE,
+            value,
+            "Strict",
+            Some(SIGN_IN_COOKIE_SECS),
+        )
+    }
+
     /// The `Set-Cookie` value of the [`PENDING_COOKIE`] with `token`.
     pub fn pending_cookie(&self, token: &SecretString) -> HeaderValue {
         self.cookie_header(
@@ -1002,7 +1014,14 @@ impl Web {
         self.cookie_header(
             name,
             "",
-            if [CSRF_COOKIE, RESET_COOKIE, WECHAT_COOKIE].contains(&name) {
+            if [
+                CSRF_COOKIE,
+                RESET_COOKIE,
+                WECHAT_COOKIE,
+                crate::signup::RESTORE_COOKIE,
+            ]
+            .contains(&name)
+            {
                 "Strict"
             } else {
                 "Lax"

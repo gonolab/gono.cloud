@@ -10,6 +10,8 @@
 //! | `GET /account/relay` | Relay: its address, the rate it reads the account's devices at, those connected to it now and the sessions they reported (see [`relay`]). |
 //! | `POST /account/display-name` | Change the display name. |
 //! | `POST /account/password` | Change the web login password (needs the current one). The other browser sessions end; this one stays. |
+//! | `POST /account/username` | Change the username of an account made by a sign-up, until a device or app signed in to it (once a day). |
+//! | `POST /account/delete` | An account without a web login password asks for its deletion: disabled at once, deleted after 7 days unless a sign-in undoes it. |
 //! | `POST /account/password/set` | Set the first web login password of an account without one, after confirming it is you with one of its identities. The other browser sessions stay. |
 //! | `POST /account/email`, `POST /account/email/confirm`, `POST /account/email/remove` | Add, replace or remove the email address with a mailed code (see [`email`]). |
 //! | `GET`/`POST /account/identities/wechat/bind`, `GET`/`POST /account/identities/<provider>/unbind` | Show a QR code that binds WeChat for the mini program, or unbind an identity (see [`methods`]). |
@@ -404,6 +406,10 @@ struct OverviewPage {
     display_name: String,
     two_factor: TwoFactorView,
     confirm: ConfirmView,
+    /// The account may still change its username (made by a sign-up, no device or app yet).
+    rename: bool,
+    /// The account deletes itself (it has no web login password and is no admin).
+    deletable: bool,
 }
 
 /// `account/webdav.html`.
@@ -676,7 +682,13 @@ async fn render(state: &AppState, visitor: &Visitor, options: PageOptions) -> Re
                 Ok(view) => view,
                 Err(err) => return internal(visitor, "ways to sign in", &err),
             };
+            let rename = match users::can_rename(&state.db, visitor.user.user_id).await {
+                Ok(rename) => rename,
+                Err(err) => return internal(visitor, "username", &err),
+            };
             let page = OverviewPage {
+                rename,
+                deletable: !visitor.user.has_password && !visitor.user.is_admin,
                 chrome,
                 frame,
                 services: service_lines(state, visitor),
@@ -1704,6 +1716,130 @@ pub async fn set_password(
     }
     tracing::info!(user = %visitor.user.username, "web login password changed by its user");
     Tab::Overview.done("password")
+}
+
+#[derive(Deserialize)]
+pub struct UsernameForm {
+    #[serde(default)]
+    csrf: String,
+    #[serde(default)]
+    username: String,
+}
+
+/// `POST /account/username`: a new username for an account made by a sign-up that no device
+/// or app signed in to yet (devices' pairing statements name the account by its username),
+/// once a day.
+pub async fn set_username(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+    Form(form): Form<UsernameForm>,
+) -> Response {
+    let visitor = match form_visitor(&state, &headers, &uri, &form.csrf).await {
+        Ok(visitor) => visitor,
+        Err(response) => return *response,
+    };
+    let t = visitor.t();
+    let Ok(username) = gono_server_core::Username::new(form.username.trim()) else {
+        return show_error(&state, &visitor, Tab::Overview, t.err_username.to_owned()).await;
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    let renamed = users::rename(
+        &state.db,
+        visitor.user.user_id,
+        &username,
+        Actor::User,
+        Some(client),
+        db::unix_now(),
+    )
+    .await;
+    let error = match renamed {
+        Ok(users::Renamed::Done) => {
+            tracing::info!(%client, from = %visitor.user.username, to = %username, "username changed by its user");
+            return Tab::Overview.done("username");
+        }
+        Ok(users::Renamed::Taken) => t.err_username_taken,
+        Ok(users::Renamed::Locked) => t.err_username_locked,
+        Ok(users::Renamed::TooSoon) => t.err_username_soon,
+        Err(err) => return internal(&visitor, "username", &err),
+    };
+    show_error(&state, &visitor, Tab::Overview, error.to_owned()).await
+}
+
+#[derive(Deserialize)]
+pub struct DeleteForm {
+    #[serde(default)]
+    csrf: String,
+    #[serde(default)]
+    confirm: String,
+}
+
+/// `POST /account/delete`: an account without a web login password asks for its deletion
+/// (`plan/third-party-sign-in-design.md`, 4.6), after confirming it is you and typing its
+/// username. It is disabled at once and deleted after 7 days unless a sign-in undoes it.
+pub async fn delete_account(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+    Form(form): Form<DeleteForm>,
+) -> Response {
+    let visitor = match form_visitor(&state, &headers, &uri, &form.csrf).await {
+        Ok(visitor) => visitor,
+        Err(response) => return *response,
+    };
+    let t = visitor.t();
+    if visitor.user.has_password || visitor.user.is_admin {
+        return Tab::Overview.back();
+    }
+    if !state.web.is_confirmed(&visitor.user) {
+        return show_error(
+            &state,
+            &visitor,
+            Tab::Overview,
+            t.password_set_confirm.to_owned(),
+        )
+        .await;
+    }
+    if form.confirm.trim() != visitor.user.username.as_str() {
+        return show_error(
+            &state,
+            &visitor,
+            Tab::Overview,
+            t.err_delete_name.to_owned(),
+        )
+        .await;
+    }
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    let now = db::unix_now();
+    let until = match users::request_deletion(
+        &state.db,
+        visitor.user.user_id,
+        Actor::User,
+        Some(client),
+        now,
+    )
+    .await
+    {
+        Ok(Some(until)) => until,
+        Ok(None) => return Tab::Overview.back(),
+        Err(err) => return internal(&visitor, "account deletion", &err),
+    };
+    tracing::info!(%client, user = %visitor.user.username, "account deletion requested by its user");
+    state.web.end_pending_sign_ins(visitor.user.user_id);
+    if let Some(connect) = &state.connect {
+        connect.poke();
+    }
+    let chrome = Chrome::for_request(&headers);
+    let lead = fill(t.deleted_lead, &[&when(visitor.lang(), now, until).0]);
+    let mut response =
+        web::Message::new(chrome, t.deleted_title, t.deleted_title, &lead).respond(StatusCode::OK);
+    response.headers_mut().append(
+        axum::http::header::SET_COOKIE,
+        state.web.removal_cookie(web::SESSION_COOKIE),
+    );
+    response
 }
 
 #[derive(Deserialize)]

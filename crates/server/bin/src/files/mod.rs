@@ -38,7 +38,7 @@
 pub mod account;
 mod ops;
 mod upload;
-mod view;
+pub(crate) mod view;
 mod zip;
 
 use std::{
@@ -173,6 +173,8 @@ pub fn routes() -> Router<AppState> {
             &format!("{ACCOUNT}/password/set"),
             post(account::set_first_password),
         )
+        .route(&format!("{ACCOUNT}/username"), post(account::set_username))
+        .route(&format!("{ACCOUNT}/delete"), post(account::delete_account))
         .route(&format!("{ACCOUNT}/email"), post(account::email::start))
         .route(
             &format!("{ACCOUNT}/email/confirm"),

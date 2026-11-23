@@ -91,6 +91,14 @@ pub fn run(config_path: &Path) -> anyhow::Result<()> {
         settings.extend(wechat_settings(&config.wechat));
     }
     settings.extend(oauth_settings(&config));
+    settings.push((
+        "sign_in.terms_url",
+        config
+            .sign_in
+            .terms_url
+            .as_ref()
+            .map_or_else(|| "(none)".to_owned(), ToString::to_string),
+    ));
     for (key, value) in settings {
         println!("  {key:<31} {value}");
     }
@@ -205,6 +213,7 @@ fn wechat_settings(wechat: &WeChatConfig) -> Vec<(&'static str, String)> {
             file_setting(wechat.verify_file.as_deref(), "(none)"),
         ),
         ("wechat.web_sign_in", wechat.web_sign_in.to_string()),
+        ("wechat.allow_signup", wechat.allow_signup.to_string()),
     ]
 }
 

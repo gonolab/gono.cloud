@@ -549,6 +549,9 @@ async fn finish(
         }
     };
     let removal = state.web.removal_cookie(WECHAT_COOKIE);
+    if let SignedIn::DeletionPending { user_id, until } = outcome {
+        return crate::signup::deletion_pending(state, headers, user_id, until);
+    }
     let SignedIn::Account(user) = outcome else {
         let chrome = Chrome::for_request(headers);
         let t = chrome.t;

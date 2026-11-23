@@ -301,6 +301,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         db: pool.clone(),
         uploads: uploads.clone(),
         s3: s3.as_ref().map(|(state, _)| state.clone()),
+        layout: dav.fs().layout().clone(),
     }
     .spawn();
     let auth = Arc::new(Authenticator::new(
@@ -389,6 +390,8 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         mailer,
         wechat,
         oauth,
+        terms_url: config.sign_in.terms_url.clone().map(Arc::new),
+        restores: Default::default(),
     };
     let connect_task = connect.clone().map(|connect| tokio::spawn(connect.run()));
     let on_signal = {
