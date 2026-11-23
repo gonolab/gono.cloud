@@ -303,6 +303,11 @@ key_file = "two-factor.key"
 # this file's directory). Default: unset (serve it some other way).
 # verify_file = "AbCdEf1234.txt"
 
+# "Scan with WeChat" on the sign-in pages: a QR code that the mini program scans and confirms,
+# then 6 digits from the phone typed into the browser. Needs the mini program's page that
+# confirms web sign-ins. Default: false.
+# web_sign_in = true
+
 [oauth.google]
 # Sign-in with Google (OpenID Connect, scopes "openid email profile") on the sign-in pages, the
 # Login Flow v2 page and /manage/login, and binding Google on the account page. Register the

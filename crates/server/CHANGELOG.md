@@ -12,6 +12,19 @@ compatible within a major version: released clients keep working with newer serv
 
 ### Added
 
+- **WeChat sign-in on the web** (`[wechat] web_sign_in`, off by default). The sign-in pages
+  (`/login`, the Login Flow v2 page, `/manage/login`) offer "Scan with WeChat": a QR code of
+  `{qr_url_prefix}<ticket>` for this browser (2 minutes, renewed while the page is open, bound to it
+  by the `__Host-gono_wechat` cookie), which the mini program locks with `POST /gono/v1/wechat/scan`
+  (answering the account, the browser's name and whether it is on the phone's network) and confirms
+  with `POST /gono/v1/wechat/confirm`, which returns 6 digits. The digits are always typed into the
+  browser (2 minutes, 3 tries, wrong ones counted like failed sign-ins), so a forwarded or phished
+  QR code signs in nothing. `deny` cancels, and `flow` reports the stage. The admin UI admits admin
+  accounts only, and the account page confirms it is you the same way (`kind: "reauth"`). Without
+  JavaScript the page reloads every 3 seconds while it waits; the script polls
+  `/login/wechat/status` instead. Only digests of tickets, cookies and digits are stored
+  (`wechat_sign_in_tickets`). See `docs/wechat-miniprogram.md`.
+
 - **Google and GitHub sign-in** (`[oauth.google]`, `[oauth.github]`, off by default). `/login`, the
   Login Flow v2 page and `/manage/login` offer "Sign in with Google" and "Sign in with GitHub" next
   to the password (forms that need no JavaScript): Google through OpenID Connect (scopes `openid

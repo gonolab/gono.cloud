@@ -204,6 +204,7 @@ fn wechat_settings(wechat: &WeChatConfig) -> Vec<(&'static str, String)> {
             "wechat.verify_file",
             file_setting(wechat.verify_file.as_deref(), "(none)"),
         ),
+        ("wechat.web_sign_in", wechat.web_sign_in.to_string()),
     ]
 }
 

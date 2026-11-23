@@ -743,6 +743,10 @@ pub struct WeChatConfig {
     /// with its exact content while enabled. Relative paths are resolved against the
     /// configuration file's directory. Optional.
     pub verify_file: Option<PathBuf>,
+    /// Offer signing in on the web by scanning a QR code with the mini program, confirmed there
+    /// with 6 digits typed into the browser (`plan/third-party-sign-in-design.md`, 5.3). It needs
+    /// the mini program's page that confirms web sign-ins. Off by default.
+    pub web_sign_in: bool,
 }
 
 /// `[oauth.*]` tables: sign-in with Google (OpenID Connect) and GitHub (an OAuth app)
@@ -1767,6 +1771,16 @@ impl Config {
                     "wechat.enabled is true, but nothing binds WeChat to an account: the WeChat \
                      panel is on the account page, part of the web file UI that \
                      files_ui.enabled turns off"
+                        .to_owned(),
+                );
+            }
+            if wechat.web_sign_in
+                && self.server.base_url.scheme() != "https"
+                && !is_local_host(&self.server.base_url)
+            {
+                warnings.push(
+                    "wechat.web_sign_in is true, but server.base_url is not https: the 6 digits \
+                     and the session cookie of a sign-in cross the network unencrypted"
                         .to_owned(),
                 );
             }

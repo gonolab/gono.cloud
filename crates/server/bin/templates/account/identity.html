@@ -27,12 +27,16 @@
   {%- if !reauth.is_empty() %}
   <p class="muted small mt-20">{% if ask_password %}{{ chrome.t.confirm_or }}{% else %}{{ chrome.t.confirm_title }}{% endif %}</p>
   {%- for button in reauth %}
+  {%- if button.link %}
+  <a class="btn block mt-6" href="{{ button.action }}">{{ button.label }}</a>
+  {%- else %}
   <form method="post" action="{{ button.action }}" class="mt-6">
     <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
     <input type="hidden" name="purpose" value="reauth">
     <input type="hidden" name="next" value="{{ here }}">
     <button class="btn block" type="submit">{{ button.label }}</button>
   </form>
+  {%- endif %}
   {%- endfor %}
   {%- endif %}
 </div></section>

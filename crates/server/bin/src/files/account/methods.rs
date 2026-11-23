@@ -271,21 +271,32 @@ fn reauth_buttons(
     state: &AppState,
     visitor: &Visitor,
     bound: &[identities::Identity],
+    here: &str,
 ) -> Vec<crate::oauth::Button> {
     let t = visitor.t();
-    let Some(oauth) = &state.oauth else {
-        return Vec::new();
-    };
-    oauth
-        .providers()
-        .into_iter()
-        .filter(|provider| bound.iter().any(|identity| identity.provider == *provider))
-        .map(|provider| crate::oauth::Button {
-            action: format!("{}/{}", crate::oauth::START_PATH, provider.as_str()),
-            label: fill(t.confirm_with, &[provider.name()]),
-            link: false,
+    let mut buttons = Vec::new();
+    // WeChat: the scan of a sign-in page, when its identity of this mini program is bound.
+    if let Some(mini) = &state.wechat
+        && bound.iter().any(|identity| {
+            identity.provider == Provider::WeChat && identity.realm == mini.app_id()
         })
-        .collect()
+    {
+        buttons.extend(crate::wechat::sign_in::reauth_button(state, t, here));
+    }
+    if let Some(oauth) = &state.oauth {
+        buttons.extend(
+            oauth
+                .providers()
+                .into_iter()
+                .filter(|provider| bound.iter().any(|identity| identity.provider == *provider))
+                .map(|provider| crate::oauth::Button {
+                    action: format!("{}/{}", crate::oauth::START_PATH, provider.as_str()),
+                    label: fill(t.confirm_with, &[provider.name()]),
+                    link: false,
+                }),
+        );
+    }
+    buttons
 }
 
 /// Renders the page of `action` for `visitor`, with `error`.
@@ -304,7 +315,7 @@ async fn action_page(
     let reauth = if confirmed {
         Vec::new()
     } else {
-        reauth_buttons(state, visitor, &bound)
+        reauth_buttons(state, visitor, &bound, &action.here)
     };
     let mut chrome = visitor.chrome(Nav::Account);
     if !reauth.is_empty() {

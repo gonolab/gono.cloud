@@ -198,6 +198,76 @@ Ends the session. `Authorization: Bearer <session>`; a body is ignored (at most 
 `204 No Content`, also for a session that expired. Errors: `not_signed_in` (no such session),
 `rate_limited`, `unavailable`. Forget the session in any case.
 
+### Signing in on the web: `scan`, `confirm`, `deny`, `flow`
+
+With `wechat.web_sign_in`, the server's sign-in pages (`/login`, the Login Flow v2 page,
+`/manage/login`) show a QR code of `{qr_url_prefix}<ticket>` ([The links](#the-links)) for the
+browser that opened them, and the account page shows one to confirm it is the account's user.
+The mini program's page that confirms web sign-ins takes it through these four calls; without
+`web_sign_in` they answer `not_found`. No authentication: every call that acts carries a fresh
+`wx.login()` code, which names the WeChat.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant GC as Gono Cloud
+    participant MP as Mini program
+    B->>GC: GET /login/wechat
+    GC-->>B: QR {qr_url_prefix}<ticket>, 2 minutes, bound to this browser
+    MP->>GC: POST scan {ticket, code, scene, platform}
+    GC-->>MP: {kind, account, browser, expires_at}: locked to this WeChat
+    MP->>GC: POST confirm {ticket, code, scene, platform}
+    GC-->>MP: {enter_code: "482913", expires_at}
+    Note over MP: The phone shows the digits; the user types them into the browser
+    B->>GC: POST /login/wechat {code: "482913"}
+    GC-->>B: signed in
+    MP->>GC: GET flow?ticket= (every 2 s)
+    GC-->>MP: {stage: "done"}
+```
+
+`POST /gono/v1/wechat/scan` takes `{"ticket", "code", "scene", "platform"}` and an optional
+`"source": "scan_code"` for the in-app scanner (`wx.scanCode({onlyFromCamera: true})`), which
+skips the scene test; the platform test stays. The scene and platform rules are `bind`'s. The
+WeChat of the code locks the sign-in, and the answer says what to show:
+
+```json
+{
+  "kind": "web_sign_in",
+  "admin": false,
+  "account": { "username": "alice", "display_name": "Alice Example" },
+  "browser": { "name": "Chrome · Windows", "same_network": false },
+  "expires_at": 1765408720
+}
+```
+
+- `kind` is `web_sign_in` (a sign-in page; `admin: true` for the admin UI's, which admits admin
+  accounts only) or `reauth` (the account page confirms it is its user, with the WeChat bound to
+  it). `same_network` compares the phone's network with the browser's (the /24 of an IPv4
+  address, the /64 of an IPv6 one). The page states it either way: the digits are always asked.
+- A WeChat bound to no account gets `"account": null` and locks nothing: show how to bind it.
+- Refusals: `ticket_expired` (410: unknown, ended or 2 minutes passed; the browser shows a new
+  one), `ticket_taken` (409: another WeChat scanned it first), `account_disabled` (403),
+  `deletion_pending` (409, with `until`), `not_permitted` (403: a non-admin account on the admin
+  UI, or another account's WeChat confirming an account), and the errors of `session`.
+
+`POST /gono/v1/wechat/confirm` takes the same body with a fresh code of the WeChat that scanned:
+`200 {"enter_code": "482913", "expires_at": <unix>}`. Show the 6 digits with "不要告诉任何人，只
+输入到你自己正在登录的浏览器里"; they are valid for 2 minutes and 3 tries in the browser, and a new
+`confirm` replaces them. Another WeChat gets `not_permitted`.
+
+`POST /gono/v1/wechat/deny` (same body) cancels the sign-in for "不是我" and "取消这次登录": `204`.
+The browser then says that the phone cancelled it and offers a new QR code.
+
+`GET /gono/v1/wechat/flow?ticket=<ticket>` says where the sign-in is: `200 {"stage", "expires_at"}`
+with `stage` `waiting`, `scanned`, `code`, `done` (the browser signed in), `denied`, `tries` (the
+digits were entered wrong 3 times) or `expired`; `ticket_expired` for an unknown ticket. Poll it
+every 2 seconds on the page of the digits.
+
+The 6 digits are what makes this safe: a QR code forwarded from someone else's browser, or
+relayed by a phishing page, signs in nothing unless the digits are typed into that browser. Only
+digests of the ticket, of the browser's cookie and of the digits are stored. The calls that act
+are limited like `bind`.
+
 ## Errors
 
 | Code | Status | Meaning |
@@ -211,7 +281,10 @@ Ends the session. `Authorization: Bearer <session>`; a body is ignored (at most 
 | `desktop_client` | 403 | The mini program runs on a desktop or in the developer tools. |
 | `account_disabled` | 403 | The account is disabled. |
 | `not_found` | 404 | No such endpoint or method, or the server does not offer the mini program. |
+| `not_permitted` | 403 | A web sign-in this WeChat may not confirm: of the admin UI for a non-admin account, of another account, or locked by another WeChat (`confirm`, `deny`). |
 | `account_exists` | 409 | The WeChat is bound to another account. |
+| `ticket_taken` | 409 | Another WeChat scanned the sign-in's QR code first. |
+| `deletion_pending` | 409 | The account waits for its deletion (`until`). |
 | `bind_failed` | 409 | The account has another WeChat of this AppID. |
 | `ticket_expired` | 410 | The QR code's ticket is expired, used or replaced. |
 | `rate_limited` | 429 | Too many requests; `Retry-After` says how many seconds to wait. |
@@ -250,11 +323,12 @@ prefix of the rule in the mini program's console:
 
 | Link | Use |
 |---|---|
-| `{qr_url_prefix}bind/<ticket>` | Binding, from the account page (today's only link). |
-| `{qr_url_prefix}<ticket>` | Reserved for signing in: a later version will show login links of this form, the ticket right below the prefix, under the same rule. |
+| `{qr_url_prefix}bind/<ticket>` | Binding, from the account page. |
+| `{qr_url_prefix}<ticket>` | Signing in on the web, or confirming it is the account's user ([`scan`](#signing-in-on-the-web-scan-confirm-deny-flow)), with `wechat.web_sign_in`. |
 
-Take the part after the prefix; if it is `bind/` followed by 22 characters of `[A-Za-z0-9]`, it
-is a bind ticket. Tell the user that other links need a newer version of the mini program.
+Take the part after the prefix: `bind/` followed by 22 characters of `[A-Za-z0-9]` is a bind
+ticket, 22 such characters alone a sign-in ticket. Tell the user that other links need a newer
+version of the mini program.
 
 The server answers every path below `/q/` with a page in English and Chinese that says to scan
 the code with WeChat, for whoever opens a link in a browser; so the prefix's path is `/q/`, on

@@ -122,6 +122,10 @@ pub const OAUTH_COOKIE: &str = "gono_oauth";
 /// browser to be bound (`gono_server_core::identities`): `HttpOnly`, `SameSite=Lax`, 10 minutes.
 pub const PENDING_COOKIE: &str = "gono_pending";
 
+/// Cookie binding a WeChat sign-in on the web to the browser that shows its QR code
+/// ([`crate::wechat::sign_in`]): `HttpOnly`, `SameSite=Strict`, 10 minutes.
+pub const WECHAT_COOKIE: &str = "gono_wechat";
+
 /// How long the [`OAUTH_COOKIE`] and the [`PENDING_COOKIE`] live, in seconds.
 const SIGN_IN_COOKIE_SECS: u32 = 10 * 60;
 
@@ -930,6 +934,7 @@ impl Web {
                 RESET_COOKIE,
                 OAUTH_COOKIE,
                 PENDING_COOKIE,
+                WECHAT_COOKIE,
             ]
             .contains(&base)
         {
@@ -967,6 +972,11 @@ impl Web {
         self.cookie_header(OAUTH_COOKIE, value, "Lax", Some(SIGN_IN_COOKIE_SECS))
     }
 
+    /// The `Set-Cookie` value of the [`WECHAT_COOKIE`] with `value`.
+    pub fn wechat_cookie(&self, value: &str) -> HeaderValue {
+        self.cookie_header(WECHAT_COOKIE, value, "Strict", Some(SIGN_IN_COOKIE_SECS))
+    }
+
     /// The `Set-Cookie` value of the [`PENDING_COOKIE`] with `token`.
     pub fn pending_cookie(&self, token: &SecretString) -> HeaderValue {
         self.cookie_header(
@@ -992,7 +1002,7 @@ impl Web {
         self.cookie_header(
             name,
             "",
-            if [CSRF_COOKIE, RESET_COOKIE].contains(&name) {
+            if [CSRF_COOKIE, RESET_COOKIE, WECHAT_COOKIE].contains(&name) {
                 "Strict"
             } else {
                 "Lax"

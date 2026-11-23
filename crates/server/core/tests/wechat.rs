@@ -729,3 +729,216 @@ async fn purging_removes_what_expired() {
     // The identity stays: only its sessions end.
     assert_eq!(identities::list(&pool, alice).await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn sign_in_tickets_lock_to_one_identity_and_take_three_tries() {
+    use gono_server_core::wechat::{CODE_TRIES, Entered, Locked, Purpose, SIGN_IN_TTL_SECS, Stage};
+
+    let (_dir, pool, alice, bob) = fixture().await;
+    bind(&pool, alice, ALICE_OPENID, NOW).await;
+    bind(&pool, bob, BOB_OPENID, NOW).await;
+    let ids = identities::list(&pool, alice).await.unwrap();
+    let alices = ids[0].id;
+    let bobs = identities::list(&pool, bob).await.unwrap()[0].id;
+    let made = wechat::create_sign_in(
+        &pool,
+        "browser-1",
+        Purpose::SignIn,
+        None,
+        "Chrome · Windows",
+        "192.0.2.0/24",
+        NOW,
+    )
+    .await
+    .unwrap();
+    let ticket = made.ticket.expose_secret().to_owned();
+    assert!(wechat::is_ticket(&ticket));
+    assert_eq!(made.expires_at, NOW + SIGN_IN_TTL_SECS);
+    let found = wechat::sign_in_ticket(&pool, &ticket, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (found.stage, found.browser_name.as_str()),
+        (Stage::Waiting, "Chrome · Windows")
+    );
+    // Only its browser finds it.
+    assert_eq!(
+        wechat::browser_sign_in(&pool, &ticket, "browser-2", NOW)
+            .await
+            .unwrap(),
+        None
+    );
+    // No digits before the scan.
+    assert_eq!(
+        wechat::issue_code(&pool, &ticket, alices, NOW)
+            .await
+            .unwrap(),
+        None
+    );
+
+    let Locked::Locked(locked) = wechat::lock_sign_in(&pool, &ticket, alices, NOW + 100)
+        .await
+        .unwrap()
+    else {
+        panic!("not locked");
+    };
+    assert_eq!(
+        locked.expires_at,
+        NOW + 100 + SIGN_IN_TTL_SECS,
+        "a scan gives it time"
+    );
+    assert_eq!(
+        wechat::lock_sign_in(&pool, &ticket, bobs, NOW + 101)
+            .await
+            .unwrap(),
+        Locked::Taken
+    );
+    assert!(matches!(
+        wechat::lock_sign_in(&pool, &ticket, alices, NOW + 101)
+            .await
+            .unwrap(),
+        Locked::Locked(_)
+    ));
+    assert_eq!(
+        wechat::issue_code(&pool, &ticket, bobs, NOW + 102)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        !wechat::deny_sign_in(&pool, &ticket, bobs, NOW + 102)
+            .await
+            .unwrap()
+    );
+    let (code, _) = wechat::issue_code(&pool, &ticket, alices, NOW + 102)
+        .await
+        .unwrap()
+        .unwrap();
+    let wrong = if code == "000000" { "111111" } else { "000000" };
+    // Another browser's tries reach nothing.
+    assert_eq!(
+        wechat::enter_code(&pool, &ticket, "browser-2", &code, NOW + 103)
+            .await
+            .unwrap(),
+        Entered::NoCode
+    );
+    assert_eq!(
+        wechat::enter_code(&pool, &ticket, "browser-1", wrong, NOW + 103)
+            .await
+            .unwrap(),
+        Entered::Wrong(CODE_TRIES - 1)
+    );
+    let Entered::Right(done) = wechat::enter_code(&pool, &ticket, "browser-1", &code, NOW + 104)
+        .await
+        .unwrap()
+    else {
+        panic!("not right");
+    };
+    assert_eq!((done.stage, done.identity_id), (Stage::Done, Some(alices)));
+    assert_eq!(
+        wechat::enter_code(&pool, &ticket, "browser-1", &code, NOW + 104)
+            .await
+            .unwrap(),
+        Entered::NoCode
+    );
+
+    // The last wrong try ends it; a denied one ends too; and a new ticket ends the browser's old.
+    let second = wechat::create_sign_in(
+        &pool,
+        "browser-1",
+        Purpose::Reauth,
+        Some(alice),
+        "x",
+        "n",
+        NOW,
+    )
+    .await
+    .unwrap();
+    let second = second.ticket.expose_secret().to_owned();
+    assert_eq!(
+        wechat::sign_in_ticket(&pool, &ticket, NOW).await.unwrap(),
+        None
+    );
+    wechat::lock_sign_in(&pool, &second, alices, NOW)
+        .await
+        .unwrap();
+    let (code, _) = wechat::issue_code(&pool, &second, alices, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    let wrong = if code == "000000" { "111111" } else { "000000" };
+    for left in (1..CODE_TRIES).rev() {
+        assert_eq!(
+            wechat::enter_code(&pool, &second, "browser-1", wrong, NOW)
+                .await
+                .unwrap(),
+            Entered::Wrong(left)
+        );
+    }
+    assert_eq!(
+        wechat::enter_code(&pool, &second, "browser-1", wrong, NOW)
+            .await
+            .unwrap(),
+        Entered::Ended
+    );
+    assert_eq!(
+        wechat::sign_in_ticket(&pool, &second, NOW)
+            .await
+            .unwrap()
+            .unwrap()
+            .stage,
+        Stage::Tries
+    );
+    let third = wechat::create_sign_in(&pool, "browser-3", Purpose::Admin, None, "x", "n", NOW)
+        .await
+        .unwrap();
+    let third = third.ticket.expose_secret().to_owned();
+    wechat::lock_sign_in(&pool, &third, bobs, NOW)
+        .await
+        .unwrap();
+    assert!(
+        wechat::deny_sign_in(&pool, &third, bobs, NOW)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        wechat::sign_in_ticket(&pool, &third, NOW)
+            .await
+            .unwrap()
+            .unwrap()
+            .stage,
+        Stage::Denied
+    );
+    // Expired, then purged.
+    let fourth = wechat::create_sign_in(&pool, "browser-4", Purpose::SignIn, None, "x", "n", NOW)
+        .await
+        .unwrap();
+    let fourth = fourth.ticket.expose_secret().to_owned();
+    let expired = NOW + SIGN_IN_TTL_SECS;
+    assert_eq!(
+        wechat::sign_in_ticket(&pool, &fourth, expired)
+            .await
+            .unwrap()
+            .unwrap()
+            .stage,
+        Stage::Expired
+    );
+    assert_eq!(
+        wechat::lock_sign_in(&pool, &fourth, alices, expired)
+            .await
+            .unwrap(),
+        Locked::Expired
+    );
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wechat_sign_in_tickets")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 3);
+    wechat::purge_expired(&pool, expired + 1000).await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wechat_sign_in_tickets")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}

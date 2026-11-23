@@ -1,0 +1,46 @@
+{%- extends "card.html" -%}
+{%- block title %}{{ chrome.t.wechat_sign_in_title }}{% endblock -%}
+{%- block head %}
+{%- if reload %}
+<noscript><meta http-equiv="refresh" content="3"></noscript>
+{%- endif %}
+{%- endblock %}
+{%- block card %}
+<div data-wechat-status="/login/wechat/status" data-wechat-stage="{{ stage }}">
+{%- if let Some(qr) = qr %}
+<h1>{{ chrome.t.wechat_sign_in_title }}</h1>
+{{ qr|safe }}
+<p class="mt-18">{{ chrome.t.wechat_sign_in_lead }}</p>
+<p class="muted small mt-6">{{ chrome.t.wechat_sign_in_refresh }}</p>
+{%- else if let Some(ended) = ended %}
+<h1>{{ ended }}</h1>
+<form method="post" action="/login/wechat/restart" class="mt-20">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="next" value="{{ next }}">
+  <input type="hidden" name="purpose" value="{{ purpose }}">
+  <button class="btn primary block" type="submit">{{ chrome.t.wechat_sign_in_restart }}</button>
+</form>
+{%- else %}
+<h1>{{ chrome.t.wechat_sign_in_scanned }}</h1>
+<p class="mt-6">{{ chrome.t.wechat_sign_in_enter }}</p>
+{%- if let Some(error) = error %}
+<div class="flash bad" role="alert">{{ error }}</div>
+{%- endif %}
+<form method="post" action="/login/wechat" class="mt-18">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="next" value="{{ next }}">
+  <input type="hidden" name="purpose" value="{{ purpose }}">
+  <label class="field" for="wechat-code"><span>{{ chrome.t.wechat_sign_in_code }}</span><input id="wechat-code" type="text" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" spellcheck="false" required autofocus></label>
+  <button class="btn primary block" type="submit">{{ chrome.t.sign_in }}</button>
+</form>
+<p class="muted small mt-6">{{ chrome.t.wechat_sign_in_tries }}</p>
+<form method="post" action="/login/wechat/restart" class="mt-18">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="next" value="{{ next }}">
+  <input type="hidden" name="purpose" value="{{ purpose }}">
+  <button class="btn block" type="submit">{{ chrome.t.wechat_sign_in_not_me }}</button>
+</form>
+{%- endif %}
+<p class="muted small mt-20"><a href="{{ back }}">{{ chrome.t.wechat_sign_in_password }}</a></p>
+</div>
+{%- endblock %}

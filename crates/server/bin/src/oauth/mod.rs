@@ -1342,11 +1342,12 @@ pub struct Button {
     pub link: bool,
 }
 
-/// The buttons of the providers this server offers on a sign-in page (Google, GitHub), whose
-/// forms go on to `next`.
+/// The buttons of the providers this server offers on a sign-in page (WeChat, Google, GitHub),
+/// which go on to `next`.
 pub fn sign_in_buttons(state: &AppState, t: &Text, next: &str) -> Vec<Button> {
-    let _ = next;
-    let mut buttons = Vec::new();
+    let mut buttons: Vec<Button> = crate::wechat::sign_in::sign_in_button(state, t, next)
+        .into_iter()
+        .collect();
     if let Some(oauth) = &state.oauth {
         for provider in oauth.providers() {
             buttons.push(Button {

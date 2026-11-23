@@ -3,6 +3,8 @@
 // - Theme switch without a reload; dates in the browser's time zone.
 // - Menus (<details>) close when another one opens, on Escape and on clicks outside.
 // - Public links (S3) are copied to the clipboard instead of opened.
+// - The WeChat sign-in page asks for its status every 2 seconds and reloads when it changes,
+//   instead of reloading every 3 seconds as it does without the script.
 // - Folder pages: selection count, drag and drop of files and folders, folder upload, and an
 //   upload queue with progress. Small files are sent with one PUT; large ones in chunks
 //   (chunked upload v2 of the server), each retried after network errors, so that an
@@ -536,7 +538,32 @@
     });
   }
 
+  /** The WeChat sign-in page: reload once the sign-in moved on (scanned, ended, expired). */
+  function setupWeChatSignIn() {
+    const page = document.querySelector("[data-wechat-status]");
+    if (!page) return;
+    const url = page.getAttribute("data-wechat-status");
+    const shown = page.getAttribute("data-wechat-stage");
+    const poll = async () => {
+      try {
+        const response = await fetch(url, { credentials: "same-origin", cache: "no-store" });
+        if (response.ok) {
+          const body = await response.json();
+          if (body.stage !== shown) {
+            window.location.reload();
+            return;
+          }
+        }
+      } catch (_) {
+        // The next poll tries again.
+      }
+      window.setTimeout(poll, 2000);
+    };
+    window.setTimeout(poll, 2000);
+  }
+
   function start() {
+    setupWeChatSignIn();
     setupTheme();
     setupTimes();
     setupMenus();

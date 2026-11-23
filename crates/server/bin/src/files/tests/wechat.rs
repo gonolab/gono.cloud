@@ -23,7 +23,7 @@ use url::Url;
 use super::{ALICE_PASSWORD, Browser, Fixture, fixture};
 use crate::{
     app,
-    i18n::{EN, Lang, Text, ZH},
+    i18n::{EN, Lang, Text, ZH, fill},
     wechat::{
         MAX_BODY_BYTES, VerifyFile, WeChat,
         api::{ApiError, FakeApi, Login},
@@ -1221,4 +1221,386 @@ async fn an_account_without_a_password_fails_a_password_sign_in_as_a_wrong_passw
         assert_eq!(reply.status, StatusCode::FORBIDDEN, "{password:?}");
         assert!(reply.text().contains(t().wrong_password));
     }
+}
+
+/// The fixture with the mini program and its sign-in on the web.
+async fn with_web_sign_in() -> (Fixture, Arc<FakeApi>, Arc<WeChat>) {
+    let mut f = fixture().await;
+    let api = Arc::new(FakeApi::default());
+    let wechat = Arc::new(
+        WeChat::new(APP_ID, Url::parse(PREFIX).unwrap(), api.clone(), None).with_web_sign_in(true),
+    );
+    f.state.wechat = Some(wechat.clone());
+    (f, api, wechat)
+}
+
+/// Opens the WeChat sign-in page of `browser` at `path`: its ticket.
+async fn sign_in_ticket(browser: &mut Browser, wechat: &WeChat, path: &str) -> String {
+    let before = wechat.shown_sign_ins().tickets();
+    let page = browser.get(path).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.text());
+    let new: Vec<String> = wechat
+        .shown_sign_ins()
+        .tickets()
+        .into_iter()
+        .filter(|ticket| !before.contains(ticket))
+        .collect();
+    assert_eq!(new.len(), 1, "{}", page.text());
+    new[0].clone()
+}
+
+impl Mini {
+    async fn scan(&self, ticket: &str, code: &str) -> Answer {
+        self.post(
+            "/gono/v1/wechat/scan",
+            &json!({ "ticket": ticket, "code": code, "scene": 1011, "platform": "ios" }),
+        )
+        .await
+    }
+
+    async fn confirm(&self, ticket: &str, code: &str) -> Answer {
+        self.post(
+            "/gono/v1/wechat/confirm",
+            &json!({ "ticket": ticket, "code": code, "scene": 1011, "platform": "ios" }),
+        )
+        .await
+    }
+
+    async fn flow(&self, ticket: &str) -> Answer {
+        self.send(
+            "GET",
+            &format!("/gono/v1/wechat/flow?ticket={ticket}"),
+            &[],
+            Body::empty(),
+        )
+        .await
+    }
+}
+
+/// Enters `code` on the WeChat sign-in page of `browser`.
+async fn enter(browser: &mut Browser, code: &str, next: &str) -> super::Reply {
+    let page = browser.get("/login").await;
+    let csrf = page.field("name=\"csrf\" value=\"");
+    browser
+        .post(
+            "/login/wechat",
+            &[("csrf", &csrf), ("code", code), ("next", next)],
+        )
+        .await
+}
+
+#[tokio::test]
+async fn a_scan_and_the_digits_sign_a_browser_in() {
+    let (f, api, wechat) = with_web_sign_in().await;
+    let mini = Mini::new(&f);
+    let mut owner = Browser::new(&f.state);
+    let csrf = owner.sign_in().await;
+    bind_alice(&mut owner, &csrf, &mini, &api, &wechat).await;
+
+    let mut browser = Browser::new(&f.state);
+    let login = browser.get("/login").await.text();
+    assert!(
+        login.contains("href=\"/login/wechat?next=%2Fapps%2Ffiles%2F\""),
+        "{login}"
+    );
+    let ticket = sign_in_ticket(
+        &mut browser,
+        &wechat,
+        "/login/wechat?next=%2Fapps%2Ffiles%2F",
+    )
+    .await;
+    let page = browser
+        .get("/login/wechat?next=%2Fapps%2Ffiles%2F")
+        .await
+        .text();
+    let qr = crate::qr::svg(&format!("{PREFIX}{ticket}")).unwrap();
+    assert!(page.contains(&qr), "the QR code carries the link: {page}");
+    assert!(page.contains("<noscript><meta http-equiv=\"refresh\" content=\"3\"></noscript>"));
+    assert!(!page.contains(&ticket), "only in the QR code");
+    let status = browser.get("/login/wechat/status").await;
+    assert_eq!(status.text(), r#"{"stage":"waiting"}"#);
+    // The page shows the same ticket again while it has time left.
+    assert_eq!(
+        wechat.shown_sign_ins().tickets(),
+        std::slice::from_ref(&ticket)
+    );
+
+    // The mini program scans: the account and the browser, and the sign-in is locked.
+    api.accept("scan-1", ALICE_OPENID);
+    let scanned = mini.scan(&ticket, "scan-1").await;
+    assert_eq!(scanned.status, StatusCode::OK, "{}", scanned.json());
+    let body = scanned.json();
+    assert_eq!(body["kind"], "web_sign_in");
+    assert_eq!(body["admin"], false);
+    assert_eq!(body["account"]["username"], "alice");
+    assert_eq!(body["account"]["display_name"], "Alice Example");
+    assert_eq!(body["browser"]["same_network"], false);
+    assert_eq!(mini.flow(&ticket).await.json()["stage"], "scanned");
+    // Another WeChat finds it taken; the same one again finds it locked to itself.
+    api.accept("scan-bob", BOB_OPENID);
+    assert_eq!(
+        mini.at(9).scan(&ticket, "scan-bob").await.json()["account"],
+        Value::Null,
+        "a WeChat without an account locks nothing"
+    );
+    api.accept("scan-1b", ALICE_OPENID);
+    assert_eq!(mini.scan(&ticket, "scan-1b").await.status, StatusCode::OK);
+
+    // The browser now asks for the digits and stops reloading.
+    let page = browser
+        .get("/login/wechat?next=%2Fapps%2Ffiles%2F")
+        .await
+        .text();
+    assert!(page.contains(t().wechat_sign_in_enter), "{page}");
+    assert!(!page.contains("http-equiv=\"refresh\""), "{page}");
+    assert_eq!(
+        browser.get("/login/wechat/status").await.text(),
+        r#"{"stage":"code"}"#
+    );
+
+    // Confirmed on the phone: the digits.
+    api.accept("confirm-1", ALICE_OPENID);
+    let confirmed = mini.confirm(&ticket, "confirm-1").await;
+    assert_eq!(confirmed.status, StatusCode::OK, "{}", confirmed.json());
+    let code = confirmed.json()["enter_code"].as_str().unwrap().to_owned();
+    assert!(code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit()));
+    // Only digests are stored.
+    let stored: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT code_hash FROM wechat_sign_in_tickets WHERE code_hash IS NOT NULL",
+    )
+    .fetch_all(&f.state.db)
+    .await
+    .unwrap();
+    assert!(stored.len() == 1 && stored[0].len() == 32);
+
+    // Another browser cannot enter them: the sign-in belongs to the browser that shows it.
+    let mut stranger = Browser::new(&f.state);
+    let foreign = enter(&mut stranger, &code, "%2Fapps%2Ffiles%2F").await;
+    assert_ne!(foreign.status, StatusCode::SEE_OTHER);
+    // A wrong try counts; the right digits sign in, without a second step.
+    let wrong = if code == "000000" { "111111" } else { "000000" };
+    let refused = enter(&mut browser, wrong, "%2Fapps%2Ffiles%2F").await;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        refused
+            .text()
+            .contains(&fill(t().wechat_sign_in_wrong, &["2"]))
+    );
+    let signed = enter(&mut browser, &code, "/apps/files/").await;
+    assert_eq!(signed.status, StatusCode::SEE_OTHER, "{}", signed.text());
+    assert_eq!(signed.location(), "/apps/files/");
+    let account = browser.get("/account/").await;
+    assert_eq!(account.status, StatusCode::OK);
+    assert!(
+        !account.text().contains("id=\"tf-on-password\""),
+        "a fresh sign-in confirms"
+    );
+    assert_eq!(mini.flow(&ticket).await.json()["stage"], "done");
+    // Done is done: the digits do not sign in twice.
+    let mut again = Browser::new(&f.state);
+    assert_ne!(
+        enter(&mut again, &code, "/apps/files/").await.status,
+        StatusCode::SEE_OTHER
+    );
+}
+
+#[tokio::test]
+async fn web_sign_ins_are_refused_with_the_reason() {
+    let (f, api, wechat) = with_web_sign_in().await;
+    let mini = Mini::new(&f);
+    let mut owner = Browser::new(&f.state);
+    let csrf = owner.sign_in().await;
+    bind_alice(&mut owner, &csrf, &mini, &api, &wechat).await;
+    let mut browser = Browser::new(&f.state);
+    let ticket = sign_in_ticket(&mut browser, &wechat, "/login/wechat").await;
+
+    // The phone rule and the scene rule; the in-app scanner counts as a scan.
+    api.accept("desk", ALICE_OPENID);
+    let desktop = mini
+        .post(
+            "/gono/v1/wechat/scan",
+            &json!({ "ticket": ticket, "code": "desk", "scene": 1011, "platform": "windows" }),
+        )
+        .await;
+    assert_eq!(
+        desktop.error(),
+        (StatusCode::FORBIDDEN, "desktop_client".to_owned())
+    );
+    let forwarded = mini
+        .post(
+            "/gono/v1/wechat/scan",
+            &json!({ "ticket": ticket, "code": "desk", "scene": 1007, "platform": "ios" }),
+        )
+        .await;
+    assert_eq!(
+        forwarded.error(),
+        (StatusCode::FORBIDDEN, "wrong_scene".to_owned())
+    );
+    api.accept("in-app", ALICE_OPENID);
+    let scanner = mini
+        .post(
+            "/gono/v1/wechat/scan",
+            &json!({
+                "ticket": ticket, "code": "in-app", "scene": 1001, "platform": "android",
+                "source": "scan_code",
+            }),
+        )
+        .await;
+    assert_eq!(scanner.status, StatusCode::OK, "{}", scanner.json());
+
+    // Another WeChat with an account finds it taken, and cannot confirm or deny it.
+    let carol = add_user(&f, "carol").await;
+    insert_identity(&f, carol, "oCarol").await;
+    api.accept("carol-scan", "oCarol");
+    assert_eq!(
+        mini.at(3).scan(&ticket, "carol-scan").await.error(),
+        (StatusCode::CONFLICT, "ticket_taken".to_owned())
+    );
+    api.accept("carol-confirm", "oCarol");
+    assert_eq!(
+        mini.at(3).confirm(&ticket, "carol-confirm").await.error(),
+        (StatusCode::FORBIDDEN, "not_permitted".to_owned())
+    );
+
+    // Denied on the phone: the browser says so and starts over on request.
+    api.accept("deny", ALICE_OPENID);
+    let denied = mini
+        .post(
+            "/gono/v1/wechat/deny",
+            &json!({ "ticket": ticket, "code": "deny", "scene": 1011, "platform": "ios" }),
+        )
+        .await;
+    assert_eq!(denied.status, StatusCode::NO_CONTENT);
+    assert_eq!(mini.flow(&ticket).await.json()["stage"], "denied");
+    let page = browser.get("/login/wechat").await;
+    assert!(
+        page.text().contains(t().wechat_sign_in_denied),
+        "{}",
+        page.text()
+    );
+    let csrf = page.field("name=\"csrf\" value=\"");
+    let restarted = browser
+        .post("/login/wechat/restart", &[("csrf", &csrf), ("next", "")])
+        .await;
+    assert_eq!(restarted.status, StatusCode::SEE_OTHER);
+    let second = sign_in_ticket(&mut browser, &wechat, "/login/wechat").await;
+    assert_ne!(second, ticket);
+    api.accept("late", ALICE_OPENID);
+    assert_eq!(
+        mini.scan(&ticket, "late").await.error(),
+        (StatusCode::GONE, "ticket_expired".to_owned())
+    );
+
+    // Three wrong tries end it.
+    api.accept("s2", ALICE_OPENID);
+    mini.scan(&second, "s2").await;
+    api.accept("c2", ALICE_OPENID);
+    let code = mini.confirm(&second, "c2").await.json()["enter_code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let wrong = if code == "000000" { "111111" } else { "000000" };
+    for _ in 0..2 {
+        assert_eq!(
+            enter(&mut browser, wrong, "").await.status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+    let ended = enter(&mut browser, wrong, "").await;
+    assert_eq!(ended.status, StatusCode::FORBIDDEN);
+    assert!(ended.text().contains(t().wechat_sign_in_tries_out));
+    let after = enter(&mut browser, &code, "").await;
+    assert_eq!(after.status, StatusCode::OK, "nothing to enter any more");
+    assert!(after.text().contains(t().wechat_sign_in_tries_out));
+    assert_eq!(mini.flow(&second).await.json()["stage"], "tries");
+
+    // A disabled account's WeChat signs in nowhere.
+    let third = {
+        let mut fresh = Browser::new(&f.state);
+        sign_in_ticket(&mut fresh, &wechat, "/login/wechat").await
+    };
+    users::set_enabled(&f.state.db, &Username::new("alice").unwrap(), false)
+        .await
+        .unwrap();
+    api.accept("s3", ALICE_OPENID);
+    assert_eq!(
+        mini.at(4).scan(&third, "s3").await.error(),
+        (StatusCode::FORBIDDEN, "account_disabled".to_owned())
+    );
+    // Unknown tickets.
+    assert_eq!(
+        mini.at(5).flow(&"x".repeat(22)).await.error(),
+        (StatusCode::GONE, "ticket_expired".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn without_web_sign_in_nothing_answers() {
+    let (f, api, _) = with_wechat(None).await;
+    let mut browser = Browser::new(&f.state);
+    assert!(!browser.get("/login").await.text().contains("/login/wechat"));
+    assert_eq!(
+        browser.get("/login/wechat").await.status,
+        StatusCode::NOT_FOUND
+    );
+    let mini = Mini::new(&f);
+    api.accept("x", ALICE_OPENID);
+    assert_eq!(
+        mini.scan(&"a".repeat(22), "x").await.error(),
+        (StatusCode::NOT_FOUND, "not_found".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn an_account_confirms_it_is_you_with_a_scan() {
+    let (f, api, wechat) = with_web_sign_in().await;
+    let mini = Mini::new(&f);
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+    bind_alice(&mut browser, &csrf, &mini, &api, &wechat).await;
+    // Another browser session, not confirmed, of an account without a password.
+    let mut other = Browser::new(&f.state);
+    other.sign_in().await;
+    sqlx::query("UPDATE users SET password_hash = NULL WHERE username = 'alice'")
+        .execute(&f.state.db)
+        .await
+        .unwrap();
+    let confirm = other.get("/account/identities/wechat/unbind").await.text();
+    let link =
+        "href=\"/login/wechat?purpose=reauth&#38;next=%2Faccount%2Fidentities%2Fwechat%2Funbind\"";
+    assert!(confirm.contains(link), "{confirm}");
+    let path = "/login/wechat?purpose=reauth&next=%2Faccount%2Fidentities%2Fwechat%2Funbind";
+    let ticket = sign_in_ticket(&mut other, &wechat, path).await;
+    // Another account's WeChat may not confirm it.
+    let carol = add_user(&f, "carol").await;
+    insert_identity(&f, carol, "oCarol").await;
+    api.accept("carol", "oCarol");
+    assert_eq!(
+        mini.at(3).scan(&ticket, "carol").await.error(),
+        (StatusCode::FORBIDDEN, "not_permitted".to_owned())
+    );
+    api.accept("scan", ALICE_OPENID);
+    assert_eq!(mini.scan(&ticket, "scan").await.json()["kind"], "reauth");
+    api.accept("confirm", ALICE_OPENID);
+    let code = mini.confirm(&ticket, "confirm").await.json()["enter_code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let page = other.get(path).await;
+    let csrf = page.field("name=\"csrf\" value=\"");
+    let confirmed = other
+        .post(
+            "/login/wechat",
+            &[
+                ("csrf", &csrf),
+                ("code", &code),
+                ("next", "/account/identities/wechat/unbind"),
+                ("purpose", "reauth"),
+            ],
+        )
+        .await;
+    assert_eq!(confirmed.location(), "/account/identities/wechat/unbind");
+    // Confirmed now, the unbind page asks for nothing more (and refuses the last way in).
+    let page = other.get("/account/identities/wechat/unbind").await.text();
+    assert!(!page.contains("/login/wechat?purpose=reauth"), "{page}");
 }

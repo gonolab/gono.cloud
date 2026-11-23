@@ -13,6 +13,7 @@
 <link rel="stylesheet" href="{{ chrome.style }}">
 <script src="{{ chrome.script }}" nonce="{{ chrome.nonce }}" defer></script>
 <script type="application/json" id="gono-text" nonce="{{ chrome.nonce }}">{{ chrome.script_text|safe }}</script>
+{%- block head %}{% endblock %}
 </head>
 <body>
 <a class="skip-link" href="#main">{{ chrome.t.skip }}</a>

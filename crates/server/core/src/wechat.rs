@@ -501,13 +501,15 @@ pub async fn logout(pool: &Pool, app_id: &str, token: &str) -> Result<bool> {
     Ok(deleted)
 }
 
-/// Removes the tickets and sessions that expired at `now`. Returns how many there were. The
-/// signup tokens are pending identities, which [`crate::identities::purge_expired`] removes.
+/// Removes the bind and sign-in tickets and the sessions that expired at `now`. Returns how many
+/// there were. The signup tokens are pending identities, which
+/// [`crate::identities::purge_expired`] removes.
 pub async fn purge_expired(pool: &Pool, now: i64) -> Result<u64> {
     let mut tx = db::begin_immediate(pool).await?;
     let mut purged = 0;
     for sql in [
         "DELETE FROM wechat_bind_tickets WHERE expires_at <= ?",
+        "DELETE FROM wechat_sign_in_tickets WHERE expires_at <= ?",
         "DELETE FROM mp_sessions WHERE expires_at <= ?",
     ] {
         purged += sqlx::query(sql)
@@ -518,6 +520,464 @@ pub async fn purge_expired(pool: &Pool, now: i64) -> Result<u64> {
     }
     tx.commit().await?;
     Ok(purged)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Signing in on the web (`wechat_sign_in_tickets`)
+// ---------------------------------------------------------------------------------------------
+
+/// How long a sign-in ticket waits for its scan, and each later stage for the next, in seconds.
+pub const SIGN_IN_TTL_SECS: i64 = 2 * 60;
+
+/// How long the 6 digits of a sign-in are valid, in seconds.
+pub const CODE_TTL_SECS: i64 = 2 * 60;
+
+/// Tries the 6 digits of a sign-in take; the last wrong one ends the sign-in.
+pub const CODE_TRIES: i64 = 3;
+
+/// Digits the phone shows.
+pub const CODE_DIGITS: usize = 6;
+
+/// What a sign-in ticket is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    /// Signing in on a sign-in page.
+    SignIn,
+    /// Signing in to the admin UI: admin accounts only.
+    Admin,
+    /// Confirming it is the user of an account, on its account page.
+    Reauth,
+}
+
+impl Purpose {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SignIn => "sign_in",
+            Self::Admin => "admin",
+            Self::Reauth => "reauth",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "admin" => Self::Admin,
+            "reauth" => Self::Reauth,
+            _ => Self::SignIn,
+        }
+    }
+}
+
+/// Where a sign-in is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Waiting for a scan.
+    Waiting,
+    /// Scanned: locked to a WeChat identity, waiting for its confirmation on the phone.
+    Scanned,
+    /// Confirmed: the phone shows the digits, which the browser is to enter.
+    Code,
+    /// The browser signed in.
+    Done,
+    /// The phone cancelled it.
+    Denied,
+    /// The digits were entered wrong too often.
+    Tries,
+    /// Its time ran out.
+    Expired,
+}
+
+impl Stage {
+    /// How the mini program's `flow` and the page's status name it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Scanned => "scanned",
+            Self::Code => "code",
+            Self::Done => "done",
+            Self::Denied => "denied",
+            Self::Tries => "tries",
+            Self::Expired => "expired",
+        }
+    }
+
+    /// Whether the sign-in ended without signing in.
+    pub fn ended(self) -> bool {
+        matches!(self, Self::Denied | Self::Tries | Self::Expired)
+    }
+}
+
+/// A sign-in ticket as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignInTicket {
+    /// Row id.
+    pub id: i64,
+    /// What it is for.
+    pub purpose: Purpose,
+    /// The account of a confirmation ([`Purpose::Reauth`]).
+    pub user_id: Option<i64>,
+    /// The browser's name.
+    pub browser_name: String,
+    /// The browser's network.
+    pub browser_net: String,
+    /// Where it is; [`Stage::Expired`] once its time ran out.
+    pub stage: Stage,
+    /// The identity it is locked to.
+    pub identity_id: Option<i64>,
+    /// When the digits end.
+    pub code_expires_at: Option<i64>,
+    /// Tries left for the digits.
+    pub tries_left: i64,
+    /// When it ends.
+    pub expires_at: i64,
+}
+
+#[derive(FromRow)]
+struct SignInRow {
+    id: i64,
+    purpose: String,
+    user_id: Option<i64>,
+    browser_name: String,
+    browser_net: String,
+    stage: String,
+    ended: Option<String>,
+    identity_id: Option<i64>,
+    code_expires_at: Option<i64>,
+    tries_left: i64,
+    expires_at: i64,
+}
+
+impl SignInRow {
+    fn into_ticket(self, now: i64) -> SignInTicket {
+        let stage = match (self.stage.as_str(), self.ended.as_deref()) {
+            ("done", _) => Stage::Done,
+            (_, Some("denied")) => Stage::Denied,
+            (_, Some(_)) => Stage::Tries,
+            _ if self.expires_at <= now => Stage::Expired,
+            ("scanned", _) => Stage::Scanned,
+            ("code", _) => Stage::Code,
+            _ => Stage::Waiting,
+        };
+        SignInTicket {
+            id: self.id,
+            purpose: Purpose::parse(&self.purpose),
+            user_id: self.user_id,
+            browser_name: self.browser_name,
+            browser_net: self.browser_net,
+            stage,
+            identity_id: self.identity_id,
+            code_expires_at: self.code_expires_at,
+            tries_left: self.tries_left,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+const SIGN_IN_COLUMNS: &str = "id, purpose, user_id, browser_name, browser_net, stage, ended, \
+                               identity_id, code_expires_at, tries_left, expires_at";
+
+/// The digest of the digits `code` of `ticket`: only the holder of the ticket (the server, in
+/// memory, for the browser that shows it) can compute it, so a copy of the database does not
+/// give the digits away.
+fn code_digest(ticket: &str, code: &str) -> [u8; 32] {
+    secret::digest(&format!("gono-wechat-code\0{ticket}\0{code}"))
+}
+
+/// Six random digits.
+fn new_code() -> String {
+    use rand::RngExt as _;
+    format!("{:06}", rand::rng().random_range(0..1_000_000u32))
+}
+
+/// Makes a sign-in ticket for the browser whose cookie is `browser`, and ends its earlier ones.
+/// `user_id` is the account of a [`Purpose::Reauth`]. Returns the ticket (once) and when it
+/// ends.
+pub async fn create_sign_in(
+    pool: &Pool,
+    browser: &str,
+    purpose: Purpose,
+    user_id: Option<i64>,
+    browser_name: &str,
+    browser_net: &str,
+    now: i64,
+) -> Result<Ticket> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let browser_hash = secret::digest(browser);
+    sqlx::query("DELETE FROM wechat_sign_in_tickets WHERE browser_hash = ?")
+        .bind(&browser_hash[..])
+        .execute(&mut *tx)
+        .await?;
+    let ticket = secret::random_token(TICKET_CHARS);
+    let expires_at = now.saturating_add(SIGN_IN_TTL_SECS);
+    let id = db::next_id(&mut tx, "wechat_sign_in_tickets").await?;
+    let name: String = browser_name.chars().take(64).collect();
+    sqlx::query(
+        "INSERT INTO wechat_sign_in_tickets (id, ticket_hash, browser_hash, purpose, user_id, \
+         browser_name, browser_net, stage, tries_left, created_at, expires_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(&secret::digest(ticket.expose_secret())[..])
+    .bind(&browser_hash[..])
+    .bind(purpose.as_str())
+    .bind(user_id.filter(|_| purpose == Purpose::Reauth))
+    .bind(name)
+    .bind(browser_net)
+    .bind(CODE_TRIES)
+    .bind(now)
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Ticket { ticket, expires_at })
+}
+
+/// The sign-in ticket `ticket`, if one was made, whatever its stage.
+pub async fn sign_in_ticket(pool: &Pool, ticket: &str, now: i64) -> Result<Option<SignInTicket>> {
+    let sql = format!("SELECT {SIGN_IN_COLUMNS} FROM wechat_sign_in_tickets WHERE ticket_hash = ?");
+    let row: Option<SignInRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(&secret::digest(ticket)[..])
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|row| row.into_ticket(now)))
+}
+
+/// The sign-in ticket `ticket` of the browser whose cookie is `browser`.
+pub async fn browser_sign_in(
+    pool: &Pool,
+    ticket: &str,
+    browser: &str,
+    now: i64,
+) -> Result<Option<SignInTicket>> {
+    let sql = format!(
+        "SELECT {SIGN_IN_COLUMNS} FROM wechat_sign_in_tickets \
+         WHERE ticket_hash = ? AND browser_hash = ?"
+    );
+    let row: Option<SignInRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(&secret::digest(ticket)[..])
+        .bind(&secret::digest(browser)[..])
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|row| row.into_ticket(now)))
+}
+
+/// Outcome of [`lock_sign_in`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Locked {
+    /// Locked to the identity (or already to it); it has [`SIGN_IN_TTL_SECS`] from now.
+    Locked(SignInTicket),
+    /// Another identity scanned it first.
+    Taken,
+    /// Unknown, ended, done or expired.
+    Expired,
+}
+
+/// Locks the live sign-in ticket `ticket` to WeChat identity `identity_id`, which scanned it.
+pub async fn lock_sign_in(pool: &Pool, ticket: &str, identity_id: i64, now: i64) -> Result<Locked> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let sql = format!("SELECT {SIGN_IN_COLUMNS} FROM wechat_sign_in_tickets WHERE ticket_hash = ?");
+    let row: Option<SignInRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(&secret::digest(ticket)[..])
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(found) = row.map(|row| row.into_ticket(now)) else {
+        return Ok(Locked::Expired);
+    };
+    match found.stage {
+        Stage::Waiting => {}
+        Stage::Scanned | Stage::Code if found.identity_id == Some(identity_id) => {
+            return Ok(Locked::Locked(found));
+        }
+        Stage::Scanned | Stage::Code => return Ok(Locked::Taken),
+        _ => return Ok(Locked::Expired),
+    }
+    let expires_at = now.saturating_add(SIGN_IN_TTL_SECS);
+    sqlx::query(
+        "UPDATE wechat_sign_in_tickets SET stage = 'scanned', identity_id = ?, expires_at = ? \
+         WHERE id = ?",
+    )
+    .bind(identity_id)
+    .bind(expires_at)
+    .bind(found.id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Locked::Locked(SignInTicket {
+        stage: Stage::Scanned,
+        identity_id: Some(identity_id),
+        expires_at,
+        ..found
+    }))
+}
+
+/// Shows the digits of the sign-in ticket `ticket`, locked to `identity_id`, on its phone: new
+/// ones, valid for [`CODE_TTL_SECS`] and [`CODE_TRIES`] tries. `None` if the ticket is not
+/// locked to that identity or has ended.
+pub async fn issue_code(
+    pool: &Pool,
+    ticket: &str,
+    identity_id: i64,
+    now: i64,
+) -> Result<Option<(String, i64)>> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let code = new_code();
+    let expires_at = now.saturating_add(CODE_TTL_SECS);
+    let issued = sqlx::query(
+        "UPDATE wechat_sign_in_tickets SET stage = 'code', code_hash = ?, code_expires_at = ?, \
+         tries_left = ?, expires_at = ? WHERE ticket_hash = ? AND identity_id = ? \
+         AND stage IN ('scanned', 'code') AND expires_at > ?",
+    )
+    .bind(&code_digest(ticket, &code)[..])
+    .bind(expires_at)
+    .bind(CODE_TRIES)
+    .bind(expires_at)
+    .bind(&secret::digest(ticket)[..])
+    .bind(identity_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    tx.commit().await?;
+    Ok(issued.then_some((code, expires_at)))
+}
+
+/// Ends the sign-in ticket `ticket` as the phone of `identity_id` cancelled it. Returns `false`
+/// if it is not locked to that identity or has ended.
+pub async fn deny_sign_in(pool: &Pool, ticket: &str, identity_id: i64, now: i64) -> Result<bool> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let denied = sqlx::query(
+        "UPDATE wechat_sign_in_tickets SET stage = 'ended', ended = 'denied', code_hash = NULL, \
+         code_expires_at = NULL WHERE ticket_hash = ? AND identity_id = ? \
+         AND stage IN ('scanned', 'code') AND expires_at > ?",
+    )
+    .bind(&secret::digest(ticket)[..])
+    .bind(identity_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    tx.commit().await?;
+    Ok(denied)
+}
+
+/// Outcome of [`enter_code`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Entered {
+    /// The digits are right: the sign-in is done, by this identity.
+    Right(SignInTicket),
+    /// Wrong, with tries left.
+    Wrong(i64),
+    /// Wrong for the last time: the sign-in ended.
+    Ended,
+    /// No digits wait for this browser: not confirmed yet, ended or expired.
+    NoCode,
+}
+
+/// Checks the digits `code` that the browser whose cookie is `browser` entered for its sign-in
+/// ticket `ticket`. Each try counts before the comparison; the right digits finish the sign-in
+/// (once).
+pub async fn enter_code(
+    pool: &Pool,
+    ticket: &str,
+    browser: &str,
+    code: &str,
+    now: i64,
+) -> Result<Entered> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let sql = format!(
+        "SELECT {SIGN_IN_COLUMNS}, code_hash FROM wechat_sign_in_tickets \
+         WHERE ticket_hash = ? AND browser_hash = ?"
+    );
+    #[derive(FromRow)]
+    struct Row {
+        #[sqlx(flatten)]
+        ticket: SignInRow,
+        code_hash: Option<Vec<u8>>,
+    }
+    let row: Option<Row> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(&secret::digest(ticket)[..])
+        .bind(&secret::digest(browser)[..])
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(row) = row else {
+        return Ok(Entered::NoCode);
+    };
+    let stored = row.code_hash;
+    let found = row.ticket.into_ticket(now);
+    let live = found.stage == Stage::Code
+        && found.tries_left > 0
+        && found.code_expires_at.is_some_and(|until| until > now);
+    let Some(stored) = stored.filter(|_| live) else {
+        return Ok(Entered::NoCode);
+    };
+    let right = code.len() == CODE_DIGITS
+        && code.bytes().all(|b| b.is_ascii_digit())
+        && secret::constant_time_eq(&stored, &code_digest(ticket, code));
+    if right {
+        sqlx::query(
+            "UPDATE wechat_sign_in_tickets SET stage = 'done', code_hash = NULL, \
+             code_expires_at = NULL WHERE id = ?",
+        )
+        .bind(found.id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(Entered::Right(SignInTicket {
+            stage: Stage::Done,
+            ..found
+        }));
+    }
+    let left = found.tries_left - 1;
+    if left > 0 {
+        sqlx::query("UPDATE wechat_sign_in_tickets SET tries_left = ? WHERE id = ?")
+            .bind(left)
+            .bind(found.id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(Entered::Wrong(left));
+    }
+    sqlx::query(
+        "UPDATE wechat_sign_in_tickets SET tries_left = 0, stage = 'ended', ended = 'tries', \
+         code_hash = NULL, code_expires_at = NULL WHERE id = ?",
+    )
+    .bind(found.id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Entered::Ended)
+}
+
+/// Ends the sign-in tickets of the browser whose cookie is `browser`.
+pub async fn end_browser_sign_ins(pool: &Pool, browser: &str) -> Result<()> {
+    let mut tx = db::begin_immediate(pool).await?;
+    sqlx::query("DELETE FROM wechat_sign_in_tickets WHERE browser_hash = ?")
+        .bind(&secret::digest(browser)[..])
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The WeChat identity `identity_id` with its account, as a sign-in finds it: its openid must
+/// be `openid` (the WeChat user that asks now).
+pub async fn identity_of(
+    pool: &Pool,
+    identity_id: i64,
+    app_id: &str,
+    openid: &str,
+) -> Result<bool> {
+    let found: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM external_identities WHERE id = ? AND provider = 'wechat' AND realm = ? \
+         AND subject = ?",
+    )
+    .bind(identity_id)
+    .bind(app_id)
+    .bind(openid)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.is_some())
 }
 
 #[cfg(test)]

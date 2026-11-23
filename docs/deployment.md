@@ -560,6 +560,7 @@ verify_file = "/etc/gono-cloud/AbCdEf1234.txt"
 | `app_id` | The mini program's AppID, `wx` and 16 letters or digits, as its console shows it. Changing it later starts over: the bindings and sessions of the previous AppID no longer count, although the admin UI still lists those bindings on each account's page. |
 | `secret_file` | The file that holds the AppSecret (the first line; relative paths start in the directory of `config.toml`). The AppSecret never goes into `config.toml`; `config check` names the file and whether it exists, never the secret, and `serve` reads it when it starts and refuses to start without it or with an empty one. It warns when others can read the file. |
 | `qr_url_prefix` | The prefix of the QR links, exactly as the console's rule has it: an `https://` URL ending in `/`, without credentials, query or fragment, at most 200 bytes. Binding links are `<prefix>bind/<ticket>`. Its host may differ from `base_url`'s. |
+| `web_sign_in` | Optional, `false` by default. The sign-in pages (`/login`, the Login Flow v2 page, `/manage/login`) offer "Scan with WeChat": a QR code that the mini program scans and confirms, after which the phone shows 6 digits that the user types into the browser. Turn it on once the mini program has its page that confirms web sign-ins ([wechat-miniprogram.md](wechat-miniprogram.md#signing-in-on-the-web-scan-confirm-deny-flow)). |
 | `verify_file` | Optional. WeChat's verification file for the rule, served at `/<its file name>` with its exact content as `text/plain`, and nowhere else. Its name must be letters, digits, `-`, `_` and `.`, ending in `.txt`, as WeChat names it; it is read when `serve` starts (at most 4 KiB). Leave it unset to serve the file another way. |
 
 `config check` validates the table and warns when `files_ui` is off (the panel that binds is on
@@ -589,8 +590,15 @@ What users see:
   `account_page`, `admin` or `cli`) with the AppID, never the openid. The admin UI lists each
   account's identities with when they were bound and last used, and unbinds them; so do
   `gono-cloud user identities` and `user unlink`.
-- **Limits.** `session` and `bind` of the mini program are limited per client address like the
-  sign-in pages: failures count, successful sign-ins do not.
+- **Signing in on the web** (`web_sign_in`). The sign-in page shows a QR code for this browser,
+  valid for 2 minutes and renewed while the page is open; it reloads every 3 seconds without
+  JavaScript. Scanned and confirmed in the mini program, the phone shows 6 digits, valid for 2
+  minutes and 3 tries, which the user types into the browser: a QR code forwarded from someone
+  else's browser signs in nothing. It signs in without two-step verification, like every
+  third-party sign-in; the admin UI admits admin accounts only. The account page confirms it is
+  you the same way. Wrong digits count against the browser's address like failed sign-ins.
+- **Limits.** `session`, `bind`, `scan`, `confirm` and `deny` of the mini program are limited
+  per client address like the sign-in pages: failures count, successful calls do not.
 
 ## Google and GitHub sign-in
 

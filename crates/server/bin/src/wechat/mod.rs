@@ -7,6 +7,10 @@
 //! | `POST /gono/v1/wechat/bind` | Binds the openid of a signup token to the account of a bind ticket from the account page, and opens a session. |
 //! | `GET /gono/v1/wechat/account` | The name and services of the session's account (`Authorization: Bearer <session>`). |
 //! | `POST /gono/v1/wechat/logout` | Ends the session. |
+//! | `POST /gono/v1/wechat/scan` | With `[wechat] web_sign_in`: the WeChat that scanned the QR code of a sign-in page (`{qr_url_prefix}<ticket>`) locks the sign-in, and learns which account and browser it is for. |
+//! | `POST /gono/v1/wechat/confirm` | The same WeChat confirms: the answer holds the 6 digits to type into the browser. |
+//! | `POST /gono/v1/wechat/deny` | The same WeChat cancels the sign-in. |
+//! | `GET /gono/v1/wechat/flow?ticket=` | Where the sign-in is: `waiting`, `scanned`, `code`, `done`, `denied`, `tries`, `expired`. |
 //! | `GET /q/<anything>` | A page that says to scan the QR code with WeChat, for whoever opens a QR link in a browser. It starts nothing. |
 //! | `GET /<verify file name>` | The verification file of `wechat.verify_file`, as it is. |
 //!
@@ -41,6 +45,7 @@
 //!   redacted by [`crate::request_log`]); lines name the account instead.
 
 pub mod api;
+pub mod sign_in;
 
 use std::{
     collections::HashMap,
@@ -62,8 +67,10 @@ use axum::{
 use gono_server_core::{
     config::{WeChatConfig, verify_file_name},
     db,
+    identities::{self, Provider},
+    users,
     web_sessions::SessionUser,
-    wechat::{self as store, Account, Bind, Lookup, NewSession, SignIn},
+    wechat::{self as store, Account, Bind, Locked, Lookup, NewSession, Purpose, SignIn, Stage},
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -169,6 +176,10 @@ pub struct WeChat {
     verify: Option<VerifyFile>,
     /// Shown bind tickets by the id of the browser session that made them.
     shown: Mutex<HashMap<i64, Shown>>,
+    /// `[wechat] web_sign_in`: the sign-in pages offer scanning.
+    web_sign_in: bool,
+    /// The sign-in tickets the browsers show.
+    sign_ins: sign_in::Shown,
 }
 
 /// Reads the AppSecret of `wechat.secret_file`: its first line, without the line break.
@@ -199,7 +210,31 @@ impl WeChat {
             limiter: RateLimiter::new(),
             verify,
             shown: Mutex::new(HashMap::new()),
+            web_sign_in: false,
+            sign_ins: sign_in::Shown::default(),
         }
+    }
+
+    /// The same, with signing in on the web by scanning when `on`.
+    #[must_use]
+    pub fn with_web_sign_in(mut self, on: bool) -> Self {
+        self.web_sign_in = on;
+        self
+    }
+
+    /// Whether the sign-in pages offer scanning (`[wechat] web_sign_in`).
+    pub fn web_sign_in(&self) -> bool {
+        self.web_sign_in
+    }
+
+    /// The sign-in tickets the browsers show.
+    pub(crate) fn shown_sign_ins(&self) -> &sign_in::Shown {
+        &self.sign_ins
+    }
+
+    /// The link of a sign-in ticket, which its QR code carries: `<prefix><ticket>`.
+    pub fn sign_in_link(&self, ticket: &str) -> String {
+        format!("{}{ticket}", self.qr_url_prefix)
     }
 
     /// The mini program of `config` (validated, enabled). Reads the AppSecret and the
@@ -223,7 +258,7 @@ impl WeChat {
             .as_deref()
             .map(VerifyFile::read)
             .transpose()?;
-        Ok(Self::new(app_id, prefix, Arc::new(api), verify))
+        Ok(Self::new(app_id, prefix, Arc::new(api), verify).with_web_sign_in(config.web_sign_in))
     }
 
     /// The mini program's AppID.
@@ -344,6 +379,13 @@ pub fn routes(wechat: Option<&WeChat>) -> Router<AppState> {
                 &format!("{API_PATH}/logout"),
                 post(logout).fallback(not_found),
             )
+            .route(&format!("{API_PATH}/scan"), post(scan).fallback(not_found))
+            .route(
+                &format!("{API_PATH}/confirm"),
+                post(confirm).fallback(not_found),
+            )
+            .route(&format!("{API_PATH}/deny"), post(deny).fallback(not_found))
+            .route(&format!("{API_PATH}/flow"), get(flow).fallback(not_found))
             .route(QR_PATH, get(scan_page))
             .route(&format!("{QR_PATH}{{*rest}}"), get(scan_page));
         if let Some(name) = wechat.verify_file_name() {
@@ -696,6 +738,324 @@ pub async fn logout(
             tracing::error!(error = %err, "cannot end a mini program session");
             unavailable()
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct ScanRequest {
+    ticket: String,
+    code: String,
+    #[serde(default)]
+    scene: u32,
+    platform: String,
+    /// `scan_code` for the in-app scanner (`wx.scanCode({onlyFromCamera: true})`), whose scene
+    /// is not a scan's.
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// [`check_client`] that takes the in-app scanner as a scan.
+fn check_scan(request: &ScanRequest) -> Result<(), Box<Response>> {
+    if !PLATFORMS.contains(&request.platform.as_str()) {
+        return Err(Box::new(error(StatusCode::FORBIDDEN, "desktop_client")));
+    }
+    match request.source.as_deref() {
+        None | Some("enter") => check_client(request.scene, &request.platform),
+        Some("scan_code") => Ok(()),
+        Some(_) => Err(Box::new(bad_request())),
+    }
+}
+
+/// What a sign-in mini program call found: the WeChat that asks, bound to an account.
+struct Asking {
+    request: ScanRequest,
+    openid: String,
+}
+
+/// Parses and checks a request of `scan`, `confirm` or `deny`, and asks WeChat whose code it
+/// carries.
+async fn asking(
+    wechat: &WeChat,
+    client: IpAddr,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Asking, Box<Response>> {
+    if !wechat.web_sign_in {
+        return Err(Box::new(error(StatusCode::NOT_FOUND, "not_found")));
+    }
+    let request: ScanRequest = parse(body)?;
+    if !store::is_ticket(&request.ticket) || !is_code(&request.code) {
+        return Err(Box::new(bad_request()));
+    }
+    check_scan(&request)?;
+    let openid = match wechat.api.code_to_session(&request.code).await {
+        Ok(login) => login.openid,
+        Err(ApiError::InvalidCode) => {
+            return Err(Box::new(error(StatusCode::BAD_REQUEST, "code_invalid")));
+        }
+        Err(ApiError::RiskyUser) => {
+            return Err(Box::new(error(StatusCode::FORBIDDEN, "risky_user")));
+        }
+        Err(ApiError::RateLimited) => {
+            tracing::warn!(%client, "WeChat's rate limit refused a web sign-in");
+            return Err(Box::new(rate_limited(WECHAT_RETRY_AFTER)));
+        }
+        Err(ApiError::Failed(why)) => {
+            tracing::warn!(%client, error = %why, "cannot exchange a mini program's sign-in code with WeChat");
+            return Err(Box::new(unavailable()));
+        }
+    };
+    Ok(Asking { request, openid })
+}
+
+/// The answer to a database failure of a sign-in call.
+fn failed(err: &gono_server_core::Error) -> Response {
+    tracing::error!(error = %err, "a WeChat sign-in on the web failed");
+    unavailable()
+}
+
+/// `POST /gono/v1/wechat/scan`.
+pub async fn scan(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let wechat = match wechat_of(&state) {
+        Ok(wechat) => wechat,
+        Err(response) => return *response,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    if let Err(response) = wechat.admit(client) {
+        return *response;
+    }
+    let response = scan_with(&state, &wechat, client, body).await;
+    wechat.charge(client, response)
+}
+
+async fn scan_with(
+    state: &AppState,
+    wechat: &WeChat,
+    client: IpAddr,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let Asking { request, openid } = match asking(wechat, client, body).await {
+        Ok(asking) => asking,
+        Err(response) => return *response,
+    };
+    let now = db::unix_now();
+    let ticket = match store::sign_in_ticket(&state.db, &request.ticket, now).await {
+        Ok(Some(ticket)) if !ticket.stage.ended() && ticket.stage != Stage::Done => ticket,
+        Ok(_) => return error(StatusCode::GONE, "ticket_expired"),
+        Err(err) => return failed(&err),
+    };
+    let kind = match ticket.purpose {
+        Purpose::Reauth => "reauth",
+        Purpose::SignIn | Purpose::Admin => "web_sign_in",
+    };
+    let browser = serde_json::json!({
+        "name": ticket.browser_name,
+        "same_network": gono_server_core::email::client_net(client) == ticket.browser_net,
+    });
+    let identity =
+        match identities::find(&state.db, Provider::WeChat, &wechat.app_id, &openid).await {
+            Ok(identity) => identity,
+            Err(err) => return failed(&err),
+        };
+    let Some(identity) = identity else {
+        // This WeChat has no account: the mini program says how to bind it. Nothing is locked.
+        return json(
+            StatusCode::OK,
+            &serde_json::json!({
+                "kind": kind,
+                "admin": ticket.purpose == Purpose::Admin,
+                "account": null,
+                "browser": browser,
+                "expires_at": ticket.expires_at,
+            }),
+        );
+    };
+    let user = match users::by_id(&state.db, identity.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return error(StatusCode::GONE, "ticket_expired"),
+        Err(err) => return failed(&err),
+    };
+    if let Some(until) = user.deleting_at {
+        return json(
+            StatusCode::CONFLICT,
+            &serde_json::json!({ "error": "deletion_pending", "until": until }),
+        );
+    }
+    if !user.enabled {
+        return error(StatusCode::FORBIDDEN, "account_disabled");
+    }
+    let permitted = match ticket.purpose {
+        Purpose::SignIn => true,
+        Purpose::Admin => user.is_admin,
+        Purpose::Reauth => ticket.user_id == Some(user.id),
+    };
+    if !permitted {
+        return error(StatusCode::FORBIDDEN, "not_permitted");
+    }
+    match store::lock_sign_in(&state.db, &request.ticket, identity.id, now).await {
+        Ok(Locked::Locked(locked)) => {
+            tracing::info!(%client, user = %user.username, "a WeChat scanned a sign-in on the web");
+            json(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "kind": kind,
+                    "admin": ticket.purpose == Purpose::Admin,
+                    "account": {
+                        "username": user.username.as_str(),
+                        "display_name": user.display_name,
+                    },
+                    "browser": browser,
+                    "expires_at": locked.expires_at,
+                }),
+            )
+        }
+        Ok(Locked::Taken) => error(StatusCode::CONFLICT, "ticket_taken"),
+        Ok(Locked::Expired) => error(StatusCode::GONE, "ticket_expired"),
+        Err(err) => failed(&err),
+    }
+}
+
+/// The identity of `openid` that locked the sign-in of `ticket`, or the answer to refuse with.
+async fn locker(
+    state: &AppState,
+    wechat: &WeChat,
+    ticket: &str,
+    openid: &str,
+    now: i64,
+) -> Result<i64, Box<Response>> {
+    let found = store::sign_in_ticket(&state.db, ticket, now)
+        .await
+        .map_err(|err| Box::new(failed(&err)))?;
+    let Some(identity_id) = found
+        .filter(|found| matches!(found.stage, Stage::Scanned | Stage::Code))
+        .and_then(|found| found.identity_id)
+    else {
+        return Err(Box::new(error(StatusCode::GONE, "ticket_expired")));
+    };
+    match store::identity_of(&state.db, identity_id, &wechat.app_id, openid).await {
+        Ok(true) => Ok(identity_id),
+        Ok(false) => Err(Box::new(error(StatusCode::FORBIDDEN, "not_permitted"))),
+        Err(err) => Err(Box::new(failed(&err))),
+    }
+}
+
+/// `POST /gono/v1/wechat/confirm`: the digits for the browser.
+pub async fn confirm(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let wechat = match wechat_of(&state) {
+        Ok(wechat) => wechat,
+        Err(response) => return *response,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    if let Err(response) = wechat.admit(client) {
+        return *response;
+    }
+    let response = async {
+        let Asking { request, openid } = match asking(&wechat, client, body).await {
+            Ok(asking) => asking,
+            Err(response) => return *response,
+        };
+        let now = db::unix_now();
+        let identity_id = match locker(&state, &wechat, &request.ticket, &openid, now).await {
+            Ok(identity_id) => identity_id,
+            Err(response) => return *response,
+        };
+        match store::issue_code(&state.db, &request.ticket, identity_id, now).await {
+            Ok(Some((code, expires_at))) => {
+                tracing::info!(%client, "a WeChat confirmed a sign-in on the web");
+                json(
+                    StatusCode::OK,
+                    &serde_json::json!({ "enter_code": code, "expires_at": expires_at }),
+                )
+            }
+            Ok(None) => error(StatusCode::GONE, "ticket_expired"),
+            Err(err) => failed(&err),
+        }
+    }
+    .await;
+    wechat.charge(client, response)
+}
+
+/// `POST /gono/v1/wechat/deny`: the phone cancels the sign-in.
+pub async fn deny(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let wechat = match wechat_of(&state) {
+        Ok(wechat) => wechat,
+        Err(response) => return *response,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    if let Err(response) = wechat.admit(client) {
+        return *response;
+    }
+    let response = async {
+        let Asking { request, openid } = match asking(&wechat, client, body).await {
+            Ok(asking) => asking,
+            Err(response) => return *response,
+        };
+        let now = db::unix_now();
+        let identity_id = match locker(&state, &wechat, &request.ticket, &openid, now).await {
+            Ok(identity_id) => identity_id,
+            Err(response) => return *response,
+        };
+        match store::deny_sign_in(&state.db, &request.ticket, identity_id, now).await {
+            Ok(true) => {
+                tracing::info!(%client, "a WeChat cancelled a sign-in on the web");
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Ok(false) => error(StatusCode::GONE, "ticket_expired"),
+            Err(err) => failed(&err),
+        }
+    }
+    .await;
+    wechat.charge(client, response)
+}
+
+#[derive(Deserialize)]
+pub struct FlowQuery {
+    #[serde(default)]
+    ticket: String,
+}
+
+/// `GET /gono/v1/wechat/flow?ticket=`.
+pub async fn flow(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    query: Result<axum::extract::Query<FlowQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let wechat = match wechat_of(&state) {
+        Ok(wechat) => wechat,
+        Err(response) => return *response,
+    };
+    if !wechat.web_sign_in {
+        return error(StatusCode::NOT_FOUND, "not_found");
+    }
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    let Ok(axum::extract::Query(query)) = query else {
+        return bad_request();
+    };
+    if !store::is_ticket(&query.ticket) {
+        return wechat.charge(client, bad_request());
+    }
+    match store::sign_in_ticket(&state.db, &query.ticket, db::unix_now()).await {
+        Ok(Some(ticket)) => json(
+            StatusCode::OK,
+            &serde_json::json!({ "stage": ticket.stage.as_str(), "expires_at": ticket.expires_at }),
+        ),
+        Ok(None) => wechat.charge(client, error(StatusCode::GONE, "ticket_expired")),
+        Err(err) => failed(&err),
     }
 }
 

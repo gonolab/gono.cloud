@@ -408,6 +408,34 @@ pub async fn sign_in(pool: &Pool, claims: &Claims, now: i64) -> Result<SignedIn>
     Ok(outcome)
 }
 
+/// Signs in with identity `identity_id`, which a provider just confirmed (WeChat's mini
+/// program): the account it is bound to, with the identity. A sign-in of an enabled account
+/// records the identity's `last_seen_at`.
+pub async fn sign_in_identity(
+    pool: &Pool,
+    identity_id: i64,
+    now: i64,
+) -> Result<(SignedIn, Option<Identity>)> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let sql = format!("SELECT {IDENTITY_COLUMNS} FROM external_identities WHERE id = ?");
+    let identity: Option<Identity> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(identity_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(identity) = identity else {
+        return Ok((SignedIn::Unbound, None));
+    };
+    let Some(user) = user_in(&mut tx, identity.user_id).await? else {
+        return Ok((SignedIn::Unbound, None));
+    };
+    let outcome = signed_in(user);
+    if matches!(outcome, SignedIn::Account(_)) {
+        touch_in(&mut tx, identity.id, None, None, now).await?;
+        tx.commit().await?;
+    }
+    Ok((outcome, Some(identity)))
+}
+
 /// An automatic binding by address ([`bind_by_email`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundByEmail {

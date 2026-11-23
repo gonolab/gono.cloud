@@ -51,7 +51,8 @@ INSERT INTO id_sequences (name, last_id) VALUES
     ('s3_buckets', 0),
     ('users', 0),
     ('web_sessions', 0),
-    ('wechat_bind_tickets', 0);
+    ('wechat_bind_tickets', 0),
+    ('wechat_sign_in_tickets', 0);
 
 -- The row every write transaction locks first (`SELECT ... FOR UPDATE`), so that one writer
 -- at a time changes the database, across all processes, as with SQLite.
@@ -571,6 +572,38 @@ CREATE TABLE wechat_bind_tickets (
     INDEX wechat_bind_tickets_user_id (user_id),
     INDEX wechat_bind_tickets_expires_at (expires_at),
     FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC;
+
+CREATE TABLE wechat_sign_in_tickets (
+    id              BIGINT       NOT NULL PRIMARY KEY,
+    ticket_hash     BINARY(32)   NOT NULL UNIQUE,
+    browser_hash    BINARY(32)   NOT NULL,
+    purpose         VARCHAR(8)   NOT NULL,
+    user_id         BIGINT,
+    browser_name    VARCHAR(64)  NOT NULL,
+    browser_net     VARCHAR(64)  NOT NULL,
+    stage           VARCHAR(8)   NOT NULL,
+    ended           VARCHAR(8),
+    identity_id     BIGINT,
+    code_hash       BINARY(32),
+    code_expires_at BIGINT,
+    tries_left      BIGINT       NOT NULL DEFAULT 3,
+    created_at      BIGINT       NOT NULL,
+    expires_at      BIGINT       NOT NULL,
+    CHECK (LENGTH(ticket_hash) = 32),
+    CHECK (LENGTH(browser_hash) = 32),
+    CHECK (purpose IN ('sign_in', 'admin', 'reauth')),
+    CHECK (stage IN ('waiting', 'scanned', 'code', 'done', 'ended')),
+    CHECK (ended IS NULL OR ended IN ('denied', 'tries')),
+    CHECK (tries_left >= 0),
+    CHECK ((purpose = 'reauth') = (user_id IS NOT NULL)),
+    CHECK ((stage = 'ended') = (ended IS NOT NULL)),
+    CHECK (stage = 'waiting' OR identity_id IS NOT NULL),
+    CHECK ((code_hash IS NULL) = (code_expires_at IS NULL)),
+    INDEX wechat_sign_in_tickets_browser (browser_hash),
+    INDEX wechat_sign_in_tickets_expires_at (expires_at),
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+    FOREIGN KEY (identity_id) REFERENCES external_identities (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE mp_sessions (

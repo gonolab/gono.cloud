@@ -66,7 +66,8 @@ INSERT INTO id_sequences (name, last_id) VALUES
     ('s3_buckets', 0),
     ('users', 0),
     ('web_sessions', 0),
-    ('wechat_bind_tickets', 0);
+    ('wechat_bind_tickets', 0),
+    ('wechat_sign_in_tickets', 0);
 
 -- Server-wide settings that are generated once and must stay stable for the lifetime of the
 -- installation.
@@ -740,6 +741,45 @@ CREATE TABLE pending_identities (
 
 CREATE INDEX pending_identities_subject ON pending_identities (provider, realm, subject);
 CREATE INDEX pending_identities_expires_at ON pending_identities (expires_at);
+
+-- Tickets of signing in on the web by scanning a QR code with the mini program
+-- (`gono_server_core::wechat`, `plan/third-party-sign-in-design.md` 5.3): made for a browser,
+-- whose sign-in page shows the ticket as a QR code; locked to the WeChat identity whose mini
+-- program scanned it; then 6 digits shown on the phone, which the same browser enters. Valid
+-- for 2 minutes, extended when scanned and confirmed; a new one of the browser ends its earlier
+-- ones.
+CREATE TABLE wechat_sign_in_tickets (
+    id            INTEGER PRIMARY KEY,
+    -- SHA-256 of the ticket (128 random bits) and of the browser's cookie (256 random bits).
+    ticket_hash   BLOB    NOT NULL UNIQUE CHECK (length(ticket_hash) = 32),
+    browser_hash  BLOB    NOT NULL CHECK (length(browser_hash) = 32),
+    -- 'sign_in' (a sign-in page), 'admin' (the admin UI's, for admin accounts only) or
+    -- 'reauth' (confirming it is the user of `user_id` on the account page).
+    purpose       TEXT    NOT NULL CHECK (purpose IN ('sign_in', 'admin', 'reauth')),
+    user_id       INTEGER REFERENCES users (id) ON DELETE CASCADE,
+    -- What the mini program shows of the browser: its name from the User-Agent, and its network
+    -- (the /24 or /64 of its address), compared with the phone's.
+    browser_name  TEXT    NOT NULL CHECK (length(browser_name) <= 64),
+    browser_net   TEXT    NOT NULL COLLATE BINARY CHECK (length(browser_net) BETWEEN 1 AND 64),
+    -- 'waiting' for a scan; 'scanned': locked to `identity_id`; 'code': the digits were shown on
+    -- the phone; 'done': the browser signed in; 'ended': `ended` says why.
+    stage         TEXT    NOT NULL CHECK (stage IN ('waiting', 'scanned', 'code', 'done', 'ended')),
+    ended         TEXT    CHECK (ended IS NULL OR ended IN ('denied', 'tries')),
+    identity_id   INTEGER REFERENCES external_identities (id) ON DELETE CASCADE,
+    -- SHA-256 of the digits with the ticket, never the digits; they end at `code_expires_at`.
+    code_hash     BLOB    CHECK (code_hash IS NULL OR length(code_hash) = 32),
+    code_expires_at INTEGER,
+    tries_left    INTEGER NOT NULL DEFAULT 3 CHECK (tries_left >= 0),
+    created_at    INTEGER NOT NULL,
+    expires_at    INTEGER NOT NULL,
+    CHECK ((purpose = 'reauth') = (user_id IS NOT NULL)),
+    CHECK ((stage = 'ended') = (ended IS NOT NULL)),
+    CHECK (stage = 'waiting' OR identity_id IS NOT NULL),
+    CHECK ((code_hash IS NULL) = (code_expires_at IS NULL))
+) STRICT;
+
+CREATE INDEX wechat_sign_in_tickets_browser ON wechat_sign_in_tickets (browser_hash);
+CREATE INDEX wechat_sign_in_tickets_expires_at ON wechat_sign_in_tickets (expires_at);
 
 -- Sessions of the mini program with a bound WeChat identity. They read the account's name and
 -- services and nothing else: no files, no WebDAV, no S3. A session ends 30 days after its last

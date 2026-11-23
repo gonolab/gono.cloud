@@ -284,6 +284,19 @@ pub fn router(state: AppState) -> Router {
             post(oauth::cancel_unbound),
         )
         .route(oauth::LINK_PATH, get(oauth::link_page).post(oauth::link))
+        // Without `[wechat] web_sign_in` these answer 404.
+        .route(
+            wechat::sign_in::PATH,
+            get(wechat::sign_in::page).post(wechat::sign_in::enter),
+        )
+        .route(
+            &format!("{}/restart", wechat::sign_in::PATH),
+            post(wechat::sign_in::restart),
+        )
+        .route(
+            &format!("{}/status", wechat::sign_in::PATH),
+            get(wechat::sign_in::status),
+        )
         .route(web::THEME_PATH, post(site::theme))
         .route("/apps/assets/{name}", get(site::asset));
     if state.files.is_some() {
