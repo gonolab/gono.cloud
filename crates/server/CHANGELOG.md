@@ -12,6 +12,24 @@ compatible within a major version: released clients keep working with newer serv
 
 ### Added
 
+- **Google and GitHub sign-in** (`[oauth.google]`, `[oauth.github]`, off by default). `/login`, the
+  Login Flow v2 page and `/manage/login` offer "Sign in with Google" and "Sign in with GitHub" next
+  to the password (forms that need no JavaScript): Google through OpenID Connect (scopes `openid
+  email profile`, PKCE `S256`, a nonce, the ID token's `iss`, `aud`, `exp` and `nonce` checked),
+  GitHub through an OAuth app (scope `user:email`, PKCE, the numeric user id as the identity). A
+  bound identity signs in without two-step verification; one bound to no account is bound
+  automatically when the provider verified an address that an account here proved with a code (the
+  address gets a notice; `identity.bound` with `how: "email"`), and otherwise leads to a page that
+  binds it after a password sign-in. The state is random, single use, 10 minutes, and bound to a
+  cookie of the browser (`__Host-gono_oauth`); failed callbacks count against the client address.
+  The account page binds Google and GitHub, confirms it is you with a fresh sign-in of a bound one,
+  and lets an account without a password set its first one after such a sign-in (`password.set`).
+  The admin UI gives sessions to admin accounts only. Client secrets are read from
+  `client_secret_file`; `config check` prints the redirect URIs
+  (`<base_url>/login/oauth/<provider>/callback`) and warns about plain-http `base_url`. Access
+  tokens are revoked at once and never kept. See "Google and GitHub sign-in" in
+  `docs/deployment.md`.
+
 - **Ways to sign in** (`plan/third-party-sign-in-design.md`). Accounts sign in with their web login
   password, with third-party identities (the WeChat of the mini program today; Google, GitHub and
   WeChat on the web follow), or with both, and always keep one: the last identity of an account

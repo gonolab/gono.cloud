@@ -1,0 +1,19 @@
+{%- extends "card.html" -%}
+{%- block title %}{{ title }}{% endblock -%}
+{%- block card %}
+<h1>{{ title }}</h1>
+{%- if !label.is_empty() %}
+<p class="mono mt-6">{{ label }}</p>
+{%- endif %}
+<p class="mt-18">{{ chrome.t.unbound_lead }}</p>
+<a class="btn primary block mt-6" href="{{ sign_in }}">{{ chrome.t.unbound_sign_in }}</a>
+{%- if let Some(signup) = signup %}
+<a class="btn block mt-20" href="{{ signup }}">{{ chrome.t.unbound_signup }}</a>
+<p class="muted small mt-6">{{ chrome.t.unbound_signup_note }}</p>
+{%- endif %}
+<form method="post" action="/login/unbound/cancel" class="mt-20">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="next" value="{{ next }}">
+  <button class="btn block" type="submit">{{ chrome.t.cancel }}</button>
+</form>
+{%- endblock %}

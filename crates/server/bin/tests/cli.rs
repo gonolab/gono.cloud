@@ -359,6 +359,53 @@ fn config_check_shows_the_mini_program_but_not_its_secret() {
 }
 
 #[test]
+fn config_check_shows_the_redirect_uris_but_not_the_client_secrets() {
+    let instance = Instance::new();
+    let mut config = std::fs::read_to_string(instance.config()).unwrap();
+    config.push_str(
+        r#"
+        [oauth.github]
+        enabled = true
+        client_id = "Ov23liAbCdEf"
+        client_secret_file = "github-secret"
+        "#,
+    );
+    std::fs::write(instance.config(), config).unwrap();
+    let secret_file = instance.dir.path().join("github-secret");
+    let check = run(&mut instance.command(&["config", "check"]));
+    assert!(check.status.success(), "{}", text(&check.stderr));
+    let shown = text(&check.stdout);
+    for expected in [
+        "oauth.google.enabled            false",
+        "oauth.github.enabled            true",
+        "oauth.github.client_id          Ov23liAbCdEf",
+        "oauth.github.allow_signup       false",
+        &format!(
+            "oauth.github redirect URI       http://{}/login/oauth/github/callback",
+            instance.addr
+        ),
+    ] {
+        assert!(shown.contains(expected), "{expected} in {shown}");
+    }
+    assert!(
+        shown.contains(&format!("{} (missing)", secret_file.display())),
+        "{shown}"
+    );
+    // `serve` reads the secret when it starts and refuses to start without it.
+    assert!(instance.init().status.success());
+    let serve = run(&mut instance.command(&["serve"]));
+    assert!(!serve.status.success());
+    assert!(
+        text(&serve.stderr).contains("oauth.github.client_secret_file"),
+        "{}",
+        text(&serve.stderr)
+    );
+    std::fs::write(&secret_file, "s3cr3t-of-the-app\n").unwrap();
+    let shown = text(&run(&mut instance.command(&["config", "check"])).stdout);
+    assert!(!shown.contains("s3cr3t-of-the-app"), "{shown}");
+}
+
+#[test]
 fn missing_config_files_get_a_hint() {
     let output = run(gono_cloud().args(["config", "check", "--config", "/nonexistent.toml"]));
     assert!(!output.status.success());

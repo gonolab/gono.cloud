@@ -277,7 +277,7 @@ key_file = "two-factor.key"
 
 [wechat]
 # The WeChat mini program whose users bind their WeChat to their accounts on the account page
-# (Overview, "WeChat": a QR code to scan with WeChat) and then sign in to the mini program with
+# (Overview, "Ways to sign in": a QR code to scan with WeChat) and then sign in to the mini program with
 # it. A mini program session reads the account's name and services, never its files. Off by
 # default: then the account page says that the server does not offer it. See "WeChat" in
 # docs/deployment.md and docs/wechat-miniprogram.md.
@@ -302,3 +302,22 @@ key_file = "two-factor.key"
 # it (<random>.txt) and served at /<that name> with its exact content (relative paths start in
 # this file's directory). Default: unset (serve it some other way).
 # verify_file = "AbCdEf1234.txt"
+
+[oauth.google]
+# Sign-in with Google (OpenID Connect, scopes "openid email profile") on the sign-in pages, the
+# Login Flow v2 page and /manage/login, and binding Google on the account page. Register the
+# redirect URI <base_url>/login/oauth/google/callback (`config check` prints it) for a web
+# client in the Google Cloud console. Off by default. See "Google and GitHub sign-in" in
+# docs/deployment.md.
+# enabled = true
+# client_id = "1234567890-abc.apps.googleusercontent.com"
+# The file that holds the client secret (its first line; relative paths start in this file's
+# directory). The secret never goes into this file. Required when enabled.
+# client_secret_file = "google-secret"
+
+[oauth.github]
+# Sign-in with GitHub (an OAuth app, scope "user:email"), as above. The app's callback URL is
+# <base_url>/login/oauth/github/callback. Off by default.
+# enabled = true
+# client_id = "Ov23liAbCdEf"
+# client_secret_file = "github-secret"

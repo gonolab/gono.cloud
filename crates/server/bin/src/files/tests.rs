@@ -95,6 +95,7 @@ async fn fixture_with(files: bool) -> Fixture {
         s3: None,
         mailer: None,
         wechat: None,
+        oauth: None,
     };
     Fixture {
         _dir: dir,
@@ -3639,4 +3640,5 @@ async fn a_device_that_needs_two_step_verification_is_sent_to_the_overview_and_b
 }
 
 mod email;
+mod oauth;
 mod wechat;

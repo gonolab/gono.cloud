@@ -10,6 +10,7 @@
 //! | `GET /account/relay` | Relay: its address, the rate it reads the account's devices at, those connected to it now and the sessions they reported (see [`relay`]). |
 //! | `POST /account/display-name` | Change the display name. |
 //! | `POST /account/password` | Change the web login password (needs the current one). The other browser sessions end; this one stays. |
+//! | `POST /account/password/set` | Set the first web login password of an account without one, after confirming it is you with one of its identities. The other browser sessions stay. |
 //! | `POST /account/email`, `POST /account/email/confirm`, `POST /account/email/remove` | Add, replace or remove the email address with a mailed code (see [`email`]). |
 //! | `GET`/`POST /account/identities/wechat/bind`, `GET`/`POST /account/identities/<provider>/unbind` | Show a QR code that binds WeChat for the mini program, or unbind an identity (see [`methods`]). |
 //! | `GET /account/confirm`, `POST /account/confirm` | Confirm it is you, then go on (see [`methods`]). |
@@ -617,6 +618,8 @@ struct PageOptions {
     notice: Option<String>,
     /// An error makes the page answer 422.
     error: Option<String>,
+    /// An error of an earlier request, shown after its redirect (the page answers 200).
+    failed: Option<String>,
     /// Where to continue once two-step verification is on.
     next: Option<String>,
 }
@@ -639,6 +642,7 @@ async fn render(state: &AppState, visitor: &Visitor, options: PageOptions) -> Re
         s3: s3_forms,
         notice,
         error,
+        failed,
         next,
     } = options;
     let status = if error.is_some() {
@@ -646,6 +650,7 @@ async fn render(state: &AppState, visitor: &Visitor, options: PageOptions) -> Re
     } else {
         StatusCode::OK
     };
+    let error = error.or(failed);
     let chrome = visitor.chrome(Nav::Account);
     let frame = AccountFrame::new(visitor, tab, notice, error);
     // Without direct connections, the tab still lists the registered devices so that a lost
@@ -1476,6 +1481,8 @@ pub async fn allow_pairing(
 pub struct DoneQuery {
     done: Option<String>,
     next: Option<String>,
+    /// What went wrong on a round trip to a provider ([`methods::failure`]).
+    failed: Option<String>,
 }
 
 /// The notice of `?done=<done>` on `tab`, after a change made with one of its forms.
@@ -1517,9 +1524,15 @@ async fn show(
         .done
         .as_deref()
         .and_then(|done| notice(state, visitor.t(), tab, done));
+    let failed = query
+        .failed
+        .as_deref()
+        .filter(|_| tab == Tab::Overview)
+        .and_then(|failed| methods::failure(visitor.t(), failed));
     let options = PageOptions {
         tab,
         notice,
+        failed,
         next: next_path(query.next.as_deref()),
         ..PageOptions::default()
     };
@@ -1691,6 +1704,76 @@ pub async fn set_password(
     }
     tracing::info!(user = %visitor.user.username, "web login password changed by its user");
     Tab::Overview.done("password")
+}
+
+#[derive(Deserialize)]
+pub struct FirstPasswordForm {
+    #[serde(default)]
+    csrf: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    password_repeat: String,
+}
+
+/// `POST /account/password/set`: the first web login password of an account without one
+/// (`plan/third-party-sign-in-design.md`, 5.4). It needs a confirmation of the session, by a
+/// sign-in with one of the account's identities in the last [`web::CONFIRM_TTL_SECS`]; the
+/// account's other sessions stay.
+pub async fn set_first_password(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+    Form(form): Form<FirstPasswordForm>,
+) -> Response {
+    let visitor = match form_visitor(&state, &headers, &uri, &form.csrf).await {
+        Ok(visitor) => visitor,
+        Err(response) => return *response,
+    };
+    let t = visitor.t();
+    if visitor.user.has_password {
+        return Tab::Overview.back();
+    }
+    if !state.web.is_confirmed(&visitor.user) {
+        let error = t.password_set_confirm.to_owned();
+        return show_error(&state, &visitor, Tab::Overview, error).await;
+    }
+    if form.password != form.password_repeat {
+        return show_error(
+            &state,
+            &visitor,
+            Tab::Overview,
+            t.err_passwords_differ.to_owned(),
+        )
+        .await;
+    }
+    let new = SecretString::from(form.password);
+    if let Err(err) = password::check_policy(&new) {
+        return show_error(&state, &visitor, Tab::Overview, core_message(t, &err)).await;
+    }
+    let hash = match tokio::task::spawn_blocking(move || password::hash(&new)).await {
+        Ok(Ok(hash)) => hash,
+        Ok(Err(err)) => return internal(&visitor, "password hash", &err),
+        Err(err) => return internal(&visitor, "password hash", &err),
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    match users::set_first_password(
+        &state.db,
+        visitor.user.user_id,
+        &hash,
+        Some(client),
+        db::unix_now(),
+    )
+    .await
+    {
+        Ok(true) => {
+            tracing::info!(%client, user = %visitor.user.username, "first web login password set by its user");
+            Tab::Overview.done("password-set")
+        }
+        Ok(false) => Tab::Overview.back(),
+        Err(err) => internal(&visitor, "first password", &err),
+    }
 }
 
 /// `POST /account/app-passwords`.

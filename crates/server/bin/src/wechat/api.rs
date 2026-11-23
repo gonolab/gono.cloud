@@ -2,17 +2,17 @@
 //! the sign-in code of a mini program (`wx.login()`) for the openid of its user.
 //!
 //! - [`WeChatApi`] is what the endpoints use. [`HttpApi`] asks
-//!   `https://api.weixin.qq.com/sns/jscode2session` with reqwest: rustls on ring with the
-//!   webpki roots (as every other TLS client of the workspace), HTTP/1.1, no proxy, no
-//!   redirects, and timeouts, so that a slow WeChat cannot hold a request for long. Tests use
-//!   [`FakeApi`], which answers what it was told.
+//!   `https://api.weixin.qq.com/sns/jscode2session` with the client of [`crate::http_client`]
+//!   (rustls on ring with the webpki roots, HTTP/1.1, no proxy, no redirects, timeouts), so
+//!   that a slow WeChat cannot hold a request for long. Tests use [`FakeApi`], which answers
+//!   what it was told.
 //! - The request carries the AppSecret and the code in its query string, as WeChat wants it.
 //!   Neither ever reaches a log or an error: errors are built without the URL, and WeChat's own
 //!   messages are not repeated, only its error codes.
 //! - The answer's `session_key` is never read: nothing here decrypts the mini program's data,
 //!   and it is neither stored nor sent anywhere.
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{fmt, future::Future, pin::Pin};
 
 use anyhow::Context as _;
 use secrecy::{ExposeSecret as _, SecretString};
@@ -21,12 +21,6 @@ use url::Url;
 
 /// WeChat's `jscode2session`.
 pub const ENDPOINT: &str = "https://api.weixin.qq.com/sns/jscode2session";
-
-/// How long connecting to WeChat may take.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long one exchange may take in all.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The largest answer read, in bytes; WeChat's have a few hundred.
 const MAX_ANSWER_BYTES: usize = 16 * 1024;
@@ -91,22 +85,6 @@ impl fmt::Debug for HttpApi {
     }
 }
 
-/// The TLS client configuration: ring, TLS 1.2 and 1.3, the Mozilla roots of `webpki-roots`,
-/// nothing from the platform, and HTTP/1.1 only (reqwest is built without HTTP/2).
-fn tls_config() -> rustls::ClientConfig {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .expect("ring supports the default protocol versions")
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    config
-}
-
 impl HttpApi {
     /// The API for the mini program `app_id` with its AppSecret.
     pub fn new(app_id: &str, secret: SecretString) -> anyhow::Result<Self> {
@@ -119,16 +97,10 @@ impl HttpApi {
 
     /// The API at `endpoint` instead of WeChat's, for tests.
     fn with_endpoint(endpoint: Url, app_id: &str, secret: SecretString) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls_config())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            // The URL carries the AppSecret: it goes to WeChat and nowhere else.
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .user_agent(concat!("gono-cloud/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .context("set up the HTTPS client of WeChat's API")?;
+        // The URL carries the AppSecret: the client follows no redirect, so it goes to WeChat
+        // and nowhere else.
+        let http =
+            crate::http_client::client().context("set up the HTTPS client of WeChat's API")?;
         Ok(Self {
             http,
             endpoint,
@@ -168,45 +140,14 @@ impl WeChatApi for HttpApi {
 /// A reqwest error for the log: without the URL (which holds the AppSecret and the code), with
 /// its causes.
 fn describe(err: reqwest::Error) -> String {
-    let err = err.without_url();
-    if err.is_timeout() {
-        return "WeChat did not answer in time".to_owned();
-    }
-    let mut text = format!("cannot reach WeChat: {err}");
-    let mut source = std::error::Error::source(&err);
-    while let Some(cause) = source {
-        text.push_str(": ");
-        text.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    text
+    crate::http_client::describe("WeChat", err)
 }
 
 /// The body of `response`, at most [`MAX_ANSWER_BYTES`].
-async fn read_answer(mut response: reqwest::Response) -> Result<Vec<u8>, ApiError> {
-    let too_large = || {
-        ApiError::Failed(format!(
-            "WeChat's answer is larger than {MAX_ANSWER_BYTES} bytes"
-        ))
-    };
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_ANSWER_BYTES as u64)
-    {
-        return Err(too_large());
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
+async fn read_answer(response: reqwest::Response) -> Result<Vec<u8>, ApiError> {
+    crate::http_client::read_body("WeChat", response, MAX_ANSWER_BYTES)
         .await
-        .map_err(|err| ApiError::Failed(describe(err)))?
-    {
-        if body.len() + chunk.len() > MAX_ANSWER_BYTES {
-            return Err(too_large());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+        .map_err(ApiError::Failed)
 }
 
 /// The fields of an answer that are read. `session_key` is not among them, so it is never
@@ -299,7 +240,7 @@ impl WeChatApi for FakeApi {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},

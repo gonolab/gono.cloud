@@ -179,6 +179,9 @@ struct SignInPage<'a> {
     client: &'a str,
     csrf: &'a str,
     error: Option<&'a str>,
+    /// The buttons of the third-party providers, which come back to this page.
+    providers: Vec<crate::oauth::Button>,
+    next: String,
 }
 
 /// The consent page (`templates/login_flow/consent.html`).
@@ -275,16 +278,21 @@ fn blocked_page(headers: &HeaderMap, lead: fn(&Text) -> &'static str) -> Respons
 fn login_page(
     state: &AppState,
     headers: &HeaderMap,
+    page_path: &str,
     status: StatusCode,
     client: &str,
     message: Option<&str>,
 ) -> Response {
     let (csrf, cookie) = state.web.login_csrf(headers);
+    let mut chrome = Chrome::for_request(headers);
+    chrome.form_action = crate::oauth::form_origins(state);
     let page = SignInPage {
-        chrome: Chrome::for_request(headers),
+        providers: crate::oauth::sign_in_buttons(state, chrome.t, page_path),
+        chrome,
         client,
         csrf: &csrf,
         error: message,
+        next: page_path.to_owned(),
     };
     let mut response = web::render(status, &page);
     response.headers_mut().append(header::SET_COOKIE, cookie);
@@ -424,6 +432,7 @@ fn back_to(uri: &Uri, cookies: &[HeaderValue]) -> Response {
 pub async fn page(
     State(state): State<AppState>,
     Path(token): Path<String>,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Response {
     let flow = match login_flows::find(&state.db, &token, db::unix_now()).await {
@@ -446,7 +455,14 @@ pub async fn page(
             direct_refusal(&state, &headers, flow.id).await
         }
         Some(session) => consent_page(&state, &headers, &flow, &session),
-        None => login_page(&state, &headers, StatusCode::OK, &flow.client_name, None),
+        None => login_page(
+            &state,
+            &headers,
+            uri.path(),
+            StatusCode::OK,
+            &flow.client_name,
+            None,
+        ),
     }
 }
 
@@ -478,6 +494,7 @@ pub async fn submit(
             return login_page(
                 &state,
                 &headers,
+                uri.path(),
                 StatusCode::FORBIDDEN,
                 &flow.client_name,
                 Some(t.form_expired_sign_in),
@@ -490,16 +507,22 @@ pub async fn submit(
             .await
         {
             SignIn::SecondStep(cookie) => web::see_other(web::TWO_STEP_PATH, &[cookie]),
-            SignIn::Ok(token) => back_to(
-                &uri,
-                &[
+            SignIn::Ok(token) => {
+                let cookies = [
                     state.web.session_cookie(&token),
                     state.web.removal_cookie(CSRF_COOKIE),
-                ],
-            ),
+                ];
+                let next = crate::oauth::after_password(&state, &headers, uri.path());
+                if next == uri.path() {
+                    back_to(&uri, &cookies)
+                } else {
+                    web::see_other(&next, &cookies)
+                }
+            }
             SignIn::Invalid => login_page(
                 &state,
                 &headers,
+                uri.path(),
                 StatusCode::FORBIDDEN,
                 &flow.client_name,
                 Some(t.wrong_password),
@@ -515,6 +538,7 @@ pub async fn submit(
         return login_page(
             &state,
             &headers,
+            uri.path(),
             StatusCode::FORBIDDEN,
             &flow.client_name,
             Some(t.session_ended),

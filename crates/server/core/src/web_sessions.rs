@@ -57,6 +57,11 @@ pub struct SessionUser {
 /// Creates a session for `user_id` and returns the cookie token. The token is returned once;
 /// only its digest is stored.
 pub async fn create(pool: &Pool, user_id: i64, now: i64) -> Result<SecretString> {
+    Ok(create_with_id(pool, user_id, now).await?.1)
+}
+
+/// Like [`create`], with the session's row id.
+pub async fn create_with_id(pool: &Pool, user_id: i64, now: i64) -> Result<(i64, SecretString)> {
     let token = secret::random_token(TOKEN_CHARS);
     let digest = secret::digest(token.expose_secret());
     let mut tx = db::begin_immediate(pool).await?;
@@ -74,7 +79,7 @@ pub async fn create(pool: &Pool, user_id: i64, now: i64) -> Result<SecretString>
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(token)
+    Ok((id, token))
 }
 
 #[derive(FromRow)]

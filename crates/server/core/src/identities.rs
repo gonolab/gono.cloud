@@ -33,7 +33,7 @@ use crate::{
     db::{self, Flag, Pool, Text, Tx},
     error::{Error, Result},
     secret,
-    users::CreatedVia,
+    users::{CreatedVia, User},
 };
 
 /// The realm of Google's identities: the issuer of its ID tokens.
@@ -350,6 +350,139 @@ pub(crate) async fn touch_in(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// What signing in with an identity found ([`sign_in`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignedIn {
+    /// The identity is bound to this enabled account; its sign-in is recorded.
+    Account(Box<User>),
+    /// It is bound to a disabled account.
+    Disabled,
+    /// It is bound to an account that waits for its deletion, until then.
+    DeletionPending(i64),
+    /// It is bound to no account.
+    Unbound,
+}
+
+/// The account `user_id` inside `tx`.
+async fn user_in(tx: &mut Tx, user_id: i64) -> Result<Option<User>> {
+    let sql = format!(
+        "SELECT {} FROM users WHERE id = ?",
+        crate::users::USER_COLUMNS
+    );
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(user_id)
+        .fetch_optional(&mut **tx)
+        .await?)
+}
+
+/// What [`SignedIn`] says of an account that the identity is bound to.
+fn signed_in(user: User) -> SignedIn {
+    match user.deleting_at {
+        Some(until) => SignedIn::DeletionPending(until),
+        None if !user.enabled => SignedIn::Disabled,
+        None => SignedIn::Account(Box::new(user)),
+    }
+}
+
+/// Signs in with the identity of `claims`, as its provider just reported it: the account it is
+/// bound to, if any. A sign-in of an enabled account records the identity's `last_seen_at` and
+/// the label the provider reports now (GitHub logins can be renamed).
+pub async fn sign_in(pool: &Pool, claims: &Claims, now: i64) -> Result<SignedIn> {
+    let claims = claims.checked()?;
+    let mut tx = db::begin_immediate(pool).await?;
+    let Some(identity) = find_in(&mut tx, claims.provider, &claims.realm, &claims.subject).await?
+    else {
+        return Ok(SignedIn::Unbound);
+    };
+    let Some(user) = user_in(&mut tx, identity.user_id).await? else {
+        return Ok(SignedIn::Unbound);
+    };
+    let outcome = signed_in(user);
+    if matches!(outcome, SignedIn::Account(_)) {
+        let label = (claims.provider != Provider::WeChat).then_some(claims.label.as_str());
+        touch_in(&mut tx, identity.id, label, claims.unionid.as_deref(), now).await?;
+        tx.commit().await?;
+    }
+    Ok(outcome)
+}
+
+/// An automatic binding by address ([`bind_by_email`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundByEmail {
+    /// The account, enabled, which signs in now.
+    pub user: Box<User>,
+    /// The identity bound to it.
+    pub identity: Identity,
+    /// The account's address, which the provider verified: it gets the notice.
+    pub email: String,
+}
+
+/// Binds the identity of `claims`, which is bound to no account, to the account whose address
+/// is one of `verified` (the addresses the provider verified, lower-cased), when that account
+/// proved the address itself (`users.email`), is enabled, waits for no deletion and has no
+/// identity of this provider and realm yet (`plan/third-party-sign-in-design.md`, 3.3). Records
+/// `identity.bound` with [`How::Email`]. `None` binds nothing.
+pub async fn bind_by_email(
+    pool: &Pool,
+    claims: &Claims,
+    verified: &[String],
+    client_ip: Option<IpAddr>,
+    now: i64,
+) -> Result<Option<BoundByEmail>> {
+    let claims = claims.checked()?;
+    let addresses: Vec<String> = verified
+        .iter()
+        .filter_map(|address| crate::email::normalize_address(address))
+        .take(db::MAX_LIST)
+        .collect();
+    if addresses.is_empty() {
+        return Ok(None);
+    }
+    let mut tx = db::begin_immediate(pool).await?;
+    for email in addresses {
+        let sql = format!(
+            "SELECT {} FROM users WHERE email = ?",
+            crate::users::USER_COLUMNS
+        );
+        let user: Option<User> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(&email)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(user) = user else {
+            continue;
+        };
+        if !user.enabled || user.deleting_at.is_some() {
+            continue;
+        }
+        match bind_in(
+            &mut tx,
+            user.id,
+            &claims,
+            How::Email,
+            Actor::User,
+            client_ip,
+            now,
+        )
+        .await?
+        {
+            Bound::Bound(identity) => {
+                tx.commit().await?;
+                return Ok(Some(BoundByEmail {
+                    user: Box::new(user),
+                    identity,
+                    email,
+                }));
+            }
+            // The account has one of this provider already: nothing is bound, and the sign-in
+            // goes on as for any identity bound to no account.
+            Bound::AccountHasOne | Bound::NoAccount => {}
+            // Bound meanwhile: the caller signs in again.
+            Bound::Already(_) | Bound::OtherAccount => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 /// Outcome of [`bind`].

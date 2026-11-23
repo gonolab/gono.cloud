@@ -24,5 +24,16 @@
     {%- endif %}
     <div class="actions mt-20"><button class="btn{% if danger %} danger{% else %} primary{% endif %}" type="submit"{% if no_password %} disabled{% endif %}>{{ button }}</button><a class="btn" href="/account/">{{ chrome.t.cancel }}</a></div>
   </form>
+  {%- if !reauth.is_empty() %}
+  <p class="muted small mt-20">{% if ask_password %}{{ chrome.t.confirm_or }}{% else %}{{ chrome.t.confirm_title }}{% endif %}</p>
+  {%- for button in reauth %}
+  <form method="post" action="{{ button.action }}" class="mt-6">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+    <input type="hidden" name="purpose" value="reauth">
+    <input type="hidden" name="next" value="{{ here }}">
+    <button class="btn block" type="submit">{{ button.label }}</button>
+  </form>
+  {%- endfor %}
+  {%- endif %}
 </div></section>
 {%- endblock %}

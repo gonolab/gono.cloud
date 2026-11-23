@@ -113,6 +113,18 @@ pub const TWO_STEP_PATH: &str = "/login/two-step";
 /// HTTPS requires that path, and keeps other hosts of the site from planting a value they know.
 pub const RESET_COOKIE: &str = "gono_reset";
 
+/// Cookie binding a sign-in with Google or GitHub to the browser that started it
+/// ([`crate::oauth`]): `HttpOnly`, `SameSite=Lax` (the provider's redirect back is a navigation
+/// from another site, which must carry it), for the 10 minutes a sign-in may take.
+pub const OAUTH_COOKIE: &str = "gono_oauth";
+
+/// Cookie holding the token of a third-party identity bound to no account, which waits in this
+/// browser to be bound (`gono_server_core::identities`): `HttpOnly`, `SameSite=Lax`, 10 minutes.
+pub const PENDING_COOKIE: &str = "gono_pending";
+
+/// How long the [`OAUTH_COOKIE`] and the [`PENDING_COOKIE`] live, in seconds.
+const SIGN_IN_COOKIE_SECS: u32 = 10 * 60;
+
 /// Length of the value of the [`RESET_COOKIE`]: 43 characters of `[A-Za-z0-9]`, 256 bits.
 const RESET_CHARS: usize = 43;
 
@@ -911,7 +923,15 @@ impl Web {
     /// it is otherwise.
     pub fn cookie_name(&self, base: &str) -> String {
         if self.secure
-            && [SESSION_COOKIE, CSRF_COOKIE, TWO_STEP_COOKIE, RESET_COOKIE].contains(&base)
+            && [
+                SESSION_COOKIE,
+                CSRF_COOKIE,
+                TWO_STEP_COOKIE,
+                RESET_COOKIE,
+                OAUTH_COOKIE,
+                PENDING_COOKIE,
+            ]
+            .contains(&base)
         {
             format!("{HOST_PREFIX}{base}")
         } else {
@@ -940,6 +960,31 @@ impl Web {
     /// The `Set-Cookie` value that stores a session token.
     pub fn session_cookie(&self, token: &SecretString) -> HeaderValue {
         self.cookie_header(SESSION_COOKIE, token.expose_secret(), "Lax", None)
+    }
+
+    /// The `Set-Cookie` value of the [`OAUTH_COOKIE`] with `value`.
+    pub fn oauth_cookie(&self, value: &str) -> HeaderValue {
+        self.cookie_header(OAUTH_COOKIE, value, "Lax", Some(SIGN_IN_COOKIE_SECS))
+    }
+
+    /// The `Set-Cookie` value of the [`PENDING_COOKIE`] with `token`.
+    pub fn pending_cookie(&self, token: &SecretString) -> HeaderValue {
+        self.cookie_header(
+            PENDING_COOKIE,
+            token.expose_secret(),
+            "Lax",
+            Some(SIGN_IN_COOKIE_SECS),
+        )
+    }
+
+    /// How long `client` has to wait before it may try to sign in again, if it has to.
+    pub fn rate_limited(&self, client: IpAddr) -> Option<Duration> {
+        self.limiter.check(client)
+    }
+
+    /// Counts a failed sign-in of `client` (a third-party one that was not completed).
+    pub fn record_failure(&self, client: IpAddr) {
+        self.limiter.record_failure(client);
     }
 
     /// The `Set-Cookie` value that deletes cookie `name`.
@@ -1149,6 +1194,28 @@ impl Web {
         match web_sessions::create(&self.pool, user.id, db::unix_now()).await {
             Ok(token) => {
                 tracing::info!(%client, user = %user.username, method = "password", "web sign-in");
+                Some(token)
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "cannot create a session");
+                None
+            }
+        }
+    }
+
+    /// Opens a session for `user`, who just signed in with an identity of `provider`, and
+    /// confirms it for [`CONFIRM_TTL_SECS`]: no second step is asked after a third-party
+    /// sign-in (`plan/third-party-sign-in-design.md`, 1). Returns the cookie token.
+    pub async fn open_session_with(
+        &self,
+        client: IpAddr,
+        user: &User,
+        provider: gono_server_core::identities::Provider,
+    ) -> Option<SecretString> {
+        match web_sessions::create_with_id(&self.pool, user.id, db::unix_now()).await {
+            Ok((session_id, token)) => {
+                self.confirm_session(session_id, user.id);
+                tracing::info!(%client, user = %user.username, method = provider.as_str(), "web sign-in");
                 Some(token)
             }
             Err(err) => {
@@ -1453,6 +1520,9 @@ pub struct Chrome {
     pub query: String,
     /// Strings for the script (JSON, safe inside a `<script type="application/json">`).
     pub script_text: String,
+    /// Origins besides this one that the page's forms reach through a redirect (the OAuth
+    /// providers of its sign-in buttons), separated by spaces: they join its `form-action`.
+    pub form_action: String,
 }
 
 impl Chrome {
@@ -1483,6 +1553,7 @@ impl Chrome {
             here: "/".to_owned(),
             query: String::new(),
             script_text: script_text(t),
+            form_action: String::new(),
         }
     }
 
@@ -1597,11 +1668,17 @@ pub(crate) use page;
 
 /// The `Content-Security-Policy` of a page whose script carries `nonce`: the page's own
 /// stylesheet and script, images and media from this origin (previews), requests and forms
-/// to this origin only, and no framing.
-fn page_policy(nonce: &str) -> String {
+/// to this origin only (and to `form_action`, the providers that its sign-in forms are sent on
+/// to: browsers check the redirects of a form against `form-action`), and no framing.
+fn page_policy(nonce: &str, form_action: &str) -> String {
+    let extra = if form_action.is_empty() {
+        String::new()
+    } else {
+        format!(" {form_action}")
+    };
     format!(
         "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'self'; img-src 'self'; \
-         media-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; \
+         media-src 'self'; connect-src 'self'; form-action 'self'{extra}; frame-ancestors 'none'; \
          base-uri 'none'; object-src 'none'"
     )
 }
@@ -1644,7 +1721,11 @@ pub fn render(status: StatusCode, page: &impl Page) -> Response {
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
-    add_security_headers(response.headers_mut(), &page_policy(&page.chrome().nonce));
+    let chrome = page.chrome();
+    add_security_headers(
+        response.headers_mut(),
+        &page_policy(&chrome.nonce, &chrome.form_action),
+    );
     response
 }
 

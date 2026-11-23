@@ -124,6 +124,7 @@ async fn fixture() -> Fixture {
         s3: None,
         mailer: None,
         wechat: None,
+        oauth: None,
     };
     Fixture {
         _dir: dir,
@@ -1889,4 +1890,91 @@ async fn the_page_of_an_account_lists_its_identities_and_unbinds_them() {
         "{}",
         entries[0].details
     );
+}
+
+#[tokio::test]
+async fn the_admin_ui_takes_third_party_sign_ins_of_admins_only() {
+    use crate::oauth::{
+        OAuth,
+        mock::{Mock, Person},
+    };
+    use gono_server_core::identities::{self, Claims, GOOGLE_REALM, Provider};
+
+    let mut f = fixture().await;
+    let mock = Mock::start().await;
+    f.state.oauth = Some(Arc::new(
+        OAuth::new(&f.state.base_url, Some(mock.google()), None).unwrap(),
+    ));
+    for (user, subject) in [(f.root, "1"), (f.alice, "2")] {
+        let claims = Claims {
+            provider: Provider::Google,
+            realm: GOOGLE_REALM.to_owned(),
+            subject: subject.to_owned(),
+            unionid: None,
+            label: format!("{subject}@gmail.com"),
+            email: None,
+            email_verified: false,
+            name: None,
+        };
+        identities::bind(
+            &f.state.db,
+            user,
+            &claims,
+            identities::How::Cli,
+            gono_server_core::audit::Actor::Cli,
+            None,
+            db::unix_now(),
+        )
+        .await
+        .unwrap();
+    }
+    let sign_in = |subject: &'static str| {
+        let state = f.state.clone();
+        let mock = &mock;
+        async move {
+            let mut browser = Browser::new(&state);
+            let form = browser.get(&path("/login")).await;
+            assert!(
+                form.body.contains("action=\"/login/oauth/google\""),
+                "{}",
+                form.body
+            );
+            assert!(
+                form.body.contains("name=\"next\" value=\"/manage/\""),
+                "{}",
+                form.body
+            );
+            let started = browser
+                .post(
+                    "/login/oauth/google",
+                    &[
+                        ("csrf", &form.csrf()),
+                        ("purpose", "sign_in"),
+                        ("next", "/manage/"),
+                    ],
+                )
+                .await;
+            assert_eq!(started.status, StatusCode::SEE_OTHER, "{}", started.body);
+            let person = Person::new(subject, &format!("{subject}@gmail.com"));
+            let callback = browser
+                .get(&mock.approve(started.location(), &person))
+                .await;
+            let overview = browser.get(&path("/")).await;
+            (callback, overview)
+        }
+    };
+    // alice is no admin: refused, and no session.
+    let (callback, overview) = sign_in("2").await;
+    assert_eq!(callback.status, StatusCode::FORBIDDEN);
+    assert!(
+        callback.body.contains(EN.a_not_admin_error),
+        "{}",
+        callback.body
+    );
+    assert_eq!(overview.location(), path("/login"));
+    // root is.
+    let (callback, overview) = sign_in("1").await;
+    assert_eq!(callback.status, StatusCode::SEE_OTHER);
+    assert_eq!(callback.location(), path("/"));
+    assert_eq!(overview.status, StatusCode::OK);
 }

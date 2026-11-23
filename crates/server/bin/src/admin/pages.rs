@@ -58,6 +58,9 @@ pub struct LoginPage<'a> {
     pub csrf: &'a str,
     pub user: &'a str,
     pub error: Option<&'a str>,
+    /// The buttons of the third-party providers, which go on to `next`.
+    pub providers: Vec<crate::oauth::Button>,
+    pub next: String,
 }
 
 /// `admin/not_admin.html`: signed in, but not as an admin.

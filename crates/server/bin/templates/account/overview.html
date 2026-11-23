@@ -127,6 +127,7 @@
       </form>
     </div></section>
     <section class="panel" id="password"><div class="panel-body">
+      {%- if methods.has_password %}
       <h2>{{ chrome.t.web_password }}</h2>
       <p class="muted small">{{ chrome.t.web_password_note }}</p>
       <form method="post" action="/account/password">
@@ -137,6 +138,22 @@
         <label class="field" for="pw-repeat"><span>{{ chrome.t.repeat_password }}</span><input id="pw-repeat" type="password" name="password_repeat" autocomplete="new-password" required minlength="8"></label>
         <button class="btn block" type="submit">{{ chrome.t.change_password }}</button>
       </form>
+      {%- else %}
+      <h2>{{ chrome.t.password_set_title }}</h2>
+      <p class="muted small">{{ chrome.t.password_set_note }}</p>
+      {%- if confirm.confirmed %}
+      <form method="post" action="/account/password/set">
+        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+        <input type="text" name="username" value="{{ frame.username }}" autocomplete="username" hidden>
+        <label class="field" for="pw-first"><span>{{ chrome.t.new_password }}</span><input id="pw-first" type="password" name="password" autocomplete="new-password" required minlength="8"></label>
+        <label class="field" for="pw-first-repeat"><span>{{ chrome.t.repeat_password }}</span><input id="pw-first-repeat" type="password" name="password_repeat" autocomplete="new-password" required minlength="8"></label>
+        <button class="btn primary block" type="submit">{{ chrome.t.password_set_button }}</button>
+      </form>
+      {%- else %}
+      <p class="small mt-18">{{ chrome.t.password_set_confirm }}</p>
+      <a class="btn block" href="/account/confirm?next=%2Faccount%2F%23password">{{ chrome.t.confirm_title }}</a>
+      {%- endif %}
+      {%- endif %}
     </div></section>
   </div>
 </div>

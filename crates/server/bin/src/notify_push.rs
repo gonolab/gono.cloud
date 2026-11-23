@@ -505,6 +505,7 @@ mod tests {
             s3: None,
             mailer: None,
             wechat: None,
+            oauth: None,
         };
         let app = crate::app::router(state.clone());
         tokio::spawn(async move {

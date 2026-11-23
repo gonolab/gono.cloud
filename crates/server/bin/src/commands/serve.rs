@@ -32,6 +32,7 @@ use crate::{
     janitor::Janitor,
     logging::{self, Destination},
     mail::{Mailer, SmtpMailer},
+    oauth::OAuth,
     ratelimit::RateLimiter,
     s3::S3Ui,
     shutdown,
@@ -135,6 +136,24 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
     } else {
         None
     };
+    // Google and GitHub sign-in: the client secrets are read now as well.
+    let oauth = OAuth::from_config(&config).context("set up the sign-in of [oauth]")?;
+    for (key, provider) in config.oauth_providers() {
+        if let Some(file) = &provider.client_secret_file {
+            let secret_key = if key == "google" {
+                "oauth.google.client_secret_file"
+            } else {
+                "oauth.github.client_secret_file"
+            };
+            warn_if_readable_by_others(file, secret_key);
+        }
+        tracing::info!(
+            provider = key,
+            allow_signup = provider.allow_signup,
+            "third-party sign-in enabled"
+        );
+    }
+    let oauth = oauth.map(Arc::new);
     let bind = config.server.bind;
     let listener = TcpListener::bind(bind)
         .await
@@ -369,6 +388,7 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         s3: S3Ui::from_config(&config.s3).map(Arc::new),
         mailer,
         wechat,
+        oauth,
     };
     let connect_task = connect.clone().map(|connect| tokio::spawn(connect.run()));
     let on_signal = {

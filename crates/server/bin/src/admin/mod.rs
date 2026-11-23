@@ -461,12 +461,17 @@ fn login_form(
     error: Option<&str>,
 ) -> Response {
     let (csrf, cookie) = state.web.login_csrf(headers);
+    let mut chrome = admin.chrome(state, headers);
+    chrome.form_action = crate::oauth::form_origins(state);
+    let next = admin.url("/");
     let page = LoginPage {
-        chrome: admin.chrome(state, headers),
+        providers: crate::oauth::sign_in_buttons(state, chrome.t, &next),
+        chrome,
         prefix: admin.prefix(),
         csrf: &csrf,
         user,
         error,
+        next,
     };
     let mut response = web::render(status, &page);
     response.headers_mut().append(header::SET_COOKIE, cookie);
@@ -532,7 +537,8 @@ async fn login(
                 .await
             {
                 web::Started::Session(token) => {
-                    let mut response = see_other(&admin.url("/"));
+                    let next = crate::oauth::after_password(&state, &headers, &admin.url("/"));
+                    let mut response = see_other(&next);
                     let headers = response.headers_mut();
                     headers.append(header::SET_COOKIE, state.web.session_cookie(&token));
                     headers.append(header::SET_COOKIE, state.web.removal_cookie(CSRF_COOKIE));

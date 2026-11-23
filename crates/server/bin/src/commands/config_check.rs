@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use gono_server_core::{
+    Config,
     config::{DbConfig, RelayConfig, S3Config, SmtpConfig, WeChatConfig},
     db::Backend,
 };
@@ -89,6 +90,7 @@ pub fn run(config_path: &Path) -> anyhow::Result<()> {
     if config.wechat.enabled {
         settings.extend(wechat_settings(&config.wechat));
     }
+    settings.extend(oauth_settings(&config));
     for (key, value) in settings {
         println!("  {key:<31} {value}");
     }
@@ -203,6 +205,55 @@ fn wechat_settings(wechat: &WeChatConfig) -> Vec<(&'static str, String)> {
             file_setting(wechat.verify_file.as_deref(), "(none)"),
         ),
     ]
+}
+
+/// The settings of `[oauth.google]` and `[oauth.github]`: each one's switch, and for an enabled
+/// one its client ID, the secret's file (named, never read here), `allow_signup` and the
+/// redirect URI to register in the provider's console.
+fn oauth_settings(config: &Config) -> Vec<(&'static str, String)> {
+    let mut settings = Vec::new();
+    for (key, provider) in [
+        ("google", &config.oauth.google),
+        ("github", &config.oauth.github),
+    ] {
+        let [enabled, client_id, secret, signup, redirect] = if key == "google" {
+            [
+                "oauth.google.enabled",
+                "oauth.google.client_id",
+                "oauth.google.client_secret_file",
+                "oauth.google.allow_signup",
+                "oauth.google redirect URI",
+            ]
+        } else {
+            [
+                "oauth.github.enabled",
+                "oauth.github.client_id",
+                "oauth.github.client_secret_file",
+                "oauth.github.allow_signup",
+                "oauth.github redirect URI",
+            ]
+        };
+        settings.push((enabled, provider.enabled.to_string()));
+        if provider.enabled {
+            settings.push((
+                client_id,
+                provider
+                    .client_id
+                    .clone()
+                    .unwrap_or_else(|| "(none)".to_owned()),
+            ));
+            settings.push((
+                secret,
+                file_setting(provider.client_secret_file.as_deref(), "(none)"),
+            ));
+            settings.push((signup, provider.allow_signup.to_string()));
+            settings.push((
+                redirect,
+                gono_server_core::config::oauth_redirect_uri(&config.server.base_url, key),
+            ));
+        }
+    }
+    settings
 }
 
 /// The effective settings of an enabled S3 API.

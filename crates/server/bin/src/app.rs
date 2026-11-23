@@ -28,6 +28,9 @@
 //!   sign-in page `/login`, `/logout`, the theme switch and the assets of every HTML page:
 //!   see [`crate::site`]; resetting a forgotten password by mail under `/login/forgot` and
 //!   `/login/reset`, when `smtp.enabled` as well: see [`crate::recovery`].
+//! - Sign-in with Google and GitHub under `/login/oauth/`, and the pages of an identity bound to
+//!   no account (`/login/unbound`, `/login/link`), when one of `[oauth.*]` is enabled: see
+//!   [`crate::oauth`].
 //! - The WeChat mini program's API under `/gono/v1/wechat/`, the page of its QR links below
 //!   `/q/` and its verification file, when `wechat.enabled`: see [`crate::wechat`]. Without
 //!   it, every path below `/gono/v1/wechat/` answers `404 {"error":"not_found"}`.
@@ -72,7 +75,7 @@ use crate::{
     client_ip::client_ip,
     connect, direct,
     files::{self, Files},
-    login_flow, nextcloud, notify_push,
+    login_flow, nextcloud, notify_push, oauth,
     ratelimit::RateLimiter,
     recovery, request_log,
     s3::S3Ui,
@@ -118,6 +121,8 @@ pub struct AppState {
     /// The WeChat mini program, when `wechat.enabled` ([`crate::wechat`]). Without it, the
     /// account page offers no binding and the mini program's API answers `not_found`.
     pub wechat: Option<Arc<wechat::WeChat>>,
+    /// Sign-in with Google and GitHub, when one of `[oauth.*]` is enabled ([`crate::oauth`]).
+    pub oauth: Option<Arc<oauth::OAuth>>,
 }
 
 impl AppState {
@@ -263,6 +268,22 @@ pub fn router(state: AppState) -> Router {
             "/login/reset",
             get(recovery::reset_page).post(recovery::reset),
         )
+        // Without `[oauth.*]` these answer 404; the pages of identities bound to no account
+        // say that nothing waits.
+        .route(
+            &format!("{}/{{provider}}", oauth::START_PATH),
+            post(oauth::start),
+        )
+        .route(
+            &format!("{}/{{provider}}/callback", oauth::START_PATH),
+            get(oauth::callback),
+        )
+        .route(oauth::UNBOUND_PATH, get(oauth::unbound_page))
+        .route(
+            &format!("{}/cancel", oauth::UNBOUND_PATH),
+            post(oauth::cancel_unbound),
+        )
+        .route(oauth::LINK_PATH, get(oauth::link_page).post(oauth::link))
         .route(web::THEME_PATH, post(site::theme))
         .route("/apps/assets/{name}", get(site::asset));
     if state.files.is_some() {
@@ -607,6 +628,7 @@ mod tests {
             s3: None,
             mailer: None,
             wechat: None,
+            oauth: None,
         };
         Fixture {
             dir,

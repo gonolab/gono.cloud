@@ -485,3 +485,99 @@ async fn pending_identities_wait_for_their_holder_and_bind_once() {
         1
     );
 }
+
+#[tokio::test]
+async fn signing_in_finds_the_account_and_binds_by_a_verified_address() {
+    use gono_server_core::identities::SignedIn;
+
+    let (_dir, pool, alice, bob) = fixture().await;
+    let claims = google("108", "alice@gmail.com");
+    assert_eq!(
+        identities::sign_in(&pool, &claims, NOW).await.unwrap(),
+        SignedIn::Unbound
+    );
+    // Only an address the account proved itself counts, and only one the provider verified.
+    sqlx::query("UPDATE users SET email = 'alice@example.com' WHERE id = ?")
+        .bind(alice)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let none = identities::bind_by_email(&pool, &claims, &[], None, NOW)
+        .await
+        .unwrap();
+    assert_eq!(none, None);
+    let other = ["someone@example.com".to_owned()];
+    assert_eq!(
+        identities::bind_by_email(&pool, &claims, &other, None, NOW)
+            .await
+            .unwrap(),
+        None
+    );
+    let verified = [
+        "someone@example.com".to_owned(),
+        "Alice@Example.COM".to_owned(),
+    ];
+    let bound = identities::bind_by_email(&pool, &claims, &verified, None, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (bound.user.id, bound.email.as_str()),
+        (alice, "alice@example.com")
+    );
+    let entries = audit::list(&pool, Some(alice), None, 5).await.unwrap();
+    assert!(entries[0].details.contains("\"how\":\"email\""));
+
+    // Signing in finds it, and refreshes its label.
+    let renamed = Claims {
+        label: "alice.new@gmail.com".to_owned(),
+        ..claims.clone()
+    };
+    let SignedIn::Account(user) = identities::sign_in(&pool, &renamed, NOW + 5).await.unwrap()
+    else {
+        panic!("not signed in");
+    };
+    assert_eq!(user.id, alice);
+    let identity = identities::list(&pool, alice).await.unwrap().remove(0);
+    assert_eq!(
+        (identity.label.as_str(), identity.last_seen_at),
+        ("alice.new@gmail.com", NOW + 5)
+    );
+    // An account with one of the provider gets no second one by address.
+    assert_eq!(
+        identities::bind_by_email(&pool, &google("109", "x"), &verified, None, NOW)
+            .await
+            .unwrap(),
+        None
+    );
+
+    // Disabled, and waiting for deletion, the account does not sign in and binds nothing.
+    sqlx::query("UPDATE users SET enabled = 0, email = 'bob@example.com' WHERE id = ?")
+        .bind(bob)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let bobs = github("1", "bob");
+    let address = ["bob@example.com".to_owned()];
+    assert_eq!(
+        identities::bind_by_email(&pool, &bobs, &address, None, NOW)
+            .await
+            .unwrap(),
+        None
+    );
+    bind(&pool, bob, &bobs).await;
+    assert_eq!(
+        identities::sign_in(&pool, &bobs, NOW).await.unwrap(),
+        SignedIn::Disabled
+    );
+    sqlx::query("UPDATE users SET deleting_at = ? WHERE id = ?")
+        .bind(NOW + 100)
+        .bind(bob)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        identities::sign_in(&pool, &bobs, NOW).await.unwrap(),
+        SignedIn::DeletionPending(NOW + 100)
+    );
+}

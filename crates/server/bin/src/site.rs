@@ -5,6 +5,7 @@
 //! | `GET /` | Redirects to the file UI, or to the admin UI when the file UI is off. |
 //! | `GET /login`, `POST /login` | Sign in with the web login password (file UI only). `?next=` names a local page to return to. |
 //! | `POST /logout` | Sign out (file UI only). |
+//! | `POST /login/oauth/<provider>` and the pages after it | Sign in with Google or GitHub (with `[oauth.*]`): see [`crate::oauth`]. |
 //! | `GET /login/two-step`, `POST /login/two-step` | The second step of every web sign-in of an account with two-step verification: a TOTP code or a recovery code. A recovery code is followed by a page that says how many are left. |
 //! | `GET /login/forgot`, `POST /login/forgot`, `GET /login/reset`, `POST /login/reset` | Resetting a forgotten password with a code mailed to the account's address (file UI and `[smtp]` only): see [`crate::recovery`]. |
 //! | `POST /apps/theme` | Switches the theme (system, light, dark) and returns to the page; a script asking for JSON gets the new theme instead. |
@@ -152,6 +153,8 @@ struct SignInPage {
     error: Option<&'static str>,
     /// Link to `/login/forgot`: only while mail can be sent.
     forgot: bool,
+    /// The buttons of the third-party providers, which go on to `next`.
+    providers: Vec<crate::oauth::Button>,
 }
 
 /// `two_step.html`: the second step of a sign-in.
@@ -253,6 +256,8 @@ pub async fn two_step(
                 state.web.removal_cookie(CSRF_COOKIE),
                 state.web.two_step_removal(),
             ];
+            // An identity waiting in this browser is bound first, if the user wants it.
+            let next = crate::oauth::after_password(&state, &headers, &next);
             let Some(left) = recovery_left else {
                 return web::see_other(&next, &cookies);
             };
@@ -311,7 +316,7 @@ fn after_sign_in(next: Option<&str>) -> String {
 /// site, otherwise the file UI, or the account page for an account without the web file
 /// service, rather than a page that only says the service is off. The sign-in form carries the
 /// file UI as its default target, which counts as no page chosen.
-fn landing(next: Option<&str>, services: Services) -> String {
+pub(crate) fn landing(next: Option<&str>, services: Services) -> String {
     match next
         .and_then(local_path)
         .filter(|path| *path != "/login" && *path != FILES_HOME)
@@ -334,7 +339,9 @@ fn sign_in_form(
     let mut chrome = Chrome::for_request(headers);
     chrome.files = true;
     chrome.here = "/login".to_owned();
+    chrome.form_action = crate::oauth::form_origins(state);
     let page = SignInPage {
+        providers: crate::oauth::sign_in_buttons(state, chrome.t, next),
         chrome,
         csrf,
         user: user.to_owned(),
@@ -430,7 +437,7 @@ pub async fn login(
             let next = landing(Some(&form.next), account.services);
             match state.web.start_session(client, &account, &next).await {
                 Started::Session(token) => web::see_other(
-                    &next,
+                    &crate::oauth::after_password(&state, &headers, &next),
                     &[
                         state.web.session_cookie(&token),
                         state.web.removal_cookie(CSRF_COOKIE),

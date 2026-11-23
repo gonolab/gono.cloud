@@ -169,6 +169,10 @@ pub fn routes() -> Router<AppState> {
             post(account::set_display_name),
         )
         .route(&format!("{ACCOUNT}/password"), post(account::set_password))
+        .route(
+            &format!("{ACCOUNT}/password/set"),
+            post(account::set_first_password),
+        )
         .route(&format!("{ACCOUNT}/email"), post(account::email::start))
         .route(
             &format!("{ACCOUNT}/email/confirm"),
@@ -179,8 +183,8 @@ pub fn routes() -> Router<AppState> {
             post(account::email::remove),
         )
         .route(
-            &format!("{ACCOUNT}/identities/wechat/bind"),
-            get(account::methods::wechat_bind_page).post(account::methods::wechat_bind),
+            &format!("{ACCOUNT}/identities/{{provider}}/bind"),
+            get(account::methods::bind_page).post(account::methods::bind),
         )
         .route(
             &format!("{ACCOUNT}/identities/{{provider}}/unbind"),

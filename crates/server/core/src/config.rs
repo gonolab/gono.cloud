@@ -89,6 +89,9 @@ pub struct Config {
     /// `[wechat]`: the WeChat mini program whose users bind and sign in to their accounts.
     #[serde(default)]
     pub wechat: WeChatConfig,
+    /// `[oauth.google]`, `[oauth.github]`: sign-in with Google and GitHub.
+    #[serde(default)]
+    pub oauth: OAuthConfig,
 }
 
 /// `[server]` table.
@@ -742,6 +745,47 @@ pub struct WeChatConfig {
     pub verify_file: Option<PathBuf>,
 }
 
+/// `[oauth.*]` tables: sign-in with Google (OpenID Connect) and GitHub (an OAuth app)
+/// (`plan/third-party-sign-in-design.md`). Each is off by default; without either, the sign-in
+/// pages offer the password (and WeChat) only.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OAuthConfig {
+    /// `[oauth.google]`.
+    pub google: OAuthProviderConfig,
+    /// `[oauth.github]`.
+    pub github: OAuthProviderConfig,
+}
+
+/// One `[oauth.<provider>]` table. The client secret never goes into the configuration: it is
+/// the first line of `client_secret_file`, read when `serve` starts.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OAuthProviderConfig {
+    /// Offer sign-in with the provider.
+    pub enabled: bool,
+    /// The OAuth client ID from the provider's console. Required when enabled.
+    pub client_id: Option<String>,
+    /// A file holding the client secret: its first line, without the line break. Relative
+    /// paths are resolved against the configuration file's directory. Required when enabled.
+    pub client_secret_file: Option<PathBuf>,
+    /// Let an identity of the provider that is bound to no account create one. Off by default:
+    /// an unbound identity can then only be bound to an existing account.
+    pub allow_signup: bool,
+}
+
+/// The longest OAuth client ID accepted, in bytes.
+pub const MAX_CLIENT_ID_BYTES: usize = 255;
+
+/// The redirect URI of the OAuth provider `provider` (`google`, `github`) on a server whose
+/// public origin is `base_url`: what its console must list.
+pub fn oauth_redirect_uri(base_url: &Url, provider: &str) -> String {
+    format!(
+        "{}/login/oauth/{provider}/callback",
+        base_url.as_str().trim_end_matches('/')
+    )
+}
+
 /// The longest `wechat.qr_url_prefix` accepted, in bytes: the QR codes of its links stay easy
 /// to scan.
 pub const MAX_QR_URL_PREFIX_BYTES: usize = 200;
@@ -984,6 +1028,8 @@ impl Config {
             self.smtp.password_file.as_mut(),
             self.wechat.secret_file.as_mut(),
             self.wechat.verify_file.as_mut(),
+            self.oauth.google.client_secret_file.as_mut(),
+            self.oauth.github.client_secret_file.as_mut(),
         ]
         .into_iter()
         .flatten()
@@ -1088,6 +1134,10 @@ impl Config {
 
         // [wechat]
         self.validate_wechat(&mut reject);
+
+        // [oauth.*]
+        validate_oauth(&self.oauth.google, "google", &mut reject);
+        validate_oauth(&self.oauth.github, "github", &mut reject);
 
         if issues.is_empty() {
             Ok(())
@@ -1405,6 +1455,17 @@ impl Config {
         }
     }
 
+    /// The `[oauth.*]` tables that are enabled, with their provider keys.
+    pub fn oauth_providers(&self) -> Vec<(&'static str, &OAuthProviderConfig)> {
+        [
+            ("google", &self.oauth.google),
+            ("github", &self.oauth.github),
+        ]
+        .into_iter()
+        .filter(|(_, provider)| provider.enabled)
+        .collect()
+    }
+
     /// Checks the `[wechat]` table. Values that are set are always checked; what the mini
     /// program needs is only required once it is enabled.
     fn validate_wechat(&self, reject: &mut impl FnMut(&'static str, String)) {
@@ -1682,6 +1743,23 @@ impl Config {
             }
         }
 
+        for (key, _) in self.oauth_providers() {
+            if !self.files_ui.enabled {
+                warnings.push(format!(
+                    "oauth.{key}.enabled is true, but nobody signs in with it: the sign-in pages \
+                     are part of the web file UI that files_ui.enabled turns off"
+                ));
+            }
+            if self.server.base_url.scheme() != "https" && !is_local_host(&self.server.base_url) {
+                warnings.push(format!(
+                    "oauth.{key}.enabled is true, but server.base_url is not https: the provider \
+                     sends the browser back to {} in the clear, and providers refuse plain http \
+                     redirect URIs except for localhost",
+                    oauth_redirect_uri(&self.server.base_url, key)
+                ));
+            }
+        }
+
         let wechat = &self.wechat;
         if wechat.enabled {
             if !self.files_ui.enabled {
@@ -1703,6 +1781,48 @@ impl Config {
             }
         }
         warnings
+    }
+}
+
+/// Checks one `[oauth.<provider>]` table. Values that are set are always checked; what sign-in
+/// needs is only required once it is enabled.
+fn validate_oauth(
+    provider: &OAuthProviderConfig,
+    key: &'static str,
+    reject: &mut impl FnMut(&'static str, String),
+) {
+    let (id_key, secret_key) = match key {
+        "google" => ("oauth.google.client_id", "oauth.google.client_secret_file"),
+        _ => ("oauth.github.client_id", "oauth.github.client_secret_file"),
+    };
+    match &provider.client_id {
+        Some(id)
+            if id.is_empty()
+                || id.len() > MAX_CLIENT_ID_BYTES
+                || !id.bytes().all(|b| b.is_ascii_graphic()) =>
+        {
+            reject(
+                id_key,
+                format!(
+                    "{id:?} is not a client ID: 1 to {MAX_CLIENT_ID_BYTES} visible ASCII \
+                     characters, as the provider's console shows it"
+                ),
+            );
+        }
+        None if provider.enabled => {
+            reject(id_key, format!("is required when oauth.{key}.enabled"));
+        }
+        _ => {}
+    }
+    match &provider.client_secret_file {
+        Some(file) if file.as_os_str().is_empty() => {
+            reject(secret_key, "must not be empty".to_owned());
+        }
+        None if provider.enabled => reject(
+            secret_key,
+            format!("is required when oauth.{key}.enabled: the file that holds the client secret"),
+        ),
+        _ => {}
     }
 }
 
@@ -2940,5 +3060,77 @@ mod tests {
         let mut off = with_wechat(&WECHAT.replace("enabled = true", "enabled = false"));
         off.files_ui.enabled = false;
         assert!(off.warnings().is_empty());
+    }
+
+    const GOOGLE: &str = "enabled = true\nclient_id = \"1234-abc.apps.googleusercontent.com\"\n\
+                          client_secret_file = \"google-secret\"";
+
+    /// Parses `MINIMAL` with an `[oauth.<provider>]` table holding `body`.
+    fn with_oauth(provider: &str, body: &str) -> Config {
+        parse(&format!("{MINIMAL}\n[oauth.{provider}]\n{body}\n"))
+    }
+
+    #[test]
+    fn oauth_is_off_by_default_and_needs_a_client_when_on() {
+        let config = parse(MINIMAL);
+        assert!(!config.oauth.google.enabled && !config.oauth.github.enabled);
+        assert!(config.oauth_providers().is_empty());
+        let mut keys = issue_keys(&with_oauth("github", "enabled = true"));
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["oauth.github.client_id", "oauth.github.client_secret_file"]
+        );
+        let google = with_oauth("google", GOOGLE);
+        assert!(issue_keys(&google).is_empty());
+        assert!(!google.oauth.google.allow_signup);
+        assert_eq!(google.oauth_providers().len(), 1);
+        for invalid in ["", "a b", "\\u0007"] {
+            let config = with_oauth(
+                "google",
+                &GOOGLE.replace("1234-abc.apps.googleusercontent.com", invalid),
+            );
+            assert_eq!(
+                issue_keys(&config),
+                ["oauth.google.client_id"],
+                "{invalid:?}"
+            );
+        }
+        // The secret never goes into the file.
+        assert!(
+            Config::from_toml(&format!(
+                "{MINIMAL}\n[oauth.google]\n{GOOGLE}\nclient_secret = \"x\"\n"
+            ))
+            .is_err()
+        );
+        let mut config = with_oauth("google", GOOGLE);
+        config.resolve_relative_paths(Path::new("/etc/gono-cloud"));
+        assert_eq!(
+            config.oauth.google.client_secret_file.as_deref(),
+            Some(Path::new("/etc/gono-cloud/google-secret"))
+        );
+        assert_eq!(
+            oauth_redirect_uri(&config.server.base_url, "google"),
+            "https://cloud.example.com/login/oauth/google/callback"
+        );
+    }
+
+    #[test]
+    fn oauth_warns_about_plain_http_and_a_missing_file_ui() {
+        let mut config = with_oauth("github", &GOOGLE.replace("google", "github"));
+        assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+        config.files_ui.enabled = false;
+        config.server.base_url = Url::parse("http://cloud.example.com").unwrap();
+        let warnings = config.warnings();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[1].contains("files_ui.enabled"), "{warnings:?}");
+        assert!(
+            warnings[2].contains("http://cloud.example.com/login/oauth/github/callback"),
+            "{warnings:?}"
+        );
+        // A test installation on this host may use plain http.
+        config.files_ui.enabled = true;
+        config.server.base_url = Url::parse("http://127.0.0.1:8080").unwrap();
+        assert!(config.warnings().is_empty(), "{:?}", config.warnings());
     }
 }

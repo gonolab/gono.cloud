@@ -4,7 +4,7 @@
 //!
 //! | Request | Page or action |
 //! |---|---|
-//! | `GET /account/identities/wechat/bind`, `POST` the same | Confirm, then make a bind ticket of the mini program of `[wechat]`. The overview then shows its QR code until it expires. |
+//! | `GET /account/identities/<provider>/bind`, `POST` the same | Confirm, then bind: for WeChat a bind ticket of the mini program of `[wechat]`, whose QR code the overview shows until it expires; for Google and GitHub a sign-in there ([`crate::oauth`]). |
 //! | `GET /account/identities/<provider>/unbind`, `POST` the same | Say what unbinding does, confirm, then unbind the identity. For WeChat it signs the mini program out. |
 //! | `GET /account/confirm`, `POST /account/confirm` | Confirm it is you, then go on to `next` (a page of the account). |
 //!
@@ -28,7 +28,7 @@
 //! ends every mini program session of the identity. Neither changes `updated_at`. Without
 //! `[wechat]` the panel says that the server does not offer it, and its pages answer `404`.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
 
 use askama::Template;
 use axum::{
@@ -57,7 +57,6 @@ use crate::{
     files::{Visitor, view::when},
     i18n::{Text, fill},
     web::{self, Chrome, Nav, page},
-    wechat::WeChat,
 };
 
 /// One way to sign in, as the panel lists it.
@@ -97,15 +96,18 @@ pub struct MethodsView {
 pub(crate) fn offered_realm(state: &AppState, provider: Provider) -> Option<String> {
     match provider {
         Provider::WeChat => state.wechat.as_ref().map(|mini| mini.app_id().to_owned()),
-        // Google and GitHub sign-in are not offered yet.
-        Provider::Google | Provider::GitHub => None,
+        Provider::Google | Provider::GitHub => state
+            .oauth
+            .as_ref()
+            .and_then(|oauth| oauth.provider(provider))
+            .map(|_| shown_realm(state, provider).unwrap_or_default()),
     }
 }
 
 /// The realm of `provider` whose identity the account page shows and unbinds.
 fn shown_realm(state: &AppState, provider: Provider) -> Option<String> {
     match provider {
-        Provider::WeChat => offered_realm(state, provider),
+        Provider::WeChat => state.wechat.as_ref().map(|mini| mini.app_id().to_owned()),
         Provider::Google => Some(GOOGLE_REALM.to_owned()),
         Provider::GitHub => Some(GITHUB_REALM.to_owned()),
     }
@@ -190,10 +192,31 @@ pub(super) fn notice(t: &'static Text, done: &str) -> Option<String> {
         "wechat-ticket" => t.notice_wechat_ticket.to_owned(),
         "unbound-wechat" => t.notice_wechat_unbound.to_owned(),
         "confirmed" => t.notice_confirmed.to_owned(),
+        "cancelled" => t.oauth_cancelled_lead.to_owned(),
+        "password-set" => t.notice_password_set.to_owned(),
         done => {
-            let provider = Provider::parse(done.strip_prefix("unbound-")?)?;
-            fill(t.notice_identity_unbound, &[provider_name(t, provider)])
+            if let Some(key) = done.strip_prefix("unbound-") {
+                fill(
+                    t.notice_identity_unbound,
+                    &[provider_name(t, Provider::parse(key)?)],
+                )
+            } else {
+                let provider = Provider::parse(done.strip_prefix("bound-")?)?;
+                fill(t.notice_identity_bound, &[provider_name(t, provider)])
+            }
         }
+    })
+}
+
+/// The error of `?failed=<failed>` after a round trip to a provider from the account page.
+pub(super) fn failure(t: &'static Text, failed: &str) -> Option<String> {
+    let (what, key) = failed.split_once('-')?;
+    let name = provider_name(t, Provider::parse(key)?);
+    Some(match what {
+        "taken" => fill(t.err_identity_taken, &[name]),
+        "has" => fill(t.err_identity_has_one, &[name]),
+        "other" => fill(t.err_reauth_other, &[name]),
+        _ => return None,
     })
 }
 
@@ -220,6 +243,11 @@ struct ActionPage {
     /// sign-in of one of its identities.
     no_password: bool,
     error: Option<String>,
+    /// Confirming with a provider instead, while the session is not confirmed: buttons that
+    /// come back to `here`.
+    reauth: Vec<crate::oauth::Button>,
+    /// This page, where the confirmation with a provider comes back to.
+    here: String,
 }
 
 page!(ActionPage);
@@ -233,19 +261,59 @@ struct Action {
     button: &'static str,
     danger: bool,
     next: String,
+    /// The page itself (`GET`), where a confirmation with a provider comes back to.
+    here: String,
+}
+
+/// The buttons that confirm it is the visitor with one of the identities `bound` to the
+/// account, of the providers this server offers (Google and GitHub).
+fn reauth_buttons(
+    state: &AppState,
+    visitor: &Visitor,
+    bound: &[identities::Identity],
+) -> Vec<crate::oauth::Button> {
+    let t = visitor.t();
+    let Some(oauth) = &state.oauth else {
+        return Vec::new();
+    };
+    oauth
+        .providers()
+        .into_iter()
+        .filter(|provider| bound.iter().any(|identity| identity.provider == *provider))
+        .map(|provider| crate::oauth::Button {
+            action: format!("{}/{}", crate::oauth::START_PATH, provider.as_str()),
+            label: fill(t.confirm_with, &[provider.name()]),
+            link: false,
+        })
+        .collect()
 }
 
 /// Renders the page of `action` for `visitor`, with `error`.
-fn action_page(
+async fn action_page(
     state: &AppState,
     visitor: &Visitor,
     action: Action,
     status: StatusCode,
     error: Option<String>,
 ) -> Response {
+    let bound = match identities::list(&state.db, visitor.user.user_id).await {
+        Ok(bound) => bound,
+        Err(err) => return internal(visitor, "ways to sign in", &err),
+    };
     let confirmed = state.web.is_confirmed(&visitor.user);
+    let reauth = if confirmed {
+        Vec::new()
+    } else {
+        reauth_buttons(state, visitor, &bound)
+    };
+    let mut chrome = visitor.chrome(Nav::Account);
+    if !reauth.is_empty() {
+        chrome.form_action = crate::oauth::form_origins(state);
+    }
     let page = ActionPage {
-        chrome: visitor.chrome(Nav::Account),
+        chrome,
+        reauth,
+        here: action.here,
         username: visitor.user.username.to_string(),
         title: action.title,
         lead: action.lead,
@@ -285,19 +353,34 @@ fn unbind_action(t: &'static Text, provider: Provider) -> Action {
         button: t.unbind_confirm,
         danger: true,
         next: String::new(),
+        here: format!("{ACCOUNT}/identities/{}/unbind", provider.as_str()),
     }
 }
 
-/// The page that makes a WeChat bind ticket.
-fn wechat_bind_action(t: &'static Text) -> Action {
-    Action {
-        title: t.wechat_bind_title.to_owned(),
-        lead: t.wechat_note.to_owned(),
-        note: Some(t.wechat_show_note),
-        action: format!("{ACCOUNT}/identities/wechat/bind"),
-        button: t.wechat_show,
-        danger: false,
-        next: String::new(),
+/// The page that binds `provider`: a WeChat bind ticket, or the way to Google or GitHub.
+fn bind_action(t: &'static Text, provider: Provider) -> Action {
+    let path = format!("{ACCOUNT}/identities/{}/bind", provider.as_str());
+    match provider {
+        Provider::WeChat => Action {
+            title: t.wechat_bind_title.to_owned(),
+            lead: t.wechat_note.to_owned(),
+            note: Some(t.wechat_show_note),
+            action: path.clone(),
+            button: t.wechat_show,
+            danger: false,
+            next: String::new(),
+            here: path,
+        },
+        Provider::Google | Provider::GitHub => Action {
+            title: fill(t.bind_title, &[provider.name()]),
+            lead: fill(t.bind_lead, &[provider.name()]),
+            note: Some(t.link_lead),
+            action: path.clone(),
+            button: t.bind_go,
+            danger: false,
+            next: String::new(),
+            here: path,
+        },
     }
 }
 
@@ -323,6 +406,7 @@ pub async fn unbind_page(
         StatusCode::OK,
         None,
     )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -359,7 +443,7 @@ pub async fn unbind(
         Confirmation::Refused(error) => {
             let action = unbind_action(t, provider);
             let status = StatusCode::UNPROCESSABLE_ENTITY;
-            return action_page(&state, &visitor, action, status, Some(error.to_owned()));
+            return action_page(&state, &visitor, action, status, Some(error.to_owned())).await;
         }
         Confirmation::Halt(response) => return *response,
     }
@@ -383,58 +467,61 @@ pub async fn unbind(
         Ok(Unbound::LastSignIn) => {
             let action = unbind_action(t, provider);
             let error = Some(t.err_last_sign_in.to_owned());
-            action_page(&state, &visitor, action, StatusCode::CONFLICT, error)
+            action_page(&state, &visitor, action, StatusCode::CONFLICT, error).await
         }
         Err(err) => internal(&visitor, "unbind an identity", &err),
     }
 }
 
-/// The visitor of a WeChat page and the mini program, or the page to answer with: `404` while
-/// this server does not offer the mini program.
-fn mini_program(state: &AppState) -> Result<Arc<WeChat>, Box<Response>> {
-    state
-        .wechat
-        .clone()
+/// The provider of a binding page that this server offers, `404` otherwise.
+fn bindable(state: &AppState, key: &str) -> Result<Provider, Box<Response>> {
+    Provider::parse(key)
+        .filter(|provider| offered_realm(state, *provider).is_some())
         .ok_or_else(|| Box::new(StatusCode::NOT_FOUND.into_response()))
 }
 
-/// `GET /account/identities/wechat/bind`.
-pub async fn wechat_bind_page(
+/// `GET /account/identities/<provider>/bind`.
+pub async fn bind_page(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: Uri,
+    Path(key): Path<String>,
 ) -> Response {
     let visitor = match account_visitor(&state, &headers, &uri).await {
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
-    if let Err(response) = mini_program(&state) {
-        return *response;
-    }
+    let provider = match bindable(&state, &key) {
+        Ok(provider) => provider,
+        Err(response) => return *response,
+    };
     action_page(
         &state,
         &visitor,
-        wechat_bind_action(visitor.t()),
+        bind_action(visitor.t(), provider),
         StatusCode::OK,
         None,
     )
+    .await
 }
 
-/// `POST /account/identities/wechat/bind`: makes a bind ticket, whose QR code the overview
-/// shows.
-pub async fn wechat_bind(
+/// `POST /account/identities/<provider>/bind`: for WeChat, makes a bind ticket, whose QR code
+/// the overview shows; for Google and GitHub, sends the browser to the provider to sign in with
+/// the identity to bind.
+pub async fn bind(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     uri: Uri,
+    Path(key): Path<String>,
     Form(form): Form<ConfirmForm>,
 ) -> Response {
     let visitor = match form_visitor(&state, &headers, &uri, &form.csrf).await {
         Ok(visitor) => visitor,
         Err(response) => return *response,
     };
-    let mini = match mini_program(&state) {
-        Ok(mini) => mini,
+    let provider = match bindable(&state, &key) {
+        Ok(provider) => provider,
         Err(response) => return *response,
     };
     let t = visitor.t();
@@ -442,12 +529,34 @@ pub async fn wechat_bind(
     match confirmation(&state, &visitor, client, form.password).await {
         Confirmation::Confirmed => {}
         Confirmation::Refused(error) => {
-            let action = wechat_bind_action(t);
+            let action = bind_action(t, provider);
             let status = StatusCode::UNPROCESSABLE_ENTITY;
-            return action_page(&state, &visitor, action, status, Some(error.to_owned()));
+            return action_page(&state, &visitor, action, status, Some(error.to_owned())).await;
         }
         Confirmation::Halt(response) => return *response,
     }
+    let user = &visitor.user;
+    let (Some(oauth), Provider::Google | Provider::GitHub) = (&state.oauth, provider) else {
+        return wechat_ticket(&state, &visitor, client).await;
+    };
+    if let Some(realm) = offered_realm(&state, provider) {
+        match identities::of_account(&state.db, user.user_id, provider, &realm).await {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                let error = fill(t.err_identity_has_one, &[provider.name()]);
+                return show_error(&state, &visitor, Tab::Overview, error).await;
+            }
+            Err(err) => return internal(&visitor, "ways to sign in", &err),
+        }
+    }
+    oauth.begin_bind(&state, &headers, provider, user).await
+}
+
+/// Makes a WeChat bind ticket for the visitor, whose QR code the overview shows.
+async fn wechat_ticket(state: &AppState, visitor: &Visitor, client: std::net::IpAddr) -> Response {
+    let Some(mini) = state.wechat.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let user = &visitor.user;
     match wechat::create_ticket(&state.db, user.user_id, mini.app_id(), db::unix_now()).await {
         Ok(NewTicket::Ticket(ticket)) => {
@@ -456,10 +565,10 @@ pub async fn wechat_bind(
             Tab::Overview.done("wechat-ticket")
         }
         Ok(NewTicket::Bound) => {
-            let error = t.err_wechat_bound.to_owned();
-            show_error(&state, &visitor, Tab::Overview, error).await
+            let error = visitor.t().err_wechat_bound.to_owned();
+            show_error(state, visitor, Tab::Overview, error).await
         }
-        Err(err) => internal(&visitor, "WeChat bind ticket", &err),
+        Err(err) => internal(visitor, "WeChat bind ticket", &err),
     }
 }
 
@@ -484,8 +593,13 @@ fn confirm_action(t: &'static Text, next: String) -> Action {
         action: format!("{ACCOUNT}/confirm"),
         button: t.confirm_button,
         danger: false,
+        here: format!("{ACCOUNT}/confirm?next={}", encode(&next)),
         next,
     }
+}
+
+fn encode(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
 /// `GET /account/confirm?next=<page of the account>`.
@@ -507,6 +621,7 @@ pub async fn confirm_page(
         StatusCode::OK,
         None,
     )
+    .await
 }
 
 /// `POST /account/confirm`.
@@ -529,7 +644,7 @@ pub async fn confirm(
         Confirmation::Refused(error) => {
             let action = confirm_action(visitor.t(), next);
             let status = StatusCode::UNPROCESSABLE_ENTITY;
-            action_page(&state, &visitor, action, status, Some(error.to_owned()))
+            action_page(&state, &visitor, action, status, Some(error.to_owned())).await
         }
         Confirmation::Halt(response) => *response,
     }

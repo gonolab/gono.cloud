@@ -245,6 +245,26 @@ pub fn address_removed(lang: Lang, base_url: &Url, username: &str) -> Composed {
     }
 }
 
+/// The notice to the address of `username` that an identity of `provider` (`label`, its
+/// address or login) was bound to the account automatically, because the provider verified this
+/// address (`plan/third-party-sign-in-design.md`, 3.3). It carries no link that signs in.
+pub fn identity_bound(
+    lang: Lang,
+    base_url: &Url,
+    username: &str,
+    provider: &str,
+    label: &str,
+) -> Composed {
+    let t = lang.t();
+    Composed {
+        subject: t.mail_identity_subject.to_owned(),
+        text: fill(
+            t.mail_identity_text,
+            &[provider, label, username, &origin(base_url)],
+        ),
+    }
+}
+
 /// Sends `message` to `to` on a task of its own, so that the request does not wait for the mail
 /// server (and its time does not depend on whether a message was sent at all). Failures are
 /// logged with `what`.

@@ -231,16 +231,17 @@ user sets up there:
 
 | Tab | What it shows |
 |---|---|
-| Overview (`/account/`) | The account's services, on or off, each linked to where it is used; its ways to sign in (the web login password and the WeChat of the mini program, "WeChat" below), its email address ("Email" below), two-step verification, the display name and the web login password. Every account has it, with or without services. |
+| Overview (`/account/`) | The account's services, on or off, each linked to where it is used; its ways to sign in (the web login password, the WeChat of the mini program and Google and GitHub accounts: "WeChat" and "Google and GitHub sign-in" below), its email address ("Email" below), two-step verification, the display name and the web login password. Every account has it, with or without services. |
 | WebDAV (`/account/webdav`) | The server and WebDAV addresses clients connect to, and the user's app passwords, to create or revoke, for example for Finder, Windows Explorer or rclone. |
 | S3 (`/account/s3`) | The user's buckets and access keys ([s3.md](s3.md)). |
 | Direct connections (`/account/direct`) | The devices registered for remote access ("Remote access" below). |
 | Relay (`/account/relay`) | The relay's address, whether it carries the account's devices at full speed (the relay service) or only at the limited rate (direct connections alone), the devices connected to it now and the sessions they reported. It needs direct connections, which admit the devices to the relay already. |
 
 The forms of the overview that change how the account signs in or is recovered (binding and
-unbinding WeChat, adding, replacing and removing the email address, two-step verification) ask
-the user to confirm it is them first: they take the web login password, and once it was right,
-the same browser can use them without it for 5 minutes (`/account/confirm` confirms ahead).
+unbinding WeChat, Google or GitHub, adding, replacing and removing the email address, two-step
+verification) ask the user to confirm it is them first: they take the web login password, or a
+fresh sign-in with a bound Google or GitHub account, and once it was right, the same browser can
+use them without it for 5 minutes (`/account/confirm` confirms ahead).
 Unbinding opens a page that says what it does. An account keeps at least one way to sign in:
 the last third-party identity of an account without a web login password cannot be unbound
 until the account has a password.
@@ -590,6 +591,93 @@ What users see:
   `gono-cloud user identities` and `user unlink`.
 - **Limits.** `session` and `bind` of the mini program are limited per client address like the
   sign-in pages: failures count, successful sign-ins do not.
+
+## Google and GitHub sign-in
+
+With `[oauth.google]` and `[oauth.github]`, users sign in with their Google or GitHub account
+next to the web login password: on `/login`, on the page of Login Flow v2 (Nextcloud clients and
+device registration), and on `/manage/login`. On the account page ("Ways to sign in") they bind
+and unbind them. Both are off by default; without them the sign-in pages are as before.
+
+Register the server with the provider first:
+
+- **Google:** in the Google Cloud console, an OAuth client of type "Web application" with the
+  authorized redirect URI `https://cloud.example.com/login/oauth/google/callback`. The server
+  asks for the scopes `openid email profile`: the identity (`sub`), the address and the name.
+- **GitHub:** an OAuth app (Settings, Developer settings, OAuth Apps) with the authorization
+  callback URL `https://cloud.example.com/login/oauth/github/callback`. The server asks for the
+  scope `user:email`: the account's numeric id, login and name need none, its verified addresses
+  do. It uses PKCE, which GitHub accepts.
+
+`config check` prints the redirect URIs to register. Put each client secret into a file of its
+own, readable by the service, and turn the provider on; then restart the service:
+
+```sh
+sudo install -m 0640 -o root -g gono-cloud /dev/null /etc/gono-cloud/google-secret
+sudoedit /etc/gono-cloud/google-secret    # the client secret on the first line
+```
+
+```toml
+[oauth.google]
+enabled = true
+client_id = "1234567890-abc.apps.googleusercontent.com"
+client_secret_file = "/etc/gono-cloud/google-secret"
+
+[oauth.github]
+enabled = true
+client_id = "Ov23liAbCdEf"
+client_secret_file = "/etc/gono-cloud/github-secret"
+```
+
+| Key | What it sets |
+|---|---|
+| `client_id` | The client ID of the provider's console. Changing it later keeps the bindings: Google's `sub` and GitHub's user id do not depend on the app. |
+| `client_secret_file` | The file that holds the client secret (the first line; relative paths start in the directory of `config.toml`). The secret never goes into `config.toml`; `config check` names the file and whether it exists, never the secret, and `serve` reads it when it starts and refuses to start without it. It warns when others can read the file. |
+
+`config check` warns when `base_url` is not HTTPS (the providers send the browser back to it,
+and refuse plain `http` redirect URIs except for `localhost`) and when `files_ui` is off (the
+sign-in pages belong to the web file UI). The server connects to `https://accounts.google.com`
+and `https://oauth2.googleapis.com` for Google, and to `https://github.com` and
+`https://api.github.com` for GitHub (port 443), through rustls with the CA list built into the
+binary. It reads the user's identity, address and name, revokes the access token at once and
+keeps no token. Codes, states, tokens, the providers' ids of users and their addresses are never
+logged; log lines name the account.
+
+What users see:
+
+- **A bound identity signs in**, and two-step verification is not asked: the provider's own
+  second step stands in for it. A third-party sign-in of a disabled account is refused.
+- **Automatic binding.** A Google or GitHub account whose address the provider verified, and
+  which equals the address an account here proved with a code ("Email" above), is bound to that
+  account at its first sign-in and signs in. The address gets a notice, and the audit log records
+  `identity.bound` with `how: "email"`. Only addresses the account verified itself count, and an
+  account with an identity of the provider gets no second one.
+- **Any other identity** leads to a page that offers to sign in with the username and password,
+  after which the user confirms binding it ("Bind the Google account a@gmail.com to alice?").
+  That password sign-in asks for the second step as usual.
+- **On the account page,** binding sends the user to the provider after confirming it is them;
+  the identity must not belong to another account. Confirming it is you also works with a fresh
+  sign-in of a bound Google or GitHub account, and an account without a web login password sets
+  one there after such a sign-in.
+- **The admin UI** takes the same sign-ins; only admin accounts get a session.
+
+Security notes:
+
+- **Whoever controls an account's mailbox can sign in to it**, through a Google or GitHub account
+  with that address, without its two-step verification. This was decided; what is left against
+  it is the notice mail, the `identity.bound` record with `how: "email"`, and that only addresses
+  the account verified itself count. Through the admin UI, control of an admin's mailbox
+  therefore gives the admin UI: to keep an admin account out of this, remove its email address.
+- **Login CSRF and replay.** The `state` of a sign-in is random, used once, valid for 10 minutes
+  and bound to a cookie of the browser that started it (`__Host-gono_oauth`, `SameSite=Lax`);
+  PKCE ties the code to the server, and Google's `nonce` ties its ID token to the state. A
+  callback in another browser does nothing. The redirect URI is fixed, and where the user goes
+  afterwards stays on the server. Failed callbacks count against the client address like failed
+  sign-ins.
+- **Reachability.** Google is not reachable from mainland China, neither from a server there nor
+  from users' browsers, and GitHub often is slow from there: a server in mainland China offers
+  WeChat only. A provider that cannot be reached shows "not possible right now"; the password
+  works as before.
 
 ## The S3 API
 

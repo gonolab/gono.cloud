@@ -15,5 +15,6 @@
     <input id="flow-password" type="password" name="password" autocomplete="current-password" required></label>
   <button class="btn primary block" type="submit">{{ chrome.t.log_in }}</button>
 </form>
+{% include "providers.html" %}
 <p class="muted small mt-18">{{ chrome.t.flow_sign_in_note }}</p>
 {%- endblock %}
