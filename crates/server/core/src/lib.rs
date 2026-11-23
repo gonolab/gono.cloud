@@ -21,8 +21,10 @@
 //! - [`web_sessions`]: browser sessions of the server's HTML pages.
 //! - [`direct_downloads`]: links that let media players stream a file without credentials.
 //! - [`email`]: email addresses of accounts and the one-time codes that prove them.
-//! - [`wechat`]: WeChat mini program identities of accounts, the tickets that bind them and the
-//!   mini program's sessions.
+//! - [`identities`]: third-party identities of accounts (WeChat, Google, GitHub), the rule of
+//!   the last way in, and the identities waiting to be bound.
+//! - [`wechat`]: the WeChat mini program: the tickets that bind its users' identities and its
+//!   sessions.
 //! - [`s3`]: S3 buckets (names bound to folders) and S3 access keys.
 //! - [`services`]: the services an account may use, which admins turn on.
 //! - [`rescan`]: walking a user's tree on disk for `gono-cloud rescan`.
@@ -39,6 +41,7 @@ pub mod devices;
 pub mod direct_downloads;
 pub mod email;
 pub mod error;
+pub mod identities;
 pub mod locks;
 pub mod login_flows;
 pub mod meta;

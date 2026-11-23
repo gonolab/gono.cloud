@@ -809,6 +809,90 @@ fn services_start_off_and_can_be_switched() {
     );
 }
 
+#[tokio::test]
+async fn identities_are_listed_and_unlinked_but_the_last_way_in_stays() {
+    let instance = Instance::new();
+    assert!(instance.init().status.success());
+    let shown = |args: &[&str]| {
+        let output = run(&mut instance.command(args));
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        text(&output.stdout)
+    };
+    assert!(
+        shown(&["user", "identities", "admin"]).contains("admin has no third-party identities"),
+    );
+    // A WeChat identity, as the mini program binds one, and an account without a password.
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", instance.db().display()))
+        .await
+        .unwrap();
+    for sql in [
+        "UPDATE id_sequences SET last_id = last_id + 1 WHERE name = 'external_identities'",
+        "INSERT INTO external_identities (id, user_id, provider, realm, subject, label, \
+         created_at, last_seen_at) VALUES (1, 1, 'wechat', 'wxd930ea5d5a258f4f', 'oAdmin', '', \
+         1800000000, 1800000000)",
+        "UPDATE users SET password_hash = NULL WHERE id = 1",
+    ] {
+        sqlx::query(sql).execute(&pool).await.unwrap();
+    }
+    pool.close().await;
+    let listed = shown(&["user", "identities", "admin"]);
+    assert!(
+        listed.contains("PROVIDER")
+            && listed.contains("wechat")
+            && listed.contains("wxd930ea5d5a258f4f"),
+        "{listed}"
+    );
+    assert!(
+        !listed.contains("oAdmin"),
+        "subjects are never shown: {listed}"
+    );
+    assert!(
+        listed.contains("admin has no web login password"),
+        "{listed}"
+    );
+
+    // The last way in stays until the account has a password.
+    let refused = run(&mut instance.command(&["user", "unlink", "admin", "wechat"]));
+    assert!(!refused.status.success());
+    assert!(
+        text(&refused.stderr).contains("user set-password admin"),
+        "{}",
+        text(&refused.stderr)
+    );
+    let unknown = run(&mut instance.command(&["user", "unlink", "admin", "facebook"]));
+    assert!(!unknown.status.success());
+    let set = run_with_stdin(
+        &mut instance.command(&["user", "set-password", "admin", "--password-stdin"]),
+        &format!("{PASSWORD}\n"),
+    );
+    assert!(set.status.success(), "{}", text(&set.stderr));
+    let unlinked = shown(&["user", "unlink", "admin", "wechat"]);
+    assert!(
+        unlinked.contains("Unbound the wechat identity of admin"),
+        "{unlinked}"
+    );
+    assert!(shown(&["user", "identities", "admin"]).contains("no third-party identities"));
+    assert!(shown(&["user", "unlink", "admin", "wechat"]).contains("admin has no wechat identity"));
+
+    // The audit log names the command line.
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", instance.db().display()))
+        .await
+        .unwrap();
+    let kinds: Vec<(String, String)> =
+        sqlx::query_as("SELECT kind, actor FROM audit_log WHERE user_id = 1 ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    pool.close().await;
+    assert_eq!(
+        kinds,
+        [
+            ("password.set".to_owned(), "cli".to_owned()),
+            ("identity.unbound".to_owned(), "cli".to_owned())
+        ]
+    );
+}
+
 #[test]
 fn app_passwords_are_shown_once_and_can_be_revoked() {
     let instance = Instance::new();

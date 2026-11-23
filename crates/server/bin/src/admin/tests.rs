@@ -30,6 +30,7 @@ use super::{Admin, ServerInfo, format_bytes};
 use crate::{
     app::{self, AppState},
     auth::Authenticator,
+    i18n::EN,
     ratelimit::RateLimiter,
     web::{self, Web},
 };
@@ -584,7 +585,13 @@ async fn accounts_are_created_changed_and_deleted_with_redirects() {
         .await
         .unwrap()
         .unwrap();
-    assert!(password::verify(&SecretString::from("a new password".to_owned()), &hash).unwrap());
+    assert!(
+        password::verify(
+            &SecretString::from("a new password".to_owned()),
+            hash.as_deref().unwrap()
+        )
+        .unwrap()
+    );
 
     // Deleting asks first and moves the files away.
     let confirm = browser.get(&path("/users/carol/delete")).await;
@@ -1436,6 +1443,7 @@ async fn new_app_passwords_are_shown_only_to_the_admin_who_created_them() {
         username: Username::new(name).unwrap(),
         display_name: name.to_owned(),
         is_admin: true,
+        has_password: true,
         services: gono_server_core::services::Services::ALL,
     };
     admin.remember(
@@ -1755,20 +1763,24 @@ async fn the_page_of_an_account_shows_its_email_address() {
 }
 
 #[tokio::test]
-async fn the_page_of_an_account_shows_whether_it_has_wechat_bound() {
+async fn the_page_of_an_account_lists_its_identities_and_unbinds_them() {
     use gono_server_core::wechat::{self, Bind, NewTicket, SignIn};
     use secrecy::ExposeSecret as _;
 
     let f = fixture().await;
     let mut browser = Browser::new(&f.state);
-    browser.sign_in("root", ROOT_PASSWORD).await;
-    let fact = |body: &str| {
-        let start = body.find("<dt>WeChat</dt><dd>").expect("the WeChat fact") + 19;
-        body[start..start + body[start..].find("</dd>").unwrap()].to_owned()
-    };
+    let csrf = browser.root().await;
     let page = browser.get(&path("/users/alice")).await;
     assert_eq!(page.status, StatusCode::OK);
-    assert_eq!(fact(&page.body), "Not bound");
+    assert!(page.body.contains(EN.a_identities_none), "{}", page.body);
+    assert!(
+        page.body.contains(&format!(
+            "<dt>{}</dt><dd>{}</dd>",
+            EN.web_password, EN.a_password_set
+        )),
+        "{}",
+        page.body
+    );
 
     // Bound on 2027-01-15, whether or not this server has `[wechat]` now.
     let at = 1_800_000_000;
@@ -1798,12 +1810,83 @@ async fn the_page_of_an_account_shows_whether_it_has_wechat_bound() {
     .unwrap();
     assert!(matches!(bound, Bind::Bound { .. }), "{bound:?}");
     let page = browser.get(&path("/users/alice")).await;
-    assert_eq!(
-        fact(&page.body),
-        format!(
-            "Bound since {} (wxd930ea5d5a258f4f)",
-            super::pages::date(at)
-        )
+    assert!(
+        page.body
+            .contains("<b>WeChat</b><span class=\"mono\">wxd930ea5d5a258f4f</span>"),
+        "{}",
+        page.body
+    );
+    let date = super::pages::date(at);
+    assert!(
+        page.body.contains(&format!("Bound {date}, last used ")),
+        "{}",
+        page.body
     );
     assert!(!page.body.contains("oAlice"), "the openid is not shown");
+    let identity = gono_server_core::identities::list(&f.state.db, f.alice)
+        .await
+        .unwrap()
+        .remove(0);
+    let unbind = path(&format!("/users/alice/identities/{}/unbind", identity.id));
+    assert!(
+        page.body.contains(&format!("action=\"{unbind}\"")),
+        "{}",
+        page.body
+    );
+
+    // The last way in of an account without a password stays.
+    sqlx::query("UPDATE users SET password_hash = NULL WHERE id = ?")
+        .bind(f.alice)
+        .execute(&f.state.db)
+        .await
+        .unwrap();
+    let page = browser.get(&path("/users/alice")).await;
+    assert!(page.body.contains(EN.a_password_none), "{}", page.body);
+    let refused = browser.post(&unbind, &[("csrf", &csrf)]).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    let escaped = EN.a_err_last_sign_in.replace('\'', "&#39;");
+    assert!(refused.body.contains(&escaped), "{}", refused.body);
+
+    // With a password it goes, and the audit log says who did it.
+    let set = browser
+        .post(
+            &path("/users/alice/password"),
+            &[
+                ("csrf", &csrf),
+                ("password", "a new password"),
+                ("password_repeat", "a new password"),
+            ],
+        )
+        .await;
+    assert_eq!(set.status, StatusCode::SEE_OTHER);
+    let unbound = browser.post(&unbind, &[("csrf", &csrf)]).await;
+    assert_eq!(unbound.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        unbound.location(),
+        format!("{}?done=unbound", path("/users/alice"))
+    );
+    let location = unbound.location().to_owned();
+    let page = browser.get(&location).await;
+    assert!(page.body.contains(EN.a_notice_unbound), "{}", page.body);
+    assert!(page.body.contains(EN.a_identities_none), "{}", page.body);
+    let entries = gono_server_core::audit::list(&f.state.db, Some(f.alice), None, 10)
+        .await
+        .unwrap();
+    let kinds: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|entry| (entry.kind.as_str(), entry.actor.as_str()))
+        .collect();
+    assert_eq!(
+        kinds[..3],
+        [
+            ("identity.unbound", "admin"),
+            ("password.set", "admin"),
+            ("identity.bound", "user")
+        ]
+    );
+    assert!(
+        entries[0].details.contains("\"how\":\"admin\""),
+        "{}",
+        entries[0].details
+    );
 }

@@ -797,7 +797,13 @@ async fn disabled_accounts_cannot_reset() {
         .await
         .unwrap()
         .unwrap();
-    assert!(password::verify(&SecretString::from(ALICE_PASSWORD.to_owned()), &hash).unwrap());
+    assert!(
+        password::verify(
+            &SecretString::from(ALICE_PASSWORD.to_owned()),
+            hash.as_deref().unwrap()
+        )
+        .unwrap()
+    );
 
     // A disabled account gets no code either, and the page says the same as ever.
     let answer = forgot(&mut browser, "alice").await;

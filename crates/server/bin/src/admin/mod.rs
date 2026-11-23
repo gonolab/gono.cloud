@@ -12,6 +12,7 @@
 //! | `POST <p>/users/<name>/promote`, `.../demote` | Grant or withdraw admin access. |
 //! | `POST <p>/users/<name>/display-name` | Change the display name. |
 //! | `POST <p>/users/<name>/password` | Set the web login password. |
+//! | `POST <p>/users/<name>/identities/<id>/unbind` | Unbind a third-party identity; refused for the last way in of an account without a password. |
 //! | `GET  <p>/users/<name>/delete`, `POST` the same | Confirm and delete the account. |
 //! | `POST <p>/users/<name>/app-passwords` | Create an app password, then show it once at `<p>/created`. |
 //! | `POST <p>/users/<name>/app-passwords/<id>/delete` | Revoke an app password. |
@@ -83,10 +84,10 @@ use serde::Deserialize;
 
 pub(crate) use self::pages::{AppPasswordForm, ScopeChip};
 use self::pages::{
-    AppPasswordRow, CreatedPage, DeletePage, Fact, Feature, Frame, LoginPage, MOUNT_ROWS,
-    MessagePage, MountInput, NewUserPage, NotAdminPage, OverviewPage, RefusalRow, RelayDeviceRow,
-    RelayPage, RelayView, RemoteDeviceRow, RevokeDevicePage, SessionRow, UserPage, UserRow,
-    UserView, UsersPage,
+    AppPasswordRow, CreatedPage, DeletePage, Fact, Feature, Frame, IdentityRow, LoginPage,
+    MOUNT_ROWS, MessagePage, MountInput, NewUserPage, NotAdminPage, OverviewPage, RefusalRow,
+    RelayDeviceRow, RelayPage, RelayView, RemoteDeviceRow, RevokeDevicePage, SessionRow, UserPage,
+    UserRow, UserView, UsersPage,
 };
 use crate::{
     app::AppState,
@@ -259,6 +260,10 @@ pub fn routes(prefix: &str) -> Router<AppState> {
             post(set_display_name),
         )
         .route(&format!("{p}/users/{{name}}/password"), post(set_password))
+        .route(
+            &format!("{p}/users/{{name}}/identities/{{id}}/unbind"),
+            post(unbind_identity),
+        )
         .route(
             &format!("{p}/users/{{name}}/delete"),
             get(delete_page).post(delete_user),
@@ -1330,7 +1335,7 @@ async fn user_page_response(
         Ok(email) => email,
         Err(err) => return internal_error(&session.chrome, &err),
     };
-    let wechat = match gono_server_core::wechat::identities(&state.db, user.id).await {
+    let identities = match gono_server_core::identities::list(&state.db, user.id).await {
         Ok(identities) => identities,
         Err(err) => return internal_error(&session.chrome, &err),
     };
@@ -1390,22 +1395,28 @@ async fn user_page_response(
             },
             two_factor_on: two_factor_status.is_some(),
             email: email.unwrap_or_else(|| t.a_email_none.to_owned()),
-            // Every AppID the account has an identity of, also of a mini program configured
-            // before: an admin sees what a change of `wechat.app_id` left behind.
-            wechat: if wechat.is_empty() {
-                t.a_wechat_none.to_owned()
-            } else {
-                wechat
-                    .iter()
-                    .map(|identity| {
-                        fill(
-                            t.a_wechat_bound,
-                            &[&pages::date(identity.created_at), &identity.app_id],
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            },
+            has_password: user.has_password,
+            // Every identity of the account, also of a WeChat mini program configured before:
+            // an admin sees what a change of `wechat.app_id` left behind.
+            identities: identities
+                .iter()
+                .map(|identity| IdentityRow {
+                    id: identity.id,
+                    provider: crate::files::account::methods::provider_name(t, identity.provider),
+                    label: if identity.provider == gono_server_core::identities::Provider::WeChat {
+                        identity.realm.clone()
+                    } else {
+                        identity.label.clone()
+                    },
+                    since: fill(
+                        t.a_identity_since,
+                        &[
+                            &pages::date(identity.created_at),
+                            &ago(t, now, identity.last_seen_at, pages::date),
+                        ],
+                    ),
+                })
+                .collect(),
             services: service_view::rows(t, state, user.services),
         },
         is_self: user.id == session.user.user_id,
@@ -1672,6 +1683,7 @@ async fn user_page(
         Some("demoted") => Some(fill(t.a_notice_demoted, &[name])),
         Some("renamed") => Some(t.a_notice_renamed.to_owned()),
         Some("password") => Some(t.a_notice_password.to_owned()),
+        Some("unbound") => Some(t.a_notice_unbound.to_owned()),
         Some("device-revoked") => Some(t.notice_device_revoked.to_owned()),
         Some("two-factor-reset") if state.remote_access_needs_two_factor() => {
             Some(t.a_notice_tf_reset.to_owned())
@@ -1983,7 +1995,9 @@ async fn set_password(
             return user_error(&state, &admin, &session, &user, status, error).await;
         }
     };
-    if let Err(err) = users::set_password_hash(&state.db, &user.username, &hash).await {
+    if let Err(err) =
+        users::set_password_hash(&state.db, &user.username, &hash, audit::Actor::Admin).await
+    {
         return internal_error(&session.chrome, &err);
     }
     // Sign the user out everywhere else; an admin changing their own password stays in.
@@ -1997,6 +2011,62 @@ async fn set_password(
         "{}?done=password",
         admin.user_url(user.username.as_str())
     ))
+}
+
+/// `POST <admin>/users/<name>/identities/<id>/unbind`: unbinds a third-party identity of the
+/// account, and with a WeChat identity its mini program sessions. The last way in of an account
+/// without a web password stays: the admin sets a password first.
+async fn unbind_identity(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((name, id)): Path<(String, i64)>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let admin = match admin(&state) {
+        Ok(admin) => admin,
+        Err(halt) => return *halt,
+    };
+    let session = match form_session(&state, &admin, &headers, &form.csrf).await {
+        Ok(session) => session,
+        Err(halt) => return *halt,
+    };
+    let user = match find_user(&state, &admin, &session, &name).await {
+        Ok(user) => user,
+        Err(halt) => return *halt,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    use gono_server_core::identities::{self, How, Unbound, Which};
+    match identities::unbind(
+        &state.db,
+        user.id,
+        Which::Id(id),
+        How::Admin,
+        audit::Actor::Admin,
+        Some(client),
+        db::unix_now(),
+    )
+    .await
+    {
+        Ok(Unbound::Done(identity)) => {
+            tracing::info!(
+                by = %session.user.username,
+                user = %user.username,
+                provider = identity.provider.as_str(),
+                "admin unbound an identity"
+            );
+            see_other(&format!(
+                "{}?done=unbound",
+                admin.user_url(user.username.as_str())
+            ))
+        }
+        Ok(Unbound::NotBound) => see_other(&admin.user_url(user.username.as_str())),
+        Ok(Unbound::LastSignIn) => {
+            let error = session.chrome.t.a_err_last_sign_in.to_owned();
+            user_error(&state, &admin, &session, &user, StatusCode::CONFLICT, error).await
+        }
+        Err(err) => internal_error(&session.chrome, &err),
+    }
 }
 
 async fn delete_page(

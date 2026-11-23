@@ -1,0 +1,28 @@
+{%- extends "files/frame.html" -%}
+{%- block title %}{{ title }}{% endblock -%}
+{%- block content %}
+<div class="page-head"><div><h1>{{ title }}</h1><p class="sub"><span class="mono">{{ username }}</span></p></div></div>
+{%- if let Some(error) = error %}
+<div class="flash bad" role="alert">{{ error }}</div>
+{%- endif %}
+<section class="panel"><div class="panel-body">
+  <p>{{ lead }}</p>
+  {%- if let Some(note) = note %}
+  <p class="muted small mt-6">{{ note }}</p>
+  {%- endif %}
+  {%- if no_password %}
+  <p class="muted small mt-18">{{ chrome.t.confirm_no_password }}</p>
+  {%- endif %}
+  <form method="post" action="{{ action }}" class="mt-20">
+    <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
+    {%- if !next.is_empty() %}
+    <input type="hidden" name="next" value="{{ next }}">
+    {%- endif %}
+    {%- if ask_password %}
+    <input type="text" name="username" value="{{ username }}" autocomplete="username" hidden>
+    <label class="field" for="confirm-password"><span>{{ chrome.t.tf_password }}</span><input id="confirm-password" type="password" name="password" autocomplete="current-password" required autofocus></label>
+    {%- endif %}
+    <div class="actions mt-20"><button class="btn{% if danger %} danger{% else %} primary{% endif %}" type="submit"{% if no_password %} disabled{% endif %}>{{ button }}</button><a class="btn" href="/account/">{{ chrome.t.cancel }}</a></div>
+  </form>
+</div></section>
+{%- endblock %}

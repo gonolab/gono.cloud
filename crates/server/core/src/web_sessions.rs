@@ -1,7 +1,7 @@
 //! Browser sessions (`web_sessions` table).
 //!
-//! A session is created only by signing in with the web login password on one of the server's
-//! HTML pages (Login Flow v2 now, the web admin UI later); app passwords never create one. The
+//! A session is created only by signing in on one of the server's HTML pages, with the web login
+//! password or a third-party identity ([`crate::identities`]); app passwords never create one. The
 //! browser holds a random token in a cookie and the table holds its SHA-256 digest.
 //!
 //! - A session ends [`IDLE_TIMEOUT_SECS`] after its last use and at the latest
@@ -47,6 +47,9 @@ pub struct SessionUser {
     pub display_name: String,
     /// Whether it may use the web admin UI.
     pub is_admin: bool,
+    /// Whether it has a web login password (an account without one signs in with its
+    /// third-party identities only).
+    pub has_password: bool,
     /// The services it may use.
     pub services: Services,
 }
@@ -88,6 +91,8 @@ struct Row {
     is_admin: bool,
     #[sqlx(try_from = "Flag")]
     enabled: bool,
+    #[sqlx(try_from = "Flag")]
+    has_password: bool,
     #[sqlx(flatten)]
     services: Services,
 }
@@ -97,8 +102,9 @@ pub async fn lookup(pool: &Pool, token: &str, now: i64) -> Result<Option<Session
     let digest = secret::digest(token);
     let row: Option<Row> = sqlx::query_as(
         "SELECT s.id, s.created_at, s.last_seen_at, s.expires_at, u.id AS user_id, u.username, \
-         u.display_name, u.is_admin, u.enabled, u.service_files, u.service_webdav, \
-         u.service_s3, u.service_direct, u.service_relay FROM web_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?",
+         u.display_name, u.is_admin, u.enabled, (u.password_hash IS NOT NULL) AS has_password, \
+         u.service_files, u.service_webdav, u.service_s3, u.service_direct, u.service_relay \
+         FROM web_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?",
     )
     .bind(&digest[..])
     .fetch_optional(pool)
@@ -126,6 +132,7 @@ pub async fn lookup(pool: &Pool, token: &str, now: i64) -> Result<Option<Session
         username: Username::new(row.username)?,
         display_name: row.display_name,
         is_admin: row.is_admin,
+        has_password: row.has_password,
         services: row.services,
     }))
 }

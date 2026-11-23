@@ -4,11 +4,14 @@ use std::path::Path;
 
 use anyhow::Context;
 use gono_server_core::{
-    db, password,
+    audit::Actor,
+    db,
+    identities::{self, How, Unbound, Which},
+    password,
     services::Service,
     storage::DataLayout,
     two_factor::{self, TurnedOff},
-    users::{self, NewUser},
+    users::{self, CreatedVia, NewUser},
     web_sessions,
 };
 
@@ -38,7 +41,7 @@ pub async fn run(config_path: &Path, command: UserCommand) -> anyhow::Result<()>
                 return Err(gono_server_core::Error::UserExists(username).into());
             }
             let hash = read_password_hash(password, &username).await?;
-            let id = users::create(
+            let id = users::create_via(
                 &pool,
                 &NewUser {
                     username: &username,
@@ -47,6 +50,7 @@ pub async fn run(config_path: &Path, command: UserCommand) -> anyhow::Result<()>
                     is_admin: admin,
                     services: gono_server_core::services::Services::NONE,
                 },
+                CreatedVia::Cli,
                 |id| layout.create_user(id),
             )
             .await?;
@@ -106,7 +110,7 @@ pub async fn run(config_path: &Path, command: UserCommand) -> anyhow::Result<()>
         UserCommand::SetPassword { username, password } => {
             let user = users::get(&pool, &username).await?;
             let hash = read_password_hash(password, &username).await?;
-            users::set_password_hash(&pool, &username, &hash).await?;
+            users::set_password_hash(&pool, &username, &hash, Actor::Cli).await?;
             let ended = web_sessions::delete_for_user(&pool, user.id, None).await?;
             println!("Changed the web login password of {username}.");
             if ended > 0 {
@@ -161,6 +165,68 @@ pub async fn run(config_path: &Path, command: UserCommand) -> anyhow::Result<()>
             enable,
             disable,
         } => services(&pool, &username, enable, disable).await,
+        UserCommand::Identities { username } => {
+            let user = users::get(&pool, &username).await?;
+            let rows: Vec<Vec<String>> = identities::list(&pool, user.id)
+                .await?
+                .into_iter()
+                .map(|identity| {
+                    vec![
+                        identity.provider.as_str().to_owned(),
+                        identity.realm,
+                        identity.label,
+                        format_time(identity.created_at),
+                        format_time(identity.last_seen_at),
+                    ]
+                })
+                .collect();
+            if rows.is_empty() {
+                println!("{username} has no third-party identities.");
+            } else {
+                print_table(&["PROVIDER", "REALM", "LABEL", "BOUND", "LAST USED"], &rows);
+            }
+            if !user.has_password {
+                println!("{username} has no web login password.");
+            }
+            Ok(())
+        }
+        UserCommand::Unlink { username, provider } => {
+            let user = users::get(&pool, &username).await?;
+            let bound: Vec<_> = identities::list(&pool, user.id)
+                .await?
+                .into_iter()
+                .filter(|identity| identity.provider == provider)
+                .collect();
+            if bound.is_empty() {
+                println!("{username} has no {} identity.", provider.as_str());
+            }
+            for identity in bound {
+                match identities::unbind(
+                    &pool,
+                    user.id,
+                    Which::Id(identity.id),
+                    How::Cli,
+                    Actor::Cli,
+                    None,
+                    db::unix_now(),
+                )
+                .await?
+                {
+                    Unbound::Done(identity) => println!(
+                        "Unbound the {} identity of {username} ({}).",
+                        identity.provider.as_str(),
+                        identity.realm
+                    ),
+                    Unbound::NotBound => {}
+                    Unbound::LastSignIn => anyhow::bail!(
+                        "this {} identity is the only way {username} signs in; set a web login \
+                         password first with `gono-cloud user set-password {username}`",
+                        provider.as_str()
+                    ),
+                }
+            }
+            Ok(())
+        }
         UserCommand::Disable { username } => {
             let user = users::get(&pool, &username).await?;
             users::set_enabled(&pool, &username, false).await?;

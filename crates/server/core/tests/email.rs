@@ -461,7 +461,7 @@ async fn a_reset_code_sets_the_password_and_ends_the_sessions() {
     );
     let username = Username::new("alice").unwrap();
     let (account, hash) = users::credentials(&pool, &username).await.unwrap().unwrap();
-    assert_eq!(hash, "new hash");
+    assert_eq!(hash.as_deref(), Some("new hash"));
     assert_eq!(account.updated_at, later + 1);
     let sessions: Vec<i64> = sqlx::query_scalar("SELECT user_id FROM web_sessions")
         .fetch_all(&pool)
@@ -515,7 +515,7 @@ async fn disabled_accounts_cannot_reset() {
         Reset::Refused
     );
     let (_, hash) = users::credentials(&pool, &username).await.unwrap().unwrap();
-    assert_eq!(hash, "old hash");
+    assert_eq!(hash.as_deref(), Some("old hash"));
 }
 
 #[tokio::test]

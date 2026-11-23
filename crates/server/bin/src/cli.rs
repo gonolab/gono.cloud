@@ -199,6 +199,25 @@ pub enum UserCommand {
         disable: Option<ServiceList>,
     },
 
+    /// List the third-party identities (WeChat, Google, GitHub) a user signs in with.
+    Identities {
+        /// Account whose identities are listed.
+        username: Username,
+    },
+
+    /// Unbind a user's identity of a provider (`wechat`, `google` or `github`), of every realm
+    /// (also of a WeChat mini program configured before). Unbinding WeChat signs its mini
+    /// program out. The last way in of an account without a web login password is kept: set
+    /// one first with `user set-password`.
+    Unlink {
+        /// Account whose identity is unbound.
+        username: Username,
+
+        /// `wechat`, `google` or `github`.
+        #[arg(value_parser = parse_provider)]
+        provider: gono_server_core::identities::Provider,
+    },
+
     /// Change the name clients show for a user.
     SetDisplayName {
         /// Account whose display name changes.
@@ -359,6 +378,12 @@ pub enum S3BucketCommand {
         /// Bucket name.
         name: String,
     },
+}
+
+/// The provider of `user unlink`.
+fn parse_provider(value: &str) -> Result<gono_server_core::identities::Provider, String> {
+    gono_server_core::identities::Provider::parse(value)
+        .ok_or_else(|| format!("{value:?} is not a provider: wechat, google or github"))
 }
 
 /// A comma-separated list of services (`webdav,s3`, `all`), the value of `user services

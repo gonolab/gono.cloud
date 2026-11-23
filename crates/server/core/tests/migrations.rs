@@ -26,11 +26,11 @@ use sqlx::Row as _;
 /// the edit and add a new migration instead.
 const SQLITE_MIGRATIONS: &[(i64, &str)] = &[(
     1,
-    "4d7994e283b6cf7ab7e872132dbe0488efbc6d49baf4375fa43004bde06d00ac9e3001d8075e9e124ddc4d2489f4886e",
+    "bbbaad154f336dfa0ba712973a5b0215081bcc5eaaa2794234eeedceae089b9b71684ab32b6fc6e046dcad4dba1f62fb",
 )];
 const MYSQL_MIGRATIONS: &[(i64, &str)] = &[(
     1,
-    "b3333b4d503577a9386b6cff9fc7e0c0f57b8e4c19a6b4f891980dae695eaf80014f096f44a196932fb88cc9be5ff021",
+    "47234c7379446949231de70a4ddccf90dd7f73f835520f4d5a92de44b2ca074247e176a39abeca52317948e3bba9f12c",
 )];
 
 /// The tables of the schema on both backends.
@@ -45,6 +45,7 @@ const TABLES: &[&str] = &[
     "devices",
     "direct_downloads",
     "email_codes",
+    "external_identities",
     "files",
     "id_sequences",
     "locks",
@@ -52,6 +53,7 @@ const TABLES: &[&str] = &[
     "mp_sessions",
     "object_meta",
     "object_parts",
+    "pending_identities",
     "recovery_codes",
     "retired_usernames",
     "revocations_applied",
@@ -66,8 +68,6 @@ const TABLES: &[&str] = &[
     "users",
     "web_sessions",
     "wechat_bind_tickets",
-    "wechat_identities",
-    "wechat_signup_tokens",
 ];
 
 fn sqlite_config(dir: &Path) -> DbConfig {
@@ -89,8 +89,8 @@ async fn insert_user(pool: &Pool, username: &str) -> i64 {
     let mut tx = db::begin_immediate(pool).await.unwrap();
     let id = db::next_id(&mut tx, "users").await.unwrap();
     sqlx::query(
-        "INSERT INTO users (id, username, display_name, password_hash, created_at, updated_at) \
-         VALUES (?, ?, ?, 'x', 0, 0)",
+        "INSERT INTO users (id, username, display_name, password_hash, created_at, updated_at, \
+         created_via) VALUES (?, ?, ?, 'x', 0, 0, 'cli')",
     )
     .bind(id)
     .bind(username)
@@ -358,8 +358,8 @@ async fn schema_enforces_constraints() {
 
     // Usernames are unique.
     rejects(
-        "INSERT INTO users (id, username, display_name, password_hash, created_at, updated_at) \
-         SELECT id + 1000, username, 'x', 'x', 0, 0 FROM users WHERE id = ?",
+        "INSERT INTO users (id, username, display_name, password_hash, created_at, updated_at, \
+         created_via) SELECT id + 1000, username, 'x', 'x', 0, 0, 'cli' FROM users WHERE id = ?",
     )
     .await;
     // Foreign keys are enforced.
@@ -423,6 +423,25 @@ async fn schema_enforces_constraints() {
              VALUES (1000, ?, 'a', 0, 'e', 'yesterday')",
         )
         .await;
+        // Accounts come from somewhere known, and one waiting for its deletion is disabled.
+        rejects(
+            "INSERT INTO users (id, username, display_name, password_hash, created_at, \
+             updated_at, created_via) VALUES (1000 + ?, 'nobody', 'x', 'x', 0, 0, 'ldap')",
+        )
+        .await;
+        rejects("UPDATE users SET deleting_at = 1 WHERE id = ?").await;
+        // Only WeChat identities have a unionid.
+        rejects(
+            "INSERT INTO external_identities (id, user_id, provider, realm, subject, unionid, \
+             label, created_at, last_seen_at) \
+             VALUES (1000, ?, 'google', 'https://accounts.google.com', '1', 'u', '', 0, 0)",
+        )
+        .await;
+        rejects(
+            "INSERT INTO external_identities (id, user_id, provider, realm, subject, label, \
+             created_at, last_seen_at) VALUES (1000, ?, 'facebook', 'x', '1', '', 0, 0)",
+        )
+        .await;
     } else {
         // Strict mode rejects values of the wrong type and values too long for their column.
         rejects(
@@ -432,7 +451,7 @@ async fn schema_enforces_constraints() {
         .await;
         rejects(
             "INSERT INTO users (id, username, display_name, password_hash, created_at, \
-             updated_at) VALUES (1000 + ?, REPEAT('a', 65), 'x', 'x', 0, 0)",
+             updated_at, created_via) VALUES (1000 + ?, REPEAT('a', 65), 'x', 'x', 0, 0, 'cli')",
         )
         .await;
     }
@@ -646,14 +665,17 @@ async fn initial_admin_is_created_only_once() {
         .await
         .expect("first admin");
 
-    let (Flag(is_admin), Flag(enabled), stored_hash): (Flag, Flag, String) =
-        sqlx::query_as("SELECT is_admin, enabled, password_hash FROM users WHERE username = ?")
-            .bind("admin")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (Flag(is_admin), Flag(enabled), stored_hash, via): (Flag, Flag, String, String) =
+        sqlx::query_as(
+            "SELECT is_admin, enabled, password_hash, created_via FROM users WHERE username = ?",
+        )
+        .bind("admin")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(is_admin && enabled);
     assert_eq!(stored_hash, phc);
+    assert_eq!(via, "cli", "the first admin is made with the command line");
 
     let other = Username::new("mallory").unwrap();
     let err = users::create_initial_admin(&pool, &other, "Mallory", &phc)

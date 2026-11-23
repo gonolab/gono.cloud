@@ -43,15 +43,15 @@ INSERT INTO id_sequences (name, last_id) VALUES
     ('device_events', 0),
     ('devices', 0),
     ('email_codes', 0),
+    ('external_identities', 0),
     ('files', 0),
     ('login_flows', 0),
     ('mp_sessions', 0),
+    ('pending_identities', 0),
     ('s3_buckets', 0),
     ('users', 0),
     ('web_sessions', 0),
-    ('wechat_bind_tickets', 0),
-    ('wechat_identities', 0),
-    ('wechat_signup_tokens', 0);
+    ('wechat_bind_tickets', 0);
 
 -- The row every write transaction locks first (`SELECT ... FOR UPDATE`), so that one writer
 -- at a time changes the database, across all processes, as with SQLite.
@@ -74,11 +74,13 @@ CREATE TABLE users (
     -- `gono_server_core::Username`: at most 64 bytes.
     username      VARBINARY(64) NOT NULL UNIQUE,
     display_name  VARCHAR(255)  NOT NULL,
-    password_hash VARCHAR(255)  NOT NULL,
+    password_hash VARCHAR(255),
     enabled       INT           NOT NULL DEFAULT 1,
     is_admin      INT           NOT NULL DEFAULT 0,
     created_at    BIGINT        NOT NULL,
     updated_at    BIGINT        NOT NULL,
+    created_via   VARCHAR(8)    NOT NULL,
+    deleting_at   BIGINT,
     -- See the SQLite schema. VARCHAR rather than VARBINARY: addresses are lower-cased ASCII
     -- without spaces, so `utf8mb4_bin`, which ignores trailing spaces, compares them byte for
     -- byte.
@@ -90,6 +92,8 @@ CREATE TABLE users (
     service_relay  INT NOT NULL DEFAULT 0,
     CHECK (enabled IN (0, 1)),
     CHECK (is_admin IN (0, 1)),
+    CHECK (created_via IN ('admin', 'cli', 'wechat', 'google', 'github')),
+    CHECK (deleting_at IS NULL OR enabled = 0),
     CHECK (email IS NULL OR (LENGTH(email) BETWEEN 3 AND 254 AND email = LOWER(email))),
     CHECK (service_files IN (0, 1)),
     CHECK (service_webdav IN (0, 1)),
@@ -508,22 +512,53 @@ CREATE TABLE email_codes (
     FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC;
 
--- See the SQLite schema for the four tables of WeChat mini programs. AppIDs, openids and
--- unionids are VARBINARY: they are compared byte for byte.
-CREATE TABLE wechat_identities (
+-- See the SQLite schema for the third-party identities and the tables of WeChat mini programs.
+-- Realms, subjects, AppIDs and unionids are VARBINARY: they are compared byte for byte.
+CREATE TABLE external_identities (
     id           BIGINT         NOT NULL PRIMARY KEY,
     user_id      BIGINT         NOT NULL,
-    app_id       VARBINARY(32)  NOT NULL,
-    openid       VARBINARY(128) NOT NULL,
+    provider     VARCHAR(8)     NOT NULL,
+    realm        VARBINARY(64)  NOT NULL,
+    subject      VARBINARY(255) NOT NULL,
     unionid      VARBINARY(128),
+    label        VARCHAR(255)   NOT NULL,
     created_at   BIGINT         NOT NULL,
     last_seen_at BIGINT         NOT NULL,
-    CHECK (LENGTH(app_id) BETWEEN 1 AND 32),
-    CHECK (LENGTH(openid) BETWEEN 1 AND 128),
+    CHECK (provider IN ('wechat', 'google', 'github')),
+    CHECK (LENGTH(realm) BETWEEN 1 AND 64),
+    CHECK (LENGTH(subject) BETWEEN 1 AND 255),
     CHECK (unionid IS NULL OR LENGTH(unionid) BETWEEN 1 AND 128),
-    UNIQUE KEY wechat_identities_openid (app_id, openid),
-    UNIQUE KEY wechat_identities_user_app (user_id, app_id),
+    CHECK (unionid IS NULL OR provider = 'wechat'),
+    UNIQUE KEY external_identities_subject (provider, realm, subject),
+    UNIQUE KEY external_identities_user (user_id, provider, realm),
     FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC;
+
+CREATE TABLE pending_identities (
+    id             BIGINT         NOT NULL PRIMARY KEY,
+    token_hash     BINARY(32)     NOT NULL UNIQUE,
+    holder         VARCHAR(16)    NOT NULL,
+    provider       VARCHAR(8)     NOT NULL,
+    realm          VARBINARY(64)  NOT NULL,
+    subject        VARBINARY(255) NOT NULL,
+    unionid        VARBINARY(128),
+    label          VARCHAR(255)   NOT NULL,
+    email          VARCHAR(254),
+    email_verified INT            NOT NULL DEFAULT 0,
+    name           VARCHAR(255),
+    created_at     BIGINT         NOT NULL,
+    expires_at     BIGINT         NOT NULL,
+    CHECK (LENGTH(token_hash) = 32),
+    CHECK (holder IN ('mini_program', 'web')),
+    CHECK (provider IN ('wechat', 'google', 'github')),
+    CHECK (LENGTH(realm) BETWEEN 1 AND 64),
+    CHECK (LENGTH(subject) BETWEEN 1 AND 255),
+    CHECK (unionid IS NULL OR LENGTH(unionid) BETWEEN 1 AND 128),
+    CHECK (email IS NULL OR LENGTH(email) BETWEEN 3 AND 254),
+    CHECK (email_verified IN (0, 1)),
+    CHECK (unionid IS NULL OR provider = 'wechat'),
+    INDEX pending_identities_subject (provider, realm, subject),
+    INDEX pending_identities_expires_at (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE wechat_bind_tickets (
@@ -538,35 +573,15 @@ CREATE TABLE wechat_bind_tickets (
     FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC;
 
-CREATE TABLE wechat_signup_tokens (
-    id         BIGINT         NOT NULL PRIMARY KEY,
-    token_hash BINARY(32)     NOT NULL UNIQUE,
-    app_id     VARBINARY(32)  NOT NULL,
-    openid     VARBINARY(128) NOT NULL,
-    unionid    VARBINARY(128),
-    created_at BIGINT         NOT NULL,
-    expires_at BIGINT         NOT NULL,
-    CHECK (LENGTH(token_hash) = 32),
-    CHECK (LENGTH(app_id) BETWEEN 1 AND 32),
-    CHECK (LENGTH(openid) BETWEEN 1 AND 128),
-    CHECK (unionid IS NULL OR LENGTH(unionid) BETWEEN 1 AND 128),
-    INDEX wechat_signup_tokens_openid (app_id, openid),
-    INDEX wechat_signup_tokens_expires_at (expires_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC;
-
 CREATE TABLE mp_sessions (
-    id           BIGINT         NOT NULL PRIMARY KEY,
-    token_hash   BINARY(32)     NOT NULL UNIQUE,
-    user_id      BIGINT         NOT NULL,
-    app_id       VARBINARY(32)  NOT NULL,
-    openid       VARBINARY(128) NOT NULL,
-    created_at   BIGINT         NOT NULL,
-    last_seen_at BIGINT         NOT NULL,
-    expires_at   BIGINT         NOT NULL,
+    id           BIGINT     NOT NULL PRIMARY KEY,
+    token_hash   BINARY(32) NOT NULL UNIQUE,
+    identity_id  BIGINT     NOT NULL,
+    created_at   BIGINT     NOT NULL,
+    last_seen_at BIGINT     NOT NULL,
+    expires_at   BIGINT     NOT NULL,
     CHECK (LENGTH(token_hash) = 32),
-    CHECK (LENGTH(app_id) BETWEEN 1 AND 32),
-    CHECK (LENGTH(openid) BETWEEN 1 AND 128),
-    INDEX mp_sessions_user_app (user_id, app_id),
+    INDEX mp_sessions_identity_id (identity_id),
     INDEX mp_sessions_expires_at (expires_at),
-    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    FOREIGN KEY (identity_id) REFERENCES external_identities (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC;

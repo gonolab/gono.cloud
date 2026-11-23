@@ -11,6 +11,26 @@
         {%- endfor %}
       </ul>
     </div></section>
+    <section class="panel" id="methods" aria-labelledby="methods-title"><div class="panel-body">
+      <h2 id="methods-title">{{ chrome.t.methods_title }}</h2>
+      <p class="muted small">{{ chrome.t.methods_note }}</p>
+      {%- if confirm.needs_sign_in() %}
+      <p class="small mt-18"><a class="btn block" href="/account/confirm?next=%2Faccount%2F">{{ chrome.t.confirm_title }}</a></p>
+      {%- endif %}
+      <ul class="features mt-18">
+        <li><span><b>{{ chrome.t.methods_password }}</b><span class="muted">{% if methods.has_password %}{{ chrome.t.methods_password_set }}{% else %}{{ chrome.t.methods_password_none }}{% endif %}</span></span><span class="chips"><a href="#password">{% if methods.has_password %}{{ chrome.t.methods_change }}{% else %}{{ chrome.t.methods_set }}{% endif %}</a></span></li>
+        {%- for row in methods.rows %}
+        <li><span><b>{{ row.name }}</b>{% if !row.label.is_empty() %}<span class="mono">{{ row.label }}</span>{% endif %}<span class="muted">{% if let Some(bound) = row.bound %}{{ bound }}{% else if let Some(note) = row.unavailable %}{{ note }}{% else %}{{ chrome.t.methods_not_bound }}{% endif %}</span></span><span class="chips">{% if row.bound.is_some() %}<a href="/account/identities/{{ row.key }}/unbind">{{ chrome.t.methods_unbind }}</a>{% else if row.offered %}<a href="/account/identities/{{ row.key }}/bind">{{ chrome.t.methods_bind }}</a>{% endif %}</span></li>
+        {%- endfor %}
+      </ul>
+      {%- if let Some(qr) = methods.qr %}
+      <p class="small mt-18">{{ methods.scan }}</p>
+      {{ qr|safe }}
+      {%- endif %}
+      {%- if methods.no_two_step %}
+      <p class="muted small mt-18">{{ chrome.t.methods_no_two_step }}</p>
+      {%- endif %}
+    </div></section>
     <section class="panel" id="email" aria-labelledby="email-title"><div class="panel-body">
       <h2 id="email-title">{{ chrome.t.email_title }}</h2>
       <p class="muted small">{{ chrome.t.email_note }}</p>
@@ -32,52 +52,24 @@
         <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
         <input type="text" name="username" value="{{ frame.username }}" autocomplete="username" hidden>
         <label class="field" for="email-new"><span>{{ chrome.t.email_new }}</span><input id="email-new" type="email" name="email" autocomplete="email" spellcheck="false" maxlength="254" required></label>
+        {%- if confirm.ask_password() %}
         <label class="field" for="email-password"><span>{{ chrome.t.tf_password }}</span><input id="email-password" type="password" name="password" autocomplete="current-password" required></label>
+        {%- endif %}
         <button class="btn block" type="submit">{{ chrome.t.email_send }}</button>
       </form>
       {%- if email.address.is_some() %}
       <form method="post" action="/account/email/remove" class="mt-20">
         <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
         <input type="text" name="username" value="{{ frame.username }}" autocomplete="username" hidden>
+        {%- if confirm.ask_password() %}
         <label class="field" for="email-remove-password"><span>{{ chrome.t.tf_password }}</span><input id="email-remove-password" type="password" name="password" autocomplete="current-password" required></label>
+        {%- endif %}
         <button class="btn danger block" type="submit">{{ chrome.t.email_remove }}</button>
       </form>
       <p class="muted small mt-6">{{ chrome.t.email_password_note }}</p>
       {%- endif %}
       {%- else %}
       <p class="muted">{{ chrome.t.email_unavailable }}</p>
-      {%- endif %}
-    </div></section>
-    <section class="panel" id="wechat" aria-labelledby="wechat-title"><div class="panel-body">
-      <h2 id="wechat-title">{{ chrome.t.wechat_title }}</h2>
-      <p class="muted small">{{ chrome.t.wechat_note }}</p>
-      {%- if wechat.available %}
-      {%- if let Some(bound) = wechat.bound %}
-      <p>{{ bound }}</p>
-      <form method="post" action="/account/wechat/unbind" class="mt-20">
-        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-        <input type="text" name="username" value="{{ frame.username }}" autocomplete="username" hidden>
-        <label class="field" for="wechat-unbind-password"><span>{{ chrome.t.tf_password }}</span><input id="wechat-unbind-password" type="password" name="password" autocomplete="current-password" required></label>
-        <button class="btn danger block" type="submit">{{ chrome.t.wechat_unbind }}</button>
-      </form>
-      <p class="muted small mt-6">{{ chrome.t.wechat_unbind_note }}</p>
-      {%- else %}
-      {%- if let Some(qr) = wechat.qr %}
-      <p class="small mt-18">{{ wechat.scan }}</p>
-      {{ qr|safe }}
-      {%- else %}
-      <p>{{ chrome.t.wechat_none }}</p>
-      {%- endif %}
-      <form method="post" action="/account/wechat" class="mt-20">
-        <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
-        <input type="text" name="username" value="{{ frame.username }}" autocomplete="username" hidden>
-        <label class="field" for="wechat-password"><span>{{ chrome.t.tf_password }}</span><input id="wechat-password" type="password" name="password" autocomplete="current-password" required></label>
-        <button class="btn{% if wechat.qr.is_none() %} primary{% endif %} block" type="submit">{% if wechat.qr.is_some() %}{{ chrome.t.wechat_show_again }}{% else %}{{ chrome.t.wechat_show }}{% endif %}</button>
-      </form>
-      <p class="muted small mt-6">{{ chrome.t.wechat_show_note }}</p>
-      {%- endif %}
-      {%- else %}
-      <p class="muted">{{ chrome.t.wechat_unavailable }}</p>
       {%- endif %}
     </div></section>
   </div>
@@ -96,14 +88,18 @@
       <form method="post" action="/account/two-factor/renew">
         <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
         <input type="text" name="username" value="{{ frame.username }}" autocomplete="username" hidden>
+        {%- if confirm.ask_password() %}
         <label class="field" for="tf-renew-password"><span>{{ chrome.t.tf_password }}</span><input id="tf-renew-password" type="password" name="password" autocomplete="current-password" required></label>
+        {%- endif %}
         <label class="field" for="tf-renew-code"><span>{{ chrome.t.tf_code }}</span><input id="tf-renew-code" type="text" name="code" autocomplete="one-time-code" maxlength="32" required></label>
         <button class="btn block" type="submit">{{ chrome.t.tf_renew }}</button>
       </form>
       <form method="post" action="/account/two-factor/disable" class="mt-20">
         <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
         <input type="text" name="username" value="{{ frame.username }}" autocomplete="username" hidden>
+        {%- if confirm.ask_password() %}
         <label class="field" for="tf-off-password"><span>{{ chrome.t.tf_password }}</span><input id="tf-off-password" type="password" name="password" autocomplete="current-password" required></label>
+        {%- endif %}
         <label class="field" for="tf-off-code"><span>{{ chrome.t.tf_code }}</span><input id="tf-off-code" type="text" name="code" autocomplete="one-time-code" maxlength="32" required></label>
         <button class="btn danger block" type="submit">{{ chrome.t.tf_turn_off }}</button>
       </form>
@@ -112,7 +108,9 @@
         <input type="hidden" name="csrf" value="{{ chrome.csrf }}">
         <input type="hidden" name="next" value="{{ two_factor.next }}">
         <input type="text" name="username" value="{{ frame.username }}" autocomplete="username" hidden>
+        {%- if confirm.ask_password() %}
         <label class="field" for="tf-on-password"><span>{{ chrome.t.tf_password }}</span><input id="tf-on-password" type="password" name="password" autocomplete="current-password" required></label>
+        {%- endif %}
         <button class="btn primary block" type="submit">{{ chrome.t.tf_turn_on }}</button>
       </form>
       {%- else %}
@@ -128,7 +126,7 @@
         <button class="btn block" type="submit">{{ chrome.t.save }}</button>
       </form>
     </div></section>
-    <section class="panel"><div class="panel-body">
+    <section class="panel" id="password"><div class="panel-body">
       <h2>{{ chrome.t.web_password }}</h2>
       <p class="muted small">{{ chrome.t.web_password_note }}</p>
       <form method="post" action="/account/password">

@@ -1,9 +1,12 @@
 //! WeChat mini program identities, bind tickets, signup tokens and sessions
-//! (`gono_server_core::wechat`) on the backend the environment chooses (`db::testing`).
+//! (`gono_server_core::wechat`, on `gono_server_core::identities`) on the backend the
+//! environment chooses (`db::testing`).
 
 use gono_server_core::{
-    Username, audit,
+    Username,
+    audit::{self, Actor},
     db::{self, Pool},
+    identities::{self, How, Provider, Unbound, Which},
     services::Services,
     users::{self, NewUser},
     wechat::{
@@ -105,10 +108,10 @@ async fn lookup(pool: &Pool, token: &SecretString, now: i64) -> Lookup {
 /// Inserts an identity directly, as a binding that happened elsewhere would leave it.
 async fn insert_identity(pool: &Pool, user: i64, app: &str, openid: &str) -> Result<(), String> {
     let mut tx = db::begin_immediate(pool).await.unwrap();
-    let id = db::next_id(&mut tx, "wechat_identities").await.unwrap();
+    let id = db::next_id(&mut tx, "external_identities").await.unwrap();
     let inserted = sqlx::query(
-        "INSERT INTO wechat_identities (id, user_id, app_id, openid, created_at, last_seen_at) \
-         VALUES (?, ?, ?, ?, 0, 0)",
+        "INSERT INTO external_identities (id, user_id, provider, realm, subject, label, \
+         created_at, last_seen_at) VALUES (?, ?, 'wechat', ?, ?, '', 0, 0)",
     )
     .bind(id)
     .bind(user)
@@ -125,6 +128,30 @@ async fn insert_identity(pool: &Pool, user: i64, app: &str, openid: &str) -> Res
     }
 }
 
+/// The identity of `app` bound to `user`.
+async fn identity(pool: &Pool, user: i64, app: &str) -> Option<identities::Identity> {
+    identities::of_account(pool, user, Provider::WeChat, app)
+        .await
+        .unwrap()
+}
+
+/// The mini program sessions of `user`'s identities.
+async fn session_count(pool: &Pool, user: i64) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mp_sessions s JOIN external_identities i ON i.id = s.identity_id \
+         WHERE i.user_id = ?",
+    )
+    .bind(user)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The details of an audit record as JSON, whatever order its keys come in.
+fn json(details: &str) -> serde_json::Value {
+    serde_json::from_str(details).unwrap()
+}
+
 async fn count(pool: &Pool, table: &str, user: i64) -> i64 {
     let sql = format!("SELECT COUNT(*) FROM {table} WHERE user_id = ?");
     sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
@@ -134,19 +161,19 @@ async fn count(pool: &Pool, table: &str, user: i64) -> i64 {
         .unwrap()
 }
 
-async fn audit_entries(pool: &Pool, user: i64) -> Vec<(String, String)> {
+async fn audit_entries(pool: &Pool, user: i64) -> Vec<(String, serde_json::Value)> {
     audit::list(pool, Some(user), None, 100)
         .await
         .unwrap()
         .into_iter()
-        .map(|entry| (entry.kind, entry.details))
+        .map(|entry| (entry.kind, json(&entry.details)))
         .collect()
 }
 
 #[tokio::test]
 async fn a_ticket_binds_the_openid_of_a_signup_token() {
     let (_dir, pool, alice, _) = fixture().await;
-    assert!(wechat::identities(&pool, alice).await.unwrap().is_empty());
+    assert!(identities::list(&pool, alice).await.unwrap().is_empty());
 
     let ticket = new_ticket(&pool, alice, NOW).await;
     assert!(wechat::is_ticket(&ticket));
@@ -160,7 +187,7 @@ async fn a_ticket_binds_the_openid_of_a_signup_token() {
     // Only digests are stored.
     let stored: Vec<Vec<u8>> = sqlx::query_scalar(
         "SELECT ticket_hash FROM wechat_bind_tickets UNION ALL \
-         SELECT token_hash FROM wechat_signup_tokens",
+         SELECT token_hash FROM pending_identities",
     )
     .fetch_all(&pool)
     .await
@@ -183,25 +210,29 @@ async fn a_ticket_binds_the_openid_of_a_signup_token() {
     assert_eq!(account.username.as_str(), "alice");
     assert_eq!(account.display_name, "alice Example");
     assert!(account.services.webdav && !account.services.s3);
+    let bound = identity(&pool, alice, APP).await.unwrap();
     assert_eq!(
-        wechat::identity(&pool, alice, APP).await.unwrap(),
-        Some(wechat::Identity {
-            app_id: APP.to_owned(),
-            created_at: NOW + 5,
-            last_seen_at: NOW + 5,
-        })
+        (
+            bound.provider,
+            bound.realm.as_str(),
+            bound.label.as_str(),
+            bound.created_at,
+            bound.last_seen_at
+        ),
+        (Provider::WeChat, APP, "", NOW + 5, NOW + 5)
     );
-    assert_eq!(
-        wechat::identity(&pool, alice, OTHER_APP).await.unwrap(),
-        None
-    );
+    assert_eq!(identity(&pool, alice, OTHER_APP).await, None);
     // Recorded with the AppID and the client, never the openid.
     let entry = audit::list(&pool, Some(alice), None, 10).await.unwrap();
     assert_eq!(entry.len(), 1);
-    assert_eq!(entry[0].kind, "wechat.bound");
+    assert_eq!(entry[0].kind, "identity.bound");
     assert_eq!(entry[0].actor, "user");
     assert_eq!(entry[0].client_ip.as_deref(), Some("192.0.2.9"));
-    assert_eq!(entry[0].details, format!("{{\"app_id\":\"{APP}\"}}"));
+    assert_eq!(
+        json(&entry[0].details),
+        serde_json::json!({ "provider": "wechat", "how": "mini_program", "app_id": APP })
+    );
+    assert!(!entry[0].details.contains(ALICE_OPENID));
 
     // Both are used up.
     assert!(
@@ -235,11 +266,7 @@ async fn a_ticket_binds_the_openid_of_a_signup_token() {
         Lookup::Live(account.clone())
     );
     assert_eq!(
-        wechat::identity(&pool, alice, APP)
-            .await
-            .unwrap()
-            .unwrap()
-            .last_seen_at,
+        identity(&pool, alice, APP).await.unwrap().last_seen_at,
         NOW + 8
     );
     assert_eq!(
@@ -304,8 +331,8 @@ async fn tickets_expire_and_a_new_one_ends_the_previous() {
             .unwrap(),
         Bind::Bound { .. }
     ));
-    assert_eq!(wechat::identities(&pool, bob).await.unwrap().len(), 1);
-    assert!(wechat::identities(&pool, alice).await.unwrap().is_empty());
+    assert_eq!(identities::list(&pool, bob).await.unwrap().len(), 1);
+    assert!(identities::list(&pool, alice).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -376,7 +403,7 @@ async fn an_openid_and_an_account_are_bound_once_per_app_id() {
     insert_identity(&pool, alice, OTHER_APP, BOB_OPENID)
         .await
         .unwrap();
-    assert_eq!(wechat::identities(&pool, alice).await.unwrap().len(), 2);
+    assert_eq!(identities::list(&pool, alice).await.unwrap().len(), 2);
 
     // An openid that was bound elsewhere after its signup token was made: the token ends, the
     // ticket stays for another WeChat user.
@@ -435,8 +462,8 @@ async fn an_openid_and_an_account_are_bound_once_per_app_id() {
             .unwrap()
     );
     // Nothing was bound on the way.
-    assert_eq!(count(&pool, "wechat_identities", bob).await, 2);
-    assert_eq!(count(&pool, "mp_sessions", bob).await, 0);
+    assert_eq!(count(&pool, "external_identities", bob).await, 2);
+    assert_eq!(session_count(&pool, bob).await, 0);
 }
 
 #[tokio::test]
@@ -514,26 +541,29 @@ async fn sessions_end_with_unbinding_disabling_and_deleting() {
     let bobs = bind(&pool, bob, BOB_OPENID, NOW + 1).await;
 
     let ip = Some("2001:db8::7".parse().unwrap());
-    assert!(
-        wechat::unbind(&pool, alice, APP, ip, NOW + 2)
-            .await
-            .unwrap()
-    );
+    let unbind = |at: i64| {
+        identities::unbind(
+            &pool,
+            alice,
+            Which::Realm(Provider::WeChat, APP),
+            How::AccountPage,
+            Actor::User,
+            ip,
+            at,
+        )
+    };
+    assert!(matches!(unbind(NOW + 2).await.unwrap(), Unbound::Done(_)));
     for token in [&first.token, &second.token] {
         assert_eq!(lookup(&pool, token, NOW + 2).await, Lookup::Unknown);
     }
-    assert_eq!(count(&pool, "mp_sessions", alice).await, 0);
-    assert_eq!(wechat::identity(&pool, alice, APP).await.unwrap(), None);
-    assert!(
-        !wechat::unbind(&pool, alice, APP, ip, NOW + 3)
-            .await
-            .unwrap()
-    );
+    assert_eq!(session_count(&pool, alice).await, 0);
+    assert_eq!(identity(&pool, alice, APP).await, None);
+    assert_eq!(unbind(NOW + 3).await.unwrap(), Unbound::NotBound);
     assert_eq!(
         audit_entries(&pool, alice).await.first().cloned(),
         Some((
-            "wechat.unbound".to_owned(),
-            format!("{{\"app_id\":\"{APP}\"}}")
+            "identity.unbound".to_owned(),
+            serde_json::json!({ "provider": "wechat", "how": "account_page", "app_id": APP })
         ))
     );
     // Bob's binding is not touched; alice's openid is free again.
@@ -546,7 +576,7 @@ async fn sessions_end_with_unbinding_disabling_and_deleting() {
     // Disabling ends the sessions; enabling does not bring them back.
     let username = Username::new("bob").unwrap();
     users::set_enabled(&pool, &username, false).await.unwrap();
-    assert_eq!(count(&pool, "mp_sessions", bob).await, 0);
+    assert_eq!(session_count(&pool, bob).await, 0);
     assert_eq!(lookup(&pool, &bobs.token, NOW + 4).await, Lookup::Unknown);
     assert!(matches!(
         wechat::sign_in(&pool, APP, BOB_OPENID, None, NOW + 4)
@@ -595,11 +625,16 @@ async fn sessions_end_with_unbinding_disabling_and_deleting() {
     users::delete(&pool, &Username::new("alice").unwrap())
         .await
         .unwrap();
-    for table in ["wechat_identities", "wechat_bind_tickets", "mp_sessions"] {
+    for table in ["external_identities", "wechat_bind_tickets"] {
         for user in [alice, bob] {
             assert_eq!(count(&pool, table, user).await, 0, "{table}");
         }
     }
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mp_sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
     assert_eq!(
         lookup(&pool, &renewed.token, NOW + 7).await,
         Lookup::Unknown
@@ -614,7 +649,7 @@ async fn an_identity_keeps_its_newest_sessions() {
     for step in 1..=6 {
         sessions.push(new_session(&pool, ALICE_OPENID, NOW + step).await);
     }
-    assert_eq!(count(&pool, "mp_sessions", alice).await, MAX_SESSIONS);
+    assert_eq!(session_count(&pool, alice).await, MAX_SESSIONS);
     let kept = sessions.len() - usize::try_from(MAX_SESSIONS).unwrap();
     for (index, session) in sessions.iter().enumerate() {
         let found = lookup(&pool, &session.token, NOW + 10).await;
@@ -655,7 +690,7 @@ async fn the_unionid_is_kept_once_wechat_reports_it() {
 
 async fn unionid(pool: &Pool, user: i64) -> Option<String> {
     let unionid: Option<db::Text> =
-        sqlx::query_scalar("SELECT unionid FROM wechat_identities WHERE user_id = ?")
+        sqlx::query_scalar("SELECT unionid FROM external_identities WHERE user_id = ?")
             .bind(user)
             .fetch_one(pool)
             .await
@@ -670,12 +705,19 @@ async fn purging_removes_what_expired() {
     new_ticket(&pool, bob, NOW).await;
     signup(&pool, APP, BOB_OPENID, NOW).await;
     assert_eq!(wechat::purge_expired(&pool, NOW).await.unwrap(), 0);
+    assert_eq!(identities::purge_expired(&pool, NOW).await.unwrap(), 0);
     // Tickets and signup tokens end after ten minutes, sessions after 30 days.
     assert_eq!(
         wechat::purge_expired(&pool, NOW + TICKET_TTL_SECS)
             .await
             .unwrap(),
-        2
+        1
+    );
+    assert_eq!(
+        identities::purge_expired(&pool, NOW + SIGNUP_TTL_SECS)
+            .await
+            .unwrap(),
+        1
     );
     assert!(matches!(
         lookup(&pool, &session.token, NOW + TICKET_TTL_SECS).await,
@@ -683,7 +725,7 @@ async fn purging_removes_what_expired() {
     ));
     let ended = NOW + TICKET_TTL_SECS + SESSION_TTL_SECS;
     assert_eq!(wechat::purge_expired(&pool, ended).await.unwrap(), 1);
-    assert_eq!(count(&pool, "mp_sessions", alice).await, 0);
+    assert_eq!(session_count(&pool, alice).await, 0);
     // The identity stays: only its sessions end.
-    assert_eq!(wechat::identities(&pool, alice).await.unwrap().len(), 1);
+    assert_eq!(identities::list(&pool, alice).await.unwrap().len(), 1);
 }

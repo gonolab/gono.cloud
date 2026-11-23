@@ -155,9 +155,21 @@
     </div></div>
     <div class="panel"><div class="panel-body">
       <h2>{{ chrome.t.a_account }}</h2>
-      <dl class="facts mt-18"><dt>{{ chrome.t.a_user_id }}</dt><dd class="mono">{{ user.id }}</dd><dt>{{ chrome.t.a_created }}</dt><dd>{{ user.created }}</dd><dt>{{ chrome.t.a_changed }}</dt><dd>{{ user.updated }}</dd><dt>{{ chrome.t.a_storage_used }}</dt><dd>{{ user.storage }}</dd><dt>{{ chrome.t.email_title }}</dt><dd>{{ user.email }}</dd><dt>{{ chrome.t.wechat_title }}</dt><dd>{{ user.wechat }}</dd><dt>{{ chrome.t.tf_title }}</dt><dd>{{ user.two_factor }}</dd></dl>
+      <dl class="facts mt-18"><dt>{{ chrome.t.a_user_id }}</dt><dd class="mono">{{ user.id }}</dd><dt>{{ chrome.t.a_created }}</dt><dd>{{ user.created }}</dd><dt>{{ chrome.t.a_changed }}</dt><dd>{{ user.updated }}</dd><dt>{{ chrome.t.a_storage_used }}</dt><dd>{{ user.storage }}</dd><dt>{{ chrome.t.email_title }}</dt><dd>{{ user.email }}</dd><dt>{{ chrome.t.web_password }}</dt><dd>{% if user.has_password %}{{ chrome.t.a_password_set }}{% else %}{{ chrome.t.a_password_none }}{% endif %}</dd><dt>{{ chrome.t.tf_title }}</dt><dd>{{ user.two_factor }}</dd></dl>
       {%- if user.two_factor_on %}
       <form method="post" action="{{ base }}/two-factor/reset" class="mt-18"><input type="hidden" name="csrf" value="{{ frame.csrf }}"><button class="btn danger block" type="submit">{{ chrome.t.a_tf_reset }}</button></form>
+      {%- endif %}
+    </div></div>
+    <div class="panel" id="identities"><div class="panel-body">
+      <h2>{{ chrome.t.methods_title }}</h2>
+      {%- if user.identities.is_empty() %}
+      <p class="muted">{{ chrome.t.a_identities_none }}</p>
+      {%- else %}
+      <ul class="features mt-18">
+        {%- for identity in user.identities %}
+        <li><span><b>{{ identity.provider }}</b>{% if !identity.label.is_empty() %}<span class="mono">{{ identity.label }}</span>{% endif %}<span class="muted">{{ identity.since }}</span></span><span class="chips"><form method="post" action="{{ base }}/identities/{{ identity.id }}/unbind"><input type="hidden" name="csrf" value="{{ frame.csrf }}"><button class="btn danger" type="submit">{{ chrome.t.a_identity_unbind }}</button></form></span></li>
+        {%- endfor %}
+      </ul>
       {%- endif %}
     </div></div>
     <div class="panel"><div class="panel-body">

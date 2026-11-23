@@ -1,18 +1,18 @@
-//! WeChat mini program identities, the tickets that bind them to accounts, and the sessions of
-//! the mini program (`wechat_identities`, `wechat_bind_tickets`, `wechat_signup_tokens` and
-//! `mp_sessions`).
+//! The WeChat mini program: its users' identities, the tickets that bind them to accounts, and
+//! the mini program's sessions (`external_identities` of provider `wechat`,
+//! `wechat_bind_tickets`, `pending_identities` held by the mini program and `mp_sessions`).
 //!
-//! A mini program knows its users by the openid WeChat gives each of them for its AppID. The
-//! server learns that openid only by exchanging a sign-in code of the mini program with WeChat
-//! (`jscode2session`, in the binary); this module starts where that exchange ends:
+//! A mini program knows its users by the openid WeChat gives each of them for its AppID: the
+//! identity `(wechat, <AppID>, <openid>)` of [`crate::identities`]. The server learns that
+//! openid only by exchanging a sign-in code of the mini program with WeChat (`jscode2session`,
+//! in the binary); this module starts where that exchange ends:
 //!
-//! - **Binding.** On the account page a user makes a bind ticket ([`create_ticket`], with the
-//!   web login password, checked by the caller), which the page shows as a QR code. The mini
+//! - **Binding.** On the account page a user makes a bind ticket ([`create_ticket`], once the
+//!   caller confirmed it is the account's user), which the page shows as a QR code. The mini
 //!   program that scans it first signs in ([`sign_in`]); as its openid is bound to no account
-//!   yet, it gets a signup token for that openid, and then binds it with the ticket ([`bind`]).
-//!   An account has at most one identity per AppID, and an openid of an AppID belongs to one
-//!   account at most (two unique keys). Binding gives that WeChat user the account's mini
-//!   program sessions; [`unbind`] takes them away again.
+//!   yet, it gets a signup token for that openid (a pending identity held by the mini program),
+//!   and then binds it with the ticket ([`bind`]). Binding gives that WeChat user the account's
+//!   mini program sessions; unbinding ([`crate::identities::unbind`]) takes them away again.
 //! - **Tickets** are 128 random bits ([`TICKET_CHARS`]), valid for [`TICKET_TTL_SECS`] and used
 //!   up by the binding they make. A new ticket ends the account's earlier ones.
 //! - **Signup tokens** are 256 random bits, valid for [`SIGNUP_TTL_SECS`], bound to the openid
@@ -20,14 +20,14 @@
 //!   binding uses it up.
 //! - **Sessions** are bearer tokens of 256 random bits. A session ends [`SESSION_TTL_SECS`]
 //!   after its last use (each use extends it, at most once per [`SEEN_GRANULARITY_SECS`]), when
-//!   its identity is unbound, and when the account is disabled or deleted. An identity has at
-//!   most [`MAX_SESSIONS`]: a new one ends the oldest. A session reads the account's name and
-//!   services ([`Account`]) and nothing else.
+//!   its identity is unbound (the cascade of `mp_sessions`), and when the account is disabled
+//!   or deleted. An identity has at most [`MAX_SESSIONS`]: a new one ends the oldest. A session
+//!   reads the account's name and services ([`Account`]) and nothing else.
 //!
 //! Tickets and tokens are stored only as SHA-256 digests ([`secret::digest`]): they are random,
 //! so a fast hash is enough. Every write is one write transaction, so the unique keys, the
 //! single use of tickets and the end of sessions hold under concurrent requests. The audit log
-//! records `wechat.bound` and `wechat.unbound` with the AppID, never the openid.
+//! records `identity.bound` (`how: "mini_program"`) with the AppID, never the openid.
 
 use std::net::IpAddr;
 
@@ -35,9 +35,10 @@ use secrecy::{ExposeSecret as _, SecretString};
 use sqlx::FromRow;
 
 use crate::{
-    audit::{self, Actor, Record},
+    audit::Actor,
     db::{self, Flag, Pool, Text},
-    error::{Error, Result},
+    error::Result,
+    identities::{self, Bound, Claims, Holder, How, Provider},
     secret,
     services::Services,
     types::Username,
@@ -47,7 +48,7 @@ use crate::{
 pub const TICKET_TTL_SECS: i64 = 10 * 60;
 
 /// How long a signup token is valid, in seconds.
-pub const SIGNUP_TTL_SECS: i64 = 10 * 60;
+pub const SIGNUP_TTL_SECS: i64 = identities::PENDING_TTL_SECS;
 
 /// A session ends this long after its last use, in seconds (30 days).
 pub const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
@@ -63,7 +64,7 @@ pub const MAX_SESSIONS: i64 = 5;
 pub const TICKET_CHARS: usize = 22;
 
 /// Characters of signup tokens and session tokens: 43 of `[A-Za-z0-9]` are 256 random bits.
-pub const TOKEN_CHARS: usize = 43;
+pub const TOKEN_CHARS: usize = identities::TOKEN_CHARS;
 
 /// The longest openid or unionid accepted, in bytes. WeChat's have 28 characters today.
 pub const MAX_ID_BYTES: usize = 128;
@@ -99,17 +100,6 @@ pub fn is_token(token: &str) -> bool {
     is_random(token, TOKEN_CHARS)
 }
 
-/// A WeChat identity bound to an account. The openid is not part of it: nothing shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Identity {
-    /// The AppID of the mini program.
-    pub app_id: String,
-    /// When it was bound, UNIX seconds.
-    pub created_at: i64,
-    /// When the mini program last signed in with it.
-    pub last_seen_at: i64,
-}
-
 /// What a mini program session reads of its account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
@@ -142,48 +132,6 @@ pub struct Ticket {
     pub expires_at: i64,
 }
 
-#[derive(FromRow)]
-struct IdentityRow {
-    app_id: Text,
-    created_at: i64,
-    last_seen_at: i64,
-}
-
-impl From<IdentityRow> for Identity {
-    fn from(row: IdentityRow) -> Self {
-        Self {
-            app_id: row.app_id.0,
-            created_at: row.created_at,
-            last_seen_at: row.last_seen_at,
-        }
-    }
-}
-
-/// The identities bound to account `user_id`, one per AppID, oldest first.
-pub async fn identities(pool: &Pool, user_id: i64) -> Result<Vec<Identity>> {
-    let rows: Vec<IdentityRow> = sqlx::query_as(
-        "SELECT app_id, created_at, last_seen_at FROM wechat_identities WHERE user_id = ? \
-         ORDER BY id",
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(Identity::from).collect())
-}
-
-/// The identity of AppID `app_id` bound to account `user_id`, if there is one.
-pub async fn identity(pool: &Pool, user_id: i64, app_id: &str) -> Result<Option<Identity>> {
-    let row: Option<IdentityRow> = sqlx::query_as(
-        "SELECT app_id, created_at, last_seen_at FROM wechat_identities \
-         WHERE user_id = ? AND app_id = ?",
-    )
-    .bind(user_id)
-    .bind(app_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(Identity::from))
-}
-
 /// Outcome of [`create_ticket`].
 #[derive(Debug)]
 pub enum NewTicket {
@@ -194,15 +142,17 @@ pub enum NewTicket {
 }
 
 /// Makes a bind ticket for account `user_id` and AppID `app_id`, and ends the account's earlier
-/// tickets. The caller has checked the web login password.
+/// tickets. The caller has confirmed that the account's user asks for it.
 pub async fn create_ticket(pool: &Pool, user_id: i64, app_id: &str, now: i64) -> Result<NewTicket> {
     let mut tx = db::begin_immediate(pool).await?;
-    let bound: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM wechat_identities WHERE user_id = ? AND app_id = ?")
-            .bind(user_id)
-            .bind(app_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let bound: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM external_identities WHERE user_id = ? AND provider = 'wechat' \
+         AND realm = ?",
+    )
+    .bind(user_id)
+    .bind(app_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     if bound.is_some() {
         return Ok(NewTicket::Bound);
     }
@@ -277,50 +227,35 @@ async fn account_in(tx: &mut db::Tx, user_id: i64) -> Result<Option<AccountRow>>
         .await?)
 }
 
-/// Opens a session of `user_id` with the identity (`app_id`, `openid`) inside `tx`, after
-/// ending the identity's oldest sessions beyond [`MAX_SESSIONS`].
-async fn open_session(
-    tx: &mut db::Tx,
-    user_id: i64,
-    app_id: &str,
-    openid: &str,
-    now: i64,
-) -> Result<NewSession> {
+/// Opens a session with WeChat identity `identity_id` inside `tx`, after ending the identity's
+/// oldest sessions beyond [`MAX_SESSIONS`].
+async fn open_session(tx: &mut db::Tx, identity_id: i64, now: i64) -> Result<NewSession> {
     // The newest session that stays besides the new one, the (MAX_SESSIONS - 1)th: every older
     // one ends. Ids grow with time (`id_sequences`).
     let oldest_kept: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM mp_sessions WHERE user_id = ? AND app_id = ? AND openid = ? \
-         ORDER BY id DESC LIMIT 1 OFFSET ?",
+        "SELECT id FROM mp_sessions WHERE identity_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?",
     )
-    .bind(user_id)
-    .bind(app_id)
-    .bind(openid)
+    .bind(identity_id)
     .bind(MAX_SESSIONS - 2)
     .fetch_optional(&mut **tx)
     .await?;
     if let Some(oldest_kept) = oldest_kept {
-        sqlx::query(
-            "DELETE FROM mp_sessions WHERE user_id = ? AND app_id = ? AND openid = ? AND id < ?",
-        )
-        .bind(user_id)
-        .bind(app_id)
-        .bind(openid)
-        .bind(oldest_kept)
-        .execute(&mut **tx)
-        .await?;
+        sqlx::query("DELETE FROM mp_sessions WHERE identity_id = ? AND id < ?")
+            .bind(identity_id)
+            .bind(oldest_kept)
+            .execute(&mut **tx)
+            .await?;
     }
     let token = secret::random_token(TOKEN_CHARS);
     let expires_at = now.saturating_add(SESSION_TTL_SECS);
     let id = db::next_id(tx, "mp_sessions").await?;
     sqlx::query(
-        "INSERT INTO mp_sessions (id, token_hash, user_id, app_id, openid, created_at, \
-         last_seen_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO mp_sessions (id, token_hash, identity_id, created_at, last_seen_at, \
+         expires_at) VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(&secret::digest(token.expose_secret())[..])
-    .bind(user_id)
-    .bind(app_id)
-    .bind(openid)
+    .bind(identity_id)
     .bind(now)
     .bind(now)
     .bind(expires_at)
@@ -362,56 +297,23 @@ pub async fn sign_in(
     now: i64,
 ) -> Result<SignIn> {
     let mut tx = db::begin_immediate(pool).await?;
-    let bound: Option<i64> =
-        sqlx::query_scalar("SELECT user_id FROM wechat_identities WHERE app_id = ? AND openid = ?")
-            .bind(app_id)
-            .bind(openid)
-            .fetch_optional(&mut *tx)
-            .await?;
-    if let Some(user_id) = bound {
-        let Some(row) = account_in(&mut tx, user_id).await? else {
+    if let Some(identity) = identities::find_in(&mut tx, Provider::WeChat, app_id, openid).await? {
+        let Some(row) = account_in(&mut tx, identity.user_id).await? else {
             // The cascade removes the identity with its account.
             return Ok(SignIn::Disabled);
         };
         if !row.enabled {
             return Ok(SignIn::Disabled);
         }
-        sqlx::query(
-            "UPDATE wechat_identities SET last_seen_at = ?, unionid = COALESCE(?, unionid) \
-             WHERE app_id = ? AND openid = ?",
-        )
-        .bind(now)
-        .bind(unionid)
-        .bind(app_id)
-        .bind(openid)
-        .execute(&mut *tx)
-        .await?;
-        let session = open_session(&mut tx, user_id, app_id, openid, now).await?;
+        identities::touch_in(&mut tx, identity.id, None, unionid, now).await?;
+        let session = open_session(&mut tx, identity.id, now).await?;
         let account = row.into_account()?;
         tx.commit().await?;
         return Ok(SignIn::Session { session, account });
     }
-    sqlx::query("DELETE FROM wechat_signup_tokens WHERE app_id = ? AND openid = ?")
-        .bind(app_id)
-        .bind(openid)
-        .execute(&mut *tx)
-        .await?;
-    let token = secret::random_token(TOKEN_CHARS);
-    let expires_at = now.saturating_add(SIGNUP_TTL_SECS);
-    let id = db::next_id(&mut tx, "wechat_signup_tokens").await?;
-    sqlx::query(
-        "INSERT INTO wechat_signup_tokens (id, token_hash, app_id, openid, unionid, created_at, \
-         expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(id)
-    .bind(&secret::digest(token.expose_secret())[..])
-    .bind(app_id)
-    .bind(openid)
-    .bind(unionid)
-    .bind(now)
-    .bind(expires_at)
-    .execute(&mut *tx)
-    .await?;
+    let claims = Claims::wechat(app_id, openid, unionid);
+    let (token, expires_at) =
+        identities::create_pending_in(&mut tx, Holder::MiniProgram, &claims, now).await?;
     tx.commit().await?;
     Ok(SignIn::Unbound { token, expires_at })
 }
@@ -440,23 +342,10 @@ pub enum Bind {
     BindFailed,
 }
 
-/// Runs `sql`, a `DELETE` of one row by its id, inside `tx`.
-async fn delete_row(tx: &mut db::Tx, sql: &'static str, id: i64) -> Result<()> {
-    sqlx::query(sql).bind(id).execute(&mut **tx).await?;
-    Ok(())
-}
-
-#[derive(FromRow)]
-struct SignupRow {
-    id: i64,
-    openid: Text,
-    unionid: Option<Text>,
-}
-
 /// Binds the openid of the live signup token `signup_token` of AppID `app_id` to the account
 /// of the live bind ticket `ticket`, uses both up, opens a session and records
-/// `wechat.bound`. See [`Bind`] for the refusals; every check and the binding are one write
-/// transaction.
+/// `identity.bound` (`how: "mini_program"`). See [`Bind`] for the refusals; every check and the
+/// binding are one write transaction.
 pub async fn bind(
     pool: &Pool,
     app_id: &str,
@@ -466,15 +355,11 @@ pub async fn bind(
     now: i64,
 ) -> Result<Bind> {
     let mut tx = db::begin_immediate(pool).await?;
-    let signup: Option<SignupRow> = sqlx::query_as(
-        "SELECT id, openid, unionid FROM wechat_signup_tokens \
-         WHERE token_hash = ? AND app_id = ? AND expires_at > ?",
-    )
-    .bind(&secret::digest(signup_token)[..])
-    .bind(app_id)
-    .bind(now)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let signup = identities::pending_in(&mut tx, Holder::MiniProgram, signup_token, now)
+        .await?
+        .filter(|pending| {
+            pending.claims.provider == Provider::WeChat && pending.claims.realm == app_id
+        });
     let Some(signup) = signup else {
         return Ok(Bind::SessionExpired);
     };
@@ -494,80 +379,48 @@ pub async fn bind(
     if !row.enabled {
         return Ok(Bind::Disabled);
     }
-    let openid = signup.openid.0;
-    let owner: Option<i64> =
-        sqlx::query_scalar("SELECT user_id FROM wechat_identities WHERE app_id = ? AND openid = ?")
-            .bind(app_id)
-            .bind(&openid)
-            .fetch_optional(&mut *tx)
-            .await?;
-    const END_SIGNUP: &str = "DELETE FROM wechat_signup_tokens WHERE id = ?";
-    const END_TICKET: &str = "DELETE FROM wechat_bind_tickets WHERE id = ?";
-    match owner {
-        Some(owner) if owner != user_id => {
-            delete_row(&mut tx, END_SIGNUP, signup.id).await?;
+    let bound = identities::bind_in(
+        &mut tx,
+        user_id,
+        &signup.claims,
+        How::MiniProgram,
+        Actor::User,
+        client_ip,
+        now,
+    )
+    .await?;
+    let identity = match bound {
+        // Bound to this account already: there is nothing to bind, and the ticket and the
+        // token are used up all the same.
+        Bound::Bound(identity) | Bound::Already(identity) => identity,
+        // The ticket stays valid for another WeChat user; the signup token ends.
+        Bound::OtherAccount => {
+            identities::end_pending_in(&mut tx, signup.id).await?;
             tx.commit().await?;
             return Ok(Bind::AccountExists);
         }
-        // Bound to this account already: there is nothing to bind, and the ticket and the
-        // token are used up all the same.
-        Some(_) => {}
-        None => {
-            let other: Option<i64> = sqlx::query_scalar(
-                "SELECT id FROM wechat_identities WHERE user_id = ? AND app_id = ?",
-            )
-            .bind(user_id)
-            .bind(app_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if other.is_some() {
-                delete_row(&mut tx, END_TICKET, ticket_id).await?;
-                tx.commit().await?;
-                return Ok(Bind::BindFailed);
-            }
-            let id = db::next_id(&mut tx, "wechat_identities").await?;
-            let inserted = sqlx::query(
-                "INSERT INTO wechat_identities (id, user_id, app_id, openid, unionid, \
-                 created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(id)
-            .bind(user_id)
-            .bind(app_id)
-            .bind(&openid)
-            .bind(signup.unionid.as_deref())
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await;
-            match inserted {
-                Ok(_) => {}
-                // Inside the write transaction nobody binds in between; the unique keys back
-                // the checks above up.
-                Err(err)
-                    if err
-                        .as_database_error()
-                        .is_some_and(|e| e.is_unique_violation()) =>
-                {
-                    return Ok(Bind::BindFailed);
-                }
-                Err(err) => return Err(Error::Database(err)),
-            }
-            audit::record_in(
-                &mut tx,
-                &Record::new(user_id, "wechat.bound", Actor::User)
-                    .client_ip(client_ip)
-                    .details(serde_json::json!({ "app_id": app_id })),
-                now,
-            )
-            .await?;
+        Bound::AccountHasOne => {
+            end_ticket(&mut tx, ticket_id).await?;
+            tx.commit().await?;
+            return Ok(Bind::BindFailed);
         }
-    }
-    delete_row(&mut tx, END_TICKET, ticket_id).await?;
-    delete_row(&mut tx, END_SIGNUP, signup.id).await?;
-    let session = open_session(&mut tx, user_id, app_id, &openid, now).await?;
+        Bound::NoAccount => return Ok(Bind::TicketExpired),
+    };
+    end_ticket(&mut tx, ticket_id).await?;
+    identities::end_pending_in(&mut tx, signup.id).await?;
+    let session = open_session(&mut tx, identity.id, now).await?;
     let account = row.into_account()?;
     tx.commit().await?;
     Ok(Bind::Bound { session, account })
+}
+
+/// Ends bind ticket `id` inside `tx`.
+async fn end_ticket(tx: &mut db::Tx, id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM wechat_bind_tickets WHERE id = ?")
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// What [`lookup`] found for a bearer token.
@@ -588,22 +441,19 @@ struct SessionRow {
     session_id: i64,
     last_seen_at: i64,
     expires_at: i64,
-    #[sqlx(try_from = "Flag")]
-    bound: bool,
     #[sqlx(flatten)]
     account: AccountRow,
 }
 
-/// The session of bearer token `token` of AppID `app_id`, extending it. A session counts only
-/// while its identity is bound to its account.
+/// The session of bearer token `token` of AppID `app_id`, extending it. A session lives only
+/// as long as its identity: unbinding removes it.
 pub async fn lookup(pool: &Pool, app_id: &str, token: &str, now: i64) -> Result<Lookup> {
     let sql = format!(
         "SELECT s.id AS session_id, s.last_seen_at, s.expires_at, \
-         EXISTS (SELECT 1 FROM wechat_identities i WHERE i.user_id = s.user_id \
-                 AND i.app_id = s.app_id AND i.openid = s.openid) AS bound, \
          u.id, u.username, u.display_name, u.enabled, {} \
-         FROM mp_sessions s JOIN users u ON u.id = s.user_id \
-         WHERE s.token_hash = ? AND s.app_id = ?",
+         FROM mp_sessions s JOIN external_identities i ON i.id = s.identity_id \
+         JOIN users u ON u.id = i.user_id \
+         WHERE s.token_hash = ? AND i.provider = 'wechat' AND i.realm = ?",
         crate::services::USER_COLUMNS
     );
     let row: Option<SessionRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
@@ -614,9 +464,6 @@ pub async fn lookup(pool: &Pool, app_id: &str, token: &str, now: i64) -> Result<
     let Some(row) = row else {
         return Ok(Lookup::Unknown);
     };
-    if !row.bound {
-        return Ok(Lookup::Unknown);
-    }
     if row.expires_at <= now {
         return Ok(Lookup::Expired);
     }
@@ -640,62 +487,27 @@ pub async fn lookup(pool: &Pool, app_id: &str, token: &str, now: i64) -> Result<
 /// if there was none.
 pub async fn logout(pool: &Pool, app_id: &str, token: &str) -> Result<bool> {
     let mut tx = db::begin_immediate(pool).await?;
-    let deleted = sqlx::query("DELETE FROM mp_sessions WHERE token_hash = ? AND app_id = ?")
-        .bind(&secret::digest(token)[..])
-        .bind(app_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
+    let deleted = sqlx::query(
+        "DELETE FROM mp_sessions WHERE token_hash = ? AND identity_id IN \
+         (SELECT id FROM external_identities WHERE provider = 'wechat' AND realm = ?)",
+    )
+    .bind(&secret::digest(token)[..])
+    .bind(app_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
         == 1;
     tx.commit().await?;
     Ok(deleted)
 }
 
-/// Unbinds the identity of AppID `app_id` from account `user_id`, ends every session of the
-/// account with that AppID and records `wechat.unbound`. Returns `false` if there was no
-/// identity (then nothing changed).
-pub async fn unbind(
-    pool: &Pool,
-    user_id: i64,
-    app_id: &str,
-    client_ip: Option<IpAddr>,
-    now: i64,
-) -> Result<bool> {
-    let mut tx = db::begin_immediate(pool).await?;
-    let deleted = sqlx::query("DELETE FROM wechat_identities WHERE user_id = ? AND app_id = ?")
-        .bind(user_id)
-        .bind(app_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    if deleted == 0 {
-        return Ok(false);
-    }
-    sqlx::query("DELETE FROM mp_sessions WHERE user_id = ? AND app_id = ?")
-        .bind(user_id)
-        .bind(app_id)
-        .execute(&mut *tx)
-        .await?;
-    audit::record_in(
-        &mut tx,
-        &Record::new(user_id, "wechat.unbound", Actor::User)
-            .client_ip(client_ip)
-            .details(serde_json::json!({ "app_id": app_id })),
-        now,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(true)
-}
-
-/// Removes the tickets, signup tokens and sessions that expired at `now`. Returns how many
-/// there were.
+/// Removes the tickets and sessions that expired at `now`. Returns how many there were. The
+/// signup tokens are pending identities, which [`crate::identities::purge_expired`] removes.
 pub async fn purge_expired(pool: &Pool, now: i64) -> Result<u64> {
     let mut tx = db::begin_immediate(pool).await?;
     let mut purged = 0;
     for sql in [
         "DELETE FROM wechat_bind_tickets WHERE expires_at <= ?",
-        "DELETE FROM wechat_signup_tokens WHERE expires_at <= ?",
         "DELETE FROM mp_sessions WHERE expires_at <= ?",
     ] {
         purged += sqlx::query(sql)

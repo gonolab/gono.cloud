@@ -13,6 +13,7 @@
 use sqlx::FromRow;
 
 use crate::{
+    audit::{self, Actor, Record},
     db::{self, Flag, Pool, Text},
     error::{Error, Result},
     services::Services,
@@ -51,6 +52,63 @@ pub fn validate_display_name(display_name: &str) -> Result<String> {
     Ok(display_name.to_owned())
 }
 
+/// How an account came to be (`users.created_via`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CreatedVia {
+    /// An administrator made it in the admin UI.
+    Admin,
+    /// The operator made it with the command line (`user add`, and `init` for the first admin).
+    Cli,
+    /// Its user signed up with WeChat, in the mini program.
+    WeChat,
+    /// Its user signed up with Google.
+    Google,
+    /// Its user signed up with GitHub.
+    GitHub,
+}
+
+impl CreatedVia {
+    /// The stored form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Cli => "cli",
+            Self::WeChat => "wechat",
+            Self::Google => "google",
+            Self::GitHub => "github",
+        }
+    }
+
+    /// The value of its stored form.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "admin" => Self::Admin,
+            "cli" => Self::Cli,
+            "wechat" => Self::WeChat,
+            "google" => Self::Google,
+            "github" => Self::GitHub,
+            _ => return None,
+        })
+    }
+
+    /// Whether its user made it, by signing up with a third-party identity.
+    pub fn is_self_service(self) -> bool {
+        matches!(self, Self::WeChat | Self::Google | Self::GitHub)
+    }
+}
+
+impl TryFrom<Text> for CreatedVia {
+    type Error = Error;
+
+    fn try_from(value: Text) -> Result<Self> {
+        Self::parse(&value.0).ok_or_else(|| {
+            Error::Database(sqlx::Error::Decode(
+                format!("unknown users.created_via {:?}", value.0).into(),
+            ))
+        })
+    }
+}
+
 /// A user account as stored, without its password hash.
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct User {
@@ -71,6 +129,15 @@ pub struct User {
     pub created_at: i64,
     /// Last change, UNIX seconds.
     pub updated_at: i64,
+    /// Whether it has a web login password. An account without one signs in with its
+    /// third-party identities only ([`crate::identities`]).
+    #[sqlx(try_from = "Flag")]
+    pub has_password: bool,
+    /// How it came to be.
+    #[sqlx(try_from = "Text")]
+    pub created_via: CreatedVia,
+    /// When the server deletes it, if it asked for its deletion; it is disabled until then.
+    pub deleting_at: Option<i64>,
     /// The services it may use.
     #[sqlx(flatten)]
     pub services: Services,
@@ -92,7 +159,8 @@ impl TryFrom<Text> for Username {
     }
 }
 
-/// Input of [`create`].
+/// Input of [`create`]: an account that a person makes, with a web login password. Accounts
+/// that their users make by signing up with a third-party identity have none.
 #[derive(Debug, Clone)]
 pub struct NewUser<'a> {
     /// Login name.
@@ -110,6 +178,7 @@ pub struct NewUser<'a> {
 
 /// The columns of [`User`]; the last ones are [`crate::services::COLUMNS`].
 pub(crate) const USER_COLUMNS: &str = "id, username, display_name, enabled, is_admin, created_at, updated_at, \
+                            (password_hash IS NOT NULL) AS has_password, created_via, deleting_at, \
                             service_files, service_webdav, service_s3, service_direct, service_relay";
 
 /// Returns the number of user accounts.
@@ -150,52 +219,88 @@ pub async fn create_initial_admin(
             is_admin: true,
             services: Services::NONE,
         },
+        CreatedVia::Cli,
     )
     .await?;
     tx.commit().await?;
     Ok(id)
 }
 
-/// Creates an enabled account and returns its id.
-///
-/// `prepare_storage` runs with the new id after the insert but before the commit; if it fails,
-/// the account is not created. Use it to create the storage directories.
+/// Creates an enabled account in the admin UI and returns its id (see [`create_via`]).
 pub async fn create(
     pool: &Pool,
     user: &NewUser<'_>,
     prepare_storage: impl FnOnce(i64) -> Result<()>,
 ) -> Result<i64> {
+    create_via(pool, user, CreatedVia::Admin, prepare_storage).await
+}
+
+/// Creates an enabled account made through `via` (the admin UI or the command line) and
+/// returns its id.
+///
+/// `prepare_storage` runs with the new id after the insert but before the commit; if it fails,
+/// the account is not created. Use it to create the storage directories.
+pub async fn create_via(
+    pool: &Pool,
+    user: &NewUser<'_>,
+    via: CreatedVia,
+    prepare_storage: impl FnOnce(i64) -> Result<()>,
+) -> Result<i64> {
     let mut tx = db::begin_immediate(pool).await?;
-    let id = insert(&mut tx, user).await?;
+    let id = insert(&mut tx, user, via).await?;
     prepare_storage(id)?;
     tx.commit().await?;
     Ok(id)
 }
 
-async fn insert(tx: &mut db::Tx, user: &NewUser<'_>) -> Result<i64> {
+async fn insert(tx: &mut db::Tx, user: &NewUser<'_>, via: CreatedVia) -> Result<i64> {
+    insert_account(
+        tx,
+        user.username,
+        user.display_name,
+        Some(user.password_hash),
+        user.is_admin,
+        user.services,
+        via,
+    )
+    .await
+}
+
+/// Inserts an enabled account inside `tx` and returns its id: [`Error::UsernameRetired`] for a
+/// retired name, [`Error::UserExists`] for a name in use.
+pub(crate) async fn insert_account(
+    tx: &mut db::Tx,
+    username: &Username,
+    display_name: &str,
+    password_hash: Option<&str>,
+    is_admin: bool,
+    services: Services,
+    via: CreatedVia,
+) -> Result<i64> {
     let now = db::unix_now();
     let retired: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM retired_usernames WHERE username = ?")
-            .bind(user.username.as_str())
+            .bind(username.as_str())
             .fetch_optional(&mut **tx)
             .await?;
     if retired.is_some() {
-        return Err(Error::UsernameRetired(user.username.clone()));
+        return Err(Error::UsernameRetired(username.clone()));
     }
     let id = db::next_id(tx, "users").await?;
-    let services = user.services.normalized();
+    let services = services.normalized();
     sqlx::query(
         "INSERT INTO users (id, username, display_name, password_hash, enabled, is_admin, \
-         created_at, updated_at, service_files, service_webdav, service_s3, service_direct, \
-         service_relay) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)",
+         created_at, updated_at, created_via, service_files, service_webdav, service_s3, \
+         service_direct, service_relay) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
-    .bind(user.username.as_str())
-    .bind(user.display_name)
-    .bind(user.password_hash)
-    .bind(user.is_admin)
+    .bind(username.as_str())
+    .bind(display_name)
+    .bind(password_hash)
+    .bind(is_admin)
     .bind(now)
     .bind(now)
+    .bind(via.as_str())
     .bind(services.files)
     .bind(services.webdav)
     .bind(services.s3)
@@ -204,7 +309,7 @@ async fn insert(tx: &mut db::Tx, user: &NewUser<'_>) -> Result<i64> {
     .execute(&mut **tx)
     .await
     .map_err(|err| match err.as_database_error() {
-        Some(db_err) if db_err.is_unique_violation() => Error::UserExists(user.username.clone()),
+        Some(db_err) if db_err.is_unique_violation() => Error::UserExists(username.clone()),
         _ => Error::Database(err),
     })?;
     Ok(id)
@@ -231,12 +336,16 @@ pub async fn find(pool: &Pool, username: &Username) -> Result<Option<User>> {
 struct CredentialsRow {
     #[sqlx(flatten)]
     user: User,
-    password_hash: String,
+    password_hash: Option<String>,
 }
 
-/// Looks an account up by name together with its web login password hash, for signing in.
-/// Verify the password with [`crate::password::verify`].
-pub async fn credentials(pool: &Pool, username: &Username) -> Result<Option<(User, String)>> {
+/// Looks an account up by name together with its web login password hash, for signing in:
+/// `None` for an account without a password. Verify the password with
+/// [`crate::password::verify`].
+pub async fn credentials(
+    pool: &Pool,
+    username: &Username,
+) -> Result<Option<(User, Option<String>)>> {
     let sql = format!("SELECT {USER_COLUMNS}, password_hash FROM users WHERE username = ?");
     let row: Option<CredentialsRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(username.as_str())
@@ -310,25 +419,70 @@ pub async fn delete(pool: &Pool, username: &Username) -> Result<User> {
     Ok(user)
 }
 
-/// Replaces the web login password hash of an account.
+/// Replaces the web login password hash of an account, or gives it its first one. The first
+/// password of an account that had none is recorded as `password.set`, by `actor`.
 pub async fn set_password_hash(
     pool: &Pool,
     username: &Username,
     password_hash: &str,
+    actor: Actor,
 ) -> Result<()> {
     let mut tx = db::begin_immediate(pool).await?;
-    let result =
-        sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ?")
-            .bind(password_hash)
-            .bind(db::unix_now())
+    let row: Option<(i64, Option<String>)> =
+        sqlx::query_as("SELECT id, password_hash FROM users WHERE username = ?")
             .bind(username.as_str())
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
-    if result.rows_affected() == 0 {
+    let Some((user_id, previous)) = row else {
         return Err(Error::UserNotFound(username.clone()));
+    };
+    let now = db::unix_now();
+    sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+        .bind(password_hash)
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    if previous.is_none() {
+        audit::record_in(&mut tx, &Record::new(user_id, "password.set", actor), now).await?;
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Gives account `user_id`, which has no web login password, its first one, and records
+/// `password.set` by its user. Returns `false` if the account has a password already or does
+/// not exist (then nothing changed): setting the first one needs no current password, so it
+/// never replaces one.
+pub async fn set_first_password(
+    pool: &Pool,
+    user_id: i64,
+    password_hash: &str,
+    client_ip: Option<std::net::IpAddr>,
+    now: i64,
+) -> Result<bool> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let set = sqlx::query(
+        "UPDATE users SET password_hash = ?, updated_at = ? \
+         WHERE id = ? AND password_hash IS NULL",
+    )
+    .bind(password_hash)
+    .bind(now)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if set {
+        audit::record_in(
+            &mut tx,
+            &Record::new(user_id, "password.set", Actor::User).client_ip(client_ip),
+            now,
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(set)
 }
 
 /// Enables or disables an account. A disabled account cannot sign in with any credential, and
@@ -350,7 +504,8 @@ pub async fn set_enabled(pool: &Pool, username: &Username, enabled: bool) -> Res
     }
     if !enabled {
         sqlx::query(
-            "DELETE FROM mp_sessions WHERE user_id IN (SELECT id FROM users WHERE username = ?)",
+            "DELETE FROM mp_sessions WHERE identity_id IN (SELECT i.id FROM external_identities i \
+             JOIN users u ON u.id = i.user_id WHERE u.username = ?)",
         )
         .bind(username.as_str())
         .execute(&mut *tx)

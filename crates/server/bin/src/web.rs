@@ -11,8 +11,15 @@
 //! - **Sign-in** ([`Web::sign_in`]) with the web login password (Argon2), behind a per-client
 //!   [`RateLimiter`] of its own: checked before anything is verified, one token per failure.
 //!   It is not shared with device authentication, so failing devices behind the same address
-//!   do not keep a user from signing a new device in. Unknown accounts cost the same Argon2
-//!   work as known ones, so response times do not reveal which accounts exist.
+//!   do not keep a user from signing a new device in. Unknown accounts, and accounts without a
+//!   password (they sign in with a third-party identity only), cost the same Argon2 work as the
+//!   others and fail as a wrong password does, so response times do not reveal which accounts
+//!   exist or have a password.
+//! - **Confirming it is you** ([`Web::confirm`]): the account page's forms that change how the
+//!   account signs in or is recovered ask again, for the web login password or, as an
+//!   alternative, a fresh sign-in with a bound identity
+//!   (`plan/third-party-sign-in-design.md`, 3.5). A confirmation lasts [`CONFIRM_TTL_SECS`] for
+//!   the browser session that made it, in memory only.
 //! - **Second step** ([`Web::second_step`]): an account with two-step verification gets a
 //!   pending sign-in instead of a session, bound to the account (by id) and capped per account,
 //!   per client and in all; a new one ends the oldest rather than being refused. Codes of one
@@ -133,6 +140,9 @@ const MAX_PENDING: usize = 1000;
 
 /// How long an enrolment waits for its first code, in seconds.
 const ENROLMENT_TTL_SECS: i64 = 10 * 60;
+
+/// How long confirming it is you lasts for a browser session, in seconds.
+pub const CONFIRM_TTL_SECS: i64 = 5 * 60;
 
 /// A sign-in whose password was right, waiting for its second step.
 #[derive(Debug, Clone)]
@@ -403,6 +413,8 @@ pub struct Web {
     enrolments: Mutex<HashMap<i64, Enrolment>>,
     /// Recovery codes waiting to be shown once, by session id.
     shown: Mutex<HashMap<i64, Shown>>,
+    /// Sessions whose user confirmed it is them, by session id: the account and until when.
+    confirmed: Mutex<HashMap<i64, (i64, i64)>>,
 }
 
 /// A PHC string to verify against when the account does not exist.
@@ -456,6 +468,7 @@ impl Web {
             checking: Mutex::new(HashMap::new()),
             enrolments: Mutex::new(HashMap::new()),
             shown: Mutex::new(HashMap::new()),
+            confirmed: Mutex::new(HashMap::new()),
         }
     }
 
@@ -862,6 +875,36 @@ impl Web {
             .filter(|entry| entry.until > now)
     }
 
+    /// Records that the user of `session` confirmed it is them, for [`CONFIRM_TTL_SECS`].
+    pub fn confirm(&self, session: &SessionUser) {
+        self.confirm_session(session.session_id, session.user_id);
+    }
+
+    /// Records that the user of session `session_id` of account `user_id` confirmed it is them,
+    /// for [`CONFIRM_TTL_SECS`]: also a session that a third-party sign-in just opened.
+    pub fn confirm_session(&self, session_id: i64, user_id: i64) {
+        let now = db::unix_now();
+        let mut confirmed = self
+            .confirmed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        confirmed.retain(|_, (_, until)| *until > now);
+        if confirmed.len() >= MAX_PENDING {
+            confirmed.clear();
+        }
+        confirmed.insert(session_id, (user_id, now + CONFIRM_TTL_SECS));
+    }
+
+    /// Whether the user of `session` confirmed it is them less than [`CONFIRM_TTL_SECS`] ago.
+    pub fn is_confirmed(&self, session: &SessionUser) -> bool {
+        let now = db::unix_now();
+        self.confirmed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&session.session_id)
+            .is_some_and(|(user_id, until)| *user_id == session.user_id && *until > now)
+    }
+
     /// The name of cookie `base` on this origin: with the [`HOST_PREFIX`] for the cookies of
     /// sessions, sign-ins, CSRF tokens and password resets on an HTTPS origin (whose
     /// `Set-Cookie` values carry `Secure` and `Path=/` and no `Domain`, as the prefix asks), as
@@ -981,16 +1024,20 @@ impl Web {
             },
             Err(_) => None,
         };
+        // An account without a password costs the same Argon2 work and fails like a wrong
+        // password, so the answer does not tell whether it has one.
         let phc = account
             .as_ref()
-            .map_or_else(|| dummy_hash().to_owned(), |(_, hash)| hash.clone());
+            .and_then(|(_, hash)| hash.clone())
+            .unwrap_or_else(|| dummy_hash().to_owned());
+        let has_password = account.as_ref().is_some_and(|(_, hash)| hash.is_some());
         let verified = tokio::task::spawn_blocking(move || password::verify(&password, &phc))
             .await
             .ok()
             .and_then(Result::ok)
             .unwrap_or(false);
         match account {
-            Some((user, _)) if verified && user.enabled => Verified::Ok(user),
+            Some((user, _)) if verified && has_password && user.enabled => Verified::Ok(user),
             _ => {
                 self.limiter.record_failure(client);
                 tracing::info!(%client, user = %username.trim(), "rejected web sign-in");
@@ -1101,7 +1148,7 @@ impl Web {
     pub async fn open_session(&self, client: IpAddr, user: &User) -> Option<SecretString> {
         match web_sessions::create(&self.pool, user.id, db::unix_now()).await {
             Ok(token) => {
-                tracing::info!(%client, user = %user.username, "web sign-in");
+                tracing::info!(%client, user = %user.username, method = "password", "web sign-in");
                 Some(token)
             }
             Err(err) => {

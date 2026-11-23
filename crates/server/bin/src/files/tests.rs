@@ -1838,9 +1838,14 @@ async fn pending_sign_ins_end_with_the_state_they_were_started_in() {
     // `updated_at` counts seconds.
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let hash = password::hash(&SecretString::from("a new password".to_owned())).unwrap();
-    users::set_password_hash(&f.state.db, &alice.username, &hash)
-        .await
-        .unwrap();
+    users::set_password_hash(
+        &f.state.db,
+        &alice.username,
+        &hash,
+        gono_server_core::audit::Actor::Cli,
+    )
+    .await
+    .unwrap();
     assert!(matches!(
         f.state
             .web
@@ -1966,6 +1971,7 @@ async fn secrets_shown_once_stay_with_the_account_of_their_session() {
         username: Username::new(name).unwrap(),
         display_name: name.to_owned(),
         is_admin: false,
+        has_password: true,
         services: gono_server_core::services::Services::ALL,
     };
     let (alice, bob) = (session(1, "alice"), session(2, "bob"));

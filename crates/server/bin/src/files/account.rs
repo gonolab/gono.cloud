@@ -3,7 +3,7 @@
 //!
 //! | Request | Page or action |
 //! |---|---|
-//! | `GET /account/` | Overview: the account's services, its email address, its WeChat, two-step verification, display name and web login password. |
+//! | `GET /account/` | Overview: the account's services, its ways to sign in (password and third-party identities), its email address, two-step verification, display name and web login password. |
 //! | `GET /account/webdav` | WebDAV: the addresses clients connect to, and the user's app passwords. |
 //! | `GET /account/s3` | S3: the user's buckets and access keys (see [`s3`]). |
 //! | `GET /account/direct` | Direct connections: the devices registered for remote access. |
@@ -11,19 +11,20 @@
 //! | `POST /account/display-name` | Change the display name. |
 //! | `POST /account/password` | Change the web login password (needs the current one). The other browser sessions end; this one stays. |
 //! | `POST /account/email`, `POST /account/email/confirm`, `POST /account/email/remove` | Add, replace or remove the email address with a mailed code (see [`email`]). |
-//! | `POST /account/wechat`, `POST /account/wechat/unbind` | Show a QR code that binds WeChat for the mini program, or unbind it (see [`wechat`]). |
+//! | `GET`/`POST /account/identities/wechat/bind`, `GET`/`POST /account/identities/<provider>/unbind` | Show a QR code that binds WeChat for the mini program, or unbind an identity (see [`methods`]). |
+//! | `GET /account/confirm`, `POST /account/confirm` | Confirm it is you, then go on (see [`methods`]). |
 //! | `POST /account/app-passwords` | Create an app password, then show it once at `/account/created`. |
 //! | `POST /account/app-passwords/<id>/delete` | Revoke one of the user's app passwords. |
 //! | `GET /account/devices/<endpoint id>/revoke` | The second confirmation of revoking a device for remote access. |
 //! | `POST /account/devices/<endpoint id>/revoke` | Revoke it, and the devices it introduced that are ticked. |
 //! | `POST /account/devices/<endpoint id>/sign-out` | Stop remote access for a device that stays in use: sign it out (protocol 9.4). |
 //! | `POST /account/devices/<endpoint id>/pairing` | Let the device send pairing requests for an hour. |
-//! | `POST /account/two-factor/start` | Start enrolling two-step verification (needs the password). |
+//! | `POST /account/two-factor/start` | Start enrolling two-step verification (needs confirming it is you). |
 //! | `GET /account/two-factor` | The QR code and key of the enrolment, and the form for its first code. |
 //! | `POST /account/two-factor/confirm` | Turn it on with the first code; the recovery codes follow once. The other browser sessions end; this one stays. |
 //! | `GET /account/two-factor/recovery-codes` | New recovery codes, shown once. |
-//! | `POST /account/two-factor/renew` | New recovery codes (password and a code). |
-//! | `POST /account/two-factor/disable` | Turn it off (password and a code). |
+//! | `POST /account/two-factor/renew` | New recovery codes (confirming it is you, and a code). |
+//! | `POST /account/two-factor/disable` | Turn it off (confirming it is you, and a code). |
 //! | `POST /account/s3/buckets` | Create an S3 bucket with a new folder `<s3.bucket_folder>/<name>`. |
 //! | `POST /account/s3/buckets/bind` | Make an existing folder an S3 bucket. |
 //! | `POST /account/s3/buckets/<id>/anonymous` | Change what anonymous requests may read and list in a bucket. |
@@ -57,11 +58,15 @@
 //! refused shows its tab again with the error (`422`). A new app password or S3 access key is
 //! kept in memory for its session only and shown once; the URL carries no secret. Changing the
 //! password checks the current one through the failed-attempt limiter of the sign-in pages.
+//! The forms that change how the account signs in or is recovered ask to confirm it is you
+//! first ([`confirmation`], `plan/third-party-sign-in-design.md` 3.5): the password typed into
+//! the form, or a confirmation of the same browser session in the last
+//! [`web::CONFIRM_TTL_SECS`].
 
 pub(crate) mod email;
+pub(crate) mod methods;
 pub(crate) mod relay;
 pub(crate) mod s3;
-pub(crate) mod wechat;
 
 use std::{
     collections::HashMap,
@@ -365,6 +370,27 @@ struct ServiceLine {
     href: String,
 }
 
+/// Whether the overview's forms ask to confirm it is you ([`confirmation`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct ConfirmView {
+    /// The browser session confirmed it recently: the forms need no password.
+    confirmed: bool,
+    /// The account has a web login password.
+    has_password: bool,
+}
+
+impl ConfirmView {
+    /// The forms carry a password field.
+    fn ask_password(&self) -> bool {
+        !self.confirmed && self.has_password
+    }
+
+    /// The account has no password and must confirm with a sign-in of an identity first.
+    fn needs_sign_in(&self) -> bool {
+        !self.confirmed && !self.has_password
+    }
+}
+
 /// `account/overview.html`.
 #[derive(Template)]
 #[template(path = "account/overview.html")]
@@ -372,10 +398,11 @@ struct OverviewPage {
     chrome: Chrome,
     frame: AccountFrame,
     services: Vec<ServiceLine>,
+    methods: methods::MethodsView,
     email: email::EmailView,
-    wechat: wechat::WeChatView,
     display_name: String,
     two_factor: TwoFactorView,
+    confirm: ConfirmView,
 }
 
 /// `account/webdav.html`.
@@ -640,18 +667,22 @@ async fn render(state: &AppState, visitor: &Visitor, options: PageOptions) -> Re
                 Ok(view) => view,
                 Err(err) => return internal(visitor, "email address", &err),
             };
-            let wechat = match wechat::view(state, visitor, now).await {
+            let methods = match methods::view(state, visitor, now).await {
                 Ok(view) => view,
-                Err(err) => return internal(visitor, "WeChat", &err),
+                Err(err) => return internal(visitor, "ways to sign in", &err),
             };
             let page = OverviewPage {
                 chrome,
                 frame,
                 services: service_lines(state, visitor),
+                methods,
                 email,
-                wechat,
                 display_name: visitor.user.display_name.clone(),
                 two_factor,
+                confirm: ConfirmView {
+                    confirmed: state.web.is_confirmed(&visitor.user),
+                    has_password: visitor.user.has_password,
+                },
             };
             web::render(status, &page)
         }
@@ -815,13 +846,35 @@ fn next_path(next: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Checks the visitor's web login password; `Err` is the page to answer with.
-async fn check_password(
+/// Outcome of [`confirmation`].
+enum Confirmation {
+    /// It is the account's user.
+    Confirmed,
+    /// Not confirmed; the error to show with the form again.
+    Refused(&'static str),
+    /// The page to answer with instead (too many attempts, the database failed).
+    Halt(Box<Response>),
+}
+
+/// Confirms that the visitor is the account's user before a form that needs it
+/// (`plan/third-party-sign-in-design.md`, 3.5). A password typed into the form is checked
+/// through the failed-attempt limiter of the sign-in pages, and a right one confirms the
+/// browser session for [`web::CONFIRM_TTL_SECS`]. Without one, the form passes while the
+/// session is confirmed, by a password or a fresh sign-in with a bound identity.
+async fn confirmation(
     state: &AppState,
     visitor: &Visitor,
     client: std::net::IpAddr,
     password: String,
-) -> Result<(), Box<Response>> {
+) -> Confirmation {
+    let t = visitor.t();
+    if password.is_empty() {
+        return if state.web.is_confirmed(&visitor.user) {
+            Confirmation::Confirmed
+        } else {
+            Confirmation::Refused(t.confirm_needed)
+        };
+    }
     match state
         .web
         .verify_password(
@@ -831,21 +884,35 @@ async fn check_password(
         )
         .await
     {
-        Verified::Ok(user) if user.id == visitor.user.user_id => Ok(()),
-        Verified::Ok(_) | Verified::Invalid => Err(Box::new(
-            show_error(
-                state,
-                visitor,
-                Tab::Overview,
-                visitor.t().err_current_password.to_owned(),
-            )
-            .await,
-        )),
-        Verified::RateLimited(wait) => Err(Box::new(web::too_many_attempts(
+        Verified::Ok(user) if user.id == visitor.user.user_id => {
+            state.web.confirm(&visitor.user);
+            Confirmation::Confirmed
+        }
+        Verified::Ok(_) | Verified::Invalid => Confirmation::Refused(t.err_current_password),
+        Verified::RateLimited(wait) => Confirmation::Halt(Box::new(web::too_many_attempts(
             visitor.chrome(Nav::Account),
             wait,
         ))),
-        Verified::Unavailable => Err(Box::new(web::unavailable(visitor.chrome(Nav::Account)))),
+        Verified::Unavailable => {
+            Confirmation::Halt(Box::new(web::unavailable(visitor.chrome(Nav::Account))))
+        }
+    }
+}
+
+/// [`confirmation`] for a form of the overview: `Err` is the overview again with the error,
+/// or the page to answer with.
+async fn confirm_you(
+    state: &AppState,
+    visitor: &Visitor,
+    client: std::net::IpAddr,
+    password: String,
+) -> Result<(), Box<Response>> {
+    match confirmation(state, visitor, client, password).await {
+        Confirmation::Confirmed => Ok(()),
+        Confirmation::Refused(error) => Err(Box::new(
+            show_error(state, visitor, Tab::Overview, error.to_owned()).await,
+        )),
+        Confirmation::Halt(response) => Err(response),
     }
 }
 
@@ -903,7 +970,7 @@ pub async fn two_factor_start(
         return web::unavailable(visitor.chrome(Nav::Account));
     }
     let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
-    if let Err(response) = check_password(&state, &visitor, client, form.password).await {
+    if let Err(response) = confirm_you(&state, &visitor, client, form.password).await {
         return *response;
     }
     state
@@ -1061,7 +1128,7 @@ pub async fn two_factor_renew(
         Err(response) => return *response,
     };
     let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
-    if let Err(response) = check_password(&state, &visitor, client, form.password).await {
+    if let Err(response) = confirm_you(&state, &visitor, client, form.password).await {
         return *response;
     }
     if let Err(response) = check_code(&state, &visitor, client, &form.code).await {
@@ -1096,7 +1163,7 @@ pub async fn two_factor_disable(
         Err(response) => return *response,
     };
     let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
-    if let Err(response) = check_password(&state, &visitor, client, form.password).await {
+    if let Err(response) = confirm_you(&state, &visitor, client, form.password).await {
         return *response;
     }
     if let Err(response) = check_code(&state, &visitor, client, &form.code).await {
@@ -1422,7 +1489,7 @@ fn notice(state: &AppState, t: &'static Text, tab: Tab, done: &str) -> Option<St
         }
         (Tab::Overview, "two-factor-off") => t.notice_tf_off_optional,
         (Tab::Overview, done) if done.starts_with("email-") => email::notice(t, done)?,
-        (Tab::Overview, done) if done.starts_with("wechat-") => wechat::notice(t, done)?,
+        (Tab::Overview, done) => return methods::notice(t, done),
         (Tab::Webdav, "revoked") => t.notice_revoked,
         (Tab::S3, done) => s3::notice(t, done)?,
         (Tab::Direct, "device-revoked") => t.notice_device_revoked,
@@ -1605,7 +1672,9 @@ pub async fn set_password(
         Ok(Err(err)) => return internal(&visitor, "password hash", &err),
         Err(err) => return internal(&visitor, "password hash", &err),
     };
-    if let Err(err) = users::set_password_hash(&state.db, &visitor.user.username, &hash).await {
+    if let Err(err) =
+        users::set_password_hash(&state.db, &visitor.user.username, &hash, Actor::User).await
+    {
         return internal(&visitor, "password change", &err);
     }
     // Sign-ins that were waiting for their second step with the old password end.

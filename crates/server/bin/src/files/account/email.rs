@@ -3,13 +3,14 @@
 //!
 //! | Request | Action |
 //! |---|---|
-//! | `POST /account/email` | Mail a code to a new address (needs the web login password). The overview then shows the form for the code. |
+//! | `POST /account/email` | Mail a code to a new address (needs confirming it is you). The overview then shows the form for the code. |
 //! | `POST /account/email/confirm` | Make the address of the code the account's. |
-//! | `POST /account/email/remove` | Remove the address (needs the web login password). |
+//! | `POST /account/email/remove` | Remove the address (needs confirming it is you). |
 //!
 //! The address is a recovery credential: whoever has it can reset the password. Adding,
-//! replacing and removing it therefore need the current password (checked through the
-//! failed-attempt limiter of the sign-in pages), the new address must receive its code, and the
+//! replacing and removing it therefore need confirming it is you (the current password, checked
+//! through the failed-attempt limiter of the sign-in pages, or a recent confirmation, see
+//! [`super::confirmation`]), the new address must receive its code, and the
 //! address it replaces or that is removed gets a notice. A change ends the account's sign-ins
 //! waiting for their second step and its codes still waiting, the reset codes sent to the old
 //! address among them.
@@ -33,7 +34,7 @@ use gono_server_core::{
 };
 use serde::Deserialize;
 
-use super::{Tab, check_password, form_visitor, internal, show_error};
+use super::{Tab, confirm_you, form_visitor, internal, show_error};
 use crate::{
     app::AppState,
     client_ip::client_ip,
@@ -134,7 +135,7 @@ pub async fn start(
         return fail(t.err_email_invalid.to_owned()).await;
     };
     let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
-    if let Err(response) = check_password(&state, &visitor, client, form.password).await {
+    if let Err(response) = confirm_you(&state, &visitor, client, form.password).await {
         return *response;
     }
     let user_id = visitor.user.user_id;
@@ -249,7 +250,7 @@ pub async fn remove(
         Err(response) => return *response,
     };
     let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
-    if let Err(response) = check_password(&state, &visitor, client, form.password).await {
+    if let Err(response) = confirm_you(&state, &visitor, client, form.password).await {
         return *response;
     }
     let user_id = visitor.user.user_id;

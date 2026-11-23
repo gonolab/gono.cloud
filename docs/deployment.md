@@ -231,11 +231,19 @@ user sets up there:
 
 | Tab | What it shows |
 |---|---|
-| Overview (`/account/`) | The account's services, on or off, each linked to where it is used; its email address ("Email" below), two-step verification, the display name and the web login password. Every account has it, with or without services. |
+| Overview (`/account/`) | The account's services, on or off, each linked to where it is used; its ways to sign in (the web login password and the WeChat of the mini program, "WeChat" below), its email address ("Email" below), two-step verification, the display name and the web login password. Every account has it, with or without services. |
 | WebDAV (`/account/webdav`) | The server and WebDAV addresses clients connect to, and the user's app passwords, to create or revoke, for example for Finder, Windows Explorer or rclone. |
 | S3 (`/account/s3`) | The user's buckets and access keys ([s3.md](s3.md)). |
 | Direct connections (`/account/direct`) | The devices registered for remote access ("Remote access" below). |
 | Relay (`/account/relay`) | The relay's address, whether it carries the account's devices at full speed (the relay service) or only at the limited rate (direct connections alone), the devices connected to it now and the sessions they reported. It needs direct connections, which admit the devices to the relay already. |
+
+The forms of the overview that change how the account signs in or is recovered (binding and
+unbinding WeChat, adding, replacing and removing the email address, two-step verification) ask
+the user to confirm it is them first: they take the web login password, and once it was right,
+the same browser can use them without it for 5 minutes (`/account/confirm` confirms ahead).
+Unbinding opens a page that says what it does. An account keeps at least one way to sign in:
+the last third-party identity of an account without a web login password cannot be unbound
+until the account has a password.
 
 Every tab is listed for every account. A tab whose service the account lacks says so and that
 an administrator turns it on ("Managing accounts" below), and its forms are refused; one whose
@@ -318,6 +326,8 @@ user's directories, would belong to root and could no longer be written by the s
 | `app-password add NAME --label LABEL [--scope ...] [--expires-in-days N]` | Create an app password, shown once. |
 | `app-password list NAME`, `app-password delete NAME ID` | List or revoke app passwords. |
 | `user reset-two-factor NAME` | Turn the user's two-step verification off (a lost phone without recovery codes). |
+| `user identities NAME` | List the third-party identities the user signs in with (WeChat today), with when they were bound and last used; never the provider's id of the user. |
+| `user unlink NAME PROVIDER` | Unbind the user's identity of `wechat` (or `google`, `github`); unbinding WeChat signs its mini program out. The only way in of an account without a web login password is kept: set a password first. |
 | `device list NAME`, `device revoke NAME ENDPOINT_ID` | List or revoke the devices registered for remote access ("Remote access"). |
 
 At least one enabled admin always remains: disabling, demoting or deleting the last one is
@@ -463,7 +473,8 @@ of the mails are never logged.
 What users see:
 
 - **Adding an address.** On the account page (Overview, "Email") a user enters the new address
-  and the web login password, and a 6-digit code goes to that address; entering it on the same
+  and the web login password (unless the browser confirmed it in the last 5 minutes), and a
+  6-digit code goes to that address; entering it on the same
   page binds the address. A code is valid for 10 minutes and for 5 tries. Addresses are stored
   in lower case, and an address belongs to one account: that another account has it is said
   only when the code is entered, so only whoever receives the mail learns it, and the message
@@ -559,7 +570,8 @@ It never logs the AppSecret, sign-in codes, tickets, session tokens or openids.
 
 What users see:
 
-- **Binding.** On the account page (Overview, "WeChat") a user enters the web login password,
+- **Binding.** On the account page (Overview, "Ways to sign in", WeChat's "Bind") a user
+  confirms with the web login password (unless the browser confirmed it in the last 5 minutes),
   and the page shows a QR code with the time it expires. Scanned with WeChat on the phone, it
   opens the mini program, which binds the user's WeChat to the account. A QR code is valid for
   10 minutes and once, a new one ends the previous one, and it binds only when the mini program
@@ -568,12 +580,14 @@ What users see:
   itself). Whoever scans the code gets the account in the mini program, so the page says not to
   share it. An account has one WeChat of the mini program at most, and a WeChat belongs to one
   account.
-- **Unbinding** on the same page needs the password too, and signs the mini program out on
-  every phone. Disabling or deleting an account ends its mini program sessions as well;
-  otherwise a session ends 30 days after its last use.
+- **Unbinding** ("Unbind" in the same panel) asks to confirm it is you the same way, and signs
+  the mini program out on every phone. Disabling or deleting an account ends its mini program
+  sessions as well; otherwise a session ends 30 days after its last use.
 - Neither changes the web login: browser sessions, app passwords and two-step verification stay.
-  The audit log records `wechat.bound` and `wechat.unbound` with the AppID, never the openid.
-  The admin UI shows on each account's page whether its WeChat is bound, and since when.
+  The audit log records `identity.bound` (`how: "mini_program"`) and `identity.unbound` (`how`:
+  `account_page`, `admin` or `cli`) with the AppID, never the openid. The admin UI lists each
+  account's identities with when they were bound and last used, and unbinds them; so do
+  `gono-cloud user identities` and `user unlink`.
 - **Limits.** `session` and `bind` of the mini program are limited per client address like the
   sign-in pages: failures count, successful sign-ins do not.
 

@@ -10,9 +10,10 @@ turns it on is in [deployment.md](deployment.md#wechat), what the reverse proxy 
 - The server serves one mini program, the AppID of `wechat.app_id`. Its openids are bound to
   accounts: an account has at most one WeChat of that AppID, and a WeChat belongs to one
   account at most.
-- Binding starts on the account page of the server (Overview, "WeChat"): the user enters the
-  web login password, and the page shows a QR code that the user scans with WeChat on the phone.
-  It opens the mini program, which signs in and binds. Unbinding is done on the same page.
+- Binding starts on the account page of the server (Overview, "Ways to sign in"): the user
+  confirms with the web login password, and the page shows a QR code that the user scans with
+  WeChat on the phone. It opens the mini program, which signs in and binds. Unbinding is done on
+  the same page, in the admin UI, or with `gono-cloud user unlink`.
 - A mini program session reads the account's name and services, nothing else: no files, no
   WebDAV, no S3, no page of the server.
 - Without `[wechat]` every path below `/gono/v1/wechat/` answers
@@ -21,8 +22,8 @@ turns it on is in [deployment.md](deployment.md#wechat), what the reverse proxy 
 
 ## The flow
 
-1. **The QR code.** On the account page the user asks for a QR code with the web login
-   password. It carries the link `{qr_url_prefix}bind/<ticket>` (for example
+1. **The QR code.** On the account page the user asks for a QR code, confirming with the web
+   login password. It carries the link `{qr_url_prefix}bind/<ticket>` (for example
    `https://cloud.example.com/q/bind/Xq3MZb7RkT0aVd9LpW2sYc`), is valid for 10 minutes and once,
    and a new one ends the previous one. The page shows when it expires.
 2. **Scanning.** The user scans it with WeChat's Scan on the phone. The rule
@@ -85,8 +86,8 @@ the person in front of the account page does.
 
 **This is a safeguard, not proof.** The scene and the platform come from the mini program;
 the server cannot check them, and a modified client can send any value. They stop mistakes and
-lures, not a determined attacker: the ticket (10 minutes, once, shown only to whoever entered
-the account's password) is what protects the account.
+lures, not a determined attacker: the ticket (10 minutes, once, shown only to whoever confirmed
+being the account's user, with its password) is what protects the account.
 
 Use `wx.getEnterOptionsSync()`, not `wx.getLaunchOptionsSync()`: when the mini program was in
 the background and is opened again by scanning, only the former reports the scan. The account
@@ -150,7 +151,8 @@ Binds the WeChat of a signup token to the account of a ticket. No authentication
 ```
 
 `200`: as a bound `session`, `{"session", "expires_at", "account"}`. The binding is recorded
-in the account's audit log (`wechat.bound`, with the AppID, never the openid).
+in the account's audit log (`identity.bound` with `how: "mini_program"` and the AppID, never the
+openid).
 
 The signup token is checked first, then the ticket:
 

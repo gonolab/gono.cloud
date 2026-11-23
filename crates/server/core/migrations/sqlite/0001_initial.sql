@@ -58,15 +58,15 @@ INSERT INTO id_sequences (name, last_id) VALUES
     ('device_events', 0),
     ('devices', 0),
     ('email_codes', 0),
+    ('external_identities', 0),
     ('files', 0),
     ('login_flows', 0),
     ('mp_sessions', 0),
+    ('pending_identities', 0),
     ('s3_buckets', 0),
     ('users', 0),
     ('web_sessions', 0),
-    ('wechat_bind_tickets', 0),
-    ('wechat_identities', 0),
-    ('wechat_signup_tokens', 0);
+    ('wechat_bind_tickets', 0);
 
 -- Server-wide settings that are generated once and must stay stable for the lifetime of the
 -- installation.
@@ -80,22 +80,34 @@ CREATE TABLE settings (
 -- files of different servers apart.
 INSERT INTO settings (name, value) VALUES ('instance_id', 'oc' || lower(hex(randomblob(5))));
 
--- Accounts. Users authenticate devices with app passwords; the web login password below is
--- used only for the server's HTML pages (sign-in, Login Flow v2, the file and admin UIs).
--- Ids of accounts, credentials, sessions, sign-ins and devices come from `id_sequences` (rule
--- 4): in-memory state keyed by them (the control channel, pending sign-ins, the "shown once"
--- pages) must never carry over to a newer row that reuses a deleted one's id.
+-- Accounts. Users authenticate devices with app passwords; the web login password below and
+-- the third-party identities of `external_identities` are used only for the server's HTML
+-- pages (sign-in, Login Flow v2, the file and admin UIs). Ids of accounts, credentials,
+-- sessions, sign-ins and devices come from `id_sequences` (rule 4): in-memory state keyed by
+-- them (the control channel, pending sign-ins, the "shown once" pages) must never carry over to
+-- a newer row that reuses a deleted one's id.
 CREATE TABLE users (
     id            INTEGER PRIMARY KEY,
     -- Validated by `gono_server_core::Username`: lowercase ASCII, appears verbatim in DAV URLs.
     username      TEXT    NOT NULL UNIQUE COLLATE BINARY,
     display_name  TEXT    NOT NULL,
-    -- Argon2id PHC string of the web login password.
-    password_hash TEXT    NOT NULL,
+    -- Argon2id PHC string of the web login password; NULL for an account without one, which
+    -- signs in with its third-party identities only. Such an account keeps at least one
+    -- identity (`gono_server_core::identities`).
+    password_hash TEXT,
     enabled       INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     is_admin      INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1)),
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL,
+    -- How the account came to be: 'cli' (the command line, the first admin's `init` included)
+    -- or 'admin' (the admin UI), or a sign-up with a third-party identity: 'wechat', 'google',
+    -- 'github'.
+    created_via   TEXT    NOT NULL
+                          CHECK (created_via IN ('admin', 'cli', 'wechat', 'google', 'github')),
+    -- When the server deletes the account, which asked for its deletion; NULL otherwise. Only
+    -- accounts without a web login password ask for it themselves, and the account stays
+    -- disabled until then or until the request is undone.
+    deleting_at   INTEGER CHECK (deleting_at IS NULL OR enabled = 0),
     -- The account's email address (`gono_server_core::email`): NULL, or an address its user
     -- proved to receive mail at by entering a code sent there. Lets a forgotten web login
     -- password be reset by mail. Stored lower-cased (ASCII only), so that Alice@Example.com and
@@ -650,30 +662,39 @@ CREATE TABLE email_codes (
 CREATE INDEX email_codes_user ON email_codes (user_id, purpose, created_at);
 CREATE INDEX email_codes_created_at ON email_codes (created_at);
 
--- WeChat mini program identities (`gono_server_core::wechat`): an account bound to the user a
--- mini program knows by its AppID and the openid WeChat gives that user for it. Bound on the
--- account page with a ticket that the mini program scans; one binding per account and AppID,
--- and an openid of an AppID belongs to one account at most. `unionid` is what WeChat reports
--- across the AppIDs of one developer account, when it reports one. Ids from `id_sequences`.
-CREATE TABLE wechat_identities (
+-- Third-party identities bound to accounts (`gono_server_core::identities`): a user of WeChat,
+-- known by the AppID of the mini program and the openid WeChat gives that user for it; of
+-- Google, by the `sub` of its ID tokens; or of GitHub, by its numeric user id (never the
+-- login, which can be renamed and reused). An identity signs in to its account without the web
+-- login password. It belongs to one account at most, and an account has one identity per
+-- provider and realm at most. Ids from `id_sequences`.
+CREATE TABLE external_identities (
     id           INTEGER PRIMARY KEY,
     user_id      INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    -- `wx` and 16 letters or digits.
-    app_id       TEXT    NOT NULL COLLATE BINARY CHECK (length(app_id) BETWEEN 1 AND 32),
-    -- Opaque identifiers of WeChat: letters, digits, '-' and '_'.
-    openid       TEXT    NOT NULL COLLATE BINARY CHECK (length(openid) BETWEEN 1 AND 128),
+    provider     TEXT    NOT NULL CHECK (provider IN ('wechat', 'google', 'github')),
+    -- Who issued the subject: the AppID for WeChat (`wx` and 16 letters or digits),
+    -- `https://accounts.google.com` for Google, `github.com` for GitHub.
+    realm        TEXT    NOT NULL COLLATE BINARY CHECK (length(realm) BETWEEN 1 AND 64),
+    -- The provider's opaque, stable id of the user. Never shown and never logged.
+    subject      TEXT    NOT NULL COLLATE BINARY CHECK (length(subject) BETWEEN 1 AND 255),
+    -- WeChat only: the id WeChat reports across the AppIDs of one developer account, once it
+    -- reports one.
     unionid      TEXT    COLLATE BINARY
                          CHECK (unionid IS NULL OR length(unionid) BETWEEN 1 AND 128),
+    -- What the account page shows of the identity: '' for WeChat (nothing of the openid), the
+    -- address for Google, `@login` for GitHub (refreshed at each sign-in).
+    label        TEXT    NOT NULL CHECK (length(label) <= 255),
     created_at   INTEGER NOT NULL,
-    -- The last sign-in of the mini program with this identity.
+    -- The last sign-in with it, on the web or in the mini program.
     last_seen_at INTEGER NOT NULL,
-    UNIQUE (app_id, openid),
-    UNIQUE (user_id, app_id)
+    CHECK (unionid IS NULL OR provider = 'wechat'),
+    UNIQUE (provider, realm, subject),
+    UNIQUE (user_id, provider, realm)
 ) STRICT;
 
--- Tickets that bind a WeChat identity to an account: made on the account page (with the web
--- login password), shown there as a QR code, used up by the mini program that scans it. Valid
--- for 10 minutes; a new one ends the account's earlier ones.
+-- Tickets that bind a WeChat identity to an account: made on the account page (once its user
+-- confirmed it is them), shown there as a QR code, used up by the mini program that scans it.
+-- Valid for 10 minutes; a new one ends the account's earlier ones.
 CREATE TABLE wechat_bind_tickets (
     id          INTEGER PRIMARY KEY,
     -- SHA-256 of the ticket (128 random bits). The ticket itself is never stored.
@@ -686,39 +707,54 @@ CREATE TABLE wechat_bind_tickets (
 CREATE INDEX wechat_bind_tickets_user_id ON wechat_bind_tickets (user_id);
 CREATE INDEX wechat_bind_tickets_expires_at ON wechat_bind_tickets (expires_at);
 
--- What the mini program holds for a WeChat user that is bound to no account yet: the openid
--- that signing in found unbound, for 10 minutes, so that binding it needs no second sign-in
--- with WeChat. A new one for the same openid ends the earlier ones.
-CREATE TABLE wechat_signup_tokens (
-    id         INTEGER PRIMARY KEY,
+-- Third-party identities that signed in while bound to no account (`gono_server_core::
+-- identities`): what the provider reported, kept for 10 minutes for whoever holds the token, so
+-- that binding the identity to an account or creating an account with it needs no second round
+-- trip to the provider. The mini program holds its token as a signup token, a browser in a
+-- cookie. A new one of the same identity and holder ends the earlier ones.
+CREATE TABLE pending_identities (
+    id             INTEGER PRIMARY KEY,
     -- SHA-256 of the token (256 random bits).
-    token_hash BLOB    NOT NULL UNIQUE CHECK (length(token_hash) = 32),
-    app_id     TEXT    NOT NULL COLLATE BINARY CHECK (length(app_id) BETWEEN 1 AND 32),
-    openid     TEXT    NOT NULL COLLATE BINARY CHECK (length(openid) BETWEEN 1 AND 128),
-    unionid    TEXT    COLLATE BINARY
-                       CHECK (unionid IS NULL OR length(unionid) BETWEEN 1 AND 128),
-    created_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL
+    token_hash     BLOB    NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+    -- Who holds the token: 'mini_program' or 'web' (a browser). A token is taken only from its
+    -- holder.
+    holder         TEXT    NOT NULL CHECK (holder IN ('mini_program', 'web')),
+    -- The identity, as in `external_identities`.
+    provider       TEXT    NOT NULL CHECK (provider IN ('wechat', 'google', 'github')),
+    realm          TEXT    NOT NULL COLLATE BINARY CHECK (length(realm) BETWEEN 1 AND 64),
+    subject        TEXT    NOT NULL COLLATE BINARY CHECK (length(subject) BETWEEN 1 AND 255),
+    unionid        TEXT    COLLATE BINARY
+                           CHECK (unionid IS NULL OR length(unionid) BETWEEN 1 AND 128),
+    label          TEXT    NOT NULL CHECK (length(label) <= 255),
+    -- The address the provider reported, lower-cased, and whether it verified it. Never written
+    -- into `users.email`: the server verifies addresses itself.
+    email          TEXT    COLLATE BINARY
+                           CHECK (email IS NULL OR length(email) BETWEEN 3 AND 254),
+    email_verified INTEGER NOT NULL DEFAULT 0 CHECK (email_verified IN (0, 1)),
+    -- The user's name at the provider, offered as the display name of a new account.
+    name           TEXT    CHECK (name IS NULL OR length(name) <= 255),
+    created_at     INTEGER NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    CHECK (unionid IS NULL OR provider = 'wechat')
 ) STRICT;
 
-CREATE INDEX wechat_signup_tokens_openid ON wechat_signup_tokens (app_id, openid);
-CREATE INDEX wechat_signup_tokens_expires_at ON wechat_signup_tokens (expires_at);
+CREATE INDEX pending_identities_subject ON pending_identities (provider, realm, subject);
+CREATE INDEX pending_identities_expires_at ON pending_identities (expires_at);
 
 -- Sessions of the mini program with a bound WeChat identity. They read the account's name and
 -- services and nothing else: no files, no WebDAV, no S3. A session ends 30 days after its last
--- use, when the identity is unbound, and when the account is disabled or deleted.
+-- use, when its identity is unbound (with it, by the cascade), and when the account is
+-- disabled or deleted.
 CREATE TABLE mp_sessions (
     id           INTEGER PRIMARY KEY,
     -- SHA-256 of the bearer token (256 random bits).
     token_hash   BLOB    NOT NULL UNIQUE CHECK (length(token_hash) = 32),
-    user_id      INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    -- The identity the session was opened with.
-    app_id       TEXT    NOT NULL COLLATE BINARY CHECK (length(app_id) BETWEEN 1 AND 32),
-    openid       TEXT    NOT NULL COLLATE BINARY CHECK (length(openid) BETWEEN 1 AND 128),
+    -- The WeChat identity the session was opened with.
+    identity_id  INTEGER NOT NULL REFERENCES external_identities (id) ON DELETE CASCADE,
     created_at   INTEGER NOT NULL,
     last_seen_at INTEGER NOT NULL,
     expires_at   INTEGER NOT NULL
 ) STRICT;
 
-CREATE INDEX mp_sessions_user_app ON mp_sessions (user_id, app_id);
+CREATE INDEX mp_sessions_identity_id ON mp_sessions (identity_id);
 CREATE INDEX mp_sessions_expires_at ON mp_sessions (expires_at);

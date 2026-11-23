@@ -193,7 +193,7 @@ async fn show_qr(browser: &mut Browser, csrf: &str, wechat: &WeChat) -> String {
     let before = wechat.shown_tickets();
     let shown = browser
         .post(
-            "/account/wechat",
+            "/account/identities/wechat/bind",
             &[("csrf", csrf), ("password", ALICE_PASSWORD)],
         )
         .await;
@@ -244,10 +244,10 @@ async fn add_user(f: &Fixture, name: &str) -> i64 {
 /// Inserts an identity directly, as a binding elsewhere would leave it.
 async fn insert_identity(f: &Fixture, user: i64, openid: &str) {
     let mut tx = db::begin_immediate(&f.state.db).await.unwrap();
-    let id = db::next_id(&mut tx, "wechat_identities").await.unwrap();
+    let id = db::next_id(&mut tx, "external_identities").await.unwrap();
     sqlx::query(
-        "INSERT INTO wechat_identities (id, user_id, app_id, openid, created_at, last_seen_at) \
-         VALUES (?, ?, ?, ?, 0, 0)",
+        "INSERT INTO external_identities (id, user_id, provider, realm, subject, label, \
+         created_at, last_seen_at) VALUES (?, ?, 'wechat', ?, ?, '', 0, 0)",
     )
     .bind(id)
     .bind(user)
@@ -272,10 +272,10 @@ async fn without_wechat_the_panel_says_so_and_nothing_answers() {
     let csrf = browser.sign_in().await;
     let page = browser.get("/account/").await.text();
     assert!(page.contains(t().wechat_unavailable), "{page}");
-    assert!(!page.contains("action=\"/account/wechat\""), "{page}");
+    assert!(!page.contains("/account/identities/wechat/bind"), "{page}");
     let posted = browser
         .post(
-            "/account/wechat",
+            "/account/identities/wechat/bind",
             &[("csrf", &csrf), ("password", ALICE_PASSWORD)],
         )
         .await;
@@ -307,19 +307,25 @@ async fn a_qr_code_on_the_account_page_binds_the_mini_program() {
     let mut browser = Browser::new(&f.state);
     let csrf = browser.sign_in().await;
     let page = browser.get("/account/").await.text();
-    assert!(page.contains("action=\"/account/wechat\""), "{page}");
-    assert!(page.contains(t().wechat_none), "{page}");
+    assert!(
+        page.contains("href=\"/account/identities/wechat/bind\""),
+        "{page}"
+    );
+    assert!(page.contains(t().methods_not_bound), "{page}");
     assert!(!page.contains("class=\"qr\""), "{page}");
 
     // The password is needed.
     let wrong = browser
-        .post("/account/wechat", &[("csrf", &csrf), ("password", "wrong")])
+        .post(
+            "/account/identities/wechat/bind",
+            &[("csrf", &csrf), ("password", "wrong")],
+        )
         .await;
     assert_eq!(wrong.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(wrong.text().contains(t().err_current_password));
     let forged = browser
         .post(
-            "/account/wechat",
+            "/account/identities/wechat/bind",
             &[("csrf", "forged"), ("password", ALICE_PASSWORD)],
         )
         .await;
@@ -335,7 +341,10 @@ async fn a_qr_code_on_the_account_page_binds_the_mini_program() {
     // With its expiry and the hint to scan it with WeChat.
     let hint = t().wechat_scan.split("{}").next().unwrap();
     assert!(page.contains(hint), "{page}");
-    assert!(page.contains(t().wechat_show_again), "{page}");
+    assert!(
+        page.contains("href=\"/account/identities/wechat/bind\""),
+        "a new one can be made: {page}"
+    );
     assert!(!page.contains(&ticket), "the ticket is in the QR code only");
     // Reloading shows it again; another browser of the account sees none.
     assert!(browser.get("/account/").await.text().contains(&qr));
@@ -369,8 +378,11 @@ async fn a_qr_code_on_the_account_page_binds_the_mini_program() {
 
     // The account page shows the binding, and the session reads the account.
     let page = browser.get("/account/").await.text();
-    assert!(page.contains("Bound since"), "{page}");
-    assert!(page.contains("action=\"/account/wechat/unbind\""), "{page}");
+    assert!(page.contains("bound since"), "{page}");
+    assert!(
+        page.contains("href=\"/account/identities/wechat/unbind\""),
+        "{page}"
+    );
     assert!(!page.contains("class=\"qr\""), "{page}");
     let read = mini.account(&session).await;
     assert_eq!(read.status, StatusCode::OK);
@@ -378,9 +390,12 @@ async fn a_qr_code_on_the_account_page_binds_the_mini_program() {
     let entries = audit::list(&f.state.db, Some(alice(&f).await.id), None, 10)
         .await
         .unwrap();
-    assert_eq!(entries[0].kind, "wechat.bound");
+    assert_eq!(entries[0].kind, "identity.bound");
     assert_eq!(entries[0].client_ip.as_deref(), Some("198.51.100.1"));
-    assert_eq!(entries[0].details, format!("{{\"app_id\":\"{APP_ID}\"}}"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&entries[0].details).unwrap(),
+        json!({ "provider": "wechat", "how": "mini_program", "app_id": APP_ID })
+    );
     assert!(!entries[0].details.contains(ALICE_OPENID));
 
     // The ticket is used up.
@@ -444,7 +459,7 @@ async fn a_new_qr_code_ends_the_previous_one() {
     let first = show_qr(&mut browser, &csrf, &wechat).await;
     let again = browser
         .post(
-            "/account/wechat",
+            "/account/identities/wechat/bind",
             &[("csrf", &csrf), ("password", ALICE_PASSWORD)],
         )
         .await;
@@ -462,7 +477,7 @@ async fn a_new_qr_code_ends_the_previous_one() {
     // Bound, no QR code is made.
     let refused = browser
         .post(
-            "/account/wechat",
+            "/account/identities/wechat/bind",
             &[("csrf", &csrf), ("password", ALICE_PASSWORD)],
         )
         .await;
@@ -701,7 +716,7 @@ async fn errors_of_wechat_have_codes_of_their_own() {
     let bound = mini.bind(&token, ticket.ticket.expose_secret()).await;
     assert_eq!(bound.status, StatusCode::OK);
     let unionid: Option<db::Text> =
-        sqlx::query_scalar("SELECT unionid FROM wechat_identities WHERE user_id = ?")
+        sqlx::query_scalar("SELECT unionid FROM external_identities WHERE user_id = ?")
             .bind(user)
             .fetch_one(&f.state.db)
             .await
@@ -790,7 +805,7 @@ async fn sessions_end_when_unbound_disabled_deleted_or_unused() {
     // Unbinding needs the password.
     let wrong = browser
         .post(
-            "/account/wechat/unbind",
+            "/account/identities/wechat/unbind",
             &[("csrf", &csrf), ("password", "wrong")],
         )
         .await;
@@ -798,15 +813,15 @@ async fn sessions_end_when_unbound_disabled_deleted_or_unused() {
     assert_eq!(mini.account(&session).await.status, StatusCode::OK);
     let unbound = browser
         .post(
-            "/account/wechat/unbind",
+            "/account/identities/wechat/unbind",
             &[("csrf", &csrf), ("password", ALICE_PASSWORD)],
         )
         .await;
     assert_eq!(unbound.status, StatusCode::SEE_OTHER);
-    assert_eq!(unbound.location(), "/account/?done=wechat-unbound");
-    let page = browser.get("/account/?done=wechat-unbound").await.text();
+    assert_eq!(unbound.location(), "/account/?done=unbound-wechat");
+    let page = browser.get("/account/?done=unbound-wechat").await.text();
     assert!(page.contains(t().notice_wechat_unbound), "{page}");
-    assert!(page.contains(t().wechat_none), "{page}");
+    assert!(page.contains(t().methods_not_bound), "{page}");
     assert_eq!(
         mini.account(&session).await.error(),
         (StatusCode::UNAUTHORIZED, "not_signed_in".to_owned())
@@ -818,7 +833,7 @@ async fn sessions_end_when_unbound_disabled_deleted_or_unused() {
         .into_iter()
         .map(|entry| entry.kind)
         .collect();
-    assert_eq!(kinds[..2], ["wechat.unbound", "wechat.bound"]);
+    assert_eq!(kinds[..2], ["identity.unbound", "identity.bound"]);
     // Unbinding does not touch the web login.
     assert_eq!(alice(&f).await.updated_at, user.updated_at);
 
@@ -978,7 +993,7 @@ async fn qr_links_open_a_page_that_says_to_scan_them() {
     // It starts nothing.
     let rows: i64 = sqlx::query_scalar(
         "SELECT (SELECT COUNT(*) FROM wechat_bind_tickets) + \
-         (SELECT COUNT(*) FROM wechat_signup_tokens) + (SELECT COUNT(*) FROM mp_sessions)",
+         (SELECT COUNT(*) FROM pending_identities) + (SELECT COUNT(*) FROM mp_sessions)",
     )
     .fetch_one(&f.state.db)
     .await
@@ -1031,4 +1046,179 @@ async fn the_verification_file_is_served_as_it_is() {
     let html = dir.path().join("verify.html");
     std::fs::write(&html, b"x").unwrap();
     assert!(VerifyFile::read(&html).is_err());
+}
+
+/// The id of the browser session that signed alice in last.
+async fn session_of(f: &Fixture, user: i64) -> i64 {
+    sqlx::query_scalar("SELECT id FROM web_sessions WHERE user_id = ? ORDER BY id DESC LIMIT 1")
+        .bind(user)
+        .fetch_one(&f.state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn confirming_it_is_you_lasts_five_minutes_for_the_browser() {
+    let (f, _api, wechat) = with_wechat(None).await;
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+
+    // Not confirmed: the forms ask for the password, and a form without it is refused.
+    let page = browser.get("/account/").await.text();
+    assert!(page.contains("id=\"tf-on-password\""), "{page}");
+    let bind_page = browser.get("/account/identities/wechat/bind").await;
+    assert_eq!(bind_page.status, StatusCode::OK);
+    assert!(bind_page.text().contains("id=\"confirm-password\""));
+    let refused = browser
+        .post("/account/identities/wechat/bind", &[("csrf", &csrf)])
+        .await;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(refused.text().contains(t().confirm_needed));
+    assert!(wechat.shown_tickets().is_empty());
+
+    // The confirmation page confirms and goes on to a page of the account only.
+    let wrong = browser
+        .post(
+            "/account/confirm",
+            &[
+                ("csrf", &csrf),
+                ("password", "wrong"),
+                ("next", "/account/s3"),
+            ],
+        )
+        .await;
+    assert_eq!(wrong.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(wrong.text().contains(t().err_current_password));
+    let confirmed = browser
+        .post(
+            "/account/confirm",
+            &[
+                ("csrf", &csrf),
+                ("password", ALICE_PASSWORD),
+                ("next", "/account/s3"),
+            ],
+        )
+        .await;
+    assert_eq!(confirmed.status, StatusCode::SEE_OTHER);
+    assert_eq!(confirmed.location(), "/account/s3");
+
+    // Confirmed: no password field, and the forms pass without one; a wrong one still fails.
+    let page = browser.get("/account/").await.text();
+    assert!(!page.contains("id=\"tf-on-password\""), "{page}");
+    assert!(!page.contains("id=\"email-password\""), "{page}");
+    assert!(
+        !browser
+            .get("/account/identities/wechat/bind")
+            .await
+            .text()
+            .contains("id=\"confirm-password\"")
+    );
+    let wrong = browser
+        .post(
+            "/account/identities/wechat/bind",
+            &[("csrf", &csrf), ("password", "wrong")],
+        )
+        .await;
+    assert_eq!(wrong.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let shown = browser
+        .post("/account/identities/wechat/bind", &[("csrf", &csrf)])
+        .await;
+    assert_eq!(shown.status, StatusCode::SEE_OTHER, "{}", shown.text());
+    assert_eq!(wechat.shown_tickets().len(), 1);
+
+    // Another browser of the account is not confirmed.
+    let mut other = Browser::new(&f.state);
+    let other_csrf = other.sign_in().await;
+    let refused = other
+        .post("/account/identities/wechat/bind", &[("csrf", &other_csrf)])
+        .await;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A confirmation of another account's session with the same id counts for nothing.
+    let user = alice(&f).await;
+    let session = session_of(&f, user.id).await;
+    f.state.web.confirm_session(session, user.id + 1);
+    let refused = other
+        .post("/account/identities/wechat/bind", &[("csrf", &other_csrf)])
+        .await;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn unbinding_says_what_it_does_and_keeps_the_last_way_in() {
+    let (f, api, wechat) = with_wechat(None).await;
+    let mut browser = Browser::new(&f.state);
+    let mini = Mini::new(&f);
+    let csrf = browser.sign_in().await;
+    let session = bind_alice(&mut browser, &csrf, &mini, &api, &wechat).await;
+
+    let page = browser.get("/account/identities/wechat/unbind").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.text().contains(t().unbind_wechat_lead),
+        "{}",
+        page.text()
+    );
+    assert!(
+        page.text()
+            .contains("action=\"/account/identities/wechat/unbind\"")
+    );
+    // Providers this server does not offer have no page.
+    for path in [
+        "/account/identities/google/bind",
+        "/account/identities/facebook/unbind",
+    ] {
+        assert_eq!(
+            browser.get(path).await.status,
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
+    }
+
+    // Without a password, WeChat is the last way in: it stays.
+    let user = alice(&f).await;
+    sqlx::query("UPDATE users SET password_hash = NULL WHERE id = ?")
+        .bind(user.id)
+        .execute(&f.state.db)
+        .await
+        .unwrap();
+    let page = browser.get("/account/").await.text();
+    assert!(page.contains(t().methods_password_none), "{page}");
+    // The session confirmed with the password when the QR code was shown.
+    let refused = browser
+        .post("/account/identities/wechat/unbind", &[("csrf", &csrf)])
+        .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert!(refused.text().contains(t().err_last_sign_in));
+    assert_eq!(mini.account(&session).await.status, StatusCode::OK);
+    assert!(
+        store::lookup(&f.state.db, APP_ID, &session, db::unix_now())
+            .await
+            .unwrap()
+            != store::Lookup::Unknown
+    );
+}
+
+#[tokio::test]
+async fn an_account_without_a_password_fails_a_password_sign_in_as_a_wrong_password_does() {
+    let f = fixture().await;
+    let user = alice(&f).await;
+    sqlx::query("UPDATE users SET password_hash = NULL WHERE id = ?")
+        .bind(user.id)
+        .execute(&f.state.db)
+        .await
+        .unwrap();
+    let mut browser = Browser::new(&f.state);
+    let form = browser.get("/login").await;
+    let csrf = form.field("name=\"csrf\" value=\"");
+    for password in [ALICE_PASSWORD, "", "anything"] {
+        let reply = browser
+            .post(
+                "/login",
+                &[("csrf", &csrf), ("user", "alice"), ("password", password)],
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{password:?}");
+        assert!(reply.text().contains(t().wrong_password));
+    }
 }

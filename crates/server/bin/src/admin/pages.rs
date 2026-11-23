@@ -253,10 +253,24 @@ pub struct UserView {
     pub two_factor_on: bool,
     /// The email address its user bound, or "None".
     pub email: String,
-    /// "Bound since … (AppID)" for each WeChat identity, or "Not bound".
-    pub wechat: String,
+    /// It has a web login password.
+    pub has_password: bool,
+    /// Its third-party identities.
+    pub identities: Vec<IdentityRow>,
     /// The five services, with the switch of each.
     pub services: Vec<crate::service_view::ServiceRow>,
+}
+
+/// One third-party identity of an account.
+#[derive(Debug, Clone)]
+pub struct IdentityRow {
+    pub id: i64,
+    /// 微信, Google, GitHub.
+    pub provider: &'static str,
+    /// The AppID for WeChat (also of a mini program configured before), the label otherwise.
+    pub label: String,
+    /// "Bound …, last used …".
+    pub since: String,
 }
 
 /// One mount of an app password, as text.

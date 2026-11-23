@@ -1677,9 +1677,14 @@ mod tests {
             "correct horse".to_owned(),
         ))
         .unwrap();
-        users::set_password_hash(&f.state.db, &Username::new("alice").unwrap(), &hash)
-            .await
-            .unwrap();
+        users::set_password_hash(
+            &f.state.db,
+            &Username::new("alice").unwrap(),
+            &hash,
+            gono_server_core::audit::Actor::Cli,
+        )
+        .await
+        .unwrap();
 
         let desktop = "Mozilla/5.0 (Macintosh) mirall/3.13.0 (Nextcloud, osx-23.5.0)";
         let start = f
