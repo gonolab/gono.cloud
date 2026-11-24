@@ -69,20 +69,37 @@ The page that made the QR code shows "Bound since ..." once the user reloads it.
 
 ## Scenes and platforms
 
-`session` and `bind` take the scene and the platform of the mini program and refuse it unless
-it was opened by scanning a code with WeChat on a phone:
+The calls take the scene and the platform of the mini program. Every call that signs in or
+acts needs WeChat on a phone; `bind` (and `scan`, `confirm`, `deny`) also needs the mini program
+to have been opened by scanning a code:
 
 | Field | Accepted | Refused with |
 |---|---|---|
 | `platform`, from `wx.getDeviceInfo().platform` (`wx.getSystemInfoSync().platform` before base library 2.20.1) | `ios`, `android`, `ohos` | `desktop_client`: `windows`, `mac`, `ohos_pc`, `devtools` and every other value |
-| `scene`, from `wx.getEnterOptionsSync().scene` | `1011` (a QR code scanned with Scan), `1047` (a mini program code scanned with Scan) | `wrong_scene`: `1012` and `1048` (a code recognized in an image by a long press), `1013` and `1049` (a code picked from the album), `1007` and `1008` (a shared card in a chat), `1001` (the chat list), ... and every other value |
+| `scene`, from `wx.getEnterOptionsSync().scene`, checked by `bind`, `scan`, `confirm` and `deny` only | `1011` (a QR code scanned with Scan), `1047` (a mini program code scanned with Scan) | `wrong_scene`: `1012` and `1048` (a code recognized in an image by a long press), `1013` and `1049` (a code picked from the album), `1007` and `1008` (a shared card in a chat), `1001` (the chat list), ... and every other value |
+
+| Call | Platform | Scene |
+|---|---|---|
+| `session`, `signup` | a phone | any (still sent) |
+| `bind`, `scan`, `confirm`, `deny` | a phone | `1011` or `1047` |
+| `account/delete`, `account/restore` | a phone | none sent |
+| `account`, `logout`, `PATCH account`, `flow` | none | none |
 
 The platform is checked first: a desktop client gets `desktop_client` whatever its scene.
 
-Binding gives a WeChat user the account in the mini program, so a QR code or a link that was
-forwarded, photographed or opened on a desktop must not bind: someone who receives a screenshot
-of the code in a chat would otherwise get the account. Scanning with the phone's camera is what
-the person in front of the account page does.
+Binding gives a WeChat user the account in the mini program, and with it the right to confirm
+sign-ins on the web, so a QR code or a link that was forwarded, photographed or opened on a
+desktop must not bind: someone who receives a screenshot of the code in a chat would otherwise
+get the account. Scanning with the phone's camera is what the person in front of the account
+page does.
+
+Signing in with a WeChat that is bound already carries no such risk: that WeChat is the
+account's. So `session` takes every scene, and a user whose session ended (after logging out,
+after 30 days, on a new phone) signs in again from the chat list or wherever the mini program
+was opened. A WeChat bound to no account gets a signup token from any scene too; it binds
+nothing without a ticket and `bind`'s scene rule. `signup` takes every scene like `session`:
+it makes a new account for the WeChat that asks, not someone else's. The phone rule stays for
+all of them, so WeChat on a desktop signs in to nothing.
 
 **This is a safeguard, not proof.** The scene and the platform come from the mini program;
 the server cannot check them, and a modified client can send any value. They stop mistakes and
@@ -95,7 +112,7 @@ page shows an ordinary QR code, which scans as `1011`; `1047` is accepted for mi
 which the server does not make today. WeChat's developer tools report `devtools`, which is
 refused: try binding on a phone (preview or a development version).
 
-`account` and `logout` have no such rule: a mini program opened from the chat list keeps using
+`account` and `logout` have neither rule: a mini program opened from the chat list keeps using
 the session it holds.
 
 ## Endpoints
@@ -109,7 +126,8 @@ Signs the mini program in with a code of `wx.login()`. No authentication.
 ```
 
 - `code`: the code of `wx.login()`, 1 to 256 visible ASCII characters. A code works once.
-- `scene`, `platform`: see [Scenes and platforms](#scenes-and-platforms).
+- `scene`, `platform`: see [Scenes and platforms](#scenes-and-platforms). Every scene is
+  accepted; the platform must be a phone's.
 
 `200`, when the WeChat is bound to an enabled account:
 
@@ -133,9 +151,10 @@ Signs the mini program in with a code of `wx.login()`. No authentication.
 
 - The signup token is valid for 10 minutes and names the WeChat that signed in. A new one for
   the same WeChat ends the earlier one; binding uses it up.
-- Errors: `bad_request`, `desktop_client`, `wrong_scene`, `code_invalid` (WeChat's 40029 or
-  40163: invalid, expired or used; call `wx.login()` again), `risky_user` (WeChat's 40226),
-  `account_disabled` (the WeChat's account is disabled), `rate_limited`, `unavailable`.
+- Errors: `bad_request`, `desktop_client`, `code_invalid` (WeChat's 40029 or 40163: invalid,
+  expired or used; call `wx.login()` again), `risky_user` (WeChat's 40226), `account_disabled`
+  (the WeChat's account is disabled), `deletion_pending`, `rate_limited`, `unavailable`. Never
+  `wrong_scene`.
 
 ### `POST /gono/v1/wechat/bind`
 
@@ -210,8 +229,8 @@ With `wechat.allow_signup` (off by default), `session` answers a WeChat bound to
   64 characters) names the terms the user accepted, and is required when the server has terms
   (`[sign_in] terms_url`). Errors: `signup_closed` (403) without `allow_signup`,
   `session_expired` (401) for a token that is gone, `account_exists` (409), `signup_limited`
-  (429: 5 accounts a day per network, 200 for the server), and the scene and platform rules of
-  `session`.
+  (429: 5 accounts a day per network, 200 for the server), and the platform rule of `session`
+  (any scene).
 - `PATCH /gono/v1/wechat/account {"username"}` (Bearer) changes the username of an account made
   by a sign-up, until an app password or a device signed in to it (their statements name the
   account by its username), once a day: `200` with the account; `username_taken` (409),
@@ -305,7 +324,7 @@ are limited like `bind`.
 | `not_signed_in` | 401 | No session, or one that does not exist (any more). |
 | `session_expired` | 401 | The session was not used for 30 days; or, from `bind`, the signup token is gone. |
 | `risky_user` | 403 | WeChat refuses this user as risky (its 40226). |
-| `wrong_scene` | 403 | The mini program was not opened by scanning ([Scenes and platforms](#scenes-and-platforms)). |
+| `wrong_scene` | 403 | `bind`, `scan`, `confirm`, `deny`: the mini program was not opened by scanning ([Scenes and platforms](#scenes-and-platforms)). |
 | `desktop_client` | 403 | The mini program runs on a desktop or in the developer tools. |
 | `account_disabled` | 403 | The account is disabled. |
 | `not_found` | 404 | No such endpoint or method, or the server does not offer the mini program. |

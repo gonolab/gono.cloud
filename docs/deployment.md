@@ -583,6 +583,9 @@ What users see:
   itself). Whoever scans the code gets the account in the mini program, so the page says not to
   share it. An account has one WeChat of the mini program at most, and a WeChat belongs to one
   account.
+- **Signing in again.** Once bound, the WeChat signs in to the mini program however it was
+  opened, on a phone: from the chat list, after logging out, on a new phone. Only binding needs
+  the scan. WeChat on a desktop or in the developer tools signs in to nothing.
 - **Unbinding** ("Unbind" in the same panel) asks to confirm it is you the same way, and signs
   the mini program out on every phone. Disabling or deleting an account ends its mini program
   sessions as well; otherwise a session ends 30 days after its last use.

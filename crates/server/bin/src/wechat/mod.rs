@@ -29,14 +29,20 @@
 //!   every field is checked before anything else happens.
 //! - A session reads the account's name and services and nothing else; it opens no page and
 //!   no file, WebDAV or S3 data.
-//! - **Scene and platform.** Binding gives a WeChat user the account's mini program sessions
-//!   (and, later, the right to confirm sign-ins), so a QR code or a code forwarded to someone
-//!   else must not bind. `session` and `bind` therefore take only the scenes of scanning with
-//!   the phone's camera, 1011 (a QR code) and 1047 (a mini program code), and only the phones'
-//!   platforms, `ios`, `android` and `ohos`: not desktop WeChat, not a code recognized in an
-//!   image (1012, 1048) or picked from the album (1013, 1049), not a shared card (1007, 1008).
-//!   The mini program reports both (`wx.getEnterOptionsSync().scene`,
-//!   `wx.getDeviceInfo().platform`): the check is a safeguard against mistakes and lures, not
+//! - **Platform.** Every call that signs in or acts (`session`, `bind`, `signup`, `scan`,
+//!   `confirm`, `deny`, `account/delete`, `account/restore`) takes only the phones' platforms,
+//!   `ios`, `android` and `ohos` ([`check_platform`]): not desktop WeChat, not the developer
+//!   tools.
+//! - **Scene.** Binding gives a WeChat user the account's mini program sessions and the right
+//!   to confirm sign-ins on the web, so a QR code forwarded to someone else must not bind.
+//!   `bind` (and `scan`, `confirm`, `deny`) therefore also take only the scenes of scanning
+//!   with the phone's camera, 1011 (a QR code) and 1047 (a mini program code) ([`check_client`]):
+//!   not a code recognized in an image (1012, 1048) or picked from the album (1013, 1049), not a
+//!   shared card (1007, 1008). `session` and `signup` take any scene: a WeChat that is bound
+//!   already is the account's, so it signs in again however the mini program was opened, and a
+//!   signup token binds nothing without a ticket and `bind`'s scene check.
+//! - The mini program reports both (`wx.getEnterOptionsSync().scene`,
+//!   `wx.getDeviceInfo().platform`): the checks are a safeguard against mistakes and lures, not
 //!   proof.
 //! - **Limits.** Each client address has a token bucket like the sign-in pages'
 //!   ([`RateLimiter`]). `session` and `bind` are refused while the bucket is empty, before
@@ -101,11 +107,11 @@ pub const MAX_BODY_BYTES: usize = 4 * 1024;
 /// The largest verification file, in bytes; WeChat's hold a few dozen.
 const MAX_VERIFY_FILE_BYTES: u64 = 4 * 1024;
 
-/// The scenes `session` and `bind` take: scanning a QR code (1011) or a mini program code
-/// (1047) with WeChat's scanner.
+/// The scenes `bind` (and `scan`, `confirm`, `deny`) take: scanning a QR code (1011) or a mini
+/// program code (1047) with WeChat's scanner.
 pub const SCENES: [u32; 2] = [1011, 1047];
 
-/// The platforms `session` and `bind` take: WeChat on a phone.
+/// The platforms every call that signs in or acts takes: WeChat on a phone.
 pub const PLATFORMS: [&str; 3] = ["ios", "android", "ohos"];
 
 /// How long a client waits after WeChat's own rate limit, in seconds.
@@ -494,12 +500,20 @@ fn parse<T: DeserializeOwned>(body: Result<Bytes, BytesRejection>) -> Result<T, 
     serde_json::from_slice(&body).map_err(|_| Box::new(bad_request()))
 }
 
+/// Refuses a client that is not WeChat on a phone (`desktop_client`). See the module
+/// documentation.
+fn check_platform(platform: &str) -> Result<(), Box<Response>> {
+    if PLATFORMS.contains(&platform) {
+        Ok(())
+    } else {
+        Err(Box::new(error(StatusCode::FORBIDDEN, "desktop_client")))
+    }
+}
+
 /// Refuses a client that is not WeChat on a phone (`desktop_client`) or did not open the mini
 /// program by scanning (`wrong_scene`). See the module documentation.
 fn check_client(scene: u32, platform: &str) -> Result<(), Box<Response>> {
-    if !PLATFORMS.contains(&platform) {
-        return Err(Box::new(error(StatusCode::FORBIDDEN, "desktop_client")));
-    }
+    check_platform(platform)?;
     if !SCENES.contains(&scene) {
         return Err(Box::new(error(StatusCode::FORBIDDEN, "wrong_scene")));
     }
@@ -542,7 +556,10 @@ fn signed_in(session: &NewSession, account: &Account) -> Response {
 #[derive(Deserialize)]
 struct SessionRequest {
     code: String,
-    scene: u32,
+    /// Reported by the mini program and still required, but of any value: `session` takes
+    /// every scene.
+    #[serde(rename = "scene")]
+    _scene: u32,
     platform: String,
 }
 
@@ -579,7 +596,8 @@ async fn sign_in(
     if !is_code(&request.code) {
         return bad_request();
     }
-    if let Err(response) = check_client(request.scene, &request.platform) {
+    // Any scene: see the module documentation.
+    if let Err(response) = check_platform(&request.platform) {
         return *response;
     }
     let login = match wechat.api.code_to_session(&request.code).await {
@@ -786,9 +804,7 @@ struct ScanRequest {
 
 /// [`check_client`] that takes the in-app scanner as a scan.
 fn check_scan(request: &ScanRequest) -> Result<(), Box<Response>> {
-    if !PLATFORMS.contains(&request.platform.as_str()) {
-        return Err(Box::new(error(StatusCode::FORBIDDEN, "desktop_client")));
-    }
+    check_platform(&request.platform)?;
     match request.source.as_deref() {
         None | Some("enter") => check_client(request.scene, &request.platform),
         Some("scan_code") => Ok(()),
@@ -1106,7 +1122,10 @@ struct SignupRequest {
     signup_token: String,
     #[serde(default)]
     terms_version: Option<String>,
-    scene: u32,
+    /// Reported by the mini program and still required, but of any value: `signup` takes
+    /// every scene, as `session` does.
+    #[serde(rename = "scene")]
+    _scene: u32,
     platform: String,
 }
 
@@ -1147,7 +1166,8 @@ async fn signup_with(
     {
         return bad_request();
     }
-    if let Err(response) = check_client(request.scene, &request.platform) {
+    // Any scene, as `session`.
+    if let Err(response) = check_platform(&request.platform) {
         return *response;
     }
     if !wechat.allow_signup {
@@ -1302,9 +1322,7 @@ async fn fresh_identity(
     if !is_code(&request.code) {
         return Err(Box::new(bad_request()));
     }
-    if !PLATFORMS.contains(&request.platform.as_str()) {
-        return Err(Box::new(error(StatusCode::FORBIDDEN, "desktop_client")));
-    }
+    check_platform(&request.platform)?;
     let openid = match wechat.api.code_to_session(&request.code).await {
         Ok(login) => login.openid,
         Err(ApiError::InvalidCode) => {

@@ -64,6 +64,11 @@ yourself (the bucket must be bound to the folder `Buckets/<name>`); without them
 are skipped. They use the AWS SDK as it ships, so they also check its default integrity
 checksums and presigned URLs.
 
+It also turns the WeChat mini program's API on (`[wechat]`) with a stand-in AppID and AppSecret,
+and sets `GONO_ACCEPT_WECHAT=1` for `tests/wechat.rs`. Those tests send only requests that the
+server refuses before it asks WeChat, so nothing reaches WeChat; against another server, set the
+variable only for a server whose `[wechat]` is enabled.
+
 To test a reverse proxy configuration, start the proxy so that it forwards a local port to
 `SERVER_PORT`, then run the suite through it; the notify_push tests connect to the WebSocket
 URL the capabilities advertise, which is built from `PUBLIC_URL`, so they go through the proxy
@@ -116,6 +121,7 @@ test still reports `ok`; it prints `SKIP <test>: <reason>` to stderr (also visib
 | `GONO_ACCEPT_USER2` | no | A second, unrelated, non-admin user. `run-new.sh` names it `alice@example.com`; the href test for names with `@` is skipped for names without one. |
 | `GONO_ACCEPT_PASSWORD2` | no | Full-scope app password of `GONO_ACCEPT_USER2`. |
 | `GONO_ACCEPT_PUSH_TIMEOUT_SECS` | no | How long to wait for a notify_push message (default 20). |
+| `GONO_ACCEPT_WECHAT` | no | `1` when the server has the WeChat mini program's API (`[wechat]`); the `wechat` tests are skipped otherwise. |
 
 ## Isolation and cleanup
 
@@ -141,6 +147,7 @@ test still reports `ok`; it prints `SKIP <test>: <reason>` to stderr (also visib
 | `login_flow` | 6 | Login Flow v2 init on both paths, pending polls, wrong passwords, an explicit consent page, a newly minted per-device app password, single-use poll tokens; the web login password is not a WebDAV credential. |
 | `admin` | 4 | The admin UI needs a login, accepts the web login password, and refuses app passwords of any scope (as Basic credentials and at its login form). |
 | `notify_push` | 12 | Capabilities; WebSocket authentication with an app password, bad credentials, and single-use pre-auth tokens; notifications for PUT, MKCOL, COPY, MOVE, chunked upload, and DELETE; `listen notify_file_id`; no notifications for other users. |
+| `wechat` | 3 | The mini program's API up to the point where the server would ask WeChat: `account` without a session, the phone rule of `session` and `bind`, and `bind`'s scene rule. |
 
 The Login Flow and admin tests drive plain HTML pages: they follow redirects, keep cookies, answer
 HTTP Basic challenges, fill forms with a password field (username field matched by name), and
@@ -165,6 +172,9 @@ rewrite.
 
 ## Not covered
 
+- What the WeChat mini program's API does once WeChat has exchanged a code (sessions, binding,
+  sign-up): the suite cannot answer for WeChat. The server's own tests cover it with a fake
+  WeChat API.
 - `sync-collection` REPORT (out of scope for v1).
 - Legacy-only behavior that is not part of the v1 scope: `/metrics`, the admin page contents, OCS
   placeholder endpoints (shares, notifications, user status, ...), `SEARCH`, the WebDAV aliases at

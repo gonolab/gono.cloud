@@ -486,7 +486,7 @@ async fn a_new_qr_code_ends_the_previous_one() {
 }
 
 #[tokio::test]
-async fn the_mini_program_must_be_opened_by_scanning_on_a_phone() {
+async fn signing_in_needs_a_phone_and_binding_a_scan_too() {
     let (f, api, _) = with_wechat(None).await;
     let mini = Mini::new(&f);
     let ticket = match store::create_ticket(&f.state.db, alice(&f).await.id, APP_ID, db::unix_now())
@@ -498,56 +498,110 @@ async fn the_mini_program_must_be_opened_by_scanning_on_a_phone() {
     };
     let token = mini.signup(&api, "code-0", BOB_OPENID).await;
     let mut address = 10;
-    let mut refuse = |scene: Value, platform: &str, expected: &str| {
+    // Refuses `path` with `body` from a new address with `expected`.
+    let mut refuse = |path: &'static str, body: Value, expected: &'static str| {
         address += 1;
         let mini = mini.at(address);
-        let session = json!({ "code": "code-x", "scene": scene, "platform": platform });
-        let bind = json!({
+        async move {
+            assert_eq!(
+                mini.post(path, &body).await.error(),
+                (StatusCode::FORBIDDEN, expected.to_owned()),
+                "{path} {body}"
+            );
+        }
+    };
+    let bind = |scene: Value, platform: &str| {
+        json!({
             "signup_token": token,
             "ticket": ticket,
             "scene": scene,
             "platform": platform,
-        });
-        let expected = expected.to_owned();
-        async move {
-            for (path, body) in [
-                ("/gono/v1/wechat/session", session),
-                ("/gono/v1/wechat/bind", bind),
-            ] {
-                assert_eq!(
-                    mini.post(path, &body).await.error(),
-                    (StatusCode::FORBIDDEN, expected.clone()),
-                    "{path} {body}"
-                );
-            }
-        }
+        })
     };
+    let session = |scene: Value, platform: &str| {
+        json!({
+            "code": "code-x",
+            "scene": scene,
+            "platform": platform,
+        })
+    };
+    // Not on a phone: refused whatever the scene, before WeChat is asked.
     for platform in ["windows", "mac", "ohos_pc", "devtools", "linux", "iOS", ""] {
-        refuse(json!(1011), platform, "desktop_client").await;
+        for scene in [1011, 1001] {
+            refuse(
+                "/gono/v1/wechat/session",
+                session(json!(scene), platform),
+                "desktop_client",
+            )
+            .await;
+            refuse(
+                "/gono/v1/wechat/bind",
+                bind(json!(scene), platform),
+                "desktop_client",
+            )
+            .await;
+        }
     }
+    // Binding takes only the scenes of scanning with the camera.
     for scene in [1012, 1013, 1048, 1049, 1007, 1008, 1001, 1089, 1036, 0] {
-        refuse(json!(scene), "ios", "wrong_scene").await;
+        refuse(
+            "/gono/v1/wechat/bind",
+            bind(json!(scene), "ios"),
+            "wrong_scene",
+        )
+        .await;
     }
     // A desktop client is told so whatever its scene.
-    refuse(json!(1013), "windows", "desktop_client").await;
+    refuse(
+        "/gono/v1/wechat/bind",
+        bind(json!(1013), "windows"),
+        "desktop_client",
+    )
+    .await;
     // WeChat was never asked.
     assert_eq!(api.asked(), ["code-0"]);
 
-    // Scanning on a phone works, both kinds of code, every phone platform.
-    for (index, (scene, platform)) in [(1011, "android"), (1047, "ohos"), (1047, "ios")]
-        .into_iter()
-        .enumerate()
+    // Signing in takes every scene on a phone: the chat list (1001), a code in an image
+    // (1012), a shared card (1007), ... An unbound WeChat gets a signup token.
+    for (index, (scene, platform)) in [
+        (1001, "ios"),
+        (1012, "android"),
+        (1007, "ohos"),
+        (1089, "ios"),
+        (1011, "android"),
+        (1047, "ohos"),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let code = format!("code-{scene}-{platform}");
         api.accept(&code, &format!("oPhone{index}"));
         let answer = mini
+            .at(100)
             .post(
                 "/gono/v1/wechat/session",
                 &json!({ "code": code, "scene": scene, "platform": platform }),
             )
             .await;
         assert_eq!(answer.status, StatusCode::OK, "{scene} {platform}");
+        assert!(store::is_token(
+            answer.json()["signup_token"].as_str().unwrap()
+        ));
     }
+    // A bound WeChat gets a session from the chat list, and its token still binds nothing
+    // without a scan.
+    let bound = mini.bind(&token, &ticket).await;
+    assert_eq!(bound.status, StatusCode::OK, "{}", bound.json());
+    api.accept("code-again", BOB_OPENID);
+    let again = mini
+        .post(
+            "/gono/v1/wechat/session",
+            &json!({ "code": "code-again", "scene": 1001, "platform": "ios" }),
+        )
+        .await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.json());
+    assert_eq!(again.json()["account"]["username"], "alice");
+    assert!(store::is_token(again.json()["session"].as_str().unwrap()));
 }
 
 #[tokio::test]
@@ -1638,10 +1692,21 @@ async fn the_mini_program_signs_up_renames_and_deletes_an_account() {
     f.state.wechat = Some(open);
     let mini = Mini::new(&f);
     let token = mini.signup(&api, "s1", "oNew").await;
+    // Only on a phone, but from any scene, as `session`.
+    let desktop = mini
+        .post(
+            "/gono/v1/wechat/signup",
+            &json!({ "signup_token": token, "scene": 1001, "platform": "windows" }),
+        )
+        .await;
+    assert_eq!(
+        desktop.error(),
+        (StatusCode::FORBIDDEN, "desktop_client".to_owned())
+    );
     let created = mini
         .post(
             "/gono/v1/wechat/signup",
-            &json!({ "signup_token": token, "scene": 1011, "platform": "ios" }),
+            &json!({ "signup_token": token, "scene": 1001, "platform": "ios" }),
         )
         .await;
     assert_eq!(created.status, StatusCode::OK, "{}", created.json());

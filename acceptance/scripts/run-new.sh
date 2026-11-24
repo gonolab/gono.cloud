@@ -290,7 +290,16 @@ allow_anonymous = true
 virtual_host_domain = "s3.localhost"
 # Websites: the suite sends <bucket>.web.localhost to s3.bind the same way.
 website_domain = "web.localhost"
+
+# The mini program's API with a stand-in AppID and AppSecret: the suite sends only requests that
+# the server refuses before it asks WeChat (tests/wechat.rs), so nothing reaches WeChat.
+[wechat]
+enabled = true
+app_id = "wxacceptance000000"
+secret_file = "${WORK_DIR}/wechat-secret"
+qr_url_prefix = "https://mp.example.invalid/q/"
 EOF
+(umask 077 && printf '%s\n' "not-a-real-appsecret" >"${WORK_DIR}/wechat-secret")
 
 WEB_PASSWORD="$(random_password)"
 USER2_WEB_PASSWORD="$(random_password)"
@@ -351,6 +360,7 @@ export GONO_ACCEPT_S3_BUCKET="acceptance"
 export GONO_ACCEPT_S3_PUBLIC_BUCKET="acceptance-public"
 export GONO_ACCEPT_S3_VIRTUAL_HOST_DOMAIN="s3.localhost"
 export GONO_ACCEPT_S3_WEBSITE_DOMAIN="web.localhost"
+export GONO_ACCEPT_WECHAT="1"
 
 ENV_FILE="${WORK_DIR}/accept.env"
 {
@@ -359,7 +369,7 @@ ENV_FILE="${WORK_DIR}/accept.env"
     GONO_ACCEPT_ADMIN_PATH GONO_ACCEPT_USER2 GONO_ACCEPT_PASSWORD2 \
     GONO_ACCEPT_S3_ENDPOINT GONO_ACCEPT_S3_ACCESS_KEY GONO_ACCEPT_S3_SECRET_KEY \
     GONO_ACCEPT_S3_BUCKET GONO_ACCEPT_S3_PUBLIC_BUCKET GONO_ACCEPT_S3_VIRTUAL_HOST_DOMAIN \
-    GONO_ACCEPT_S3_WEBSITE_DOMAIN; do
+    GONO_ACCEPT_S3_WEBSITE_DOMAIN GONO_ACCEPT_WECHAT; do
     printf 'export %s=%q\n' "${name}" "${!name}"
   done
 } >"${ENV_FILE}"

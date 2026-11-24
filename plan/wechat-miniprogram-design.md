@@ -81,7 +81,7 @@
 
 | Piece | Today (server) | Phase |
 |---|---|---|
-| `POST /gono/v1/wechat/session` (code, scene, platform → session or signup token) | yes; refuses non-scan scenes | 1: S1 drops the scene rule |
+| `POST /gono/v1/wechat/session` (code, scene, platform → session or signup token) | yes; phones only, any scene (S1) | 1: S1 drops the scene rule |
 | `POST /gono/v1/wechat/bind` (signup token + ticket → session) | yes | 1: S3 accepts the in-app scanner |
 | `GET /gono/v1/wechat/account` (username, display name, five switches) | yes; does not say which services the server offers | 1: S2 adds `offered` and `bound_at` |
 | `POST /gono/v1/wechat/logout` | yes | 1 |
@@ -886,7 +886,7 @@ Unknown codes follow the API's rule: `5xx` as `unavailable`, anything else as a 
 
 | Call | Platform | Scene |
 |---|---|---|
-| `session` | `ios`, `android`, `ohos` | any, with S1 (today: 1011, 1047) |
+| `session`, `signup` | `ios`, `android`, `ohos` | any (S1) |
 | `bind`, `bind/preview` | phones | 1011 or 1047; or `source: "scan_code"` with S3 |
 | `account`, `logout`, `devices` (GET) | none | none |
 | Device actions, display name, unbind (phase 2) | phones (a fresh code each) | none |
@@ -1035,13 +1035,16 @@ fields, as `/gono/v1/` allows. A ticked item is built and committed (checked aga
 
 ### Phase 1
 
-- [ ] **S1 `session`: phone rule only.** Drop `check_client`'s scene test from `session` and
+- [x] **S1 `session`: phone rule only.** Drop `check_client`'s scene test from `session` and
   keep the platform test (`desktop_client`). `bind` keeps both. The signup token is issued for
   any scene; it binds nothing without a ticket and `bind`'s scene check. Update the module
   documentation of `crates/server/bin/src/wechat/mod.rs`, docs/wechat-miniprogram.md ("Scenes
   and platforms", `session`'s errors: no more `wrong_scene`), and docs/deployment.md ("What users
   see"). Tests: scene 1001 on `ios` → a session for a bound openid and a signup token otherwise;
-  scene 1001 on `windows` → `desktop_client`; `bind` with 1001 → `wrong_scene`.
+  scene 1001 on `windows` → `desktop_client`; `bind` with 1001 → `wrong_scene`. Built: `signup`
+  follows `session` (any scene, phones only), as docs/wechat-miniprogram.md already said it takes
+  `session`'s rules; `scene` stays a required field. The acceptance suite (`tests/wechat.rs`)
+  covers what it can see without WeChat: the phone rule and `bind`'s scene rule.
 - [ ] **S2 What the server offers, and since when bound.** `account` (and the `account` object
   of `session` and `bind`) gains `"offered": {"files", "webdav", "s3", "direct", "relay"}` from
   `service_view::offered`, and `"wechat": {"bound_at": <unix>}` from
