@@ -116,16 +116,17 @@ compatible within a major version: released clients keep working with newer serv
   `session` takes every scene, so that a bound WeChat signs in again however the mini program was
   opened (the chat list, after logging out, on a new phone); `signup` does as `session`. A session
   (`Authorization: Bearer`, 30 days after its last use, at most 5 per WeChat) reads the account's
-  name and services through `GET /gono/v1/wechat/account` and nothing else, and ends with `POST
-  /gono/v1/wechat/logout`, unbinding (on the same page, in the admin UI or with the command line),
-  and disabling or deleting the account. Failures are limited per client address like sign-ins.
-  Tickets and tokens are stored only as digests; codes, tokens, openids and the AppSecret (read from
-  `wechat.secret_file`) are never logged, WeChat's `session_key` is never kept. Any path below `/q/`
-  answers a page that says to scan the code with WeChat, and `wechat.verify_file` serves the
-  console's verification file at `/<its name>`. The audit log records `identity.bound` and
-  `identity.unbound` (the AppID, never the openid); `config check` shows the settings without the
-  secret, and the admin UI shows whether each account's WeChat is bound. See
-  `docs/wechat-miniprogram.md` and "WeChat" in `docs/deployment.md`.
+  name and services through `GET /gono/v1/wechat/account` and nothing else, with which services this
+  server offers at all (`offered`) and since when the WeChat is bound (`wechat.bound_at`), also in
+  the `account` of every answer that opens a session, and ends with `POST /gono/v1/wechat/logout`,
+  unbinding (on the same page, in the admin UI or with the command line), and disabling or deleting
+  the account. Failures are limited per client address like sign-ins. Tickets and tokens are stored
+  only as digests; codes, tokens, openids and the AppSecret (read from `wechat.secret_file`) are
+  never logged, WeChat's `session_key` is never kept. Any path below `/q/` answers a page that says
+  to scan the code with WeChat, and `wechat.verify_file` serves the console's verification file at
+  `/<its name>`. The audit log records `identity.bound` and `identity.unbound` (the AppID, never the
+  openid); `config check` shows the settings without the secret, and the admin UI shows whether each
+  account's WeChat is bound. See `docs/wechat-miniprogram.md` and "WeChat" in `docs/deployment.md`.
 - **Services per account**: every account has five switches, all off for new accounts, the
   first admin included: `files` (the web file UI), `webdav` (WebDAV and the other endpoints of
   Nextcloud clients), `s3` (the S3 API), `direct` (remote access for devices, with the relay at

@@ -138,10 +138,14 @@ Signs the mini program in with a code of `wx.login()`. No authentication.
   "account": {
     "username": "alice",
     "display_name": "Alice Example",
-    "services": { "files": true, "webdav": true, "s3": false, "direct": true, "relay": false }
+    "services": { "files": true, "webdav": true, "s3": false, "direct": true, "relay": false },
+    "offered": { "files": true, "webdav": true, "s3": false, "direct": true, "relay": true },
+    "wechat": { "bound_at": 1765000000 }
   }
 }
 ```
+
+`account` is what [`GET account`](#get-gonov1wechataccount) answers.
 
 `200`, when the WeChat is bound to no account:
 
@@ -196,7 +200,9 @@ The session's account. `Authorization: Bearer <session>`.
 {
   "username": "alice",
   "display_name": "Alice Example",
-  "services": { "files": true, "webdav": true, "s3": false, "direct": true, "relay": false }
+  "services": { "files": true, "webdav": true, "s3": false, "direct": true, "relay": false },
+  "offered": { "files": true, "webdav": true, "s3": false, "direct": true, "relay": true },
+  "wechat": { "bound_at": 1765000000 }
 }
 ```
 
@@ -204,6 +210,16 @@ The session's account. `Authorization: Bearer <session>`.
   account's switches (`files`: the web file UI, `webdav`: WebDAV and the Nextcloud clients,
   `s3`: the S3 API, `direct`: remote access for devices, `relay`: the relay at the full rate),
   whether or not this server offers each.
+- `offered` says, for the same five, whether this server offers the service at all, as the
+  account page shows it: `files` while the web file UI is on, `webdav` always, `s3` while the
+  S3 API is configured, `direct` and `relay` while remote access is. An account can use a
+  service only when both are `true`; show "本服务器未提供" (this server does not offer it) when
+  `offered` is `false`, whatever the switch. `offered.relay` and `services.relay` mean the
+  full rate: with `direct` but not `relay`, the relay still helps devices connect, at a low
+  rate.
+- `wechat.bound_at` is when this WeChat was bound to the account (UNIX seconds); for an account
+  made by a sign-up in the mini program, when it was made. Unbinding and binding again starts it
+  anew.
 - Each use extends the session ([Sessions](#sessions)).
 - Errors: `not_signed_in` (no `Authorization` header, not a bearer token, or no such session:
   logged out, ended by unbinding, by disabling or deleting the account, or by a newer session),

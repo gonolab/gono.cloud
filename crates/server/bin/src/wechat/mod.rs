@@ -5,7 +5,7 @@
 //! |---|---|
 //! | `POST /gono/v1/wechat/session` | Exchanges the mini program's sign-in code with WeChat: a session for a bound openid, a signup token otherwise. |
 //! | `POST /gono/v1/wechat/bind` | Binds the openid of a signup token to the account of a bind ticket from the account page, and opens a session. |
-//! | `GET /gono/v1/wechat/account` | The name and services of the session's account (`Authorization: Bearer <session>`). |
+//! | `GET /gono/v1/wechat/account` | The name and services of the session's account (`Authorization: Bearer <session>`), which services this server offers, and since when the WeChat is bound. |
 //! | `POST /gono/v1/wechat/logout` | Ends the session. |
 //! | `POST /gono/v1/wechat/signup` | With `[wechat] allow_signup`: creates an account (no service, no password, a generated username) for the WeChat of a signup token, and opens a session. |
 //! | `PATCH /gono/v1/wechat/account` | Changes the username of an account made by a sign-up, until a device or app signed in to it. |
@@ -78,6 +78,7 @@ use gono_server_core::{
     config::{WeChatConfig, verify_file_name},
     db,
     identities::{self, Provider},
+    services::Service,
     users,
     web_sessions::SessionUser,
     wechat::{self as store, Account, Bind, Locked, Lookup, NewSession, Purpose, SignIn, Stage},
@@ -92,6 +93,7 @@ use crate::{
     client_ip::client_ip,
     i18n::Lang,
     ratelimit::RateLimiter,
+    service_view,
     web::{Chrome, Message},
 };
 
@@ -525,9 +527,12 @@ fn is_code(code: &str) -> bool {
     (1..=256).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_graphic())
 }
 
-/// What the mini program reads of `account`.
-fn account_json(account: &Account) -> serde_json::Value {
+/// What the mini program reads of `account` on the server of `state`: the account's switches
+/// (`services`), whether this server offers each service at all (`offered`, as the account page
+/// shows it), and since when the WeChat is bound.
+fn account_json(state: &AppState, account: &Account) -> serde_json::Value {
     let services = account.services;
+    let offered = |service| service_view::offered(state, service);
     serde_json::json!({
         "username": account.username.as_str(),
         "display_name": account.display_name,
@@ -538,17 +543,25 @@ fn account_json(account: &Account) -> serde_json::Value {
             "direct": services.direct,
             "relay": services.relay,
         },
+        "offered": {
+            "files": offered(Service::Files),
+            "webdav": offered(Service::Webdav),
+            "s3": offered(Service::S3),
+            "direct": offered(Service::Direct),
+            "relay": offered(Service::Relay),
+        },
+        "wechat": { "bound_at": account.bound_at },
     })
 }
 
 /// The answer that hands over a new session.
-fn signed_in(session: &NewSession, account: &Account) -> Response {
+fn signed_in(state: &AppState, session: &NewSession, account: &Account) -> Response {
     json(
         StatusCode::OK,
         &serde_json::json!({
             "session": session.token.expose_secret(),
             "expires_at": session.expires_at,
-            "account": account_json(account),
+            "account": account_json(state, account),
         }),
     )
 }
@@ -624,7 +637,7 @@ async fn sign_in(
     match signed {
         Ok(SignIn::Session { session, account }) => {
             tracing::info!(%client, user = %account.username, "WeChat mini program signed in");
-            signed_in(&session, &account)
+            signed_in(state, &session, &account)
         }
         Ok(SignIn::Unbound { token, expires_at }) => json(
             StatusCode::OK,
@@ -699,7 +712,7 @@ async fn bind_with(
     match bound {
         Ok(Bind::Bound { session, account }) => {
             tracing::info!(%client, user = %account.username, app_id = %wechat.app_id, "WeChat bound to an account");
-            signed_in(&session, &account)
+            signed_in(state, &session, &account)
         }
         Ok(Bind::SessionExpired) => not_signed_in("session_expired"),
         Ok(Bind::TicketExpired) => error(StatusCode::GONE, "ticket_expired"),
@@ -747,7 +760,7 @@ pub async fn account(
         Err(()) => return wechat.refused(client),
     };
     match store::lookup(&state.db, &wechat.app_id, token, db::unix_now()).await {
-        Ok(Lookup::Live(account)) => json(StatusCode::OK, &account_json(&account)),
+        Ok(Lookup::Live(account)) => json(StatusCode::OK, &account_json(&state, &account)),
         Ok(Lookup::Expired) => not_signed_in("session_expired"),
         Ok(Lookup::Disabled) => error(StatusCode::FORBIDDEN, "account_disabled"),
         Ok(Lookup::Unknown) => wechat.refused(client),
@@ -1223,7 +1236,7 @@ async fn signup_with(
                 }
                 tracing::info!(%client, user = %user.username, "account created by sign-up in the mini program");
                 return match store::open_session_of(&state.db, identity.id, now).await {
-                    Ok(Some((session, account))) => signed_in(&session, &account),
+                    Ok(Some((session, account))) => signed_in(state, &session, &account),
                     Ok(None) => unavailable(),
                     Err(err) => failed(&err),
                 };
@@ -1289,11 +1302,15 @@ pub async fn rename(
     )
     .await
     {
-        Ok(users::Renamed::Done) => match store::account(&state.db, account.user_id).await {
-            Ok(Some(account)) => json(StatusCode::OK, &account_json(&account)),
-            Ok(None) => error(StatusCode::FORBIDDEN, "account_disabled"),
-            Err(err) => failed(&err),
-        },
+        // Read again through the session, as `account` would.
+        Ok(users::Renamed::Done) => {
+            match store::lookup(&state.db, &wechat.app_id, token, now).await {
+                Ok(Lookup::Live(account)) => json(StatusCode::OK, &account_json(&state, &account)),
+                Ok(Lookup::Expired | Lookup::Unknown) => not_signed_in("not_signed_in"),
+                Ok(Lookup::Disabled) => error(StatusCode::FORBIDDEN, "account_disabled"),
+                Err(err) => failed(&err),
+            }
+        }
         Ok(users::Renamed::Taken) => error(StatusCode::CONFLICT, "username_taken"),
         Ok(users::Renamed::Locked) => error(StatusCode::CONFLICT, "username_locked"),
         Ok(users::Renamed::TooSoon) => rate_limited(Duration::from_secs(
@@ -1455,7 +1472,7 @@ pub async fn restore(
             connect.poke();
         }
         match store::open_session_of(&state.db, identity.id, now).await {
-            Ok(Some((session, account))) => signed_in(&session, &account),
+            Ok(Some((session, account))) => signed_in(&state, &session, &account),
             Ok(None) => error(StatusCode::FORBIDDEN, "account_disabled"),
             Err(err) => failed(&err),
         }

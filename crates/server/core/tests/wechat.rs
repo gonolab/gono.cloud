@@ -210,6 +210,7 @@ async fn a_ticket_binds_the_openid_of_a_signup_token() {
     assert_eq!(account.username.as_str(), "alice");
     assert_eq!(account.display_name, "alice Example");
     assert!(account.services.webdav && !account.services.s3);
+    assert_eq!(account.bound_at, NOW + 5);
     let bound = identity(&pool, alice, APP).await.unwrap();
     assert_eq!(
         (
@@ -273,6 +274,14 @@ async fn a_ticket_binds_the_openid_of_a_signup_token() {
         lookup(&pool, &session.token, NOW + 8).await,
         Lookup::Live(account)
     );
+    // Every later sign-in reads when the WeChat was bound, not when it signed in.
+    let SignIn::Session { account, .. } = wechat::sign_in(&pool, APP, ALICE_OPENID, None, NOW + 9)
+        .await
+        .unwrap()
+    else {
+        panic!("no session");
+    };
+    assert_eq!(account.bound_at, NOW + 5);
 }
 
 #[tokio::test]

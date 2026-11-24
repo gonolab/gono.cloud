@@ -243,16 +243,23 @@ async fn add_user(f: &Fixture, name: &str) -> i64 {
 
 /// Inserts an identity directly, as a binding elsewhere would leave it.
 async fn insert_identity(f: &Fixture, user: i64, openid: &str) {
+    insert_identity_at(f, user, openid, 0).await;
+}
+
+/// The same, bound at `bound_at`.
+async fn insert_identity_at(f: &Fixture, user: i64, openid: &str, bound_at: i64) {
     let mut tx = db::begin_immediate(&f.state.db).await.unwrap();
     let id = db::next_id(&mut tx, "external_identities").await.unwrap();
     sqlx::query(
         "INSERT INTO external_identities (id, user_id, provider, realm, subject, label, \
-         created_at, last_seen_at) VALUES (?, ?, 'wechat', ?, ?, '', 0, 0)",
+         created_at, last_seen_at) VALUES (?, ?, 'wechat', ?, ?, '', ?, ?)",
     )
     .bind(id)
     .bind(user)
     .bind(APP_ID)
     .bind(openid)
+    .bind(bound_at)
+    .bind(bound_at)
     .execute(&mut *tx)
     .await
     .unwrap();
@@ -368,10 +375,16 @@ async fn a_qr_code_on_the_account_page_binds_the_mini_program() {
     let session = body["session"].as_str().unwrap().to_owned();
     assert!(store::is_token(&session));
     assert!(body["expires_at"].as_i64().unwrap() > db::unix_now());
+    let bound_at = body["account"]["wechat"]["bound_at"].as_i64().unwrap();
+    assert!((db::unix_now() - bound_at).abs() < 60, "{bound_at}");
+    // The switches, and what this server offers: the web file UI and WebDAV, no S3 and no
+    // remote access.
     let account = json!({
         "username": "alice",
         "display_name": "Alice Example",
         "services": { "files": true, "webdav": true, "s3": true, "direct": true, "relay": true },
+        "offered": { "files": true, "webdav": true, "s3": false, "direct": false, "relay": false },
+        "wechat": { "bound_at": bound_at },
     });
     assert_eq!(body["account"], account);
     assert_eq!(api.asked(), ["code-1", "code-1b"]);
@@ -449,6 +462,28 @@ async fn a_qr_code_on_the_account_page_binds_the_mini_program() {
         (StatusCode::UNAUTHORIZED, "not_signed_in".to_owned())
     );
     assert_eq!(mini.account(&second).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_account_says_what_the_server_offers_and_since_when_it_is_bound() {
+    // Without the web file UI the server does not offer `files`, whatever the switch says.
+    let mut f = super::fixture_with(false).await;
+    let (api, _) = wechat_on(&mut f, None);
+    let mini = Mini::new(&f);
+    insert_identity_at(&f, alice(&f).await.id, ALICE_OPENID, 1_700_000_000).await;
+    api.accept("code-1", ALICE_OPENID);
+    let signed = mini.session("code-1").await;
+    assert_eq!(signed.status, StatusCode::OK, "{}", signed.json());
+    let account = signed.json()["account"].clone();
+    assert_eq!(account["services"]["files"], true);
+    assert_eq!(
+        account["offered"],
+        json!({ "files": false, "webdav": true, "s3": false, "direct": false, "relay": false })
+    );
+    assert_eq!(account["wechat"], json!({ "bound_at": 1_700_000_000 }));
+    // `account` answers the same.
+    let session = signed.json()["session"].as_str().unwrap().to_owned();
+    assert_eq!(mini.account(&session).await.json(), account);
 }
 
 #[tokio::test]
@@ -1720,6 +1755,9 @@ async fn the_mini_program_signs_up_renames_and_deletes_an_account() {
     assert_eq!(body["account"]["display_name"], "新用户");
     assert_eq!(body["account"]["services"]["files"], false);
     assert_eq!(body["account"]["services"]["direct"], false);
+    // Bound since the account was made.
+    let made_at = body["account"]["wechat"]["bound_at"].as_i64().unwrap();
+    assert!((db::unix_now() - made_at).abs() < 60, "{made_at}");
     let user = users::get(&f.state.db, &Username::new(username.clone()).unwrap())
         .await
         .unwrap();
@@ -1762,6 +1800,8 @@ async fn the_mini_program_signs_up_renames_and_deletes_an_account() {
     let renamed = rename("wanda").await;
     assert_eq!(renamed.status, StatusCode::OK, "{}", renamed.json());
     assert_eq!(renamed.json()["username"], "wanda");
+    assert_eq!(renamed.json()["wechat"]["bound_at"], made_at);
+    assert_eq!(renamed.json()["offered"]["webdav"], true);
     assert_eq!(rename("wanda2").await.status, StatusCode::TOO_MANY_REQUESTS);
 
     // Deleting needs a fresh code of the same WeChat and the username.
@@ -1815,6 +1855,7 @@ async fn the_mini_program_signs_up_renames_and_deletes_an_account() {
         .await;
     assert_eq!(restored.status, StatusCode::OK, "{}", restored.json());
     assert_eq!(restored.json()["account"]["username"], "wanda");
+    assert_eq!(restored.json()["account"]["wechat"]["bound_at"], made_at);
     let entries = audit::list(&f.state.db, Some(user.id), None, 10)
         .await
         .unwrap();

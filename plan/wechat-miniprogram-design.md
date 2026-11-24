@@ -83,7 +83,7 @@
 |---|---|---|
 | `POST /gono/v1/wechat/session` (code, scene, platform → session or signup token) | yes; phones only, any scene (S1) | 1: S1 drops the scene rule |
 | `POST /gono/v1/wechat/bind` (signup token + ticket → session) | yes | 1: S3 accepts the in-app scanner |
-| `GET /gono/v1/wechat/account` (username, display name, five switches) | yes; does not say which services the server offers | 1: S2 adds `offered` and `bound_at` |
+| `GET /gono/v1/wechat/account` (username, display name, five switches) | yes, with `offered` and `bound_at` (S2) | 1: S2 adds `offered` and `bound_at` |
 | `POST /gono/v1/wechat/logout` | yes | 1 |
 | Bind QR `{qr_url_prefix}bind/<ticket>` on the account page (Overview, "WeChat") | yes | 1 |
 | Look at the ticket's account before binding | no | 1: S4 `bind/preview` |
@@ -1045,10 +1045,12 @@ fields, as `/gono/v1/` allows. A ticked item is built and committed (checked aga
   follows `session` (any scene, phones only), as docs/wechat-miniprogram.md already said it takes
   `session`'s rules; `scene` stays a required field. The acceptance suite (`tests/wechat.rs`)
   covers what it can see without WeChat: the phone rule and `bind`'s scene rule.
-- [ ] **S2 What the server offers, and since when bound.** `account` (and the `account` object
+- [x] **S2 What the server offers, and since when bound.** `account` (and the `account` object
   of `session` and `bind`) gains `"offered": {"files", "webdav", "s3", "direct", "relay"}` from
   `service_view::offered`, and `"wechat": {"bound_at": <unix>}` from
-  `wechat_identities.created_at`.
+  `wechat_identities.created_at`. Built on `external_identities.created_at` (TP T1); the
+  `account` of `signup`, `account/restore` and `PATCH account` has both too. Not in the
+  acceptance suite: it needs a session, which needs WeChat.
 - [ ] **S3 The in-app scanner.** `bind` (and `bind/preview`) take an optional
   `"source": "enter" | "scan_code"`, default `enter`. With `scan_code` the scene test is
   skipped; the platform test stays. Document `wx.scanCode({onlyFromCamera: true})` as the only

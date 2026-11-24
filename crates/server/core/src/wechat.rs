@@ -111,6 +111,9 @@ pub struct Account {
     pub display_name: String,
     /// The services it may use.
     pub services: Services,
+    /// When the WeChat identity that reads it was bound to it, UNIX seconds: for an account
+    /// made by a sign-up in the mini program, when it was made.
+    pub bound_at: i64,
 }
 
 /// A new session: the bearer token, returned once (only its digest is stored), and when it
@@ -205,12 +208,14 @@ struct AccountRow {
 }
 
 impl AccountRow {
-    fn into_account(self) -> Result<Account> {
+    /// What a session of a WeChat identity bound at `bound_at` reads of the account.
+    fn into_account(self, bound_at: i64) -> Result<Account> {
         Ok(Account {
             user_id: self.id,
             username: Username::new(self.username)?,
             display_name: self.display_name,
             services: self.services,
+            bound_at,
         })
     }
 }
@@ -318,7 +323,7 @@ pub async fn sign_in(
         }
         identities::touch_in(&mut tx, identity.id, None, unionid, now).await?;
         let session = open_session(&mut tx, identity.id, now).await?;
-        let account = row.into_account()?;
+        let account = row.into_account(identity.created_at)?;
         tx.commit().await?;
         return Ok(SignIn::Session { session, account });
     }
@@ -337,12 +342,12 @@ pub async fn open_session_of(
     now: i64,
 ) -> Result<Option<(NewSession, Account)>> {
     let mut tx = db::begin_immediate(pool).await?;
-    let user_id: Option<i64> =
-        sqlx::query_scalar("SELECT user_id FROM external_identities WHERE id = ?")
+    let identity: Option<(i64, i64)> =
+        sqlx::query_as("SELECT user_id, created_at FROM external_identities WHERE id = ?")
             .bind(identity_id)
             .fetch_optional(&mut *tx)
             .await?;
-    let Some(user_id) = user_id else {
+    let Some((user_id, bound_at)) = identity else {
         return Ok(None);
     };
     let Some(row) = account_in(&mut tx, user_id)
@@ -352,24 +357,9 @@ pub async fn open_session_of(
         return Ok(None);
     };
     let session = open_session(&mut tx, identity_id, now).await?;
-    let account = row.into_account()?;
+    let account = row.into_account(bound_at)?;
     tx.commit().await?;
     Ok(Some((session, account)))
-}
-
-/// What a mini program session reads of account `user_id`, if it is enabled.
-pub async fn account(pool: &Pool, user_id: i64) -> Result<Option<Account>> {
-    let sql = format!(
-        "SELECT id, username, display_name, enabled, {} FROM users WHERE id = ?",
-        crate::services::COLUMNS
-    );
-    let row: Option<AccountRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await?;
-    row.filter(|row| row.enabled)
-        .map(AccountRow::into_account)
-        .transpose()
 }
 
 /// Outcome of [`bind`].
@@ -463,7 +453,7 @@ pub async fn bind(
     end_ticket(&mut tx, ticket_id).await?;
     identities::end_pending_in(&mut tx, signup.id).await?;
     let session = open_session(&mut tx, identity.id, now).await?;
-    let account = row.into_account()?;
+    let account = row.into_account(identity.created_at)?;
     tx.commit().await?;
     Ok(Bind::Bound { session, account })
 }
@@ -495,6 +485,8 @@ struct SessionRow {
     session_id: i64,
     last_seen_at: i64,
     expires_at: i64,
+    /// When the session's identity was bound.
+    bound_at: i64,
     #[sqlx(flatten)]
     account: AccountRow,
 }
@@ -503,7 +495,7 @@ struct SessionRow {
 /// as long as its identity: unbinding removes it.
 pub async fn lookup(pool: &Pool, app_id: &str, token: &str, now: i64) -> Result<Lookup> {
     let sql = format!(
-        "SELECT s.id AS session_id, s.last_seen_at, s.expires_at, \
+        "SELECT s.id AS session_id, s.last_seen_at, s.expires_at, i.created_at AS bound_at, \
          u.id, u.username, u.display_name, u.enabled, {} \
          FROM mp_sessions s JOIN external_identities i ON i.id = s.identity_id \
          JOIN users u ON u.id = i.user_id \
@@ -534,7 +526,7 @@ pub async fn lookup(pool: &Pool, app_id: &str, token: &str, now: i64) -> Result<
             .await?;
         tx.commit().await?;
     }
-    Ok(Lookup::Live(row.account.into_account()?))
+    Ok(Lookup::Live(row.account.into_account(row.bound_at)?))
 }
 
 /// Ends the session of bearer token `token` of AppID `app_id`, expired or not. Returns `false`
