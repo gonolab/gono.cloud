@@ -441,6 +441,9 @@ async fn a_qr_code_on_the_account_page_binds_the_mini_program() {
         "services": { "files": true, "webdav": true, "s3": true, "direct": true, "relay": true },
         "offered": { "files": true, "webdav": true, "s3": false, "direct": false, "relay": false },
         "wechat": { "bound_at": bound_at },
+        // Alice signs in with a password, and her account was not made by a sign-up.
+        "has_password": true,
+        "can_change_username": false,
     });
     assert_eq!(body["account"], account);
     assert_eq!(api.asked(), ["code-1", "code-1b"]);
@@ -1991,6 +1994,9 @@ async fn the_mini_program_signs_up_renames_and_deletes_an_account() {
     assert_eq!(body["account"]["display_name"], "新用户");
     assert_eq!(body["account"]["services"]["files"], false);
     assert_eq!(body["account"]["services"]["direct"], false);
+    // No web password, and the username can still change.
+    assert_eq!(body["account"]["has_password"], false);
+    assert_eq!(body["account"]["can_change_username"], true);
     // Bound since the account was made.
     let made_at = body["account"]["wechat"]["bound_at"].as_i64().unwrap();
     assert!((db::unix_now() - made_at).abs() < 60, "{made_at}");
@@ -2048,6 +2054,19 @@ async fn the_mini_program_signs_up_renames_and_deletes_an_account() {
     assert_eq!(renamed.json()["wechat"]["bound_at"], made_at);
     assert_eq!(renamed.json()["offered"]["webdav"], true);
     assert_eq!(rename("wanda2").await.status, StatusCode::TOO_MANY_REQUESTS);
+    // Once an app password exists, the username is in use: the answer says so, as `rename` does.
+    gono_server_core::app_passwords::create(
+        &f.state.db,
+        user.id,
+        "phone",
+        vec![gono_server_core::app_passwords::Scope::full_access()],
+        None,
+    )
+    .await
+    .unwrap();
+    let read = mini.account(&session).await.json();
+    assert_eq!(read["can_change_username"], false);
+    assert_eq!(read["has_password"], false);
 
     // Deleting needs a fresh code of the same WeChat and the username.
     let delete = |code: &str, confirm: &str| {

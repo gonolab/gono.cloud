@@ -122,6 +122,11 @@ pub struct Account {
     /// When the WeChat identity that reads it was bound to it, UNIX seconds: for an account
     /// made by a sign-up in the mini program, when it was made.
     pub bound_at: i64,
+    /// It has a web login password; an account without one can delete itself.
+    pub has_password: bool,
+    /// It may still change its username ([`crate::users::can_rename`]): made by a sign-up, with
+    /// no app password and no device yet.
+    pub can_change_username: bool,
 }
 
 /// A new session: the bearer token, returned once (only its digest is stored), and when it
@@ -213,6 +218,22 @@ struct AccountRow {
     enabled: bool,
     #[sqlx(flatten)]
     services: Services,
+    #[sqlx(try_from = "Flag")]
+    has_password: bool,
+    #[sqlx(try_from = "Text")]
+    created_via: String,
+    /// It has an app password or registered a device: the username is in use.
+    #[sqlx(try_from = "Flag")]
+    used: bool,
+}
+
+/// The columns of [`AccountRow`] beyond the services, from `users` named `table`.
+fn account_columns(table: &str) -> String {
+    format!(
+        "({table}.password_hash IS NOT NULL) AS has_password, {table}.created_via, \
+         (EXISTS (SELECT 1 FROM app_passwords a WHERE a.user_id = {table}.id) \
+         OR EXISTS (SELECT 1 FROM devices d WHERE d.user_id = {table}.id)) AS used"
+    )
 }
 
 impl AccountRow {
@@ -226,6 +247,10 @@ impl AccountRow {
             display_name: self.display_name,
             services: self.services,
             bound_at,
+            has_password: self.has_password,
+            can_change_username: !self.used
+                && crate::users::CreatedVia::parse(&self.created_via)
+                    .is_some_and(crate::users::CreatedVia::is_self_service),
         })
     }
 }
@@ -233,8 +258,9 @@ impl AccountRow {
 /// The account `user_id` with its `enabled` flag, inside `tx`.
 async fn account_in(tx: &mut db::Tx, user_id: i64) -> Result<Option<AccountRow>> {
     let sql = format!(
-        "SELECT id, username, display_name, enabled, {} FROM users WHERE id = ?",
-        crate::services::COLUMNS
+        "SELECT id, username, display_name, enabled, {}, {} FROM users WHERE id = ?",
+        crate::services::COLUMNS,
+        account_columns("users")
     );
     Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(user_id)
@@ -608,11 +634,12 @@ pub async fn lookup(pool: &Pool, app_id: &str, token: &str, now: i64) -> Result<
     let sql = format!(
         "SELECT s.id AS session_id, s.last_seen_at, s.expires_at, i.id AS identity_id, \
          i.created_at AS bound_at, \
-         u.id, u.username, u.display_name, u.enabled, {} \
+         u.id, u.username, u.display_name, u.enabled, {}, {} \
          FROM mp_sessions s JOIN external_identities i ON i.id = s.identity_id \
          JOIN users u ON u.id = i.user_id \
          WHERE s.token_hash = ? AND i.provider = 'wechat' AND i.realm = ?",
-        crate::services::USER_COLUMNS
+        crate::services::USER_COLUMNS,
+        account_columns("u")
     );
     let row: Option<SessionRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(&secret::digest(token)[..])

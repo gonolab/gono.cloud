@@ -211,6 +211,7 @@ async fn a_ticket_binds_the_openid_of_a_signup_token() {
     assert_eq!(account.display_name, "alice Example");
     assert!(account.services.webdav && !account.services.s3);
     assert_eq!(account.bound_at, NOW + 5);
+    assert!(account.has_password && !account.can_change_username);
     let bound = identity(&pool, alice, APP).await.unwrap();
     assert_eq!(
         (

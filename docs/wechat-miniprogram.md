@@ -166,7 +166,9 @@ Signs the mini program in with a code of `wx.login()`. No authentication.
     "display_name": "Alice Example",
     "services": { "files": true, "webdav": true, "s3": false, "direct": true, "relay": false },
     "offered": { "files": true, "webdav": true, "s3": false, "direct": true, "relay": true },
-    "wechat": { "bound_at": 1765000000 }
+    "wechat": { "bound_at": 1765000000 },
+    "has_password": true,
+    "can_change_username": false
   }
 }
 ```
@@ -255,7 +257,9 @@ The session's account. `Authorization: Bearer <session>`.
   "display_name": "Alice Example",
   "services": { "files": true, "webdav": true, "s3": false, "direct": true, "relay": false },
   "offered": { "files": true, "webdav": true, "s3": false, "direct": true, "relay": true },
-  "wechat": { "bound_at": 1765000000 }
+  "wechat": { "bound_at": 1765000000 },
+  "has_password": true,
+  "can_change_username": false
 }
 ```
 
@@ -273,6 +277,11 @@ The session's account. `Authorization: Bearer <session>`.
 - `wechat.bound_at` is when this WeChat was bound to the account (UNIX seconds); for an account
   made by a sign-up in the mini program, when it was made. Unbinding and binding again starts it
   anew.
+- `has_password` says whether the account has a web login password. Only an account without one
+  can delete itself (`account/delete`): offer 注销账号 only then.
+- `can_change_username` says whether `POST account {"username"}` can still change the username:
+  the account was made by a sign-up and no app password or device uses it yet. Offer 修改用户名
+  only then.
 - Each use extends the session ([Sessions](#sessions)).
 - Errors: `not_signed_in` (no `Authorization` header, not a bearer token, or no such session:
   logged out, ended by unbinding, by disabling or deleting the account, or by a newer session),

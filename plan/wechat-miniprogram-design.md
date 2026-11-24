@@ -78,6 +78,7 @@
 | 停止远程访问 in the mini program (S8) needs no service: unlike the account page, it works for an account without 远程直连, as 吊销 does | user | 2026-11-24 |
 | Changing the display name (S10) or the username (S16) needs the session only, no fresh `wx.login` code: S10 leaves the fresh-code rule of S8–S11 | user | 2026-11-24 |
 | `wx.request` has no PATCH: changing the account is `POST /gono/v1/wechat/account` (was `PATCH`, never released) | user | 2026-11-24 |
+| The `account` object says `has_password` and `can_change_username`, so that 我的 offers 注销账号 and 修改用户名 only when they can work (4.9) | user | 2026-11-24 |
 
 ## 2. What exists and what each phase adds
 

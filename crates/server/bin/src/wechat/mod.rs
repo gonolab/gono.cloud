@@ -619,7 +619,8 @@ fn is_code(code: &str) -> bool {
 
 /// What the mini program reads of `account` on the server of `state`: the account's switches
 /// (`services`), whether this server offers each service at all (`offered`, as the account page
-/// shows it), and since when the WeChat is bound.
+/// shows it), since when the WeChat is bound, whether the account has a web login password
+/// (without one it can delete itself), and whether it may still change its username.
 fn account_json(state: &AppState, account: &Account) -> serde_json::Value {
     let services = account.services;
     let offered = |service| service_view::offered(state, service);
@@ -641,6 +642,8 @@ fn account_json(state: &AppState, account: &Account) -> serde_json::Value {
             "relay": offered(Service::Relay),
         },
         "wechat": { "bound_at": account.bound_at },
+        "has_password": account.has_password,
+        "can_change_username": account.can_change_username,
     })
 }
 
