@@ -248,6 +248,11 @@ pub fn router(state: AppState) -> Router {
             .route(paths::DISCOVERY, get(connect::discovery))
             .route(paths::LOGIN, post(connect::login))
             .route(paths::LOGIN_POLL, post(connect::poll))
+            .route(
+                paths::LOGIN_WECHAT,
+                post(wechat::app_login::login)
+                    .layer(axum::extract::DefaultBodyLimit::max(wechat::MAX_BODY_BYTES)),
+            )
             .route(paths::WEBSOCKET, get(connect::websocket))
             .route(paths::DEVICE, axum::routing::delete(connect::sign_out));
     }

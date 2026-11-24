@@ -11,6 +11,12 @@
 //!   identity of an account without a password ([`Unbound::LastSignIn`]). Every identity row
 //!   counts, also one of a realm the server no longer offers (a WeChat AppID changed since);
 //!   an administrator can always set a password.
+//! - **One WeChat, several realms.** The mini program and the products' phone apps are realms of
+//!   their own (their AppIDs), and WeChat gives one user the same unionid in all of them when they
+//!   belong to one Open Platform account. An app's identity is bound only by that unionid, to the
+//!   account that holds a WeChat identity with it ([`sign_in_by_unionid`]); unbinding a WeChat
+//!   identity takes every WeChat identity of the account with the same unionid along
+//!   ([`unbind`]).
 //! - **Pending identities** ([`create_pending`]) are what a provider reported about a user whose
 //!   identity is bound to no account, kept for [`PENDING_TTL_SECS`] for the [`Holder`] of a
 //!   random token of [`TOKEN_CHARS`]: the mini program (its signup token) or a browser (in a
@@ -143,6 +149,9 @@ pub enum How {
     Admin,
     /// By the operator with the command line.
     Cli,
+    /// Automatically, because WeChat reported the unionid of a WeChat identity of the account
+    /// (a phone app's WeChat login).
+    Unionid,
 }
 
 impl How {
@@ -155,6 +164,7 @@ impl How {
             Self::Signup => "signup",
             Self::Admin => "admin",
             Self::Cli => "cli",
+            Self::Unionid => "unionid",
         }
     }
 }
@@ -444,6 +454,77 @@ pub async fn sign_in_identity(
     Ok((outcome, Some(identity)))
 }
 
+/// Signs in with the WeChat identity of `claims`, as an app's WeChat login just reported it
+/// (`plan/wechat-mobile-app-sign-in.md`, 4.2): the account it is bound to, as [`sign_in`] says.
+/// When it is bound to none and WeChat reported a unionid, it is bound to the one account whose
+/// WeChat identities of `realms` (the mini program's and the apps') hold that unionid, if that
+/// account is enabled and waits for no deletion, and `identity.bound` is recorded with
+/// [`How::Unionid`]. The second value says whether it was bound now. Several accounts with the
+/// unionid bind nothing: the caller treats the identity as bound to none.
+pub async fn sign_in_by_unionid(
+    pool: &Pool,
+    claims: &Claims,
+    realms: &[&str],
+    client_ip: Option<IpAddr>,
+    now: i64,
+) -> Result<(SignedIn, bool)> {
+    let claims = claims.checked()?;
+    if claims.provider != Provider::WeChat {
+        return Ok((SignedIn::Unbound, false));
+    }
+    let signed = sign_in(pool, &claims, now).await?;
+    let Some(unionid) = claims.unionid.as_deref() else {
+        return Ok((signed, false));
+    };
+    if signed != SignedIn::Unbound || realms.is_empty() {
+        return Ok((signed, false));
+    }
+    let mut tx = db::begin_immediate(pool).await?;
+    let placeholders = vec!["?"; realms.len().min(db::MAX_LIST)].join(", ");
+    let sql = format!(
+        "SELECT DISTINCT user_id FROM external_identities \
+         WHERE provider = ? AND unionid = ? AND realm IN ({placeholders})"
+    );
+    let mut query = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(Provider::WeChat.as_str())
+        .bind(unionid);
+    for realm in realms.iter().take(db::MAX_LIST) {
+        query = query.bind(*realm);
+    }
+    let accounts: Vec<i64> = query.fetch_all(&mut *tx).await?;
+    let [user_id] = accounts[..] else {
+        return Ok((SignedIn::Unbound, false));
+    };
+    let Some(user) = user_in(&mut tx, user_id).await? else {
+        return Ok((SignedIn::Unbound, false));
+    };
+    let outcome = signed_in(user);
+    if !matches!(outcome, SignedIn::Account(_)) {
+        return Ok((outcome, false));
+    }
+    match bind_in(
+        &mut tx,
+        user_id,
+        &claims,
+        How::Unionid,
+        Actor::User,
+        client_ip,
+        now,
+    )
+    .await?
+    {
+        Bound::Bound(_) => {
+            tx.commit().await?;
+            Ok((outcome, true))
+        }
+        // The account has another identity of this app (WeChat changed the openid?), or the
+        // identity was bound meanwhile: nothing is bound now.
+        Bound::Already(_) | Bound::OtherAccount | Bound::AccountHasOne | Bound::NoAccount => {
+            Ok((SignedIn::Unbound, false))
+        }
+    }
+}
+
 /// An automatic binding by address ([`bind_by_email`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundByEmail {
@@ -684,7 +765,8 @@ pub enum Which<'a> {
 /// Unbinds an identity from account `user_id` and records `identity.unbound` by `actor`,
 /// `how`. Unless the account keeps a way in, its web login password or another identity, it
 /// refuses ([`Unbound::LastSignIn`]). The mini program's sessions of the identity end with it
-/// (`mp_sessions` cascades).
+/// (`mp_sessions` cascades). A WeChat identity takes the account's other WeChat identities with
+/// the same unionid along (the phone apps' identities of the same WeChat), each recorded.
 pub async fn unbind(
     pool: &Pool,
     user_id: i64,
@@ -714,37 +796,67 @@ pub async fn unbind(
     let Some(identity) = query.fetch_optional(&mut *tx).await? else {
         return Ok(Unbound::NotBound);
     };
-    if !keeps_a_way_in(&mut tx, user_id, identity.id).await? {
+    let mut taken = vec![identity.clone()];
+    if identity.provider == Provider::WeChat {
+        taken.extend(same_wechat_in(&mut tx, user_id, identity.id).await?);
+    }
+    let ids: Vec<i64> = taken.iter().map(|identity| identity.id).collect();
+    if !keeps_a_way_in(&mut tx, user_id, &ids).await? {
         return Ok(Unbound::LastSignIn);
     }
-    sqlx::query("DELETE FROM external_identities WHERE id = ?")
-        .bind(identity.id)
-        .execute(&mut *tx)
+    for gone in &taken {
+        sqlx::query("DELETE FROM external_identities WHERE id = ?")
+            .bind(gone.id)
+            .execute(&mut *tx)
+            .await?;
+        audit::record_in(
+            &mut tx,
+            &Record::new(user_id, "identity.unbound", actor)
+                .client_ip(client_ip)
+                .details(details(gone.provider, &gone.realm, how)),
+            now,
+        )
         .await?;
-    audit::record_in(
-        &mut tx,
-        &Record::new(user_id, "identity.unbound", actor)
-            .client_ip(client_ip)
-            .details(details(identity.provider, &identity.realm, how)),
-        now,
-    )
-    .await?;
+    }
     tx.commit().await?;
     Ok(Unbound::Done(identity))
 }
 
-/// Whether account `user_id` keeps a way in without identity `without`: a web login password
-/// or another identity.
-async fn keeps_a_way_in(tx: &mut Tx, user_id: i64, without: i64) -> Result<bool> {
-    let keeps: Option<Flag> = sqlx::query_scalar(
-        "SELECT (password_hash IS NOT NULL OR EXISTS (SELECT 1 FROM external_identities i \
-         WHERE i.user_id = users.id AND i.id <> ?)) FROM users WHERE id = ?",
-    )
-    .bind(without)
-    .bind(user_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    Ok(keeps.is_some_and(|keeps| keeps.0))
+/// The other WeChat identities of account `user_id` with the unionid of its WeChat identity
+/// `id`: the same WeChat user in other realms. None when that identity has no unionid.
+async fn same_wechat_in(tx: &mut Tx, user_id: i64, id: i64) -> Result<Vec<Identity>> {
+    let sql = format!(
+        "SELECT {IDENTITY_COLUMNS} FROM external_identities o \
+         WHERE o.user_id = ? AND o.provider = ? AND o.id <> ? AND o.unionid IS NOT NULL \
+         AND o.unionid = (SELECT i.unionid FROM external_identities i WHERE i.id = ?)"
+    );
+    Ok(sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(user_id)
+        .bind(Provider::WeChat.as_str())
+        .bind(id)
+        .bind(id)
+        .fetch_all(&mut **tx)
+        .await?)
+}
+
+/// Whether account `user_id` keeps a way in without the identities `without`: a web login
+/// password or another identity.
+async fn keeps_a_way_in(tx: &mut Tx, user_id: i64, without: &[i64]) -> Result<bool> {
+    let has_password: Option<Flag> =
+        sqlx::query_scalar("SELECT (password_hash IS NOT NULL) FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    match has_password {
+        None => return Ok(false),
+        Some(Flag(true)) => return Ok(true),
+        Some(Flag(false)) => {}
+    }
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM external_identities WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_all(&mut **tx)
+        .await?;
+    Ok(ids.iter().any(|id| !without.contains(id)))
 }
 
 /// Who holds the token of a pending identity.

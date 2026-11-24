@@ -26,11 +26,11 @@ use sqlx::Row as _;
 /// the edit and add a new migration instead.
 const SQLITE_MIGRATIONS: &[(i64, &str)] = &[(
     1,
-    "2571ffcb1ddd2200edf9409cc85d0355cb04fe2dc638ac26017874b74ce6ff68f9e97c03e549f1e637a8f6b2965405cb",
+    "125b02652d4b67ff1e27ea8ea73e39c7ece5ed4777d6d83e9f12ff01bfa56a5418f6d67e2ffd96af8fa2d24e3e7696ef",
 )];
 const MYSQL_MIGRATIONS: &[(i64, &str)] = &[(
     1,
-    "b1022d3c7445a049e7f5288d6b7a1e68187184560cae3f5ada647569d73b4fda8063921c1dde37c1a16dd9f01ddca972",
+    "5702bb0fc02f759eba8853e31d210cd7279c53c1e6ba5df533e8968e4593af46de947a51408895c9074ced308188b4b1",
 )];
 
 /// The tables of the schema on both backends.

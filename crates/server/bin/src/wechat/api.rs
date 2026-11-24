@@ -1,16 +1,20 @@
-//! WeChat's server API, of which the server uses one call: `jscode2session`, which exchanges
-//! the sign-in code of a mini program (`wx.login()`) for the openid of its user.
+//! WeChat's server API, of which the server uses two calls that exchange a sign-in code for the
+//! openid (and unionid) of its user:
 //!
-//! - [`WeChatApi`] is what the endpoints use. [`HttpApi`] asks
-//!   `https://api.weixin.qq.com/sns/jscode2session` with the client of [`crate::http_client`]
-//!   (rustls on ring with the webpki roots, HTTP/1.1, no proxy, no redirects, timeouts), so
-//!   that a slow WeChat cannot hold a request for long. Tests use [`FakeApi`], which answers
-//!   what it was told.
+//! - `jscode2session`, for the code of the mini program's `wx.login()` ([`HttpApi::new`]);
+//! - `sns/oauth2/access_token`, for the code of a phone app's WeChat login (OpenSDK `SendAuth`,
+//!   [`HttpApi::app`]), with the app's own AppID and AppSecret.
+//!
+//! - [`WeChatApi`] is what the endpoints use. [`HttpApi`] asks `https://api.weixin.qq.com` with
+//!   the client of [`crate::http_client`] (rustls on ring with the webpki roots, HTTP/1.1, no
+//!   proxy, no redirects, timeouts), so that a slow WeChat cannot hold a request for long. Tests
+//!   use [`FakeApi`], which answers what it was told.
 //! - The request carries the AppSecret and the code in its query string, as WeChat wants it.
 //!   Neither ever reaches a log or an error: errors are built without the URL, and WeChat's own
 //!   messages are not repeated, only its error codes.
-//! - The answer's `session_key` is never read: nothing here decrypts the mini program's data,
-//!   and it is neither stored nor sent anywhere.
+//! - The answers' `session_key`, `access_token` and `refresh_token` are never read: nothing
+//!   here decrypts the mini program's data or calls WeChat on a user's behalf, and none of them
+//!   is stored or sent anywhere.
 
 use std::{fmt, future::Future, pin::Pin};
 
@@ -21,6 +25,18 @@ use url::Url;
 
 /// WeChat's `jscode2session`.
 pub const ENDPOINT: &str = "https://api.weixin.qq.com/sns/jscode2session";
+
+/// WeChat's token endpoint of the apps' WeChat login.
+pub const APP_ENDPOINT: &str = "https://api.weixin.qq.com/sns/oauth2/access_token";
+
+/// Whose codes an [`HttpApi`] exchanges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// The mini program's (`jscode2session`, `js_code`).
+    MiniProgram,
+    /// A phone app's (`sns/oauth2/access_token`, `code`).
+    App,
+}
 
 /// The largest answer read, in bytes; WeChat's have a few hundred.
 const MAX_ANSWER_BYTES: usize = 16 * 1024;
@@ -62,9 +78,10 @@ impl fmt::Display for ApiError {
 /// What [`WeChatApi::code_to_session`] returns.
 pub type Exchange<'a> = Pin<Box<dyn Future<Output = Result<Login, ApiError>> + Send + 'a>>;
 
-/// WeChat's server API.
+/// WeChat's server API, for one AppID.
 pub trait WeChatApi: Send + Sync + fmt::Debug {
-    /// Exchanges the sign-in code `code` of the mini program for its user.
+    /// Exchanges the sign-in code `code` (of the mini program, or of an app's WeChat login) for
+    /// its user.
     fn code_to_session<'a>(&'a self, code: &'a str) -> Exchange<'a>;
 }
 
@@ -72,6 +89,7 @@ pub trait WeChatApi: Send + Sync + fmt::Debug {
 pub struct HttpApi {
     http: reqwest::Client,
     endpoint: Url,
+    kind: Kind,
     app_id: String,
     secret: SecretString,
 }
@@ -80,6 +98,7 @@ impl fmt::Debug for HttpApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpApi")
             .field("endpoint", &self.endpoint.as_str())
+            .field("kind", &self.kind)
             .field("app_id", &self.app_id)
             .finish_non_exhaustive()
     }
@@ -90,13 +109,30 @@ impl HttpApi {
     pub fn new(app_id: &str, secret: SecretString) -> anyhow::Result<Self> {
         Self::with_endpoint(
             Url::parse(ENDPOINT).context("WeChat's endpoint")?,
+            Kind::MiniProgram,
+            app_id,
+            secret,
+        )
+    }
+
+    /// The API for the phone app `app_id` of the Open Platform with its AppSecret, which
+    /// exchanges the codes of its WeChat login.
+    pub fn app(app_id: &str, secret: SecretString) -> anyhow::Result<Self> {
+        Self::with_endpoint(
+            Url::parse(APP_ENDPOINT).context("WeChat's token endpoint")?,
+            Kind::App,
             app_id,
             secret,
         )
     }
 
     /// The API at `endpoint` instead of WeChat's, for tests.
-    fn with_endpoint(endpoint: Url, app_id: &str, secret: SecretString) -> anyhow::Result<Self> {
+    fn with_endpoint(
+        endpoint: Url,
+        kind: Kind,
+        app_id: &str,
+        secret: SecretString,
+    ) -> anyhow::Result<Self> {
         // The URL carries the AppSecret: the client follows no redirect, so it goes to WeChat
         // and nowhere else.
         let http =
@@ -104,6 +140,7 @@ impl HttpApi {
         Ok(Self {
             http,
             endpoint,
+            kind,
             app_id: app_id.to_owned(),
             secret,
         })
@@ -111,10 +148,14 @@ impl HttpApi {
 
     async fn exchange(&self, code: &str) -> Result<Login, ApiError> {
         let mut url = self.endpoint.clone();
+        let code_name = match self.kind {
+            Kind::MiniProgram => "js_code",
+            Kind::App => "code",
+        };
         url.query_pairs_mut()
             .append_pair("appid", &self.app_id)
             .append_pair("secret", self.secret.expose_secret())
-            .append_pair("js_code", code)
+            .append_pair(code_name, code)
             .append_pair("grant_type", "authorization_code");
         let response = self
             .http
@@ -150,8 +191,8 @@ async fn read_answer(response: reqwest::Response) -> Result<Vec<u8>, ApiError> {
         .map_err(ApiError::Failed)
 }
 
-/// The fields of an answer that are read. `session_key` is not among them, so it is never
-/// decoded.
+/// The fields of an answer that are read. `session_key`, `access_token` and `refresh_token` are
+/// not among them, so they are never decoded.
 #[derive(Deserialize)]
 struct Answer {
     #[serde(default)]
@@ -162,13 +203,15 @@ struct Answer {
     errcode: i64,
 }
 
-/// What an answer of `jscode2session` (JSON, whatever its content type) says.
+/// What an answer of `jscode2session` or of the token endpoint (JSON, whatever its content
+/// type) says. Both name the user the same way.
 fn parse_answer(body: &[u8]) -> Result<Login, ApiError> {
     let answer: Answer = serde_json::from_slice(body)
         .map_err(|_| ApiError::Failed("WeChat's answer is not the expected JSON".to_owned()))?;
     match answer.errcode {
         0 => {}
-        40029 | 40163 => return Err(ApiError::InvalidCode),
+        // 42003: the code of an app's WeChat login expired.
+        40029 | 40163 | 42003 => return Err(ApiError::InvalidCode),
         40226 => return Err(ApiError::RiskyUser),
         45011 => return Err(ApiError::RateLimited),
         // 40013 (invalid AppID), 40125 (invalid AppSecret), -1 (busy), ...: errmsg is not
@@ -209,6 +252,17 @@ impl FakeApi {
             Ok(Login {
                 openid: openid.to_owned(),
                 unionid: None,
+            }),
+        );
+    }
+
+    /// Makes `code` the code of the user `openid` with `unionid`.
+    pub fn accept_with_unionid(&self, code: &str, openid: &str, unionid: &str) {
+        self.answer(
+            code,
+            Ok(Login {
+                openid: openid.to_owned(),
+                unionid: Some(unionid.to_owned()),
             }),
         );
     }
@@ -291,10 +345,49 @@ mod tests {
     fn api(endpoint: Url) -> HttpApi {
         HttpApi::with_endpoint(
             endpoint,
+            Kind::MiniProgram,
             "wxd930ea5d5a258f4f",
             SecretString::from(SECRET.to_owned()),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn codes_of_an_apps_login_are_exchanged_at_the_token_endpoint() {
+        let (url, seen, server) = answering(
+            "200 OK",
+            r#"{"access_token":"ACCESS_TOKEN","expires_in":7200,"refresh_token":"REFRESH_TOKEN","openid":"oPhone1","scope":"snsapi_userinfo","unionid":"oUnion1"}"#,
+        )
+        .await;
+        let api = HttpApi::with_endpoint(
+            url,
+            Kind::App,
+            "wx0123456789abcdef",
+            SecretString::from(SECRET.to_owned()),
+        )
+        .unwrap();
+        let login = api.code_to_session("061abc").await.unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            login,
+            Login {
+                openid: "oPhone1".to_owned(),
+                unionid: Some("oUnion1".to_owned()),
+            }
+        );
+        let line = seen.lock().unwrap().clone();
+        assert_eq!(
+            line,
+            format!(
+                "GET /sns/jscode2session?appid=wx0123456789abcdef&secret={SECRET}\
+                 &code=061abc&grant_type=authorization_code HTTP/1.1"
+            )
+        );
+        assert_eq!(
+            parse_answer(br#"{"errcode":42003,"errmsg":"code expired"}"#),
+            Err(ApiError::InvalidCode)
+        );
+        assert!(HttpApi::app("wx0123456789abcdef", SecretString::from(SECRET.to_owned())).is_ok());
     }
 
     #[tokio::test]

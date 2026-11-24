@@ -246,6 +246,9 @@ Login Flow v2 starts.
 - **The login URL** is opaque. The device opens it in a browser, or shows it as a QR code so
   that the user can open it on another device; this is how a computer without a convenient
   browser signs in.
+- **WeChat.** When the server takes the WeChat login of phone apps (4.6), the answer also has
+  `"wechat": {"apps": ["wx0123456789abcdef"]}`, the AppIDs it takes. The key is absent
+  otherwise; devices ignore it unless they are one of those apps.
 - **The short ID.** The device shows its own short ID while the flow runs.
 - **Errors.**
   - `400` for a malformed body;
@@ -368,6 +371,63 @@ The endpoint ID decides what happens:
   device (9.1) deletes its credential; the database refuses to delete it on its own.
 - **Products that need both.** A product that also needs files, such as gono.md, signs in
   twice: through Login Flow v2 for files, and through this flow for its device entry.
+
+### 4.6 Signing in with WeChat (phone apps)
+
+A phone app cannot scan a QR code on its own screen. An app registered on WeChat's Open Platform,
+of the same Open Platform account as the server's WeChat mini program, may grant its own
+registration with WeChat's login instead of the browser.
+
+`POST /gono/v1/login/wechat`. It needs no authentication and is limited per client address like
+the mini program's calls.
+
+```json
+{
+  "token": "<poll token>",
+  "app_id": "wx0123456789abcdef",
+  "code": "<the code of WeChat's login>"
+}
+```
+
+- **`token`:** the poll token of the registration (4.1).
+- **`app_id`:** the app's AppID, one of the answer's `wechat.apps`.
+- **`code`:** what WeChat's OpenSDK returned to the app for `SendAuth` with the scope
+  `snsapi_userinfo`. A code works once. The app checks the `state` of WeChat's answer itself.
+
+**What the server does.**
+1. It checks that the registration is live and not granted, before it asks WeChat anything.
+2. It exchanges the code with the app's own AppSecret, which only the server holds. WeChat gives
+   the openid and the unionid, which is the same for one WeChat user in the mini program and in
+   every app of that Open Platform account.
+3. It finds the account. First by the app's own identity, else by a WeChat identity of the mini
+   program or of another listed app that has the unionid. In the second case the app's identity is
+   bound to that account (audit `identity.bound` with `how: "unionid"`). WeChat identities of an
+   account that share a unionid are one WeChat: unbinding it takes them all.
+4. It checks what the consent page checks (4.2), and grants the registration to the account as
+   the consent page would. The device then polls and proves its key (4.3).
+
+**Answers:**
+
+| Status | Body | Meaning |
+|---|---|---|
+| `200` | `{"account":{"username":"kim","display_name":"Kim"}}` | Granted to this account; poll now |
+| `200` | `{"account":null}` | This WeChat is bound to no account. Nothing was granted; the app offers another way (the browser, or the mini program) |
+| `400` | `{"error":"bad_request"}` | A malformed body |
+| `400` | `{"error":"code_invalid"}` | WeChat refused the code: used, expired, or of another AppID |
+| `403` | `{"error":"not_permitted"}` | The AppID is not one the server takes |
+| `403` | `{"error":"risky_user"}` | WeChat refuses this user as risky |
+| `403` | `{"error":"service_not_enabled"}` | The account may not use direct connections (10) |
+| `403` | `{"error":"two_factor_required"}` | The server requires two-step verification (13.1) and the account has none. The app says to turn it on on the account page; the WeChat login does not count as the second step |
+| `403` | `{"error":"account_disabled"}` | The account is disabled |
+| `404` | `{"error":"not_found"}` | The registration is unknown, expired, used or granted, or the server takes no WeChat login |
+| `409` | `{"error":"deletion_pending","until":1763800000}` | The account waits for its deletion |
+| `409` | `{"error":"too_many_devices"}` | The account reached its device limit (15) |
+| `429` | `{"error":"rate_limited"}` | With `Retry-After` |
+| `503` | `{"error":"unavailable"}` | WeChat could not be reached or failed, or reported no unionid (the Open Platform setup is incomplete) |
+
+After a refusal the registration stays live, so the user can fix the cause and try again until it
+expires. The server keeps no token of WeChat: it reads the openid and the unionid and drops the
+rest of the answer.
 
 ---
 

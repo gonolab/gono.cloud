@@ -4,7 +4,7 @@
 //! - [`statement`]: the statements devices sign, and [`Signed`], their wire form.
 //! - [`message`]: the control channel's messages.
 //! - The HTTP documents: [`Discovery`] (protocol 3), [`LoginStart`] / [`LoginStarted`]
-//!   (4.1), [`PollRequest`] / [`Registered`] (4.3).
+//!   (4.1), [`PollRequest`] / [`Registered`] (4.3), [`WeChatLogin`] / [`WeChatLoggedIn`] (4.6).
 //! - [`paths`], [`close`], [`features`] and [`limits`]: the constants of the protocol.
 //! - [`is_dialable`]: the direct addresses that may be published and dialed (protocol 7.1).
 //! - [`name`]: the rules for device names that other devices show (protocol 2.1).
@@ -32,6 +32,8 @@ pub mod paths {
     pub const LOGIN: &str = "/gono/v1/login";
     /// Polling a registration.
     pub const LOGIN_POLL: &str = "/gono/v1/login/poll";
+    /// Granting a registration with a phone app's WeChat login (protocol 4.6).
+    pub const LOGIN_WECHAT: &str = "/gono/v1/login/wechat";
     /// The control channel.
     pub const WEBSOCKET: &str = "/gono/v1/ws";
     /// Signing out (`DELETE`).
@@ -155,6 +157,46 @@ pub struct LoginStarted {
     pub challenge: String,
     /// When the flow expires.
     pub expires_at: i64,
+    /// The ways of signing in with WeChat the server offers (protocol 4.6); absent when it
+    /// offers none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wechat: Option<LoginWeChat>,
+}
+
+/// The WeChat sign-in of a registration (protocol 4.6).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginWeChat {
+    /// The AppIDs of the phone apps whose WeChat login ([`WeChatLogin`]) the server takes.
+    #[serde(default)]
+    pub apps: Vec<String>,
+}
+
+/// `POST /gono/v1/login/wechat` (protocol 4.6). `Debug` leaves the token and the code out.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeChatLogin {
+    /// The poll token of the registration. Secret.
+    pub token: String,
+    /// The app's AppID, one of [`LoginWeChat::apps`].
+    pub app_id: String,
+    /// The code of WeChat's login (OpenSDK `SendAuth`). Secret.
+    pub code: String,
+}
+
+/// The answer to [`WeChatLogin`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeChatLoggedIn {
+    /// The account the registration is granted to now, or `None` for a WeChat bound to no
+    /// account: nothing was granted.
+    pub account: Option<WeChatAccount>,
+}
+
+/// The account of a [`WeChatLoggedIn`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeChatAccount {
+    /// Its username.
+    pub username: String,
+    /// Its display name.
+    pub display_name: String,
 }
 
 /// `POST /gono/v1/login/poll` (protocol 4.3). `Debug` leaves the token out.
@@ -197,6 +239,16 @@ impl std::fmt::Debug for PollEndpoint {
     }
 }
 
+impl std::fmt::Debug for WeChatLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeChatLogin")
+            .field("token", &REDACTED)
+            .field("app_id", &self.app_id)
+            .field("code", &REDACTED)
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for PollRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PollRequest")
@@ -234,7 +286,16 @@ mod tests {
             poll: poll.clone(),
             challenge: "c".to_owned(),
             expires_at: 1,
+            wechat: None,
         };
+        let login = WeChatLogin {
+            token: "poll-token-secret".to_owned(),
+            app_id: "wx0123456789abcdef".to_owned(),
+            code: "wechat-code-secret".to_owned(),
+        };
+        let shown = format!("{login:?}");
+        assert!(!shown.contains("poll-token-secret") && !shown.contains("wechat-code-secret"));
+        assert!(shown.contains("wx0123456789abcdef"));
         let request = PollRequest {
             token: "poll-token-secret".to_owned(),
             proof: None,

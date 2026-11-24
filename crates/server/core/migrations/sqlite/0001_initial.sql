@@ -692,6 +692,8 @@ CREATE TABLE external_identities (
     UNIQUE (provider, realm, subject),
     UNIQUE (user_id, provider, realm)
 ) STRICT;
+-- A phone app's WeChat login finds the account by the unionid of its WeChat identities.
+CREATE INDEX external_identities_unionid ON external_identities (provider, unionid);
 
 -- Tickets that bind a WeChat identity to an account: made on the account page (once its user
 -- confirmed it is them), shown there as a QR code, used up by the mini program that scans it.

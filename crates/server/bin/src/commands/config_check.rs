@@ -214,6 +214,25 @@ fn wechat_settings(wechat: &WeChatConfig) -> Vec<(&'static str, String)> {
         ),
         ("wechat.web_sign_in", wechat.web_sign_in.to_string()),
         ("wechat.allow_signup", wechat.allow_signup.to_string()),
+        (
+            "wechat.mobile_apps",
+            if wechat.mobile_apps.is_empty() {
+                "(none)".to_owned()
+            } else {
+                wechat
+                    .mobile_apps
+                    .iter()
+                    .map(|app| {
+                        format!(
+                            "{} (secret {})",
+                            app.app_id,
+                            file_setting(Some(&app.secret_file), "(none)")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        ),
     ]
 }
 

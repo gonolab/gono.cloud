@@ -12,6 +12,19 @@ compatible within a major version: released clients keep working with newer serv
 
 ### Added
 
+- **WeChat login for phone apps** (`[[wechat.mobile_apps]]`, none by default). A phone app of the
+  mini program's Open Platform account grants its own device registration with WeChat's login
+  (OpenSDK `SendAuth`) instead of the browser: `POST /gono/v1/login/wechat {token, app_id, code}`
+  (connect protocol 4.6). The server exchanges the code with the app's AppSecret
+  (`sns/oauth2/access_token`), finds the account by the app's identity or by the unionid of the
+  account's WeChat in the mini program, binds the app's identity to it (`identity.bound` with
+  `how: "unionid"`), and grants the registration with the consent page's checks
+  (`service_not_enabled`, `two_factor_required`, `too_many_devices`, ...). A WeChat bound to no
+  account gets `{"account": null}`. The answer of `POST /gono/v1/login` lists the apps' AppIDs
+  under `wechat.apps`; `gono-connect` offers `PendingRegistration::wechat_apps` and
+  `sign_in_with_wechat`. Unbinding WeChat takes the account's identities of the same unionid
+  along, and they count as one way in. `config check` lists the apps and their secret files.
+
 - **Sign-up with a third-party identity** (`allow_signup` in `[oauth.google]`, `[oauth.github]` and
   `[wechat]`, off by default). An identity bound to no account may create one: on the web after
   Google or GitHub ("Create an account", `/login/signup`), in the mini program with `POST

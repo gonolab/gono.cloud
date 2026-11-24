@@ -247,6 +247,8 @@ impl Connect {
                     },
                     challenge: statement::encode_bytes(&challenge),
                     expires_at: flow.expires_at,
+                    // The server binary adds the WeChat sign-in it offers.
+                    wechat: None,
                 };
                 (200, serde_json::to_value(started).unwrap_or_default())
             }

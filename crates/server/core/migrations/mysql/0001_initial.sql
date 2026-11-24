@@ -532,6 +532,7 @@ CREATE TABLE external_identities (
     CHECK (unionid IS NULL OR provider = 'wechat'),
     UNIQUE KEY external_identities_subject (provider, realm, subject),
     UNIQUE KEY external_identities_user (user_id, provider, realm),
+    INDEX external_identities_unionid (provider, unionid),
     FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC;
 

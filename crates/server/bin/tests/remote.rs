@@ -38,6 +38,11 @@ struct Instance {
 
 impl Instance {
     fn new() -> Self {
+        Self::with("")
+    }
+
+    /// An instance whose configuration ends with `extra`.
+    fn with(extra: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let addr = free_port();
         let relay = free_port();
@@ -59,6 +64,7 @@ impl Instance {
                 enabled = true
                 public_url = "http://{relay}"
                 bind = "{relay}"
+                {extra}
                 "#
             ),
         )
@@ -345,5 +351,85 @@ async fn two_devices_register_reach_each_other_and_hear_of_a_revocation() {
 
     phone.close().await;
     home.close().await;
+    terminate(child);
+}
+
+/// A phone app learns from its registration that the server takes its WeChat login, and gets
+/// the protocol's refusals; WeChat itself is never asked here (protocol 4.6).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_phone_app_learns_whether_it_may_sign_in_with_wechat() {
+    let instance = Instance::with(
+        r#"
+        [wechat]
+        enabled = true
+        app_id = "wxd930ea5d5a258f4f"
+        secret_file = "mini-secret"
+        qr_url_prefix = "https://mp.example.cn/q/"
+
+        [[wechat.mobile_apps]]
+        app_id = "wx0123456789abcdef"
+        secret_file = "app-secret"
+        "#,
+    );
+    for file in ["mini-secret", "app-secret"] {
+        std::fs::write(
+            instance.dir.path().join(file),
+            "0123456789abcdef0123456789abcdef\n",
+        )
+        .unwrap();
+    }
+    let mut init = instance
+        .command(&["init", "--password-stdin"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write as _;
+    init.stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{PASSWORD}\n").as_bytes())
+        .unwrap();
+    assert!(init.wait().unwrap().success());
+    let child = instance
+        .command(&["serve"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_port(instance.addr);
+
+    let server = Server::new(&format!("http://{}", instance.addr)).unwrap();
+    let discovery = server.discover().await.unwrap();
+    let pending = server
+        .start_registration(
+            &discovery,
+            &SecretKey::from_bytes(&[21; 32]),
+            &DeviceInfo {
+                product: "input-show".to_owned(),
+                platform: "android".to_owned(),
+                name: "Phone".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.wechat_apps(), ["wx0123456789abcdef"]);
+    let refused = pending
+        .sign_in_with_wechat("wx9999999999999999", "code")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, gono_connect::Error::Server { status: 403, code } if code == "not_permitted"),
+        "{refused:?}"
+    );
+    let refused = pending
+        .sign_in_with_wechat("wx0123456789abcdef", "")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, gono_connect::Error::Server { status: 400, code } if code == "bad_request"),
+        "{refused:?}"
+    );
+    assert!(pending.poll().await.unwrap().is_none(), "still pending");
     terminate(child);
 }

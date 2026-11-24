@@ -126,10 +126,14 @@ async fn serve(config: Config, config_path: std::path::PathBuf) -> anyhow::Resul
         if let Some(file) = &config.wechat.secret_file {
             warn_if_readable_by_others(file, "wechat.secret_file");
         }
+        for app in &config.wechat.mobile_apps {
+            warn_if_readable_by_others(&app.secret_file, "wechat.mobile_apps secret_file");
+        }
         tracing::info!(
             app_id = wechat.app_id(),
             qr_url_prefix = %wechat.qr_url_prefix(),
             verify_file = wechat.verify_file_name(),
+            mobile_apps = ?wechat.mobile_app_ids(),
             "WeChat mini program enabled"
         );
         Some(Arc::new(wechat))

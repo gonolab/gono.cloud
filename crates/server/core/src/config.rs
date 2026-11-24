@@ -772,6 +772,25 @@ pub struct WeChatConfig {
     /// Let a WeChat user bound to no account create one in the mini program (`signup`). Off by
     /// default; the account starts with no service, like every account.
     pub allow_signup: bool,
+    /// `[[wechat.mobile_apps]]`: the products' phone apps that sign in with WeChat's own login
+    /// (OpenSDK `SendAuth`) during device registration (`POST /gono/v1/login/wechat`). Their
+    /// users are found by the unionid, which WeChat gives the same for the mini program and the
+    /// apps of one Open Platform account. Empty by default; read only while the mini program is
+    /// enabled.
+    pub mobile_apps: Vec<WeChatMobileApp>,
+}
+
+/// One `[[wechat.mobile_apps]]` table: a phone app registered on WeChat's Open Platform. Its
+/// AppSecret never goes into the configuration: it is the first line of `secret_file`, read
+/// when `serve` starts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeChatMobileApp {
+    /// The app's AppID on the Open Platform: `wx` and 16 letters or digits.
+    pub app_id: String,
+    /// A file holding the app's AppSecret: its first line, without the line break. Relative
+    /// paths are resolved against the configuration file's directory.
+    pub secret_file: PathBuf,
 }
 
 /// `[oauth.*]` tables: sign-in with Google (OpenID Connect) and GitHub (an OAuth app)
@@ -1064,6 +1083,9 @@ impl Config {
         .flatten()
         {
             resolve(file);
+        }
+        for app in &mut self.wechat.mobile_apps {
+            resolve(&mut app.secret_file);
         }
     }
 
@@ -1562,6 +1584,41 @@ impl Config {
                 ),
             );
         }
+        for (index, app) in wechat.mobile_apps.iter().enumerate() {
+            if !crate::wechat::is_app_id(&app.app_id) {
+                reject(
+                    "wechat.mobile_apps",
+                    format!(
+                        "app_id {:?} is not the AppID of an app: \"wx\" and 16 letters or \
+                         digits, as the Open Platform shows it",
+                        app.app_id
+                    ),
+                );
+            } else if wechat.app_id.as_deref() == Some(app.app_id.as_str()) {
+                reject(
+                    "wechat.mobile_apps",
+                    format!(
+                        "app_id {} is the mini program's (wechat.app_id): list the apps' own \
+                         AppIDs",
+                        app.app_id
+                    ),
+                );
+            } else if wechat.mobile_apps[..index]
+                .iter()
+                .any(|earlier| earlier.app_id == app.app_id)
+            {
+                reject(
+                    "wechat.mobile_apps",
+                    format!("app_id {} is listed twice", app.app_id),
+                );
+            }
+            if app.secret_file.as_os_str().is_empty() {
+                reject(
+                    "wechat.mobile_apps",
+                    format!("the secret_file of {} must not be empty", app.app_id),
+                );
+            }
+        }
     }
 
     /// Checks `s3.website_domain`: a DNS name of its own, below which no other host of this
@@ -1800,6 +1857,23 @@ impl Config {
         }
 
         let wechat = &self.wechat;
+        if !wechat.mobile_apps.is_empty() {
+            if !wechat.enabled {
+                warnings.push(
+                    "wechat.mobile_apps is set, but wechat.enabled is false: the apps' WeChat \
+                     login finds accounts through the mini program's identities, so it is off \
+                     as well"
+                        .to_owned(),
+                );
+            } else if !self.relay.enabled {
+                warnings.push(
+                    "wechat.mobile_apps is set, but relay.enabled is false: the apps sign in \
+                     with WeChat while registering as devices (POST /gono/v1/login), which \
+                     remote connectivity serves"
+                        .to_owned(),
+                );
+            }
+        }
         if wechat.enabled {
             if !self.files_ui.enabled {
                 warnings.push(
@@ -3071,6 +3145,87 @@ mod tests {
             issue_keys(&with_wechat("app_id = \"wx1\"")),
             ["wechat.app_id"]
         );
+    }
+
+    /// `WECHAT` with `[[wechat.mobile_apps]]` tables of `(app_id, secret_file)`.
+    fn with_mobile_apps(apps: &[(&str, &str)]) -> Config {
+        let tables: String = apps
+            .iter()
+            .map(|(app_id, file)| {
+                format!("\n[[wechat.mobile_apps]]\napp_id = {app_id:?}\nsecret_file = {file:?}\n")
+            })
+            .collect();
+        with_wechat(&format!("{WECHAT}\n{tables}"))
+    }
+
+    #[test]
+    fn mobile_apps_are_listed_with_their_secrets() {
+        assert!(parse(MINIMAL).wechat.mobile_apps.is_empty());
+        let config = with_mobile_apps(&[
+            ("wx0123456789abcdef", "app-secret"),
+            ("wx1123456789abcdef", "/etc/gono-cloud/other-secret"),
+        ]);
+        assert!(issue_keys(&config).is_empty());
+        assert_eq!(
+            config.wechat.mobile_apps,
+            [
+                WeChatMobileApp {
+                    app_id: "wx0123456789abcdef".to_owned(),
+                    secret_file: PathBuf::from("app-secret"),
+                },
+                WeChatMobileApp {
+                    app_id: "wx1123456789abcdef".to_owned(),
+                    secret_file: PathBuf::from("/etc/gono-cloud/other-secret"),
+                },
+            ]
+        );
+        // Both keys are required, and the secret itself is refused.
+        let table = |body: &str| {
+            Config::from_toml(&format!(
+                "{MINIMAL}\n[wechat]\n{WECHAT}\n[[wechat.mobile_apps]]\n{body}\n"
+            ))
+        };
+        assert!(table("app_id = \"wx0123456789abcdef\"").is_err());
+        assert!(table("secret_file = \"app-secret\"").is_err());
+        assert!(
+            table("app_id = \"wx0123456789abcdef\"\nsecret_file = \"s\"\nsecret = \"x\"").is_err()
+        );
+    }
+
+    #[test]
+    fn mobile_apps_are_checked() {
+        for apps in [
+            &[("wx123", "s")][..],
+            &[("wxd930ea5d5a258f4f", "s")],
+            &[("wx0123456789abcdef", "s"), ("wx0123456789abcdef", "t")],
+            &[("wx0123456789abcdef", "")],
+        ] {
+            assert_eq!(
+                issue_keys(&with_mobile_apps(apps)),
+                ["wechat.mobile_apps"],
+                "{apps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mobile_apps_warn_without_the_mini_program_or_the_relay() {
+        let warned = |config: &Config| {
+            config
+                .warnings()
+                .into_iter()
+                .filter(|warning| warning.starts_with("wechat.mobile_apps"))
+                .count()
+        };
+        // MINIMAL has no relay.
+        assert_eq!(warned(&with_mobile_apps(&[("wx0123456789abcdef", "s")])), 1);
+        let off = parse(&format!(
+            "{MINIMAL}\n[wechat]\n[[wechat.mobile_apps]]\napp_id = \"wx0123456789abcdef\"\n\
+             secret_file = \"s\"\n"
+        ));
+        assert_eq!(warned(&off), 1);
+        assert!(off.warnings()[0].contains("wechat.enabled is false"));
+        assert_eq!(warned(&with_wechat(WECHAT)), 0);
     }
 
     #[test]

@@ -626,6 +626,13 @@ The server keeps the openid WeChat reports and the unionid when WeChat reports o
 stores the `session_key` of `jscode2session` and never sends it to the mini program: nothing
 here decrypts data of the mini program.
 
+**Phone apps of the same Open Platform account.** With `[[wechat.mobile_apps]]`, the products'
+phone apps sign in with WeChat's own login while they register as devices
+([connect-protocol.md](connect-protocol.md), 4.6). The server finds their user's account by the
+unionid of the WeChat bound here, so WeChat must report one: the mini program is bound to the
+apps' Open Platform account. The app's identity is then bound to the same account. Unbinding the
+WeChat, here or on the account page, unbinds it from the apps as well.
+
 ## The links
 
 Every QR link starts with `wechat.qr_url_prefix`, an `https://` URL ending in `/`, which is the
@@ -666,3 +673,6 @@ What the operator and the mini program's developers set up together:
 - **The server's outgoing connection.** The server exchanges codes with
   `https://api.weixin.qq.com` (port 443), with the AppSecret of `wechat.secret_file`. The
   AppSecret goes to WeChat only; the mini program never needs it.
+- **The Open Platform**, for the phone apps' WeChat login only: the mini program bound to the
+  apps' Open Platform account, so that WeChat reports the unionid
+  ([deployment.md](deployment.md#wechat)).

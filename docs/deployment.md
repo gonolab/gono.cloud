@@ -565,6 +565,33 @@ verify_file = "/etc/gono-cloud/AbCdEf1234.txt"
 | `web_sign_in` | Optional, `false` by default. The sign-in pages (`/login`, the Login Flow v2 page, `/manage/login`) offer "Scan with WeChat": a QR code that the mini program scans and confirms, after which the phone shows 6 digits that the user types into the browser. Turn it on once the mini program has its page that confirms web sign-ins ([wechat-miniprogram.md](wechat-miniprogram.md#signing-in-on-the-web-scan-confirm-deny-flow)). |
 | `verify_file` | Optional. WeChat's verification file for the rule, served at `/<its file name>` with its exact content as `text/plain`, and nowhere else. Its name must be letters, digits, `-`, `_` and `.`, ending in `.txt`, as WeChat names it; it is read when `serve` starts (at most 4 KiB). Leave it unset to serve the file another way. |
 
+**Phone apps.** The products' phone apps can grant their device registration with WeChat's own
+login (OpenSDK `SendAuth`) instead of the browser ([connect-protocol.md](connect-protocol.md),
+4.6). Each app needs, on WeChat's Open Platform (open.weixin.qq.com):
+
+- the app registered there, with its Android package and signature, iOS bundle ID and Universal
+  Link, or HarmonyOS bundle, and 微信登录 granted to it;
+- **the mini program bound to the same Open Platform account.** WeChat then reports one unionid
+  for a user in the mini program and in the apps, which is how the server finds the account of an
+  app's login. A user whose WeChat was bound before that gets the unionid recorded at their next
+  sign-in in the mini program; until then their app's login finds no account.
+
+List each app with its own AppSecret, in a file of its own, and restart:
+
+```toml
+[[wechat.mobile_apps]]
+app_id = "wx0123456789abcdef"
+secret_file = "/etc/gono-cloud/wechat-app-secret"
+```
+
+The answer of `POST /gono/v1/login` then lists the AppIDs, and the apps offer 微信登录. The table
+needs `[wechat]` enabled and remote connectivity (`[relay] enabled`); `config check` warns
+otherwise, refuses an AppID that is the mini program's or listed twice, and names each secret file
+and whether it exists. `serve` reads the secrets when it starts and warns when others can read
+them. An app's WeChat login grants only what the consent page grants, with its checks: direct
+connections on, two-step verification when `connect.require_two_factor` is on, and room for
+another device. A WeChat bound to no account is told so, and nothing is granted.
+
 `config check` validates the table and warns when `files_ui` is off (the panel that binds is on
 the account page, part of the web file UI) and when `qr_url_prefix` is on `base_url`'s host but
 outside `/q/` (a browser that opens a link would get `404`). The server connects to

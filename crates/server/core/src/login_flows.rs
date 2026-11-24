@@ -6,7 +6,8 @@
 //!    gets a random challenge to sign (`docs/connect-protocol.md`, section 4).
 //! 2. [`find`] / [`grant`] / [`deny`]: the browser pages look the flow up by the login token;
 //!    after the user signed in with the web login password and approved the device on the
-//!    consent page, the flow is marked as granted to that user.
+//!    consent page, the flow is marked as granted to that user. A phone app that signs in with
+//!    WeChat finds its own registration by the poll token instead ([`find_device`]).
 //! 3. [`complete`]: the client's next poll consumes the granted flow and mints a new app
 //!    password (full access, labeled with the client's name) in the same transaction, and
 //!    returns it exactly once. The plaintext is never stored. A registering device polls with
@@ -202,6 +203,23 @@ pub async fn find(pool: &Pool, login_token: &str, now: i64) -> Result<Option<Flo
          WHERE login_token_hash = ? AND expires_at > ?",
     )
     .bind(&secret::digest(login_token)[..])
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(Flow::from))
+}
+
+/// The live device registration polled with `poll_token`: what a device's own sign-in sees of
+/// its flow (an app's WeChat login, `POST /gono/v1/login/wechat`), as [`find`] gives it to the
+/// browser pages. Refused registrations are not live.
+pub async fn find_device(pool: &Pool, poll_token: &str, now: i64) -> Result<Option<Flow>> {
+    let row: Option<FlowRow> = sqlx::query_as(
+        "SELECT id, client_name, granted_user_id, expires_at, device_endpoint_id, \
+         device_product, device_platform, device_version FROM login_flows \
+         WHERE poll_token_hash = ? AND expires_at > ? AND device_endpoint_id IS NOT NULL \
+         AND refusal IS NULL",
+    )
+    .bind(&secret::digest(poll_token)[..])
     .bind(now)
     .fetch_optional(pool)
     .await?;

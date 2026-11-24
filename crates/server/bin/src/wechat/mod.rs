@@ -76,6 +76,7 @@
 //!   redacted by [`crate::request_log`]); lines name the account instead.
 
 pub mod api;
+pub mod app_login;
 pub mod sign_in;
 
 use std::{
@@ -249,16 +250,27 @@ pub struct WeChat {
     sign_ins: sign_in::Shown,
     /// The actions on each account.
     actions: ActionLimiter,
+    /// `[[wechat.mobile_apps]]`: the phone apps whose WeChat login signs devices in
+    /// ([`app_login`]), each with the API of its own AppID.
+    mobile_apps: Vec<MobileApp>,
 }
 
-/// Reads the AppSecret of `wechat.secret_file`: its first line, without the line break.
-fn read_secret(path: &Path) -> anyhow::Result<SecretString> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("read wechat.secret_file {}", path.display()))?;
+/// A phone app of `[[wechat.mobile_apps]]`.
+#[derive(Debug)]
+struct MobileApp {
+    app_id: String,
+    api: Arc<dyn WeChatApi>,
+}
+
+/// Reads an AppSecret of `whose` from `path`, the file of the setting `key`: its first line,
+/// without the line break.
+fn read_secret(path: &Path, key: &str, whose: &str) -> anyhow::Result<SecretString> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("read {key} {}", path.display()))?;
     let secret = content.lines().next().unwrap_or_default().trim().to_owned();
     anyhow::ensure!(
         !secret.is_empty(),
-        "wechat.secret_file {} is empty; put the mini program's AppSecret on its first line",
+        "{key} {} is empty; put {whose} AppSecret on its first line",
         path.display()
     );
     Ok(SecretString::from(secret))
@@ -283,7 +295,36 @@ impl WeChat {
             allow_signup: false,
             sign_ins: sign_in::Shown::default(),
             actions: ActionLimiter::default(),
+            mobile_apps: Vec::new(),
         }
+    }
+
+    /// The same, with the phone app `app_id` signing in with WeChat's login, its codes
+    /// exchanged by `api`.
+    #[must_use]
+    pub fn with_mobile_app(mut self, app_id: &str, api: Arc<dyn WeChatApi>) -> Self {
+        self.mobile_apps.push(MobileApp {
+            app_id: app_id.to_owned(),
+            api,
+        });
+        self
+    }
+
+    /// The AppIDs of the phone apps that sign in with WeChat's login, in the order of the
+    /// configuration.
+    pub fn mobile_app_ids(&self) -> Vec<&str> {
+        self.mobile_apps
+            .iter()
+            .map(|app| app.app_id.as_str())
+            .collect()
+    }
+
+    /// The API of the phone app `app_id`, if it is one of `[[wechat.mobile_apps]]`.
+    fn mobile_app(&self, app_id: &str) -> Option<&Arc<dyn WeChatApi>> {
+        self.mobile_apps
+            .iter()
+            .find(|app| app.app_id == app_id)
+            .map(|app| &app.api)
     }
 
     /// The same, with signing in on the web by scanning when `on`.
@@ -330,15 +371,27 @@ impl WeChat {
             .qr_url_prefix
             .clone()
             .context("wechat.qr_url_prefix is not set")?;
-        let api = HttpApi::new(app_id, read_secret(secret_file)?)?;
+        let secret = read_secret(secret_file, "wechat.secret_file", "the mini program's")?;
+        let api = HttpApi::new(app_id, secret)?;
         let verify = config
             .verify_file
             .as_deref()
             .map(VerifyFile::read)
             .transpose()?;
-        Ok(Self::new(app_id, prefix, Arc::new(api), verify)
+        let mut wechat = Self::new(app_id, prefix, Arc::new(api), verify)
             .with_web_sign_in(config.web_sign_in)
-            .with_signup(config.allow_signup))
+            .with_signup(config.allow_signup);
+        for app in &config.mobile_apps {
+            let secret = read_secret(
+                &app.secret_file,
+                "wechat.mobile_apps secret_file",
+                "the app's",
+            )
+            .with_context(|| format!("the app {}", app.app_id))?;
+            let api = HttpApi::app(&app.app_id, secret)?;
+            wechat = wechat.with_mobile_app(&app.app_id, Arc::new(api));
+        }
+        Ok(wechat)
     }
 
     /// The mini program's AppID.

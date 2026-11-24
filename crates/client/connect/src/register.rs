@@ -9,6 +9,11 @@
 //! let credentials = pending.wait().await?;
 //! ```
 //!
+//! A phone app whose AppID is among [`PendingRegistration::wechat_apps`] can grant its own
+//! registration with WeChat's login instead of the browser (protocol 4.6): it asks WeChat's
+//! OpenSDK for a code (`SendAuth`), passes it to [`PendingRegistration::sign_in_with_wechat`],
+//! and then waits as above.
+//!
 //! Everything is bound to the origin given to [`Server::new`] (see `origin.rs`): it must be
 //! `https` (plain `http` only on a loopback host), the URLs the server names must be on it,
 //! redirects are not followed, and the `login` statement names it, never the `server` value of
@@ -21,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gono_protocol::connect::{
     DeviceEntry, DeviceId, Discovery, LoginStart, LoginStarted, PollRequest, Registered, Signed,
-    Statement, paths, statement::Login,
+    Statement, WeChatAccount, WeChatLoggedIn, WeChatLogin, paths, statement::Login,
 };
 use iroh::SecretKey;
 use serde::{Deserialize, Serialize};
@@ -262,6 +267,45 @@ impl PendingRegistration {
     /// When the registration expires, UNIX seconds by the server's clock.
     pub fn expires_at(&self) -> i64 {
         self.started.expires_at
+    }
+
+    /// The AppIDs of the phone apps whose WeChat login the server takes for this registration
+    /// (protocol 4.6); empty when it takes none.
+    pub fn wechat_apps(&self) -> &[String] {
+        self.started
+            .wechat
+            .as_ref()
+            .map_or(&[], |wechat| wechat.apps.as_slice())
+    }
+
+    /// Grants this registration with the WeChat login of the phone app `app_id` (protocol
+    /// 4.6): `code` is what WeChat's OpenSDK (`SendAuth`) gave the app, used once. Returns the
+    /// account the registration is granted to, after which [`Self::wait`] completes it, or
+    /// `None` for a WeChat bound to no account: nothing was granted, and the app offers another
+    /// way. Refusals are [`Error::Server`] with the protocol's code (`not_permitted`,
+    /// `code_invalid`, `service_not_enabled`, `two_factor_required`, `too_many_devices`, ...);
+    /// the registration stays live after them.
+    pub async fn sign_in_with_wechat(
+        &self,
+        app_id: &str,
+        code: &str,
+    ) -> Result<Option<WeChatAccount>> {
+        let url = self.origin.join(paths::LOGIN_WECHAT);
+        let request = WeChatLogin {
+            token: self.started.poll.token.clone(),
+            app_id: app_id.to_owned(),
+            code: code.to_owned(),
+        };
+        let response = self
+            .http
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&request).unwrap_or_default())
+            .send()
+            .await
+            .map_err(|err| Error::Http(err.to_string()))?;
+        let answer: WeChatLoggedIn = json_body(response).await?;
+        Ok(answer.account)
     }
 
     /// Polls once: `None` while the user has not decided.

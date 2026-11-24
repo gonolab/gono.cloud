@@ -5,6 +5,7 @@
 //! | `GET /gono/v1/connect` | The discovery document. Anonymous. |
 //! | `POST /gono/v1/login` | Starts a device registration. Anonymous; limited per client address like Login Flow v2. |
 //! | `POST /gono/v1/login/poll` | `202` while pending, the device's credential once its proof holds. |
+//! | `POST /gono/v1/login/wechat` | A phone app's WeChat login grants its registration ([`crate::wechat::app_login`]). |
 //! | `GET /gono/v1/ws` (WebSocket upgrade) | The control channel, authenticated with the device's app password. |
 //! | `DELETE /gono/v1/device` | Signs the device out (no tombstone). |
 //!
@@ -112,7 +113,14 @@ pub async fn login(
         Ok(start) => start,
         Err(_) => return bad_request("expected a registration request"),
     };
-    let (status, body) = connect.start_login(start, db::unix_now()).await;
+    let (status, mut body) = connect.start_login(start, db::unix_now()).await;
+    // The phone apps that may sign in with WeChat's login (protocol 4.6).
+    if status == 200
+        && let Some(wechat) = &state.wechat
+        && !wechat.mobile_app_ids().is_empty()
+    {
+        body["wechat"] = serde_json::json!({ "apps": wechat.mobile_app_ids() });
+    }
     json(status, &body)
 }
 
@@ -849,5 +857,218 @@ mod tests {
                 assert_eq!(poll_status, StatusCode::ACCEPTED, "still pending");
             }
         }
+    }
+
+    /// The mini program's AppID and two phone apps' AppIDs of its Open Platform account.
+    const MINI: &str = "wxd930ea5d5a258f4f";
+    const PHONE: &str = "wx0123456789abcdef";
+    const TABLET: &str = "wx1123456789abcdef";
+
+    /// Turns the mini program on in `f` with the phone and tablet apps, Alice's WeChat bound
+    /// with its unionid; returns the phone app's fake WeChat API.
+    async fn with_apps(f: &mut Fixture) -> Arc<crate::wechat::api::FakeApi> {
+        use crate::wechat::{WeChat, api::FakeApi};
+        let phone = Arc::new(FakeApi::default());
+        let wechat = WeChat::new(
+            MINI,
+            Url::parse("https://mp.example.cn/q/").unwrap(),
+            Arc::new(FakeApi::default()),
+            None,
+        )
+        .with_mobile_app(PHONE, phone.clone())
+        .with_mobile_app(TABLET, Arc::new(FakeApi::default()));
+        f.state.wechat = Some(Arc::new(wechat));
+        gono_server_core::identities::bind(
+            &f.state.db,
+            f.alice,
+            &gono_server_core::identities::Claims::wechat(MINI, "oMiniAlice", Some("oUnionAlice")),
+            gono_server_core::identities::How::MiniProgram,
+            Actor::MiniProgram,
+            None,
+            db::unix_now(),
+        )
+        .await
+        .unwrap();
+        phone
+    }
+
+    impl Fixture {
+        /// Sends an app's WeChat login for the registration of `started`.
+        async fn wechat_login(
+            &self,
+            started: &LoginStarted,
+            app_id: &str,
+            code: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            let body = serde_json::json!({
+                "token": started.poll.token,
+                "app_id": app_id,
+                "code": code,
+            });
+            let (status, body) = self
+                .send("POST", paths::LOGIN_WECHAT, &[], body.to_string())
+                .await;
+            (status, serde_json::from_str(&body).unwrap_or_default())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_phone_app_registers_with_wechats_login() {
+        let mut f = fixture_with(false, false).await;
+        let phone = with_apps(&mut f).await;
+        let (started, _) = f.start(&key(10), "My phone").await;
+        assert_eq!(
+            started.wechat,
+            Some(gono_protocol::connect::LoginWeChat {
+                apps: vec![PHONE.to_owned(), TABLET.to_owned()],
+            })
+        );
+        assert_eq!(f.poll(&key(10), &started).await.0, StatusCode::ACCEPTED);
+
+        // The phone app's identity is found by the unionid of the mini program's, and bound.
+        phone.accept_with_unionid("code-1", "oPhoneAlice", "oUnionAlice");
+        let (status, body) = f.wechat_login(&started, PHONE, "code-1").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({ "account": { "username": "alice", "display_name": "Alice" } })
+        );
+        let (status, body) = f.poll(&key(10), &started).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let registered: Registered = serde_json::from_str(&body).unwrap();
+        assert_eq!(registered.username, "alice");
+        assert!(
+            gono_server_core::identities::find(
+                &f.state.db,
+                gono_server_core::identities::Provider::WeChat,
+                PHONE,
+                "oPhoneAlice"
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        // A used registration takes no code.
+        phone.accept_with_unionid("code-2", "oPhoneAlice", "oUnionAlice");
+        let (status, body) = f.wechat_login(&started, PHONE, "code-2").await;
+        assert_eq!(
+            (status, &body["error"]),
+            (StatusCode::NOT_FOUND, &"not_found".into())
+        );
+        assert_eq!(phone.asked(), ["code-1"]);
+
+        // The next registration signs in by the app's own identity.
+        let (started, _) = f.start(&key(11), "My phone").await;
+        let (status, body) = f.wechat_login(&started, PHONE, "code-2").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(f.poll(&key(11), &started).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_unbound_wechat_grants_nothing_and_refusals_keep_the_registration() {
+        let mut f = fixture_with(false, false).await;
+        let phone = with_apps(&mut f).await;
+        let (started, _) = f.start(&key(12), "My phone").await;
+        let error = |answer: (StatusCode, serde_json::Value)| {
+            (
+                answer.0,
+                answer.1["error"].as_str().unwrap_or_default().to_owned(),
+            )
+        };
+
+        // A WeChat of no account: nothing is granted.
+        phone.accept_with_unionid("stranger", "oPhoneCarol", "oUnionCarol");
+        assert_eq!(
+            f.wechat_login(&started, PHONE, "stranger").await,
+            (StatusCode::OK, serde_json::json!({ "account": null }))
+        );
+        // Refusals before WeChat is asked: an app not listed, a malformed request, a flow that
+        // does not exist.
+        assert_eq!(
+            error(f.wechat_login(&started, "wx9999999999999999", "x").await),
+            (StatusCode::FORBIDDEN, "not_permitted".to_owned())
+        );
+        assert_eq!(
+            error(f.wechat_login(&started, "gh_123", "x").await),
+            (StatusCode::BAD_REQUEST, "bad_request".to_owned())
+        );
+        let mut gone = started.clone();
+        gone.poll.token = "unknown-token".to_owned();
+        assert_eq!(
+            error(f.wechat_login(&gone, PHONE, "x").await),
+            (StatusCode::NOT_FOUND, "not_found".to_owned())
+        );
+        assert_eq!(phone.asked(), ["stranger"]);
+        // WeChat's refusals, and an answer without a unionid.
+        assert_eq!(
+            error(f.wechat_login(&started, PHONE, "unknown-code").await),
+            (StatusCode::BAD_REQUEST, "code_invalid".to_owned())
+        );
+        phone.accept("bare", "oPhoneAlice");
+        assert_eq!(
+            error(f.wechat_login(&started, PHONE, "bare").await),
+            (StatusCode::SERVICE_UNAVAILABLE, "unavailable".to_owned())
+        );
+        // The account's state, as the consent page checks it.
+        let alice = Username::new("alice").unwrap();
+        users::set_services(
+            &f.state.db,
+            &alice,
+            gono_server_core::services::Services::NONE,
+        )
+        .await
+        .unwrap();
+        phone.accept_with_unionid("no-direct", "oPhoneAlice", "oUnionAlice");
+        assert_eq!(
+            error(f.wechat_login(&started, PHONE, "no-direct").await),
+            (StatusCode::FORBIDDEN, "service_not_enabled".to_owned())
+        );
+        users::set_services(
+            &f.state.db,
+            &alice,
+            gono_server_core::services::Services::ALL,
+        )
+        .await
+        .unwrap();
+        users::set_enabled(&f.state.db, &alice, false)
+            .await
+            .unwrap();
+        phone.accept_with_unionid("disabled", "oPhoneAlice", "oUnionAlice");
+        assert_eq!(
+            error(f.wechat_login(&started, PHONE, "disabled").await),
+            (StatusCode::FORBIDDEN, "account_disabled".to_owned())
+        );
+        users::set_enabled(&f.state.db, &alice, true).await.unwrap();
+        // Through all of it the registration stayed: it is granted now.
+        phone.accept_with_unionid("at-last", "oPhoneAlice", "oUnionAlice");
+        assert_eq!(
+            f.wechat_login(&started, PHONE, "at-last").await.0,
+            StatusCode::OK
+        );
+        assert_eq!(f.poll(&key(12), &started).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn wechats_login_asks_for_two_step_verification_when_the_server_does() {
+        let mut f = fixture_with(false, true).await;
+        let phone = with_apps(&mut f).await;
+        let (started, _) = f.start(&key(13), "My phone").await;
+        phone.accept_with_unionid("code", "oPhoneAlice", "oUnionAlice");
+        let (status, body) = f.wechat_login(&started, PHONE, "code").await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::FORBIDDEN, Some("two_factor_required"))
+        );
+        assert_eq!(f.poll(&key(13), &started).await.0, StatusCode::ACCEPTED);
+
+        // Without phone apps there is no WeChat login.
+        let f = fixture_with(false, false).await;
+        let (started, _) = f.start(&key(14), "My phone").await;
+        assert_eq!(started.wechat, None);
+        let (status, body) = f.wechat_login(&started, PHONE, "code").await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::NOT_FOUND, Some("not_found"))
+        );
     }
 }

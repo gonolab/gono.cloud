@@ -843,3 +843,224 @@ async fn self_service_accounts_rename_until_used_and_delete_after_a_cooling_off(
     assert!(kinds.contains(&"account.deletion_cancelled".to_owned()));
     assert!(kinds.contains(&"account.renamed".to_owned()));
 }
+
+/// The AppIDs of two phone apps of the mini program's Open Platform account.
+const PHONE_APP: &str = "wx0123456789abcdef";
+const TABLET_APP: &str = "wx1123456789abcdef";
+
+fn wechat(app_id: &str, openid: &str, unionid: Option<&str>) -> Claims {
+    Claims::wechat(app_id, openid, unionid)
+}
+
+async fn by_unionid(pool: &Pool, claims: &Claims) -> (identities::SignedIn, bool) {
+    identities::sign_in_by_unionid(
+        pool,
+        claims,
+        &[APP, PHONE_APP, TABLET_APP],
+        Some("192.0.2.9".parse().unwrap()),
+        NOW,
+    )
+    .await
+    .unwrap()
+}
+
+fn account_of(signed: &identities::SignedIn) -> Option<i64> {
+    match signed {
+        identities::SignedIn::Account(user) => Some(user.id),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn a_phone_app_finds_the_account_by_the_unionid_and_binds_its_identity() {
+    let (_dir, pool, alice, bob) = fixture().await;
+    // Alice's WeChat in the mini program, with its unionid; Bob's without one yet.
+    bind(
+        &pool,
+        alice,
+        &wechat(APP, "oMiniAlice", Some("oUnionAlice")),
+    )
+    .await;
+    bind(&pool, bob, &wechat(APP, "oMiniBob", None)).await;
+
+    // The app's first login binds its identity to Alice by the unionid.
+    let first = by_unionid(
+        &pool,
+        &wechat(PHONE_APP, "oPhoneAlice", Some("oUnionAlice")),
+    )
+    .await;
+    assert_eq!((account_of(&first.0), first.1), (Some(alice), true));
+    let entries = audit::list(&pool, Some(alice), None, 10).await.unwrap();
+    assert_eq!(entries[0].kind, "identity.bound");
+    assert_eq!(entries[0].actor, "user");
+    assert_eq!(entries[0].client_ip.as_deref(), Some("192.0.2.9"));
+    let details: serde_json::Value = serde_json::from_str(&entries[0].details).unwrap();
+    assert_eq!(
+        details,
+        serde_json::json!({ "provider": "wechat", "how": "unionid", "app_id": PHONE_APP })
+    );
+    // The next one signs in by the openid, binding nothing; so does one without a unionid.
+    let again = by_unionid(
+        &pool,
+        &wechat(PHONE_APP, "oPhoneAlice", Some("oUnionAlice")),
+    )
+    .await;
+    assert_eq!((account_of(&again.0), again.1), (Some(alice), false));
+    let bare = by_unionid(&pool, &wechat(PHONE_APP, "oPhoneAlice", None)).await;
+    assert_eq!((account_of(&bare.0), bare.1), (Some(alice), false));
+    // Another app of the same Open Platform account finds Alice through either identity.
+    let tablet = by_unionid(
+        &pool,
+        &wechat(TABLET_APP, "oTabletAlice", Some("oUnionAlice")),
+    )
+    .await;
+    assert_eq!((account_of(&tablet.0), tablet.1), (Some(alice), true));
+
+    // Unknown unionids and missing ones bind nothing, nor do realms not looked at.
+    for claims in [
+        wechat(PHONE_APP, "oPhoneCarol", Some("oUnionCarol")),
+        wechat(PHONE_APP, "oPhoneBob", None),
+    ] {
+        assert_eq!(
+            by_unionid(&pool, &claims).await,
+            (identities::SignedIn::Unbound, false)
+        );
+    }
+    let unlisted = identities::sign_in_by_unionid(
+        &pool,
+        &wechat(PHONE_APP, "oPhoneDan", Some("oUnionAlice")),
+        &[TABLET_APP],
+        None,
+        NOW,
+    )
+    .await
+    .unwrap();
+    // The tablet's identity names Alice, who has another identity of this app already: nothing
+    // is bound.
+    assert_eq!((account_of(&unlisted.0), unlisted.1), (None, false));
+    assert_eq!(
+        identities::sign_in_by_unionid(
+            &pool,
+            &wechat(PHONE_APP, "oPhoneEve", Some("oUnionAlice")),
+            &[],
+            None,
+            NOW
+        )
+        .await
+        .unwrap(),
+        (identities::SignedIn::Unbound, false)
+    );
+    // Google identities never bind this way.
+    assert_eq!(
+        by_unionid(&pool, &google("108", "alice@gmail.com")).await,
+        (identities::SignedIn::Unbound, false)
+    );
+}
+
+#[tokio::test]
+async fn a_unionid_on_several_accounts_or_a_closed_account_binds_nothing() {
+    let (_dir, pool, alice, bob) = fixture().await;
+    // An old AppID of the mini program left Alice's WeChat on Bob too.
+    bind(
+        &pool,
+        alice,
+        &wechat(APP, "oMiniAlice", Some("oUnionAlice")),
+    )
+    .await;
+    bind(&pool, bob, &wechat(TABLET_APP, "oOld", Some("oUnionAlice"))).await;
+    assert_eq!(
+        by_unionid(
+            &pool,
+            &wechat(PHONE_APP, "oPhoneAlice", Some("oUnionAlice"))
+        )
+        .await,
+        (identities::SignedIn::Unbound, false)
+    );
+    // Bob alone, disabled: told, not bound.
+    let (_dir, pool, _alice, bob) = fixture().await;
+    bind(&pool, bob, &wechat(APP, "oMiniBob", Some("oUnionBob"))).await;
+    users::set_enabled(&pool, &Username::new("bob").unwrap(), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        by_unionid(&pool, &wechat(PHONE_APP, "oPhoneBob", Some("oUnionBob"))).await,
+        (identities::SignedIn::Disabled, false)
+    );
+    assert!(
+        identities::find(&pool, Provider::WeChat, PHONE_APP, "oPhoneBob")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn unbinding_wechat_takes_the_apps_identities_of_the_same_wechat_along() {
+    let (_dir, pool, alice, _bob) = fixture().await;
+    bind(
+        &pool,
+        alice,
+        &wechat(APP, "oMiniAlice", Some("oUnionAlice")),
+    )
+    .await;
+    by_unionid(
+        &pool,
+        &wechat(PHONE_APP, "oPhoneAlice", Some("oUnionAlice")),
+    )
+    .await;
+    // Another WeChat of an old AppID stays: it is someone else's unionid.
+    bind(
+        &pool,
+        alice,
+        &wechat(TABLET_APP, "oOther", Some("oUnionOther")),
+    )
+    .await;
+    bind(&pool, alice, &github("583231", "octocat")).await;
+    without_password(&pool, alice).await;
+
+    let Unbound::Done(gone) = unbind(&pool, alice, Provider::WeChat, APP).await else {
+        panic!("not unbound");
+    };
+    assert_eq!(gone.realm, APP);
+    let left: Vec<(Provider, String)> = identities::list(&pool, alice)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|identity| (identity.provider, identity.realm))
+        .collect();
+    assert_eq!(
+        left,
+        [
+            (Provider::WeChat, TABLET_APP.to_owned()),
+            (Provider::GitHub, GITHUB_REALM.to_owned())
+        ]
+    );
+    let unbound: Vec<String> = audit::list(&pool, Some(alice), None, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.kind == "identity.unbound")
+        .map(|entry| entry.details)
+        .collect();
+    assert_eq!(unbound.len(), 2, "{unbound:?}");
+
+    // The same WeChat in two realms is one way in: it is not unbound while it is the last.
+    let (_dir, pool, alice, _bob) = fixture().await;
+    bind(
+        &pool,
+        alice,
+        &wechat(APP, "oMiniAlice", Some("oUnionAlice")),
+    )
+    .await;
+    by_unionid(
+        &pool,
+        &wechat(PHONE_APP, "oPhoneAlice", Some("oUnionAlice")),
+    )
+    .await;
+    without_password(&pool, alice).await;
+    assert_eq!(
+        unbind(&pool, alice, Provider::WeChat, PHONE_APP).await,
+        Unbound::LastSignIn
+    );
+    assert_eq!(identities::list(&pool, alice).await.unwrap().len(), 2);
+}
