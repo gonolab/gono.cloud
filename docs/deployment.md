@@ -578,9 +578,9 @@ What users see:
   and the page shows a QR code with the time it expires. Scanned with WeChat on the phone, it
   opens the mini program, which binds the user's WeChat to the account. A QR code is valid for
   10 minutes and once, a new one ends the previous one, and it binds only when the mini program
-  reports that it was opened by scanning it on a phone, not on a desktop and not from an image,
-  the album or a chat (a safeguard against forwarded codes; the mini program reports this
-  itself). Whoever scans the code gets the account in the mini program, so the page says not to
+  reports that it was opened by scanning it on a phone, or that its own scanner read it with the
+  camera, not on a desktop and not from an image, the album or a chat (a safeguard against
+  forwarded codes; the mini program reports this itself). Whoever scans the code gets the account in the mini program, so the page says not to
   share it. An account has one WeChat of the mini program at most, and a WeChat belongs to one
   account.
 - **Signing in again.** Once bound, the WeChat signs in to the mini program however it was

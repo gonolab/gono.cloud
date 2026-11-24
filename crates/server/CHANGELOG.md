@@ -112,7 +112,8 @@ compatible within a major version: released clients keep working with newer serv
   token otherwise, and binds with `POST /gono/v1/wechat/bind`. An account has one WeChat of the
   AppID, and a WeChat one account. Every call that signs in or acts takes only WeChat on a phone
   (`ios`, `android`, `ohos`; `desktop_client` otherwise). `bind` also takes only the scenes of
-  scanning (1011, 1047; `wrong_scene` otherwise), a safeguard against forwarded codes, while
+  scanning (1011, 1047; `wrong_scene` otherwise) or a code that the mini program's own scanner
+  read with the camera (`"source": "scan_code"`), a safeguard against forwarded codes, while
   `session` takes every scene, so that a bound WeChat signs in again however the mini program was
   opened (the chat list, after logging out, on a new phone); `signup` does as `session`. A session
   (`Authorization: Bearer`, 30 days after its last use, at most 5 per WeChat) reads the account's

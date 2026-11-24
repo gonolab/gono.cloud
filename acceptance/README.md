@@ -147,7 +147,7 @@ test still reports `ok`; it prints `SKIP <test>: <reason>` to stderr (also visib
 | `login_flow` | 6 | Login Flow v2 init on both paths, pending polls, wrong passwords, an explicit consent page, a newly minted per-device app password, single-use poll tokens; the web login password is not a WebDAV credential. |
 | `admin` | 4 | The admin UI needs a login, accepts the web login password, and refuses app passwords of any scope (as Basic credentials and at its login form). |
 | `notify_push` | 12 | Capabilities; WebSocket authentication with an app password, bad credentials, and single-use pre-auth tokens; notifications for PUT, MKCOL, COPY, MOVE, chunked upload, and DELETE; `listen notify_file_id`; no notifications for other users. |
-| `wechat` | 3 | The mini program's API up to the point where the server would ask WeChat: `account` without a session, the phone rule of `session` and `bind`, and `bind`'s scene rule. |
+| `wechat` | 4 | The mini program's API up to the point where the server would ask WeChat: `account` without a session, the phone rule of `session` and `bind`, `bind`'s scene rule and the in-app scanner (`source`). |
 
 The Login Flow and admin tests drive plain HTML pages: they follow redirects, keep cookies, answer
 HTTP Basic challenges, fill forms with a password field (username field matched by name), and

@@ -41,9 +41,14 @@
 //!   shared card (1007, 1008). `session` and `signup` take any scene: a WeChat that is bound
 //!   already is the account's, so it signs in again however the mini program was opened, and a
 //!   signup token binds nothing without a ticket and `bind`'s scene check.
-//! - The mini program reports both (`wx.getEnterOptionsSync().scene`,
-//!   `wx.getDeviceInfo().platform`): the checks are a safeguard against mistakes and lures, not
-//!   proof.
+//! - **The in-app scanner.** A code read by the mini program's own scanner
+//!   (`wx.scanCode({onlyFromCamera: true})`: the camera only, no album, no image) is as good as
+//!   a scan, but the scene then says how the mini program was opened (the chat list, say). So
+//!   `bind`, `scan`, `confirm` and `deny` take `"source": "scan_code"` in place of the scene
+//!   ([`check_scanned`]); the platform rule stays.
+//! - The mini program reports all of this (`wx.getEnterOptionsSync().scene`,
+//!   `wx.getDeviceInfo().platform`, `source`): the checks are a safeguard against mistakes and
+//!   lures, not proof.
 //! - **Limits.** Each client address has a token bucket like the sign-in pages'
 //!   ([`RateLimiter`]). `session` and `bind` are refused while the bucket is empty, before
 //!   anything in them is checked or WeChat is asked, and every one that does not succeed takes
@@ -662,6 +667,9 @@ struct BindRequest {
     ticket: String,
     scene: u32,
     platform: String,
+    /// `scan_code` for the in-app scanner; see [`check_scanned`].
+    #[serde(default)]
+    source: Option<String>,
 }
 
 /// `POST /gono/v1/wechat/bind`.
@@ -697,7 +705,9 @@ async fn bind_with(
     if !store::is_token(&request.signup_token) || !store::is_ticket(&request.ticket) {
         return bad_request();
     }
-    if let Err(response) = check_client(request.scene, &request.platform) {
+    if let Err(response) =
+        check_scanned(request.scene, &request.platform, request.source.as_deref())
+    {
         return *response;
     }
     let bound = store::bind(
@@ -809,17 +819,19 @@ struct ScanRequest {
     #[serde(default)]
     scene: u32,
     platform: String,
-    /// `scan_code` for the in-app scanner (`wx.scanCode({onlyFromCamera: true})`), whose scene
-    /// is not a scan's.
+    /// `scan_code` for the in-app scanner; see [`check_scanned`].
     #[serde(default)]
     source: Option<String>,
 }
 
-/// [`check_client`] that takes the in-app scanner as a scan.
-fn check_scan(request: &ScanRequest) -> Result<(), Box<Response>> {
-    check_platform(&request.platform)?;
-    match request.source.as_deref() {
-        None | Some("enter") => check_client(request.scene, &request.platform),
+/// [`check_client`] that takes the in-app scanner as a scan: `source` `scan_code` says that the
+/// mini program read the code with `wx.scanCode({onlyFromCamera: true})`, so its scene (how it
+/// was opened) is not checked. `enter`, or no `source`, checks the scene; any other value is
+/// `bad_request`. The platform is checked first, whatever the source.
+fn check_scanned(scene: u32, platform: &str, source: Option<&str>) -> Result<(), Box<Response>> {
+    check_platform(platform)?;
+    match source {
+        None | Some("enter") => check_client(scene, platform),
         Some("scan_code") => Ok(()),
         Some(_) => Err(Box::new(bad_request())),
     }
@@ -845,7 +857,7 @@ async fn asking(
     if !store::is_ticket(&request.ticket) || !is_code(&request.code) {
         return Err(Box::new(bad_request()));
     }
-    check_scan(&request)?;
+    check_scanned(request.scene, &request.platform, request.source.as_deref())?;
     let openid = match wechat.api.code_to_session(&request.code).await {
         Ok(login) => login.openid,
         Err(ApiError::InvalidCode) => {

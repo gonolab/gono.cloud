@@ -128,3 +128,31 @@ async fn binding_needs_a_scan() {
         assert_error(&bind, 403, "wrong_scene");
     }
 }
+
+/// The mini program's own scanner (`"source": "scan_code"`, `wx.scanCode({onlyFromCamera:
+/// true})`) counts as a scan whatever the scene: opened from the chat list (1001), the request
+/// gets past the scene rule and ends at the signup token, which does not exist. The phone rule
+/// stays, and an unknown source is a malformed request.
+#[tokio::test]
+async fn the_in_app_scanner_counts_as_a_scan() {
+    let Some(ctx) = wechat_ctx() else { return };
+    for (platform, source, status, code) in [
+        ("ios", "scan_code", 401, "session_expired"),
+        ("android", "album", 400, "bad_request"),
+        ("windows", "scan_code", 403, "desktop_client"),
+    ] {
+        let bind = post(
+            &ctx,
+            "bind",
+            &json!({
+                "signup_token": random_token(43),
+                "ticket": random_token(22),
+                "scene": 1001,
+                "platform": platform,
+                "source": source,
+            }),
+        )
+        .await;
+        assert_error(&bind, status, code);
+    }
+}

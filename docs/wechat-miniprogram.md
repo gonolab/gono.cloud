@@ -30,7 +30,8 @@ turns it on is in [deployment.md](deployment.md#wechat), what the reverse proxy 
    "扫普通链接二维码打开小程序" of the mini program's console (see [Deployment](#deployment))
    opens the mini program with the link, URL-encoded, in the `q` parameter of the page's
    `onLoad(query)`: `decodeURIComponent(query.q)`. The mini program takes the ticket from it
-   ([The links](#the-links)).
+   ([The links](#the-links)). The mini program's own scanner reads the same link
+   ([The in-app scanner](#the-in-app-scanner)).
 3. **Signing in.** The mini program calls `wx.login()` and sends the code to
    `POST /gono/v1/wechat/session` with the scene and the platform. The server asks WeChat whose
    code it is (`jscode2session`):
@@ -76,12 +77,12 @@ to have been opened by scanning a code:
 | Field | Accepted | Refused with |
 |---|---|---|
 | `platform`, from `wx.getDeviceInfo().platform` (`wx.getSystemInfoSync().platform` before base library 2.20.1) | `ios`, `android`, `ohos` | `desktop_client`: `windows`, `mac`, `ohos_pc`, `devtools` and every other value |
-| `scene`, from `wx.getEnterOptionsSync().scene`, checked by `bind`, `scan`, `confirm` and `deny` only | `1011` (a QR code scanned with Scan), `1047` (a mini program code scanned with Scan) | `wrong_scene`: `1012` and `1048` (a code recognized in an image by a long press), `1013` and `1049` (a code picked from the album), `1007` and `1008` (a shared card in a chat), `1001` (the chat list), ... and every other value |
+| `scene`, from `wx.getEnterOptionsSync().scene`, checked by `bind`, `scan`, `confirm` and `deny` only, and not with `"source": "scan_code"` | `1011` (a QR code scanned with Scan), `1047` (a mini program code scanned with Scan) | `wrong_scene`: `1012` and `1048` (a code recognized in an image by a long press), `1013` and `1049` (a code picked from the album), `1007` and `1008` (a shared card in a chat), `1001` (the chat list), ... and every other value |
 
 | Call | Platform | Scene |
 |---|---|---|
 | `session`, `signup` | a phone | any (still sent) |
-| `bind`, `scan`, `confirm`, `deny` | a phone | `1011` or `1047` |
+| `bind`, `scan`, `confirm`, `deny` | a phone | `1011` or `1047`, or any with `"source": "scan_code"` |
 | `account/delete`, `account/restore` | a phone | none sent |
 | `account`, `logout`, `PATCH account`, `flow` | none | none |
 
@@ -114,6 +115,25 @@ refused: try binding on a phone (preview or a development version).
 
 `account` and `logout` have neither rule: a mini program opened from the chat list keeps using
 the session it holds.
+
+### The in-app scanner
+
+The mini program may offer a button that scans the code itself, so that a user who opened it
+from the chat list need not leave it for WeChat's Scan. Its scene then says how the mini program
+was opened (`1001`, say), not that a code was scanned, so `bind`, `scan`, `confirm` and `deny`
+take an optional `"source"`:
+
+- `"enter"`, the default: the code came with how the mini program was opened, and the scene is
+  checked.
+- `"scan_code"`: the mini program read the code with its own scanner, and the scene is not
+  checked. The platform still is.
+- Any other value answers `bad_request`.
+
+The only correct use is
+`wx.scanCode({onlyFromCamera: true, scanType: ["qrCode"]})`: the camera only, no album, and no
+code recognized in an image, which is the protection of scene `1011`. Send `scan_code` for its
+result and for nothing else. Like the scene, `source` is the mini program's own claim: a
+safeguard against mistakes and lures, not proof.
 
 ## Endpoints
 
@@ -172,6 +192,10 @@ Binds the WeChat of a signup token to the account of a ticket. No authentication
   "platform": "ios"
 }
 ```
+
+- `scene`, `platform`: see [Scenes and platforms](#scenes-and-platforms); binding needs a scan.
+- `source` (optional): `"scan_code"` when the mini program's own scanner read the code, which
+  replaces the scene test ([The in-app scanner](#the-in-app-scanner)); `"enter"` by default.
 
 `200`: as a bound `session`, `{"session", "expires_at", "account"}`. The binding is recorded
 in the account's audit log (`identity.bound` with `how: "mini_program"` and the AppID, never the
@@ -288,8 +312,8 @@ sequenceDiagram
 ```
 
 `POST /gono/v1/wechat/scan` takes `{"ticket", "code", "scene", "platform"}` and an optional
-`"source": "scan_code"` for the in-app scanner (`wx.scanCode({onlyFromCamera: true})`), which
-skips the scene test; the platform test stays. The scene and platform rules are `bind`'s. The
+`"source": "scan_code"` for the in-app scanner ([The in-app scanner](#the-in-app-scanner)),
+which skips the scene test; the platform test stays. The scene and platform rules are `bind`'s. The
 WeChat of the code locks the sign-in, and the answer says what to show:
 
 ```json

@@ -82,7 +82,7 @@
 | Piece | Today (server) | Phase |
 |---|---|---|
 | `POST /gono/v1/wechat/session` (code, scene, platform → session or signup token) | yes; phones only, any scene (S1) | 1: S1 drops the scene rule |
-| `POST /gono/v1/wechat/bind` (signup token + ticket → session) | yes | 1: S3 accepts the in-app scanner |
+| `POST /gono/v1/wechat/bind` (signup token + ticket → session) | yes, with the in-app scanner (S3) | 1: S3 accepts the in-app scanner |
 | `GET /gono/v1/wechat/account` (username, display name, five switches) | yes, with `offered` and `bound_at` (S2) | 1: S2 adds `offered` and `bound_at` |
 | `POST /gono/v1/wechat/logout` | yes | 1 |
 | Bind QR `{qr_url_prefix}bind/<ticket>` on the account page (Overview, "WeChat") | yes | 1 |
@@ -1051,10 +1051,12 @@ fields, as `/gono/v1/` allows. A ticked item is built and committed (checked aga
   `wechat_identities.created_at`. Built on `external_identities.created_at` (TP T1); the
   `account` of `signup`, `account/restore` and `PATCH account` has both too. Not in the
   acceptance suite: it needs a session, which needs WeChat.
-- [ ] **S3 The in-app scanner.** `bind` (and `bind/preview`) take an optional
+- [x] **S3 The in-app scanner.** `bind` (and `bind/preview`) take an optional
   `"source": "enter" | "scan_code"`, default `enter`. With `scan_code` the scene test is
   skipped; the platform test stays. Document `wx.scanCode({onlyFromCamera: true})` as the only
-  correct use, and that it is a claim of the mini program, like the scene.
+  correct use, and that it is a claim of the mini program, like the scene. Built with `scan`'s
+  check (T3 had it there already); another `source` is `bad_request`. `bind/preview` takes it
+  with S4.
 - [ ] **S4 `POST /gono/v1/wechat/bind/preview`.** Body as `bind`. `200
   {"account": {"username", "display_name"}, "expires_at": <the ticket's>}`. It changes nothing
   and uses nothing up. It runs `bind`'s checks in `bind`'s order, with the same errors, but

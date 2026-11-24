@@ -640,6 +640,62 @@ async fn signing_in_needs_a_phone_and_binding_a_scan_too() {
 }
 
 #[tokio::test]
+async fn the_in_app_scanner_counts_as_a_scan() {
+    let (f, api, _) = with_wechat(None).await;
+    let mini = Mini::new(&f);
+    let ticket = match store::create_ticket(&f.state.db, alice(&f).await.id, APP_ID, db::unix_now())
+        .await
+        .unwrap()
+    {
+        NewTicket::Ticket(ticket) => ticket.ticket.expose_secret().to_owned(),
+        NewTicket::Bound => panic!("bound"),
+    };
+    let token = mini.signup(&api, "code-0", BOB_OPENID).await;
+    let bind = |platform: &str, source: Value| {
+        json!({
+            "signup_token": token,
+            "ticket": ticket,
+            // Opened from the chat list, then the in-app scanner read the code.
+            "scene": 1001,
+            "platform": platform,
+            "source": source,
+        })
+    };
+    let mut address = 10;
+    let mut refused = |body: Value| {
+        address += 1;
+        let mini = mini.at(address);
+        async move { mini.post("/gono/v1/wechat/bind", &body).await.error() }
+    };
+    // `enter`, the default, checks the scene.
+    for source in [json!("enter"), Value::Null] {
+        assert_eq!(
+            refused(bind("ios", source)).await,
+            (StatusCode::FORBIDDEN, "wrong_scene".to_owned())
+        );
+    }
+    // Only the two sources are known.
+    for source in [json!("album"), json!(""), json!("SCAN_CODE"), json!(1)] {
+        assert_eq!(
+            refused(bind("ios", source.clone())).await,
+            (StatusCode::BAD_REQUEST, "bad_request".to_owned()),
+            "{source}"
+        );
+    }
+    // The platform rule stays.
+    assert_eq!(
+        refused(bind("windows", json!("scan_code"))).await,
+        (StatusCode::FORBIDDEN, "desktop_client".to_owned())
+    );
+    // The in-app scanner binds whatever the scene.
+    let bound = mini
+        .post("/gono/v1/wechat/bind", &bind("ios", json!("scan_code")))
+        .await;
+    assert_eq!(bound.status, StatusCode::OK, "{}", bound.json());
+    assert_eq!(bound.json()["account"]["username"], "alice");
+}
+
+#[tokio::test]
 async fn requests_are_bounded_and_validated() {
     let (f, api, _) = with_wechat(None).await;
     let mini = Mini::new(&f);
