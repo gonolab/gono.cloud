@@ -2759,3 +2759,107 @@ async fn the_mini_program_changes_the_display_name_with_the_session_alone() {
     assert_eq!(limited.error().0, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(stored().await, "B");
 }
+
+#[tokio::test]
+async fn the_mini_program_unbinds_its_wechat_but_never_the_last_way_in() {
+    let (f, api, _) = with_wechat(None).await;
+    let mini = Mini::new(&f);
+    let session = alice_session(&f, &mini, &api).await;
+    api.accept("alice-again", ALICE_OPENID);
+    let other_phone = mini.session("alice-again").await.json()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bob = add_user(&f, "bob").await;
+    insert_identity(&f, bob, BOB_OPENID).await;
+    api.accept("bobs-code", BOB_OPENID);
+    api.accept("alice-1", ALICE_OPENID);
+    let unbind = |session: &str, body: Value| {
+        let mini = &mini;
+        let session = session.to_owned();
+        async move {
+            mini.act("POST", "/gono/v1/wechat/unbind", &session, &body)
+                .await
+        }
+    };
+
+    for (body, status, code) in [
+        (
+            json!({ "code": "bobs-code", "platform": "ios" }),
+            StatusCode::FORBIDDEN,
+            "not_permitted",
+        ),
+        (
+            json!({ "code": "alice-1", "platform": "mac" }),
+            StatusCode::FORBIDDEN,
+            "desktop_client",
+        ),
+        (
+            json!({ "code": "alice-1" }),
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        ),
+    ] {
+        assert_eq!(
+            unbind(&session, body.clone()).await.error(),
+            (status, code.to_owned()),
+            "{body}"
+        );
+    }
+    let alice_id = alice(&f).await.id;
+    assert_eq!(identities_of(&f, alice_id).await, 1);
+
+    // Alice has a web password: the WeChat goes, with every session of it, on every phone.
+    let done = unbind(&session, json!({ "code": "alice-1", "platform": "ios" })).await;
+    assert_eq!(done.status, StatusCode::NO_CONTENT, "{:?}", done.body);
+    assert_eq!(identities_of(&f, alice_id).await, 0);
+    for session in [&session, &other_phone] {
+        assert_eq!(
+            mini.account(session).await.error(),
+            (StatusCode::UNAUTHORIZED, "not_signed_in".to_owned())
+        );
+    }
+    let entry = &audit::list(&f.state.db, Some(alice_id), None, 10)
+        .await
+        .unwrap()[0];
+    assert_eq!(
+        (entry.kind.as_str(), entry.actor.as_str()),
+        ("identity.unbound", "mini_program")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&entry.details).unwrap(),
+        json!({ "provider": "wechat", "how": "mini_program", "app_id": APP_ID })
+    );
+    // The WeChat is bound to nothing now.
+    api.accept("alice-2", ALICE_OPENID);
+    assert!(mini.session("alice-2").await.json()["signup_token"].is_string());
+
+    // Bob has no web password and no other identity: his WeChat is his last way in.
+    sqlx::query("UPDATE users SET password_hash = NULL WHERE id = ?")
+        .bind(bob)
+        .execute(&f.state.db)
+        .await
+        .unwrap();
+    api.accept("bob-session", BOB_OPENID);
+    let bobs = mini.session("bob-session").await.json()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    api.accept("bob-1", BOB_OPENID);
+    assert_eq!(
+        unbind(&bobs, json!({ "code": "bob-1", "platform": "android" }))
+            .await
+            .error(),
+        (StatusCode::CONFLICT, "last_sign_in".to_owned())
+    );
+    assert_eq!(identities_of(&f, bob).await, 1);
+    assert_eq!(mini.account(&bobs).await.status, StatusCode::OK);
+}
+
+/// How many identities account `user_id` has.
+async fn identities_of(f: &Fixture, user_id: i64) -> usize {
+    gono_server_core::identities::list(&f.state.db, user_id)
+        .await
+        .unwrap()
+        .len()
+}

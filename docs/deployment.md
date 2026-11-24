@@ -593,11 +593,13 @@ What users see:
   account's WeChat on the phone, in place of the account page's second step, and works whether
   or not the account has direct connections. The audit log names the actor `mini_program`.
 - **Unbinding** ("Unbind" in the same panel) asks to confirm it is you the same way, and signs
-  the mini program out on every phone. Disabling or deleting an account ends its mini program
+  the mini program out on every phone. The mini program unbinds too, with a fresh sign-in of the
+  WeChat on the phone, unless WeChat is the account's last way in (no web login password and no
+  other identity). Disabling or deleting an account ends its mini program
   sessions as well; otherwise a session ends 30 days after its last use.
 - Neither changes the web login: browser sessions, app passwords and two-step verification stay.
   The audit log records `identity.bound` (`how: "mini_program"`) and `identity.unbound` (`how`:
-  `account_page`, `admin` or `cli`) with the AppID, never the openid. The admin UI lists each
+  `account_page`, `mini_program`, `admin` or `cli`) with the AppID, never the openid. The admin UI lists each
   account's identities with when they were bound and last used, and unbinds them; so do
   `gono-cloud user identities` and `user unlink`.
 - **Signing in on the web** (`web_sign_in`). The sign-in page shows a QR code for this browser,

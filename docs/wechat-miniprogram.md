@@ -13,10 +13,11 @@ turns it on is in [deployment.md](deployment.md#wechat), what the reverse proxy 
 - Binding starts on the account page of the server (Overview, "Ways to sign in"): the user
   confirms with the web login password, and the page shows a QR code that the user scans with
   WeChat on the phone. It opens the mini program, which signs in and binds. Unbinding is done on
-  the same page, in the admin UI, or with `gono-cloud user unlink`.
+  the same page, in the mini program, in the admin UI, or with `gono-cloud user unlink`.
 - A mini program session reads the account's name, its services and its devices, and changes
   its display name; with a fresh sign-in code of the account's WeChat it stops remote access for
-  a device or revokes it. Nothing else: no files, no WebDAV, no S3, no page of the server.
+  a device, revokes it, or unbinds the WeChat. Nothing else: no files, no WebDAV, no S3, no page
+  of the server.
 - Without `[wechat]` every path below `/gono/v1/wechat/` answers
   `404 {"error":"not_found"}`, and the account page says that the server does not offer a mini
   program.
@@ -386,7 +387,7 @@ One device of the session's account, by the 64 hex digits of its `endpoint_id`.
 ### Actions on the account
 
 The calls that change something on the account (`devices/<endpoint_id>/sign-out`,
-`devices/<endpoint_id>/revoke`) take, beside the session, a JSON body with:
+`devices/<endpoint_id>/revoke`, `unbind`) take, beside the session, a JSON body with:
 
 - `code`: a fresh code of `wx.login()`. The server exchanges it with WeChat, and it must be of
   the WeChat bound to the account, the session's: another WeChat's code, bound elsewhere or to
@@ -444,6 +445,22 @@ other devices forget them, on the LAN too), their connections end, and the other
 Another `confirm`, or an `also` that is not among `introduced`, answers `bad_request` and revokes
 nothing. A revoked device answers `409 device_revoked`, and `not_found` is as in
 [`devices/<endpoint_id>`](#get-gonov1wechatdevicesendpoint_id).
+
+### `POST /gono/v1/wechat/unbind`
+
+Unbinds the session's WeChat from its account (解除绑定). `Authorization: Bearer <session>`, body
+`{"code", "platform"}` ([Actions on the account](#actions-on-the-account)).
+
+`204 No Content`. It does what "Unbind" on the account page does: the server forgets the
+binding, every mini program session of this WeChat ends (on every phone, this session
+included), and the audit log records `identity.unbound` with `how: "mini_program"`. Browser
+sessions, app passwords, devices and two-step verification stay. The WeChat is then bound to no
+account: `session` answers it with a signup token, and binding again needs a new QR code of the
+account page.
+
+`409 last_sign_in` when WeChat is the account's last way in: it has no web login password and no
+other identity (Google, GitHub). Nothing changes; the page says to set a password or bind
+another way to sign in on the web first, or to delete the account.
 
 ### Accounts made in the mini program: `signup`, `PATCH account`, `account/delete`, `account/restore`
 
@@ -557,6 +574,7 @@ are limited like `bind`.
 | `not_found` | 404 | No such endpoint or method, the server does not offer the mini program, or no such device of the account. |
 | `not_permitted` | 403 | A web sign-in this WeChat may not confirm: of the admin UI for a non-admin account, of another account, or locked by another WeChat (`confirm`, `deny`); or an action whose fresh code is of another WeChat than the session's. |
 | `device_revoked` | 409 | The device is revoked: it cannot be signed out or revoked again. |
+| `last_sign_in` | 409 | `unbind`: WeChat is the account's last way in (no web login password, no other identity). |
 | `account_exists` | 409 | The WeChat is bound to another account. |
 | `ticket_taken` | 409 | Another WeChat scanned the sign-in's QR code first. |
 | `signup_closed` | 403 | The server lets no WeChat sign up (`allow_signup` is off). |
@@ -585,13 +603,13 @@ server (its 45011), `session` answers `rate_limited` with `Retry-After: 60`.
   it ends unless it is used, and every `account` moves the end to 30 days after that request
   (written at most once a minute).
 - It ends at once when the mini program logs out, when the user unbinds the WeChat on the
-  account page (every session of the account and AppID), when the account is disabled (enabling
-  it again does not bring sessions back) or deleted.
+  account page or in the mini program (every session of the account and AppID), when the account
+  is disabled (enabling it again does not bring sessions back) or deleted.
 - A WeChat has at most 5 sessions; a sixth ends the oldest.
 - A session is bound to the AppID: if the operator changes `wechat.app_id`, the sessions and
   bindings of the old AppID no longer count.
-- A session reads `account` and `devices`, changes the display name, and acts on the account's
-  devices with a fresh code; nothing else. It is not an app password: WebDAV, the Nextcloud endpoints, S3 and the pages
+- A session reads `account` and `devices`, changes the display name, and with a fresh code acts
+  on the account's devices and unbinds its WeChat; nothing else. It is not an app password: WebDAV, the Nextcloud endpoints, S3 and the pages
   answer it as if it were absent.
 
 The server keeps the openid WeChat reports and the unionid when WeChat reports one. It never

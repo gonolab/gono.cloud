@@ -130,20 +130,22 @@ compatible within a major version: released clients keep working with newer serv
   `identity.unbound` (the AppID, never the openid); `config check` shows the settings without the
   secret, and the admin UI shows whether each account's WeChat is bound. See
   `docs/wechat-miniprogram.md` and "WeChat" in `docs/deployment.md`.
-- **Devices in the WeChat mini program** (`plan/wechat-miniprogram-design.md`, phase 2). `GET
-  /gono/v1/wechat/devices` lists the devices of the session's account as the account page does
-  (active, signed out and revoked), with their short IDs, readable product and platform names,
-  and never an address; `GET /gono/v1/wechat/devices/<endpoint id>` shows one with the devices it
+- **Devices and profile in the WeChat mini program** (`plan/wechat-miniprogram-design.md`, phase 2).
+  `GET /gono/v1/wechat/devices` lists the devices of the session's account as the account page does
+  (active, signed out and revoked), with their short IDs, readable product and platform names, and
+  never an address; `GET /gono/v1/wechat/devices/<endpoint id>` shows one with the devices it
   introduced, as the account page's revocation step lists them. Other accounts' devices answer
   `not_found`. `POST /gono/v1/wechat/devices/<endpoint id>/sign-out` stops remote access for a
-  device as the account page does (protocol 9.4), also for an account without direct
-  connections, and `POST /gono/v1/wechat/devices/<endpoint id>/revoke` revokes it with the
-  introduced devices ticked (`also`) after a second confirmation that repeats its ID
-  (`confirm`); other devices get `device.revoked` with `by: "mini_program"`. Such actions need a fresh `wx.login()` code of the WeChat bound to the account
-  (`not_permitted` for another WeChat's), in place of the account page's second step; each
-  account may act 10 times a minute, and the audit log names the new actor `mini_program`. `PATCH
-  /gono/v1/wechat/account` also changes the display name, with the account page's rules and the
-  session alone, like the username.
+  device as the account page does (protocol 9.4), also for an account without direct connections,
+  and `POST /gono/v1/wechat/devices/<endpoint id>/revoke` revokes it with the introduced devices
+  ticked (`also`) after a second confirmation that repeats its ID (`confirm`); other devices get
+  `device.revoked` with `by: "mini_program"`. Such actions need a fresh `wx.login()` code of the
+  WeChat bound to the account (`not_permitted` for another WeChat's), in place of the account page's
+  second step; each account may act 10 times a minute, and the audit log names the new actor
+  `mini_program`. `PATCH /gono/v1/wechat/account` also changes the display name, with the account
+  page's rules and the session alone, like the username. `POST /gono/v1/wechat/unbind` unbinds the
+  WeChat and ends its sessions on every phone (`identity.unbound` with `how: "mini_program"`),
+  unless it is the account's last way in (`last_sign_in`).
 - **Services per account**: every account has five switches, all off for new accounts, the
   first admin included: `files` (the web file UI), `webdav` (WebDAV and the other endpoints of
   Nextcloud clients), `s3` (the S3 API), `direct` (remote access for devices, with the relay at

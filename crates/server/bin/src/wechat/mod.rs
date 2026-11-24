@@ -12,6 +12,7 @@
 //! | `GET /gono/v1/wechat/devices/<endpoint id>` | One of them, with the devices it introduced (its approvals), which revoking it can take along. |
 //! | `POST /gono/v1/wechat/devices/<endpoint id>/sign-out` | Stops remote access for the device (protocol 9.4), with a fresh code of the account's WeChat. |
 //! | `POST /gono/v1/wechat/devices/<endpoint id>/revoke` | Revokes the device and the introduced devices ticked with it (protocol 9.1, 9.2), with a fresh code. |
+//! | `POST /gono/v1/wechat/unbind` | Unbinds the WeChat from the account (every session of it ends), with a fresh code; never its last way in. |
 //! | `POST /gono/v1/wechat/signup` | With `[wechat] allow_signup`: creates an account (no service, no password, a generated username) for the WeChat of a signup token, and opens a session. |
 //! | `PATCH /gono/v1/wechat/account` | Changes the display name, and the username of an account made by a sign-up until a device or app signed in to it. |
 //! | `POST /gono/v1/wechat/account/delete` | An account without a web password asks for its deletion (a fresh code of its WeChat): disabled at once, deleted after 7 days. |
@@ -63,8 +64,8 @@
 //!   mini program behind one address (a carrier's NAT) do not lock each other out. `account`
 //!   and `logout` cost a token only for a bearer token that is no session, and are refused for
 //!   those only, as device authentication is.
-//! - **Actions on the account** (`devices/<id>/sign-out`, `devices/<id>/revoke`) need, beside
-//!   the session, a fresh
+//! - **Actions on the account** (`devices/<id>/sign-out`, `devices/<id>/revoke`, `unbind`)
+//!   need, beside the session, a fresh
 //!   code of `wx.login()` from the WeChat bound to the account, on a phone ([`fresh_code_of`]):
 //!   it stands in for the second step that the account page asks for (protocol 10). Each
 //!   account may act [`MAX_ACTIONS`] times a minute ([`ActionLimiter`]), beside the client's
@@ -497,6 +498,10 @@ pub fn routes(wechat: Option<&WeChat>) -> Router<AppState> {
             .route(
                 &format!("{API_PATH}/devices/{{endpoint_id}}/revoke"),
                 post(revoke_device).fallback(not_found),
+            )
+            .route(
+                &format!("{API_PATH}/unbind"),
+                post(unbind).fallback(not_found),
             )
             .route(&format!("{API_PATH}/scan"), post(scan).fallback(not_found))
             .route(
@@ -1890,6 +1895,62 @@ pub async fn revoke_device(
                 StatusCode::NO_CONTENT.into_response()
             }
             Err(err) => database(&err, "revoke a device"),
+        }
+    }
+    .await;
+    wechat.charge(client, response)
+}
+
+/// `POST /gono/v1/wechat/unbind` `{code, platform}`: unbinds the session's WeChat from its
+/// account, as "Unbind" on the account page does: every mini program session of the WeChat
+/// ends, on every phone, and `identity.unbound` is recorded with `how: "mini_program"` (plan
+/// `third-party-sign-in-design.md` 8). It is refused with `last_sign_in` when WeChat is the
+/// account's last way in: no web login password and no other identity.
+pub async fn unbind(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let wechat = match wechat_of(&state) {
+        Ok(wechat) => wechat,
+        Err(response) => return *response,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    let account = match session_account(&state, &wechat, client, &headers).await {
+        Ok(account) => account,
+        Err(response) => return *response,
+    };
+    if let Err(response) = wechat.admit_action(client, account.user_id) {
+        return *response;
+    }
+    let response = async {
+        let request: CodeRequest = match parse(body) {
+            Ok(request) => request,
+            Err(response) => return *response,
+        };
+        if let Err(response) = fresh_code_of(&state, &wechat, client, &request, &account).await {
+            return *response;
+        }
+        let unbound = identities::unbind(
+            &state.db,
+            account.user_id,
+            identities::Which::Id(account.identity_id),
+            identities::How::MiniProgram,
+            Actor::MiniProgram,
+            Some(client),
+            db::unix_now(),
+        )
+        .await;
+        match unbound {
+            Ok(identities::Unbound::Done(_)) => {
+                tracing::info!(%client, user = %account.username, app_id = %wechat.app_id, "WeChat unbound in the mini program");
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Ok(identities::Unbound::LastSignIn) => error(StatusCode::CONFLICT, "last_sign_in"),
+            // Unbound in the meantime: the session ended with it.
+            Ok(identities::Unbound::NotBound) => not_signed_in("not_signed_in"),
+            Err(err) => database(&err, "unbind a WeChat"),
         }
     }
     .await;

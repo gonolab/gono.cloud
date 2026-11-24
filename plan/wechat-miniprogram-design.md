@@ -1103,10 +1103,12 @@ fields, as `/gono/v1/` allows. A ticked item is built and committed (checked aga
   2026-11-24); `display_name` and `username` (S16) can come together, the username first; each
   request counts against the account's 10 actions a minute. No audit record, as on the account
   page.
-- [ ] **S11 `POST /gono/v1/wechat/unbind`** `{code, platform}` → `204`. It ends every session of
+- [x] **S11 `POST /gono/v1/wechat/unbind`** `{code, platform}` → `204`. It ends every session of
   the identity and records `identity.unbound` with `how: "mini_program"` (TP 8). It answers
   `409 last_sign_in` when WeChat is the account's last way in (TP 3.2).
-- [ ] **Common to S8–S11:**
+- [x] **Common to S8–S11:** built with S8, for S8, S9 and S11; S10 needs the session only
+  (decided on 2026-11-24) but counts against the limit. The admin UI shows no audit actor
+  anywhere today, so nothing names 小程序 there yet.
   - **A fresh code.** The server exchanges `code` with `jscode2session`. Its openid must be the
     session's, else `403 not_permitted`. WeChat's refusals map as in `session`.
   - **A phone.** Other platforms answer `desktop_client`.
