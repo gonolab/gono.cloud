@@ -1085,9 +1085,11 @@ fields, as `/gono/v1/` allows. A ticked item is built and committed (checked aga
   It lists what the account page lists, signed-out and revoked entries included. Addresses
   never appear. Built: without remote access on the server the list is empty, as the account
   page then shows none.
-- [ ] **S7 `GET /gono/v1/wechat/devices/{endpoint_id}`**: the entry, plus `introduced`, the
+- [x] **S7 `GET /gono/v1/wechat/devices/{endpoint_id}`**: the entry, plus `introduced`, the
   devices it vouched for (8.4), from the event log as the account page's revocation step takes
-  them (P 9.1). Another account's device, or none: `404 not_found` (P 10).
+  them (P 9.1). Another account's device, or none: `404 not_found` (P 10). Built: `introduced`
+  comes from `devices::introduced_by` (the approvals the account page uses) and lists entries of
+  S6; a malformed ID and a server without remote access answer `not_found` too.
 - [ ] **S8 `POST /gono/v1/wechat/devices/{endpoint_id}/sign-out`** `{code, platform}` → `204`
   (P 9.4). A revoked device: `409 device_revoked`.
 - [ ] **S9 `POST /gono/v1/wechat/devices/{endpoint_id}/revoke`** `{code, platform, confirm:

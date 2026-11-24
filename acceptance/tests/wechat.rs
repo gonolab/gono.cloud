@@ -210,7 +210,11 @@ async fn the_preview_of_a_binding_checks_what_binding_checks() {
 #[tokio::test]
 async fn the_calls_of_a_session_need_one() {
     let Some(ctx) = wechat_ctx() else { return };
-    for (method, path) in [("GET", "devices")] {
+    let some_device = "ab".repeat(32);
+    for (method, path) in [
+        ("GET", "devices".to_owned()),
+        ("GET", format!("devices/{some_device}")),
+    ] {
         let url = ctx.url(&format!("/gono/v1/wechat/{path}"));
         let request = match method {
             "GET" => ctx.http.get(url),

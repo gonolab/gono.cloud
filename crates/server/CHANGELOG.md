@@ -133,7 +133,9 @@ compatible within a major version: released clients keep working with newer serv
 - **Devices in the WeChat mini program** (`plan/wechat-miniprogram-design.md`, phase 2). `GET
   /gono/v1/wechat/devices` lists the devices of the session's account as the account page does
   (active, signed out and revoked), with their short IDs, readable product and platform names,
-  and never an address.
+  and never an address; `GET /gono/v1/wechat/devices/<endpoint id>` shows one with the devices it
+  introduced, as the account page's revocation step lists them. Other accounts' devices answer
+  `not_found`.
 - **Services per account**: every account has five switches, all off for new accounts, the
   first admin included: `files` (the web file UI), `webdav` (WebDAV and the other endpoints of
   Nextcloud clients), `s3` (the S3 API), `direct` (remote access for devices, with the relay at

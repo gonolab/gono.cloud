@@ -331,6 +331,35 @@ The devices of the session's account. `Authorization: Bearer <session>`.
   account page.
 - Errors as `account`; a bearer token that is no session costs a token of the bucket.
 
+### `GET /gono/v1/wechat/devices/<endpoint_id>`
+
+One device of the session's account, by the 64 hex digits of its `endpoint_id`.
+`Authorization: Bearer <session>`.
+
+`200`: the entry of [`devices`](#get-gonov1wechatdevices), with `introduced`:
+
+```json
+{
+  "endpoint_id": "3f6a91c47e20d6f8…",
+  "short_id": "3F6A-91C4-7E20-D6F8",
+  "name": "Home PC",
+  "state": "active",
+  "…": "…",
+  "introduced": [
+    { "endpoint_id": "9c01…", "short_id": "9C01-…", "name": "平板", "platform_name": "HarmonyOS", "…": "…" }
+  ]
+}
+```
+
+- `introduced` lists the devices this device vouched for when it approved them (protocol 8.4),
+  that are not revoked, in the order of the approvals: the account page's revocation step lists
+  the same, so that the user can revoke them along with it (protocol 9.1). Each is an entry of
+  `devices`. It is empty for a device that approved none.
+- A revoked device is shown too (`state: "revoked"`, `revoked_at`): the page then offers nothing.
+- `not_found` for a device of another account, one that does not exist, an ID that is not 64
+  lower-case hex digits, and on a server without remote access: the answer never tells whether
+  another account's device exists. Otherwise the errors of `account`.
+
 ### Accounts made in the mini program: `signup`, `PATCH account`, `account/delete`, `account/restore`
 
 With `wechat.allow_signup` (off by default), `session` answers a WeChat bound to no account with

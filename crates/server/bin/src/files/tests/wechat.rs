@@ -2239,3 +2239,107 @@ async fn the_session_lists_the_devices_of_its_account() {
         (StatusCode::UNAUTHORIZED, "not_signed_in".to_owned())
     );
 }
+
+#[tokio::test]
+async fn the_session_shows_a_device_with_the_devices_it_introduced() {
+    let (mut f, api, _) = with_wechat(None).await;
+    let session = alice_session(&f, &Mini::new(&f), &api).await;
+    let alice_id = alice(&f).await.id;
+    connect_on(&mut f).await;
+    let mini = Mini::new(&f);
+    let phone = super::register_device(&f.state, alice_id, 1, "Phone").await;
+    let work = super::register_device(&f.state, alice_id, 2, "Work PC").await;
+    let laptop = super::register_device(&f.state, alice_id, 3, "Laptop").await;
+    for subject in [&work, &laptop] {
+        devices::record_approval(&f.state.db, alice_id, phone.id, subject.id, &json!({}), 1)
+            .await
+            .unwrap();
+    }
+    let path = |hex: &str| format!("/gono/v1/wechat/devices/{hex}");
+
+    let shown = mini
+        .with_bearer("GET", &path(&phone.endpoint_id.to_hex()), &session)
+        .await;
+    assert_eq!(shown.status, StatusCode::OK, "{}", shown.json());
+    let body = shown.json();
+    assert_eq!(body["name"], "Phone");
+    assert_eq!(body["short_id"], phone.endpoint_id.short());
+    assert_eq!(body["state"], "active");
+    let introduced: Vec<&str> = body["introduced"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(introduced, ["Work PC", "Laptop"]);
+    assert_eq!(body["introduced"][0]["short_id"], work.endpoint_id.short());
+    assert_eq!(body["introduced"][0]["platform_name"], "Windows");
+    // A device that introduced nothing.
+    let shown = mini
+        .with_bearer("GET", &path(&laptop.endpoint_id.to_hex()), &session)
+        .await;
+    assert_eq!(shown.json()["introduced"], json!([]));
+
+    // A revoked device is still shown, as on the account page, with when it was revoked; the
+    // devices it introduced leave the list once revoked themselves.
+    let now = db::unix_now();
+    devices::revoke(
+        &f.state.db,
+        alice_id,
+        &[work.endpoint_id],
+        devices::RevokedBy::AccountPage,
+        None,
+        now,
+    )
+    .await
+    .unwrap();
+    let shown = mini
+        .with_bearer("GET", &path(&work.endpoint_id.to_hex()), &session)
+        .await
+        .json();
+    assert_eq!(
+        (shown["state"].clone(), shown["revoked_at"].clone()),
+        (json!("revoked"), json!(now))
+    );
+    let shown = mini
+        .with_bearer("GET", &path(&phone.endpoint_id.to_hex()), &session)
+        .await
+        .json();
+    assert_eq!(shown["introduced"].as_array().unwrap().len(), 1);
+
+    // Another account's device, an unknown one and a malformed ID look the same.
+    let bob = add_user(&f, "bob").await;
+    users::set_services(
+        &f.state.db,
+        &Username::new("bob").unwrap(),
+        gono_server_core::services::Services::NONE
+            .with(gono_server_core::services::Service::Direct, true),
+    )
+    .await
+    .unwrap();
+    let bobs = super::register_device(&f.state, bob, 4, "Bob's PC").await;
+    for hex in [
+        bobs.endpoint_id.to_hex(),
+        "5".repeat(64),
+        "not-an-id".to_owned(),
+        "AB".repeat(32),
+    ] {
+        assert_eq!(
+            mini.with_bearer("GET", &path(&hex), &session).await.error(),
+            (StatusCode::NOT_FOUND, "not_found".to_owned()),
+            "{hex}"
+        );
+    }
+    // Without a session, nothing.
+    assert_eq!(
+        mini.send(
+            "GET",
+            &path(&phone.endpoint_id.to_hex()),
+            &[],
+            Body::empty()
+        )
+        .await
+        .error(),
+        (StatusCode::UNAUTHORIZED, "not_signed_in".to_owned())
+    );
+}
