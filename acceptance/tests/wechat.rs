@@ -204,3 +204,32 @@ async fn the_preview_of_a_binding_checks_what_binding_checks() {
     .await;
     assert_error(&get, 404, "not_found");
 }
+
+/// The calls of a signed-in mini program answer `not_signed_in`, with a Bearer challenge, to a
+/// request without a session. Without credentials they cost nothing.
+#[tokio::test]
+async fn the_calls_of_a_session_need_one() {
+    let Some(ctx) = wechat_ctx() else { return };
+    for (method, path) in [("GET", "devices")] {
+        let url = ctx.url(&format!("/gono/v1/wechat/{path}"));
+        let request = match method {
+            "GET" => ctx.http.get(url),
+            "PATCH" => ctx.http.patch(url),
+            _ => ctx.http.post(url),
+        };
+        let response = send(
+            &ctx.http,
+            request
+                .header("Content-Type", "application/json")
+                .body("{}"),
+        )
+        .await;
+        assert_error(&response, 401, "not_signed_in");
+        assert_eq!(
+            response.header("www-authenticate").as_deref(),
+            Some("Bearer realm=\"gono\""),
+            "{method} {path}\n{}",
+            response.describe()
+        );
+    }
+}

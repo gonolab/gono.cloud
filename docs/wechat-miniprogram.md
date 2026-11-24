@@ -14,8 +14,8 @@ turns it on is in [deployment.md](deployment.md#wechat), what the reverse proxy 
   confirms with the web login password, and the page shows a QR code that the user scans with
   WeChat on the phone. It opens the mini program, which signs in and binds. Unbinding is done on
   the same page, in the admin UI, or with `gono-cloud user unlink`.
-- A mini program session reads the account's name and services, nothing else: no files, no
-  WebDAV, no S3, no page of the server.
+- A mini program session reads the account's name, its services and its devices, nothing
+  else: no files, no WebDAV, no S3, no page of the server.
 - Without `[wechat]` every path below `/gono/v1/wechat/` answers
   `404 {"error":"not_found"}`, and the account page says that the server does not offer a mini
   program.
@@ -283,6 +283,54 @@ Ends the session. `Authorization: Bearer <session>`; a body is ignored (at most 
 `204 No Content`, also for a session that expired. Errors: `not_signed_in` (no such session),
 `rate_limited`, `unavailable`. Forget the session in any case.
 
+### `GET /gono/v1/wechat/devices`
+
+The devices of the session's account. `Authorization: Bearer <session>`.
+
+`200`:
+
+```json
+{
+  "devices": [
+    {
+      "endpoint_id": "3f6a91c47e20d6f8…",
+      "short_id": "3F6A-91C4-7E20-D6F8",
+      "name": "Home PC",
+      "product": "input-show",
+      "product_name": "Input Show",
+      "platform": "windows",
+      "platform_name": "Windows",
+      "version": "1.4.0",
+      "registered_at": 1763100000,
+      "online": true,
+      "last_seen_at": 1763200001,
+      "accept_remote": true,
+      "unattended": false,
+      "state": "active",
+      "signed_out_at": null,
+      "revoked_at": null
+    }
+  ],
+  "limit": 50
+}
+```
+
+- It lists what the account page lists, in its order: the active devices, the signed-out ones
+  (`state: "signed_out"`, since `signed_out_at`) and the revoked ones (`state: "revoked"`, since
+  `revoked_at`), which stay as tombstones.
+- The entry is the directory entry of the remote access protocol
+  ([connect-protocol.md](connect-protocol.md) 6.1) without `services`, plus `short_id` (what pages
+  show of the 64 hex digits of `endpoint_id`), and `product_name` and `platform_name`, the
+  readable names of the slugs `product` and `platform`: show those, so the mini program needs no
+  list of products. `online` is whether the device has its control connection now;
+  `last_seen_at` is `null` for a device that never connected (从未连接).
+- `limit` is how many registered devices an account may have; signed-out and revoked ones do
+  not count.
+- Addresses never appear.
+- Without remote access on this server (`offered.direct` is `false`) the list is empty, as on the
+  account page.
+- Errors as `account`; a bearer token that is no session costs a token of the bucket.
+
 ### Accounts made in the mini program: `signup`, `PATCH account`, `account/delete`, `account/restore`
 
 With `wechat.allow_signup` (off by default), `session` answers a WeChat bound to no account with
@@ -427,8 +475,8 @@ server (its 45011), `session` answers `rate_limited` with `Retry-After: 60`.
 - A WeChat has at most 5 sessions; a sixth ends the oldest.
 - A session is bound to the AppID: if the operator changes `wechat.app_id`, the sessions and
   bindings of the old AppID no longer count.
-- A session reads `account` and nothing else. It is not an app password: WebDAV, the
-  Nextcloud endpoints, S3 and the pages answer it as if it were absent.
+- A session reads `account` and `devices` and nothing else. It is not an app password: WebDAV,
+  the Nextcloud endpoints, S3 and the pages answer it as if it were absent.
 
 The server keeps the openid WeChat reports and the unionid when WeChat reports one. It never
 stores the `session_key` of `jscode2session` and never sends it to the mini program: nothing

@@ -8,6 +8,7 @@
 //! | `POST /gono/v1/wechat/bind/preview` | The account `bind` would bind to, after `bind`'s checks, changing nothing. |
 //! | `GET /gono/v1/wechat/account` | The name and services of the session's account (`Authorization: Bearer <session>`), which services this server offers, and since when the WeChat is bound. |
 //! | `POST /gono/v1/wechat/logout` | Ends the session. |
+//! | `GET /gono/v1/wechat/devices` | The devices of the session's account, as the account page lists them: active, signed out and revoked. |
 //! | `POST /gono/v1/wechat/signup` | With `[wechat] allow_signup`: creates an account (no service, no password, a generated username) for the WeChat of a signup token, and opens a session. |
 //! | `PATCH /gono/v1/wechat/account` | Changes the username of an account made by a sign-up, until a device or app signed in to it. |
 //! | `POST /gono/v1/wechat/account/delete` | An account without a web password asks for its deletion (a fresh code of its WeChat): disabled at once, deleted after 7 days. |
@@ -85,6 +86,7 @@ use axum::{
 use gono_server_core::{
     config::{WeChatConfig, verify_file_name},
     db,
+    devices::{self, Device},
     identities::{self, Provider},
     services::Service,
     users,
@@ -428,6 +430,10 @@ pub fn routes(wechat: Option<&WeChat>) -> Router<AppState> {
             .route(
                 &format!("{API_PATH}/logout"),
                 post(logout).fallback(not_found),
+            )
+            .route(
+                &format!("{API_PATH}/devices"),
+                get(list_devices).fallback(not_found),
             )
             .route(&format!("{API_PATH}/scan"), post(scan).fallback(not_found))
             .route(
@@ -858,6 +864,106 @@ pub async fn account(
             unavailable()
         }
     }
+}
+
+/// The account of the live session whose bearer token `headers` carry, or the answer to refuse
+/// with, as `account` refuses: `not_signed_in` (a token that is no session takes a token of the
+/// client's bucket), `session_expired`, `account_disabled`. Each use extends the session.
+async fn session_account(
+    state: &AppState,
+    wechat: &WeChat,
+    client: IpAddr,
+    headers: &HeaderMap,
+) -> Result<Account, Box<Response>> {
+    let token = match bearer(headers) {
+        Ok(Some(token)) => token,
+        // No credentials cost nothing.
+        Ok(None) => return Err(Box::new(not_signed_in("not_signed_in"))),
+        Err(()) => return Err(Box::new(wechat.refused(client))),
+    };
+    match store::lookup(&state.db, &wechat.app_id, token, db::unix_now()).await {
+        Ok(Lookup::Live(account)) => Ok(account),
+        Ok(Lookup::Expired) => Err(Box::new(not_signed_in("session_expired"))),
+        Ok(Lookup::Disabled) => Err(Box::new(error(StatusCode::FORBIDDEN, "account_disabled"))),
+        Ok(Lookup::Unknown) => Err(Box::new(wechat.refused(client))),
+        Err(err) => Err(Box::new(database(&err, "look a mini program session up"))),
+    }
+}
+
+/// The answer to a database failure while doing `what`.
+fn database(err: &gono_server_core::Error, what: &str) -> Response {
+    tracing::error!(error = %err, "mini program: cannot {what}");
+    unavailable()
+}
+
+/// What the mini program reads of `device`: the directory entry of protocol 6.1 without
+/// `services` (never an address: entries have none), with its short ID, the readable names of
+/// its product and platform, and its state: `active`, `signed_out` (since `signed_out_at`) or
+/// `revoked` (since `revoked_at`).
+fn device_json(device: &Device, online: bool) -> serde_json::Value {
+    let state = if device.is_revoked() {
+        "revoked"
+    } else if device.is_signed_out() {
+        "signed_out"
+    } else {
+        "active"
+    };
+    let mut entry = device.entry(online);
+    if let Some(fields) = entry.as_object_mut() {
+        fields.remove("services");
+        fields.insert("short_id".into(), device.endpoint_id.short().into());
+        fields.insert(
+            "product_name".into(),
+            crate::login_flow::product_name(&device.product).into(),
+        );
+        fields.insert(
+            "platform_name".into(),
+            crate::login_flow::platform_name(&device.platform).into(),
+        );
+        fields.insert("state".into(), state.into());
+        fields.insert(
+            "signed_out_at".into(),
+            device.left_at.filter(|_| device.is_signed_out()).into(),
+        );
+    }
+    entry
+}
+
+/// `GET /gono/v1/wechat/devices`: what the account page's "Remote devices" lists, signed-out and
+/// revoked entries included. Without remote connectivity on this server (`offered.direct` is
+/// `false`) the list is empty, as the account page then shows none.
+pub async fn list_devices(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let wechat = match wechat_of(&state) {
+        Ok(wechat) => wechat,
+        Err(response) => return *response,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    let account = match session_account(&state, &wechat, client, &headers).await {
+        Ok(account) => account,
+        Err(response) => return *response,
+    };
+    let listed = match &state.connect {
+        Some(connect) => match connect.devices_with_presence(account.user_id).await {
+            Ok(listed) => listed,
+            Err(err) => return database(&err, "list the devices"),
+        },
+        None => Vec::new(),
+    };
+    let entries: Vec<serde_json::Value> = listed
+        .iter()
+        .map(|(device, online)| device_json(device, *online))
+        .collect();
+    json(
+        StatusCode::OK,
+        &serde_json::json!({
+            "devices": entries,
+            "limit": devices::MAX_DEVICES_PER_ACCOUNT,
+        }),
+    )
 }
 
 /// `POST /gono/v1/wechat/logout`.

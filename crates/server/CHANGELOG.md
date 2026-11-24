@@ -130,6 +130,10 @@ compatible within a major version: released clients keep working with newer serv
   `identity.unbound` (the AppID, never the openid); `config check` shows the settings without the
   secret, and the admin UI shows whether each account's WeChat is bound. See
   `docs/wechat-miniprogram.md` and "WeChat" in `docs/deployment.md`.
+- **Devices in the WeChat mini program** (`plan/wechat-miniprogram-design.md`, phase 2). `GET
+  /gono/v1/wechat/devices` lists the devices of the session's account as the account page does
+  (active, signed out and revoked), with their short IDs, readable product and platform names,
+  and never an address.
 - **Services per account**: every account has five switches, all off for new accounts, the
   first admin included: `files` (the web file UI), `webdav` (WebDAV and the other endpoints of
   Nextcloud clients), `s3` (the S3 API), `direct` (remote access for devices, with the relay at

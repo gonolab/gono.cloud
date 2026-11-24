@@ -76,6 +76,8 @@
 | Sign-up sits behind `[wechat] allow_signup`, off by default (TP 1) | user | 2026-11-23 |
 | Accounts created in the mini program start with **no service**, like every account. This replaces the earlier "they start with 远程直连 on" (TP 1) | user | 2026-11-23 |
 | The mini program also confirms web sign-ins made by scanning the web sign-in page's QR code, always with 6 digits typed into the browser (TP 1, TP 5.3) | user | 2026-11-23 |
+| 停止远程访问 in the mini program (S8) needs no service: unlike the account page, it works for an account without 远程直连, as 吊销 does | user | 2026-11-24 |
+| Changing the display name (S10) or the username (S16) needs the session only, no fresh `wx.login` code: S10 leaves the fresh-code rule of S8–S11 | user | 2026-11-24 |
 
 ## 2. What exists and what each phase adds
 
@@ -1073,7 +1075,7 @@ fields, as `/gono/v1/` allows. A ticked item is built and committed (checked aga
   that say "reads the account's name and services, nothing else": docs/wechat-miniprogram.md,
   docs/deployment.md, the module documentation of `crates/server/core/src/wechat.rs` and
   `crates/server/bin/src/wechat/mod.rs`, and the account page's `wechat_note`.
-- [ ] **S6 `GET /gono/v1/wechat/devices`** (Bearer). `{"devices": [...], "limit": 50}`. Each entry
+- [x] **S6 `GET /gono/v1/wechat/devices`** (Bearer). `{"devices": [...], "limit": 50}`. Each entry
   has the P 6.1 fields without `services`, plus:
   - `short_id`, `product_name`, `platform_name`;
   - `state`: `active`, `signed_out` or `revoked`, with `signed_out_at` (`devices.left_at`) and
@@ -1081,7 +1083,8 @@ fields, as `/gono/v1/` allows. A ticked item is built and committed (checked aga
     as the account page does.
 
   It lists what the account page lists, signed-out and revoked entries included. Addresses
-  never appear.
+  never appear. Built: without remote access on the server the list is empty, as the account
+  page then shows none.
 - [ ] **S7 `GET /gono/v1/wechat/devices/{endpoint_id}`**: the entry, plus `introduced`, the
   devices it vouched for (8.4), from the event log as the account page's revocation step takes
   them (P 9.1). Another account's device, or none: `404 not_found` (P 10).

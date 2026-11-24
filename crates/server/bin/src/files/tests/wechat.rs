@@ -10,7 +10,7 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
 };
 use gono_server_core::{
-    Username, audit, db,
+    Username, audit, db, devices,
     users::{self, NewUser},
     wechat::{self as store, NewTicket},
 };
@@ -264,6 +264,32 @@ async fn insert_identity_at(f: &Fixture, user: i64, openid: &str, bound_at: i64)
     .await
     .unwrap();
     tx.commit().await.unwrap();
+}
+
+/// Turns remote connectivity on in `f`, as `serve` does with `[connect]`. Make the [`Mini`]
+/// after this: its router holds the state.
+async fn connect_on(f: &mut Fixture) {
+    let connect = gono_server_connect::Connect::new(
+        f.state.db.clone(),
+        gono_server_connect::ConnectConfig {
+            base_url: super::ORIGIN.parse().unwrap(),
+            relay_url: "https://relay.example.com".parse().unwrap(),
+            audit_retention_secs: 3600,
+            require_two_factor: false,
+        },
+    )
+    .await
+    .unwrap();
+    f.state.connect = Some(connect);
+}
+
+/// A session of alice's WeChat, bound to her account directly.
+async fn alice_session(f: &Fixture, mini: &Mini, api: &FakeApi) -> String {
+    insert_identity_at(f, alice(f).await.id, ALICE_OPENID, 1_700_000_000).await;
+    api.accept("code-alice-session", ALICE_OPENID);
+    let signed = mini.session("code-alice-session").await;
+    assert_eq!(signed.status, StatusCode::OK, "{}", signed.json());
+    signed.json()["session"].as_str().unwrap().to_owned()
 }
 
 async fn alice(f: &Fixture) -> users::User {
@@ -2105,4 +2131,111 @@ async fn the_account_page_renames_a_self_service_account_until_it_is_used() {
         .await;
     assert_eq!(soon.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(soon.text().contains(t().err_username_soon));
+}
+
+#[tokio::test]
+async fn the_session_lists_the_devices_of_its_account() {
+    let (mut f, api, _) = with_wechat(None).await;
+    let session = alice_session(&f, &Mini::new(&f), &api).await;
+    // Without remote connectivity the server has no devices to show.
+    let listed = Mini::new(&f)
+        .with_bearer("GET", "/gono/v1/wechat/devices", &session)
+        .await;
+    assert_eq!(listed.json(), json!({ "devices": [], "limit": 50 }));
+
+    connect_on(&mut f).await;
+    let mini = Mini::new(&f);
+    let alice_id = alice(&f).await.id;
+    let home = super::register_device(&f.state, alice_id, 1, "Home PC").await;
+    let laptop = super::register_device(&f.state, alice_id, 2, "Laptop").await;
+    let old = super::register_device(&f.state, alice_id, 3, "Old PC").await;
+    let bob = add_user(&f, "bob").await;
+    users::set_services(
+        &f.state.db,
+        &Username::new("bob").unwrap(),
+        gono_server_core::services::Services::NONE
+            .with(gono_server_core::services::Service::Direct, true),
+    )
+    .await
+    .unwrap();
+    super::register_device(&f.state, bob, 4, "Bob's PC").await;
+    let now = db::unix_now();
+    devices::leave(&f.state.db, laptop.id, audit::Actor::User, now)
+        .await
+        .unwrap();
+    devices::revoke(
+        &f.state.db,
+        alice_id,
+        &[old.endpoint_id],
+        devices::RevokedBy::AccountPage,
+        None,
+        now,
+    )
+    .await
+    .unwrap();
+
+    let listed = mini
+        .with_bearer("GET", "/gono/v1/wechat/devices", &session)
+        .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.json());
+    assert_eq!(listed.header("cache-control"), "no-store");
+    let body = listed.json();
+    assert_eq!(body["limit"], 50);
+    let entries = body["devices"].as_array().unwrap();
+    assert_eq!(entries.len(), 3, "the account's own devices only: {body}");
+    let entry = |name: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("no {name}: {body}"))
+            .clone()
+    };
+    // An active device that never connected.
+    assert_eq!(
+        entry("Home PC"),
+        json!({
+            "endpoint_id": home.endpoint_id.to_hex(),
+            "short_id": home.endpoint_id.short(),
+            "name": "Home PC",
+            "product": "input-show",
+            "product_name": "Input Show",
+            "platform": "windows",
+            "platform_name": "Windows",
+            "version": "",
+            "registered_at": home.registered_at,
+            "online": false,
+            "last_seen_at": null,
+            "accept_remote": home.accept_remote,
+            "unattended": false,
+            "state": "active",
+            "signed_out_at": null,
+            "revoked_at": null,
+        })
+    );
+    let signed_out = entry("Laptop");
+    assert_eq!(signed_out["state"], "signed_out");
+    assert_eq!(signed_out["signed_out_at"], now);
+    assert_eq!(signed_out["revoked_at"], Value::Null);
+    let revoked = entry("Old PC");
+    assert_eq!(revoked["state"], "revoked");
+    assert_eq!(revoked["revoked_at"], now);
+    assert_eq!(revoked["signed_out_at"], Value::Null);
+    // Never the services or an address.
+    for entry in entries {
+        let keys: Vec<&String> = entry.as_object().unwrap().keys().collect();
+        assert!(
+            keys.iter()
+                .all(|key| *key != "services" && !key.contains("addr")),
+            "{keys:?}"
+        );
+    }
+
+    // Without a session, nothing.
+    let anonymous = mini
+        .send("GET", "/gono/v1/wechat/devices", &[], Body::empty())
+        .await;
+    assert_eq!(
+        anonymous.error(),
+        (StatusCode::UNAUTHORIZED, "not_signed_in".to_owned())
+    );
 }
