@@ -686,7 +686,7 @@ texts! {
     confirm_needed: "Confirm it is you first: enter your web login password.", "请先确认是你：输入网页登录密码。";
     confirm_no_password: "This account has no web login password. Confirm it is you by signing in again with one of its ways to sign in.", "这个账号没有网页登录密码。请用它的一种登录方式重新登录，以确认是你。";
     notice_confirmed: "You confirmed it is you.", "已确认是你。";
-    wechat_note: "Bind your WeChat to use this account in this server's WeChat mini program. The mini program sees your name and services, never your files.", "绑定微信后，可以在本服务器的微信小程序中使用这个账号。小程序只能看到你的名称和服务，看不到你的文件。";
+    wechat_note: "Bind your WeChat to use this account in this server's WeChat mini program. The mini program sees your name, services and devices, changes your display name, and, after you sign in to WeChat on your phone again, stops remote access for or revokes your devices and unbinds. It never sees your files.", "绑定微信后，可以在本服务器的微信小程序中使用这个账号。小程序能看到你的名称、服务和设备，可以修改显示名称；在手机上重新确认微信身份后，还能停止设备的远程访问、吊销设备和解除绑定。它看不到你的文件。";
     wechat_unavailable: "This server does not offer a WeChat mini program.", "本服务器没有提供微信小程序。";
     wechat_bind_title: "Bind WeChat", "绑定微信";
     wechat_show: "Show QR code", "显示二维码";

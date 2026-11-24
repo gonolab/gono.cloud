@@ -145,7 +145,9 @@ compatible within a major version: released clients keep working with newer serv
   `mini_program`. `PATCH /gono/v1/wechat/account` also changes the display name, with the account
   page's rules and the session alone, like the username. `POST /gono/v1/wechat/unbind` unbinds the
   WeChat and ends its sessions on every phone (`identity.unbound` with `how: "mini_program"`),
-  unless it is the account's last way in (`last_sign_in`).
+  unless it is the account's last way in (`last_sign_in`). The account page's WeChat panel says
+  what the mini program can do; a session is still no credential for files, WebDAV, S3 or a
+  page.
 - **Services per account**: every account has five switches, all off for new accounts, the
   first admin included: `files` (the web file UI), `webdav` (WebDAV and the other endpoints of
   Nextcloud clients), `s3` (the S3 API), `direct` (remote access for devices, with the relay at

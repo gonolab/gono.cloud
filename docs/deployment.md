@@ -518,8 +518,9 @@ What users see:
 
 With `[wechat]`, the users of a WeChat mini program bind their WeChat to their account and then
 sign in to the mini program with it. The server serves one mini program, the one whose AppID
-and AppSecret it is given; a mini program session reads the account's name and services, never
-its files. Off by default: the account page then says that the server does not offer a mini
+and AppSecret it is given; a mini program session reads the account's name, services and
+devices, changes its display name, and, with a fresh sign-in of the WeChat on the phone, signs
+out and revokes the account's devices and unbinds the WeChat. It never reads files. Off by default: the account page then says that the server does not offer a mini
 program, and the mini program's API answers `404`. The API, its errors and what the mini
 program's developers set up are in [wechat-miniprogram.md](wechat-miniprogram.md).
 

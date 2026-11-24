@@ -24,7 +24,10 @@
 //!   after its last use (each use extends it, at most once per [`SEEN_GRANULARITY_SECS`]), when
 //!   its identity is unbound (the cascade of `mp_sessions`), and when the account is disabled
 //!   or deleted. An identity has at most [`MAX_SESSIONS`]: a new one ends the oldest. A session
-//!   reads the account's name and services ([`Account`]) and nothing else.
+//!   reads the account's name and services ([`Account`]); the binary also lets it read the
+//!   account's devices, change the display name, and, with a fresh sign-in code of its WeChat,
+//!   sign out or revoke the devices and unbind. It is never a credential for files, WebDAV, S3
+//!   or a page.
 //!
 //! Tickets and tokens are stored only as SHA-256 digests ([`secret::digest`]): they are random,
 //! so a fast hash is enough. Every write is one write transaction, so the unique keys, the

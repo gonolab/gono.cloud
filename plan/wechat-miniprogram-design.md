@@ -1,9 +1,8 @@
 # WeChat mini program: features and screens (design)
 
-> 2026-11-23. **Status (2026-11-24): server work partly built.** The server side of phase 1
-> (S1–S4), of phase 3's web sign-in (TP T1 in `b6e6dc6`, TP T3 in `f0b7361`) and of phase 4
-> (S13–S16, TP T4 in `38c1b4b`) is built; phase 2 (S5–S11), S12 and the device confirmation of
-> phase 3 are not. The mini program itself lives in its own repository (section 0), not here.
+> 2026-11-23. **Status (2026-11-24): server work partly built.** The server side of phases 1 and
+> 2 (S1–S11), of phase 3's web sign-in (TP T1 in `b6e6dc6`, TP T3 in `f0b7361`) and of phase 4
+> (S13–S16, TP T4 in `38c1b4b`) is built; S12 and the device confirmation of phase 3 are not. The mini program itself lives in its own repository (section 0), not here.
 > Section 9 lists the server changes and ticks the built ones; the questions still open for the
 > user are in section 10.
 >
@@ -90,8 +89,8 @@
 | Bind QR `{qr_url_prefix}bind/<ticket>` on the account page (Overview, "WeChat") | yes | 1 |
 | Look at the ticket's account before binding | yes (`bind/preview`, S4) | 1: S4 `bind/preview` |
 | `/q/` page for browsers, verification file | yes | 1 |
-| Device list, device page, sign-out, revoke | no (account page and admin UI only) | 2: S5–S9 |
-| Display name, unbind from the mini program | no (account page only; `PATCH account` changes the username only) | 2: S10, S11 |
+| Device list, device page, sign-out, revoke | yes (S5–S9) | 2: S5–S9 |
+| Display name, unbind from the mini program | yes (S10, S11) | 2: S10, S11 |
 | Confirmations `{qr_url_prefix}<ticket>`: web sign-in, device sign-in | web sign-in: yes (`scan`, `confirm`, `deny`, `flow`, TP T3); device sign-in: no | 3: TP 5.3 (T3), RD 5.1–5.2 |
 | `wechat_identities` as the WeChat rows of `external_identities` | yes (TP T1) | before phase 3: TP T1 |
 | Subscription messages, `access_token` | no | 3: S12 |
@@ -1069,12 +1068,14 @@ fields, as `/gono/v1/` allows. A ticked item is built and committed (checked aga
 
 ### Phase 2
 
-- [ ] **S5 The session's scope.** A session reads the account, its services and its devices,
+- [x] **S5 The session's scope.** A session reads the account, its services and its devices,
   and can sign out and revoke the account's devices, change the display name and unbind, each
   with a fresh code. It is still no file, WebDAV, S3 or page credential. Update the documents
   that say "reads the account's name and services, nothing else": docs/wechat-miniprogram.md,
   docs/deployment.md, the module documentation of `crates/server/core/src/wechat.rs` and
-  `crates/server/bin/src/wechat/mod.rs`, and the account page's `wechat_note`.
+  `crates/server/bin/src/wechat/mod.rs`, and the account page's `wechat_note`. Built after S11,
+  once the session could do all of it; the display name needs no fresh code (decided on
+  2026-11-24). The binding test still checks that a session opens no page and no WebDAV.
 - [x] **S6 `GET /gono/v1/wechat/devices`** (Bearer). `{"devices": [...], "limit": 50}`. Each entry
   has the P 6.1 fields without `services`, plus:
   - `short_id`, `product_name`, `platform_name`;

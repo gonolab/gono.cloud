@@ -33,8 +33,10 @@
 //! - The mini program is not a browser: there are no cookies, so neither the origin checks nor
 //!   the CSRF tokens of the pages apply. Every body is JSON of at most [`MAX_BODY_BYTES`], and
 //!   every field is checked before anything else happens.
-//! - A session reads the account's name and services and nothing else; it opens no page and
-//!   no file, WebDAV or S3 data.
+//! - A session reads the account's name, services and devices and changes its display name;
+//!   with a fresh code of the account's WeChat it signs out and revokes the account's devices
+//!   and unbinds the WeChat (the actions below). Nothing else: it opens no page and no file,
+//!   WebDAV or S3 data.
 //! - **Platform.** Every call that signs in or acts (`session`, `bind`, `bind/preview`,
 //!   `signup`, `scan`, `confirm`, `deny`, `account/delete`, `account/restore`) takes only the
 //!   phones' platforms, `ios`, `android` and `ohos` ([`check_platform`]): not desktop WeChat,
