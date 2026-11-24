@@ -1,8 +1,11 @@
 # WeChat mini program: features and screens (design)
 
-> 2026-11-23. **Status: design, nothing built.** No mini program code and no server change come with
-> this document. The server changes it needs are listed in section 9; the questions still open for
-> the user are in section 10.
+> 2026-11-23. **Status (2026-11-24): server work partly built.** The server side of phase 3's web
+> sign-in (TP T1 in `b6e6dc6`, TP T3 in `f0b7361`) and of phase 4 (S13–S16, TP T4 in `38c1b4b`)
+> is built; phase 1 (S1–S4) is being built; phase 2 (S5–S11), S12 and the device confirmation of
+> phase 3 are not. The mini program itself lives in its own repository (section 0), not here.
+> Section 9 lists the server changes and ticks the built ones; the questions still open for the
+> user are in section 10.
 >
 > Read for it: [docs/wechat-miniprogram.md](../docs/wechat-miniprogram.md) (the API the server has
 > today), `crates/server/bin/src/wechat/`, `crates/server/core/src/wechat.rs`,
@@ -86,11 +89,11 @@
 | Look at the ticket's account before binding | no | 1: S4 `bind/preview` |
 | `/q/` page for browsers, verification file | yes | 1 |
 | Device list, device page, sign-out, revoke | no (account page and admin UI only) | 2: S5–S9 |
-| Display name, unbind from the mini program | no (account page only) | 2: S10, S11 |
-| Confirmations `{qr_url_prefix}<ticket>`: web sign-in, device sign-in | no (reserved) | 3: TP 5.3 (T3), RD 5.1–5.2 |
-| `wechat_identities` as the WeChat rows of `external_identities` | no | before phase 3: TP T1 |
+| Display name, unbind from the mini program | no (account page only; `PATCH account` changes the username only) | 2: S10, S11 |
+| Confirmations `{qr_url_prefix}<ticket>`: web sign-in, device sign-in | web sign-in: yes (`scan`, `confirm`, `deny`, `flow`, TP T3); device sign-in: no | 3: TP 5.3 (T3), RD 5.1–5.2 |
+| `wechat_identities` as the WeChat rows of `external_identities` | yes (TP T1) | before phase 3: TP T1 |
 | Subscription messages, `access_token` | no | 3: S12 |
-| Sign-up, accounts without a web password, renaming, deletion in the mini program | no | 4: S13–S16 |
+| Sign-up, accounts without a web password, renaming, deletion in the mini program | yes (`signup`, `PATCH account {username}`, `account/delete`, `account/restore`, TP T4) | 4: S13–S16 |
 
 ## 3. Phases
 
@@ -1023,11 +1026,12 @@ the same phone sees none of it.
 change for that: one AppID, one more installation. No secret is in the build: the AppSecret
 lives only on the server (`wechat.secret_file`).
 
-## 9. Server changes (checklist, not done here)
+## 9. Server changes (checklist)
 
 Each change updates [docs/wechat-miniprogram.md](../docs/wechat-miniprogram.md) and, where users
 see it, docs/deployment.md "WeChat". Each one adds tests and acceptance cases. Answers only gain
-fields, as `/gono/v1/` allows.
+fields, as `/gono/v1/` allows. A ticked item is built and committed (checked against the code on
+2026-11-24).
 
 ### Phase 1
 
@@ -1098,7 +1102,7 @@ fields, as `/gono/v1/` allows.
 
 ### Phase 3
 
-- [ ] **Web sign-in by scanning: TP T3.**
+- [x] **Web sign-in by scanning: TP T3** (`f0b7361`, on TP T1 in `b6e6dc6`).
   - `scan`, `confirm`, `deny` and `flow` under `/gono/v1/wechat/` with `kind`;
   - the 6 digits typed into the browser;
   - the sign-in tickets of the web pages.
@@ -1125,7 +1129,9 @@ fields, as `/gono/v1/` allows.
 
 ### Phase 4
 
-- [ ] **S13 `POST /gono/v1/wechat/signup`** `{signup_token, terms_version, scene, platform}` →
+Built in TP T4 (`38c1b4b`).
+
+- [x] **S13 `POST /gono/v1/wechat/signup`** `{signup_token, terms_version, scene, platform}` →
   `{session, expires_at, account}`, the mini program's part of TP T4:
   - only while `[wechat] allow_signup` is on (off by default); otherwise `403 signup_closed`, and
     the mini program does not offer 新建账号;
@@ -1137,10 +1143,10 @@ fields, as `/gono/v1/` allows.
   - audit `account.created` with `via: "wechat"`, and `identity.bound` with `how: "signup"`;
   - **limits:** one account per openid, a daily cap per client network and one for the whole
     server.
-- [ ] **S14 The administrator's side** (TP 4.7). `/manage` marks accounts created by sign-up
+- [x] **S14 The administrator's side** (TP 4.7). `/manage` marks accounts created by sign-up
   (自助：微信) and can filter by it. Administrators get no notice (decided on 2026-11-23). With S12,
-  turning on a service sends 账号开通通知.
-- [ ] **S15 Deletion with a cooling-off period**, for accounts without a web password only:
+  turning on a service sends 账号开通通知: that notice is part of S12 and not built.
+- [x] **S15 Deletion with a cooling-off period**, for accounts without a web password only:
   - `POST /gono/v1/wechat/account/delete {code, platform, confirm: <username>}` → `204`. The
     account is disabled at once: its sessions end, its devices' control connections close and
     are refused, and the relay refuses them, as for a disabled account (P 10, 11.2). Their app
@@ -1154,7 +1160,7 @@ fields, as `/gono/v1/` allows.
     devices, and the retired-username rule applies (P 9.1). `/manage` shows pending deletions
     and lets an administrator cancel one or delete at once;
   - the web account page offers the same deletion (TP 4.6).
-- [ ] **S16 `PATCH /gono/v1/wechat/account {username}`**, for accounts created by sign-up,
+- [x] **S16 `PATCH /gono/v1/wechat/account {username}`**, for accounts created by sign-up,
   while the account has no app password and has never registered a device. Devices' pairing
   statements name the account by its username (P 8.3, 8.4), so a name in use by a device must
   not change. Otherwise `409 username_locked`. The new name follows `Username`'s rules (lower-case
