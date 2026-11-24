@@ -5,6 +5,7 @@
 //! |---|---|
 //! | `POST /gono/v1/wechat/session` | Exchanges the mini program's sign-in code with WeChat: a session for a bound openid, a signup token otherwise. |
 //! | `POST /gono/v1/wechat/bind` | Binds the openid of a signup token to the account of a bind ticket from the account page, and opens a session. |
+//! | `POST /gono/v1/wechat/bind/preview` | The account `bind` would bind to, after `bind`'s checks, changing nothing. |
 //! | `GET /gono/v1/wechat/account` | The name and services of the session's account (`Authorization: Bearer <session>`), which services this server offers, and since when the WeChat is bound. |
 //! | `POST /gono/v1/wechat/logout` | Ends the session. |
 //! | `POST /gono/v1/wechat/signup` | With `[wechat] allow_signup`: creates an account (no service, no password, a generated username) for the WeChat of a signup token, and opens a session. |
@@ -29,33 +30,35 @@
 //!   every field is checked before anything else happens.
 //! - A session reads the account's name and services and nothing else; it opens no page and
 //!   no file, WebDAV or S3 data.
-//! - **Platform.** Every call that signs in or acts (`session`, `bind`, `signup`, `scan`,
-//!   `confirm`, `deny`, `account/delete`, `account/restore`) takes only the phones' platforms,
-//!   `ios`, `android` and `ohos` ([`check_platform`]): not desktop WeChat, not the developer
-//!   tools.
+//! - **Platform.** Every call that signs in or acts (`session`, `bind`, `bind/preview`,
+//!   `signup`, `scan`, `confirm`, `deny`, `account/delete`, `account/restore`) takes only the
+//!   phones' platforms, `ios`, `android` and `ohos` ([`check_platform`]): not desktop WeChat,
+//!   not the developer tools.
 //! - **Scene.** Binding gives a WeChat user the account's mini program sessions and the right
 //!   to confirm sign-ins on the web, so a QR code forwarded to someone else must not bind.
-//!   `bind` (and `scan`, `confirm`, `deny`) therefore also take only the scenes of scanning
-//!   with the phone's camera, 1011 (a QR code) and 1047 (a mini program code) ([`check_client`]):
-//!   not a code recognized in an image (1012, 1048) or picked from the album (1013, 1049), not a
-//!   shared card (1007, 1008). `session` and `signup` take any scene: a WeChat that is bound
-//!   already is the account's, so it signs in again however the mini program was opened, and a
-//!   signup token binds nothing without a ticket and `bind`'s scene check.
+//!   `bind` (and `bind/preview`, `scan`, `confirm`, `deny`) therefore also take only the scenes
+//!   of scanning with the phone's camera, 1011 (a QR code) and 1047 (a mini program code)
+//!   ([`check_client`]): not a code recognized in an image (1012, 1048) or picked from the
+//!   album (1013, 1049), not a shared card (1007, 1008). `session` and `signup` take any scene:
+//!   a WeChat that is bound already is the account's, so it signs in again however the mini
+//!   program was opened, and a signup token binds nothing without a ticket and `bind`'s scene
+//!   check.
 //! - **The in-app scanner.** A code read by the mini program's own scanner
 //!   (`wx.scanCode({onlyFromCamera: true})`: the camera only, no album, no image) is as good as
 //!   a scan, but the scene then says how the mini program was opened (the chat list, say). So
-//!   `bind`, `scan`, `confirm` and `deny` take `"source": "scan_code"` in place of the scene
-//!   ([`check_scanned`]); the platform rule stays.
+//!   `bind`, `bind/preview`, `scan`, `confirm` and `deny` take `"source": "scan_code"` in place
+//!   of the scene ([`check_scanned`]); the platform rule stays.
 //! - The mini program reports all of this (`wx.getEnterOptionsSync().scene`,
 //!   `wx.getDeviceInfo().platform`, `source`): the checks are a safeguard against mistakes and
 //!   lures, not proof.
 //! - **Limits.** Each client address has a token bucket like the sign-in pages'
-//!   ([`RateLimiter`]). `session` and `bind` are refused while the bucket is empty, before
-//!   anything in them is checked or WeChat is asked, and every one that does not succeed takes
-//!   a token (an invalid code, a refused scene, an expired ticket, ...). A successful one costs
-//!   nothing, so that the users of the mini program behind one address (a carrier's NAT) do
-//!   not lock each other out. `account` and `logout` cost a token only for a bearer token that
-//!   is no session, and are refused for those only, as device authentication is.
+//!   ([`RateLimiter`]). `session`, `bind`, `bind/preview` and the other calls that sign in or
+//!   act are refused while the bucket is empty, before anything in them is checked or WeChat is
+//!   asked, and every one that does not succeed takes a token (an invalid code, a refused
+//!   scene, an expired ticket, ...). A successful one costs nothing, so that the users of the
+//!   mini program behind one address (a carrier's NAT) do not lock each other out. `account`
+//!   and `logout` cost a token only for a bearer token that is no session, and are refused for
+//!   those only, as device authentication is.
 //! - Tickets, tokens, codes and openids never reach the log (the paths below `/q/` are
 //!   redacted by [`crate::request_log`]); lines name the account instead.
 
@@ -86,7 +89,9 @@ use gono_server_core::{
     services::Service,
     users,
     web_sessions::SessionUser,
-    wechat::{self as store, Account, Bind, Locked, Lookup, NewSession, Purpose, SignIn, Stage},
+    wechat::{
+        self as store, Account, Bind, Locked, Lookup, NewSession, Preview, Purpose, SignIn, Stage,
+    },
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -114,8 +119,8 @@ pub const MAX_BODY_BYTES: usize = 4 * 1024;
 /// The largest verification file, in bytes; WeChat's hold a few dozen.
 const MAX_VERIFY_FILE_BYTES: u64 = 4 * 1024;
 
-/// The scenes `bind` (and `scan`, `confirm`, `deny`) take: scanning a QR code (1011) or a mini
-/// program code (1047) with WeChat's scanner.
+/// The scenes `bind` (and `bind/preview`, `scan`, `confirm`, `deny`) take: scanning a QR code
+/// (1011) or a mini program code (1047) with WeChat's scanner.
 pub const SCENES: [u32; 2] = [1011, 1047];
 
 /// The platforms every call that signs in or acts takes: WeChat on a phone.
@@ -400,6 +405,10 @@ pub fn routes(wechat: Option<&WeChat>) -> Router<AppState> {
                 post(session).fallback(not_found),
             )
             .route(&format!("{API_PATH}/bind"), post(bind).fallback(not_found))
+            .route(
+                &format!("{API_PATH}/bind/preview"),
+                post(bind_preview).fallback(not_found),
+            )
             .route(
                 &format!("{API_PATH}/account"),
                 get(account).patch(rename).fallback(not_found),
@@ -691,6 +700,28 @@ pub async fn bind(
     wechat.charge(client, response)
 }
 
+/// The request of `bind` or `bind/preview`, parsed and checked: its shapes, then the platform
+/// and the scene (or the in-app scanner).
+fn bind_request(body: Result<Bytes, BytesRejection>) -> Result<BindRequest, Box<Response>> {
+    let request: BindRequest = parse(body)?;
+    if !store::is_token(&request.signup_token) || !store::is_ticket(&request.ticket) {
+        return Err(Box::new(bad_request()));
+    }
+    check_scanned(request.scene, &request.platform, request.source.as_deref())?;
+    Ok(request)
+}
+
+/// The answer to a refusal of `bind` (or of `bind/preview`, which refuses as `bind` would).
+fn bind_refused(refused: &Bind) -> Response {
+    match refused {
+        Bind::SessionExpired => not_signed_in("session_expired"),
+        Bind::TicketExpired | Bind::Bound { .. } => error(StatusCode::GONE, "ticket_expired"),
+        Bind::Disabled => error(StatusCode::FORBIDDEN, "account_disabled"),
+        Bind::AccountExists => error(StatusCode::CONFLICT, "account_exists"),
+        Bind::BindFailed => error(StatusCode::CONFLICT, "bind_failed"),
+    }
+}
+
 /// The answer of `bind` to an admitted `client`.
 async fn bind_with(
     state: &AppState,
@@ -698,18 +729,10 @@ async fn bind_with(
     client: IpAddr,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    let request: BindRequest = match parse(body) {
+    let request = match bind_request(body) {
         Ok(request) => request,
         Err(response) => return *response,
     };
-    if !store::is_token(&request.signup_token) || !store::is_ticket(&request.ticket) {
-        return bad_request();
-    }
-    if let Err(response) =
-        check_scanned(request.scene, &request.platform, request.source.as_deref())
-    {
-        return *response;
-    }
     let bound = store::bind(
         &state.db,
         &wechat.app_id,
@@ -724,13 +747,69 @@ async fn bind_with(
             tracing::info!(%client, user = %account.username, app_id = %wechat.app_id, "WeChat bound to an account");
             signed_in(state, &session, &account)
         }
-        Ok(Bind::SessionExpired) => not_signed_in("session_expired"),
-        Ok(Bind::TicketExpired) => error(StatusCode::GONE, "ticket_expired"),
-        Ok(Bind::Disabled) => error(StatusCode::FORBIDDEN, "account_disabled"),
-        Ok(Bind::AccountExists) => error(StatusCode::CONFLICT, "account_exists"),
-        Ok(Bind::BindFailed) => error(StatusCode::CONFLICT, "bind_failed"),
+        Ok(refused) => bind_refused(&refused),
         Err(err) => {
             tracing::error!(error = %err, "cannot bind WeChat to an account");
+            unavailable()
+        }
+    }
+}
+
+/// `POST /gono/v1/wechat/bind/preview`: the account the ticket binds to, so that the mini
+/// program can name it before the user binds. It takes `bind`'s body, makes `bind`'s checks in
+/// `bind`'s order and refuses with `bind`'s errors, but changes nothing and uses nothing up
+/// ([`store::preview`]). A refusal takes a token of the client's bucket, as in `bind`. It tells
+/// the account's name to whoever holds the ticket, who could bind with it anyway.
+pub async fn bind_preview(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let wechat = match wechat_of(&state) {
+        Ok(wechat) => wechat,
+        Err(response) => return *response,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    if let Err(response) = wechat.admit(client) {
+        return *response;
+    }
+    let response = preview_with(&state, &wechat, body).await;
+    wechat.charge(client, response)
+}
+
+/// The answer of `bind/preview` to an admitted client.
+async fn preview_with(
+    state: &AppState,
+    wechat: &WeChat,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let request = match bind_request(body) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    let previewed = store::preview(
+        &state.db,
+        &wechat.app_id,
+        &request.signup_token,
+        &request.ticket,
+        db::unix_now(),
+    )
+    .await;
+    match previewed {
+        Ok(Preview::Ready(found)) => json(
+            StatusCode::OK,
+            &serde_json::json!({
+                "account": {
+                    "username": found.username.as_str(),
+                    "display_name": found.display_name,
+                },
+                "expires_at": found.expires_at,
+            }),
+        ),
+        Ok(Preview::Refused(refused)) => bind_refused(&refused),
+        Err(err) => {
+            tracing::error!(error = %err, "cannot look a bind ticket up");
             unavailable()
         }
     }

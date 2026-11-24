@@ -10,8 +10,8 @@ use gono_server_core::{
     services::Services,
     users::{self, NewUser},
     wechat::{
-        self, Bind, Lookup, MAX_SESSIONS, NewSession, NewTicket, SEEN_GRANULARITY_SECS,
-        SESSION_TTL_SECS, SIGNUP_TTL_SECS, SignIn, TICKET_TTL_SECS,
+        self, Bind, Lookup, MAX_SESSIONS, NewSession, NewTicket, Preview, SEEN_GRANULARITY_SECS,
+        SESSION_TTL_SECS, SIGNUP_TTL_SECS, SignIn, TICKET_TTL_SECS, TicketAccount,
     },
 };
 use secrecy::{ExposeSecret as _, SecretString};
@@ -282,6 +282,124 @@ async fn a_ticket_binds_the_openid_of_a_signup_token() {
         panic!("no session");
     };
     assert_eq!(account.bound_at, NOW + 5);
+}
+
+/// What a preview of `token` and `ticket` at `now` answers: the account, or the code of the
+/// refusal.
+async fn preview(
+    pool: &Pool,
+    token: &str,
+    ticket: &str,
+    now: i64,
+) -> Result<TicketAccount, &'static str> {
+    match wechat::preview(pool, APP, token, ticket, now)
+        .await
+        .unwrap()
+    {
+        Preview::Ready(found) => Ok(found),
+        Preview::Refused(Bind::SessionExpired) => Err("session_expired"),
+        Preview::Refused(Bind::TicketExpired) => Err("ticket_expired"),
+        Preview::Refused(Bind::Disabled) => Err("account_disabled"),
+        Preview::Refused(Bind::AccountExists) => Err("account_exists"),
+        Preview::Refused(Bind::BindFailed) => Err("bind_failed"),
+        Preview::Refused(Bind::Bound { .. }) => panic!("a preview bound"),
+    }
+}
+
+#[tokio::test]
+async fn a_preview_names_the_account_and_uses_nothing_up() {
+    let (_dir, pool, alice, bob) = fixture().await;
+    let ticket = new_ticket(&pool, alice, NOW).await;
+    let token = signup(&pool, APP, ALICE_OPENID, NOW).await;
+    let ready = TicketAccount {
+        username: Username::new("alice").unwrap(),
+        display_name: "alice Example".to_owned(),
+        expires_at: NOW + TICKET_TTL_SECS,
+    };
+    // As often as the mini program asks: nothing is used up, bound, opened or recorded.
+    for at in [NOW + 1, NOW + 2] {
+        assert_eq!(preview(&pool, &token, &ticket, at).await, Ok(ready.clone()));
+    }
+    assert!(
+        wechat::ticket_is_live(&pool, alice, &ticket, NOW + 2)
+            .await
+            .unwrap()
+    );
+    assert_eq!(identity(&pool, alice, APP).await, None);
+    assert_eq!(session_count(&pool, alice).await, 0);
+    assert!(audit_entries(&pool, alice).await.is_empty());
+
+    // `bind`'s checks in `bind`'s order: the token first, then the ticket, then its account.
+    let unknown_token = "a".repeat(wechat::TOKEN_CHARS);
+    let unknown_ticket = "b".repeat(wechat::TICKET_CHARS);
+    assert_eq!(
+        preview(&pool, &unknown_token, &unknown_ticket, NOW + 3).await,
+        Err("session_expired")
+    );
+    let other_app = signup(&pool, OTHER_APP, BOB_OPENID, NOW + 3).await;
+    assert_eq!(
+        preview(&pool, &other_app, &ticket, NOW + 3).await,
+        Err("session_expired")
+    );
+    assert_eq!(
+        preview(&pool, &token, &unknown_ticket, NOW + 3).await,
+        Err("ticket_expired")
+    );
+    // An expired ticket, with a live token (another WeChat's: a new one would end `token`).
+    let late = signup(&pool, APP, "oLate", NOW + TICKET_TTL_SECS).await;
+    assert_eq!(
+        preview(&pool, &late, &ticket, NOW + TICKET_TTL_SECS).await,
+        Err("ticket_expired")
+    );
+    let bobs = new_ticket(&pool, bob, NOW + 3).await;
+    let bob_name = Username::new("bob").unwrap();
+    users::set_enabled(&pool, &bob_name, false).await.unwrap();
+    assert_eq!(
+        preview(&pool, &token, &bobs, NOW + 3).await,
+        Err("account_disabled")
+    );
+    users::set_enabled(&pool, &bob_name, true).await.unwrap();
+
+    // The openid was bound to another account meanwhile: unlike `bind`, the token stays.
+    let carols = signup(&pool, APP, "oCarol", NOW + 4).await;
+    insert_identity(&pool, bob, APP, "oCarol").await.unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            preview(&pool, &carols, &ticket, NOW + 4).await,
+            Err("account_exists")
+        );
+    }
+    // The ticket's account got another openid meanwhile: unlike `bind`, the ticket stays.
+    let daves = signup(&pool, APP, "oDave", NOW + 4).await;
+    for _ in 0..2 {
+        assert_eq!(
+            preview(&pool, &daves, &bobs, NOW + 4).await,
+            Err("bind_failed")
+        );
+    }
+    assert!(
+        wechat::ticket_is_live(&pool, bob, &bobs, NOW + 4)
+            .await
+            .unwrap()
+    );
+    assert_eq!(count(&pool, "external_identities", bob).await, 1);
+
+    // The same token and ticket still bind; then the preview says they are used up.
+    assert!(matches!(
+        wechat::bind(&pool, APP, &token, &ticket, None, NOW + 5)
+            .await
+            .unwrap(),
+        Bind::Bound { .. }
+    ));
+    assert_eq!(
+        preview(&pool, &token, &ticket, NOW + 5).await,
+        Err("session_expired")
+    );
+    let again = signup(&pool, APP, "oErin", NOW + 5).await;
+    assert_eq!(
+        preview(&pool, &again, &ticket, NOW + 5).await,
+        Err("ticket_expired")
+    );
 }
 
 #[tokio::test]

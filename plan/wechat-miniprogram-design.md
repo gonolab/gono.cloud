@@ -1,8 +1,8 @@
 # WeChat mini program: features and screens (design)
 
-> 2026-11-23. **Status (2026-11-24): server work partly built.** The server side of phase 3's web
-> sign-in (TP T1 in `b6e6dc6`, TP T3 in `f0b7361`) and of phase 4 (S13–S16, TP T4 in `38c1b4b`)
-> is built; phase 1 (S1–S4) is being built; phase 2 (S5–S11), S12 and the device confirmation of
+> 2026-11-23. **Status (2026-11-24): server work partly built.** The server side of phase 1
+> (S1–S4), of phase 3's web sign-in (TP T1 in `b6e6dc6`, TP T3 in `f0b7361`) and of phase 4
+> (S13–S16, TP T4 in `38c1b4b`) is built; phase 2 (S5–S11), S12 and the device confirmation of
 > phase 3 are not. The mini program itself lives in its own repository (section 0), not here.
 > Section 9 lists the server changes and ticks the built ones; the questions still open for the
 > user are in section 10.
@@ -86,7 +86,7 @@
 | `GET /gono/v1/wechat/account` (username, display name, five switches) | yes, with `offered` and `bound_at` (S2) | 1: S2 adds `offered` and `bound_at` |
 | `POST /gono/v1/wechat/logout` | yes | 1 |
 | Bind QR `{qr_url_prefix}bind/<ticket>` on the account page (Overview, "WeChat") | yes | 1 |
-| Look at the ticket's account before binding | no | 1: S4 `bind/preview` |
+| Look at the ticket's account before binding | yes (`bind/preview`, S4) | 1: S4 `bind/preview` |
 | `/q/` page for browsers, verification file | yes | 1 |
 | Device list, device page, sign-out, revoke | no (account page and admin UI only) | 2: S5–S9 |
 | Display name, unbind from the mini program | no (account page only; `PATCH account` changes the username only) | 2: S10, S11 |
@@ -1057,12 +1057,13 @@ fields, as `/gono/v1/` allows. A ticked item is built and committed (checked aga
   correct use, and that it is a claim of the mini program, like the scene. Built with `scan`'s
   check (T3 had it there already); another `source` is `bad_request`. `bind/preview` takes it
   with S4.
-- [ ] **S4 `POST /gono/v1/wechat/bind/preview`.** Body as `bind`. `200
+- [x] **S4 `POST /gono/v1/wechat/bind/preview`.** Body as `bind`. `200
   {"account": {"username", "display_name"}, "expires_at": <the ticket's>}`. It changes nothing
   and uses nothing up. It runs `bind`'s checks in `bind`'s order, with the same errors, but
   `account_exists` and `bind_failed` end neither the token nor the ticket. Refusals take a token
   of the limiter, as in `bind`. It reveals the username to whoever holds the ticket, who could
-  bind with it anyway.
+  bind with it anyway. Built on the checks `bind` itself runs (`wechat::preview`, with
+  `identities::check_bind_in` shared with `bind_in`), in a write transaction it rolls back.
 
 ### Phase 2
 

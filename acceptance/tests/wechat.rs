@@ -156,3 +156,51 @@ async fn the_in_app_scanner_counts_as_a_scan() {
         assert_error(&bind, status, code);
     }
 }
+
+/// `bind/preview` takes `bind`'s body, makes `bind`'s checks in `bind`'s order and refuses with
+/// `bind`'s errors: the phone rule, the scene rule or the in-app scanner, the shapes of the
+/// token and the ticket, and then a signup token that does not exist. Only `POST` answers.
+#[tokio::test]
+async fn the_preview_of_a_binding_checks_what_binding_checks() {
+    let Some(ctx) = wechat_ctx() else { return };
+    let body = |token: String, scene: u32, platform: &str, source: &str| {
+        json!({
+            "signup_token": token,
+            "ticket": random_token(22),
+            "scene": scene,
+            "platform": platform,
+            "source": source,
+        })
+    };
+    for (body, status, code) in [
+        (
+            body(random_token(43), 1011, "devtools", "enter"),
+            403,
+            "desktop_client",
+        ),
+        (
+            body(random_token(43), 1001, "ios", "enter"),
+            403,
+            "wrong_scene",
+        ),
+        (
+            body("short".to_owned(), 1011, "ios", "enter"),
+            400,
+            "bad_request",
+        ),
+        (
+            body(random_token(43), 1001, "ohos", "scan_code"),
+            401,
+            "session_expired",
+        ),
+    ] {
+        let preview = post(&ctx, "bind/preview", &body).await;
+        assert_error(&preview, status, code);
+    }
+    let get = send(
+        &ctx.http,
+        ctx.http.get(ctx.url("/gono/v1/wechat/bind/preview")),
+    )
+    .await;
+    assert_error(&get, 404, "not_found");
+}

@@ -537,8 +537,43 @@ pub enum Bound {
     NoAccount,
 }
 
+/// What [`bind_in`] would find for the identity of `claims` and account `user_id` inside `tx`,
+/// without binding anything: `None` when it would bind, otherwise [`Bound::Already`] or the
+/// refusal ([`Bound::NoAccount`], [`Bound::OtherAccount`], [`Bound::AccountHasOne`]), checked
+/// in that order.
+pub(crate) async fn check_bind_in(
+    tx: &mut Tx,
+    user_id: i64,
+    claims: &Claims,
+) -> Result<Option<Bound>> {
+    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if exists.is_none() {
+        return Ok(Some(Bound::NoAccount));
+    }
+    if let Some(identity) = find_in(tx, claims.provider, &claims.realm, &claims.subject).await? {
+        return Ok(Some(if identity.user_id == user_id {
+            Bound::Already(identity)
+        } else {
+            Bound::OtherAccount
+        }));
+    }
+    let other: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM external_identities WHERE user_id = ? AND provider = ? AND realm = ?",
+    )
+    .bind(user_id)
+    .bind(claims.provider.as_str())
+    .bind(&claims.realm)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(other.is_some().then_some(Bound::AccountHasOne))
+}
+
 /// Binds the identity of `claims` to account `user_id` inside `tx` and records
-/// `identity.bound` by `actor`, `how`. See [`Bound`] for the refusals, which change nothing.
+/// `identity.bound` by `actor`, `how`. See [`Bound`] for the refusals, which change nothing;
+/// [`check_bind_in`] makes the checks.
 pub(crate) async fn bind_in(
     tx: &mut Tx,
     user_id: i64,
@@ -549,30 +584,8 @@ pub(crate) async fn bind_in(
     now: i64,
 ) -> Result<Bound> {
     let claims = claims.checked()?;
-    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
-        .bind(user_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-    if exists.is_none() {
-        return Ok(Bound::NoAccount);
-    }
-    if let Some(identity) = find_in(tx, claims.provider, &claims.realm, &claims.subject).await? {
-        return Ok(if identity.user_id == user_id {
-            Bound::Already(identity)
-        } else {
-            Bound::OtherAccount
-        });
-    }
-    let other: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM external_identities WHERE user_id = ? AND provider = ? AND realm = ?",
-    )
-    .bind(user_id)
-    .bind(claims.provider.as_str())
-    .bind(&claims.realm)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if other.is_some() {
-        return Ok(Bound::AccountHasOne);
+    if let Some(found) = check_bind_in(tx, user_id, &claims).await? {
+        return Ok(found);
     }
     let id = db::next_id(tx, "external_identities").await?;
     let inserted = sqlx::query(

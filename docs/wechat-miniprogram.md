@@ -40,8 +40,11 @@ turns it on is in [deployment.md](deployment.md#wechat), what the reverse proxy 
      bind it to another account, the user unbinds it on that account's page first. The ticket
      stays unused.
    - the WeChat is bound to no account: the answer is a signup token, valid for 10 minutes.
-4. **Binding.** `POST /gono/v1/wechat/bind` with the signup token and the ticket binds the
-   WeChat to the ticket's account and answers with a session. The ticket is used up.
+4. **Binding.** `POST /gono/v1/wechat/bind/preview` with the signup token and the ticket names
+   the ticket's account, so that the mini program can show it and ask "bind to this account?"
+   (a QR code someone else sent the user would name someone else's account). It uses nothing
+   up. On the user's yes, `POST /gono/v1/wechat/bind` with the same body binds the WeChat to the
+   ticket's account and answers with a session. The ticket is used up.
 5. **Using the session.** The mini program keeps the session (`wx.setStorageSync`) and sends it
    as `Authorization: Bearer <session>` to `GET /gono/v1/wechat/account`; `POST
    /gono/v1/wechat/logout` ends it.
@@ -77,12 +80,12 @@ to have been opened by scanning a code:
 | Field | Accepted | Refused with |
 |---|---|---|
 | `platform`, from `wx.getDeviceInfo().platform` (`wx.getSystemInfoSync().platform` before base library 2.20.1) | `ios`, `android`, `ohos` | `desktop_client`: `windows`, `mac`, `ohos_pc`, `devtools` and every other value |
-| `scene`, from `wx.getEnterOptionsSync().scene`, checked by `bind`, `scan`, `confirm` and `deny` only, and not with `"source": "scan_code"` | `1011` (a QR code scanned with Scan), `1047` (a mini program code scanned with Scan) | `wrong_scene`: `1012` and `1048` (a code recognized in an image by a long press), `1013` and `1049` (a code picked from the album), `1007` and `1008` (a shared card in a chat), `1001` (the chat list), ... and every other value |
+| `scene`, from `wx.getEnterOptionsSync().scene`, checked by `bind`, `bind/preview`, `scan`, `confirm` and `deny` only, and not with `"source": "scan_code"` | `1011` (a QR code scanned with Scan), `1047` (a mini program code scanned with Scan) | `wrong_scene`: `1012` and `1048` (a code recognized in an image by a long press), `1013` and `1049` (a code picked from the album), `1007` and `1008` (a shared card in a chat), `1001` (the chat list), ... and every other value |
 
 | Call | Platform | Scene |
 |---|---|---|
 | `session`, `signup` | a phone | any (still sent) |
-| `bind`, `scan`, `confirm`, `deny` | a phone | `1011` or `1047`, or any with `"source": "scan_code"` |
+| `bind`, `bind/preview`, `scan`, `confirm`, `deny` | a phone | `1011` or `1047`, or any with `"source": "scan_code"` |
 | `account/delete`, `account/restore` | a phone | none sent |
 | `account`, `logout`, `PATCH account`, `flow` | none | none |
 
@@ -213,6 +216,29 @@ The signup token is checked first, then the ticket:
 
 Also `bad_request` (a malformed token or ticket among them), `desktop_client`, `wrong_scene`,
 `rate_limited` and `unavailable`.
+
+### `POST /gono/v1/wechat/bind/preview`
+
+The account a binding would bind to, before binding. No authentication. The body is `bind`'s,
+`source` included.
+
+`200`:
+
+```json
+{
+  "account": { "username": "alice", "display_name": "Alice Example" },
+  "expires_at": 1765408600
+}
+```
+
+- `account` is the ticket's account; `expires_at` is when the ticket (the QR code) ends, which
+  the confirmation can show.
+- It checks what `bind` checks, in `bind`'s order, and refuses with `bind`'s errors, but it
+  changes nothing and uses nothing up: after `account_exists` the signup token still stands,
+  after `bind_failed` the ticket does, and after a `200` both do. A `bind` that follows can
+  still be refused, if something changed in between.
+- A refusal takes a token of the client's bucket, as in `bind`. Whoever holds the ticket learns
+  the account's name, as they would by binding with it.
 
 ### `GET /gono/v1/wechat/account`
 
@@ -362,7 +388,7 @@ are limited like `bind`.
 | `bad_request` | 400 | The body is not the JSON the endpoint takes, or a field has the wrong form. |
 | `code_invalid` | 400 | WeChat refused the code: invalid, expired or used. |
 | `not_signed_in` | 401 | No session, or one that does not exist (any more). |
-| `session_expired` | 401 | The session was not used for 30 days; or, from `bind`, the signup token is gone. |
+| `session_expired` | 401 | The session was not used for 30 days; or, from `bind` and `bind/preview`, the signup token is gone. |
 | `risky_user` | 403 | WeChat refuses this user as risky (its 40226). |
 | `wrong_scene` | 403 | `bind`, `scan`, `confirm`, `deny`: the mini program was not opened by scanning ([Scenes and platforms](#scenes-and-platforms)). |
 | `desktop_client` | 403 | The mini program runs on a desktop or in the developer tools. |
@@ -383,9 +409,9 @@ are limited like `bind`.
 | `unavailable` | 503 | WeChat could not be reached or failed, or the server's database did; `Retry-After: 30`. |
 
 **Rate limits.** Each client address (IPv6: each `/64`) has a bucket of 20 failures that
-refills by one every 10 seconds, as the server's sign-in pages do. A `session` or `bind` that
-does not succeed takes one, and while the bucket is empty both answer `rate_limited` without
-doing anything. Successful ones cost nothing, so that many users behind one address (a
+refills by one every 10 seconds, as the server's sign-in pages do. A `session`, `bind` or
+`bind/preview` that does not succeed takes one (so do the other calls that sign in or act), and
+while the bucket is empty they answer `rate_limited` without doing anything. Successful ones cost nothing, so that many users behind one address (a
 carrier's NAT) do not lock each other out. `account` and `logout` take one only for a bearer
 token that is no session, and are refused only for those. When WeChat's own limit refuses the
 server (its 45011), `session` answers `rate_limited` with `Retry-After: 60`.

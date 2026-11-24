@@ -11,8 +11,10 @@
 //!   caller confirmed it is the account's user), which the page shows as a QR code. The mini
 //!   program that scans it first signs in ([`sign_in`]); as its openid is bound to no account
 //!   yet, it gets a signup token for that openid (a pending identity held by the mini program),
-//!   and then binds it with the ticket ([`bind`]). Binding gives that WeChat user the account's
-//!   mini program sessions; unbinding ([`crate::identities::unbind`]) takes them away again.
+//!   and then binds it with the ticket ([`bind`]). Before that, [`preview`] names the ticket's
+//!   account with `bind`'s checks, using nothing up, so that the user sees which account the
+//!   code binds to. Binding gives that WeChat user the account's mini program sessions;
+//!   unbinding ([`crate::identities::unbind`]) takes them away again.
 //! - **Tickets** are 128 random bits ([`TICKET_CHARS`]), valid for [`TICKET_TTL_SECS`] and used
 //!   up by the binding they make. A new ticket ends the account's earlier ones.
 //! - **Signup tokens** are 256 random bits, valid for [`SIGNUP_TTL_SECS`], bound to the openid
@@ -386,6 +388,60 @@ pub enum Bind {
     BindFailed,
 }
 
+/// What the checks of [`bind`] found before it binds.
+struct Checked {
+    /// The live signup token.
+    signup: identities::Pending,
+    /// The live ticket's row and when it ends.
+    ticket_id: i64,
+    ticket_expires_at: i64,
+    /// The ticket's account, enabled.
+    row: AccountRow,
+}
+
+/// The first checks of [`bind`], inside `tx`, in its order: the signup token
+/// ([`Bind::SessionExpired`]), the ticket ([`Bind::TicketExpired`]) and its account
+/// ([`Bind::Disabled`]). `Err` holds the refusal.
+async fn check_bind(
+    tx: &mut db::Tx,
+    app_id: &str,
+    signup_token: &str,
+    ticket: &str,
+    now: i64,
+) -> Result<std::result::Result<Checked, Bind>> {
+    let signup = identities::pending_in(tx, Holder::MiniProgram, signup_token, now)
+        .await?
+        .filter(|pending| {
+            pending.claims.provider == Provider::WeChat && pending.claims.realm == app_id
+        });
+    let Some(signup) = signup else {
+        return Ok(Err(Bind::SessionExpired));
+    };
+    let ticket_row: Option<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT id, user_id, expires_at FROM wechat_bind_tickets \
+         WHERE ticket_hash = ? AND expires_at > ?",
+    )
+    .bind(&secret::digest(ticket)[..])
+    .bind(now)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((ticket_id, user_id, ticket_expires_at)) = ticket_row else {
+        return Ok(Err(Bind::TicketExpired));
+    };
+    let Some(row) = account_in(tx, user_id).await? else {
+        return Ok(Err(Bind::TicketExpired));
+    };
+    if !row.enabled {
+        return Ok(Err(Bind::Disabled));
+    }
+    Ok(Ok(Checked {
+        signup,
+        ticket_id,
+        ticket_expires_at,
+        row,
+    }))
+}
+
 /// Binds the openid of the live signup token `signup_token` of AppID `app_id` to the account
 /// of the live bind ticket `ticket`, uses both up, opens a session and records
 /// `identity.bound` (`how: "mini_program"`). See [`Bind`] for the refusals; every check and the
@@ -399,30 +455,16 @@ pub async fn bind(
     now: i64,
 ) -> Result<Bind> {
     let mut tx = db::begin_immediate(pool).await?;
-    let signup = identities::pending_in(&mut tx, Holder::MiniProgram, signup_token, now)
-        .await?
-        .filter(|pending| {
-            pending.claims.provider == Provider::WeChat && pending.claims.realm == app_id
-        });
-    let Some(signup) = signup else {
-        return Ok(Bind::SessionExpired);
+    let Checked {
+        signup,
+        ticket_id,
+        row,
+        ..
+    } = match check_bind(&mut tx, app_id, signup_token, ticket, now).await? {
+        Ok(checked) => checked,
+        Err(refused) => return Ok(refused),
     };
-    let ticket_row: Option<(i64, i64)> = sqlx::query_as(
-        "SELECT id, user_id FROM wechat_bind_tickets WHERE ticket_hash = ? AND expires_at > ?",
-    )
-    .bind(&secret::digest(ticket)[..])
-    .bind(now)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some((ticket_id, user_id)) = ticket_row else {
-        return Ok(Bind::TicketExpired);
-    };
-    let Some(row) = account_in(&mut tx, user_id).await? else {
-        return Ok(Bind::TicketExpired);
-    };
-    if !row.enabled {
-        return Ok(Bind::Disabled);
-    }
+    let user_id = row.id;
     let bound = identities::bind_in(
         &mut tx,
         user_id,
@@ -456,6 +498,66 @@ pub async fn bind(
     let account = row.into_account(identity.created_at)?;
     tx.commit().await?;
     Ok(Bind::Bound { session, account })
+}
+
+/// The account a bind ticket binds to, as [`preview`] shows it before binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketAccount {
+    /// Its login name.
+    pub username: Username,
+    /// Its display name.
+    pub display_name: String,
+    /// When the ticket ends, UNIX seconds.
+    pub expires_at: i64,
+}
+
+/// Outcome of [`preview`].
+#[derive(Debug)]
+pub enum Preview {
+    /// [`bind`] would bind the openid to this account now (or find it bound to it already).
+    Ready(TicketAccount),
+    /// [`bind`] would refuse so; never [`Bind::Bound`].
+    Refused(Bind),
+}
+
+/// What [`bind`] would do with `signup_token` and `ticket` now, without doing it: the ticket's
+/// account, or the refusal `bind` would answer, after the same checks in the same order. It
+/// changes nothing and uses nothing up: unlike `bind`, its [`Bind::AccountExists`] ends no
+/// token and its [`Bind::BindFailed`] no ticket. It runs in a write transaction that it rolls
+/// back, so that it sees what `bind` would see.
+pub async fn preview(
+    pool: &Pool,
+    app_id: &str,
+    signup_token: &str,
+    ticket: &str,
+    now: i64,
+) -> Result<Preview> {
+    let mut tx = db::begin_immediate(pool).await?;
+    let Checked {
+        signup,
+        ticket_expires_at,
+        row,
+        ..
+    } = match check_bind(&mut tx, app_id, signup_token, ticket, now).await? {
+        Ok(checked) => checked,
+        Err(refused) => return Ok(Preview::Refused(refused)),
+    };
+    let refused = match identities::check_bind_in(&mut tx, row.id, &signup.claims).await? {
+        None | Some(Bound::Already(_) | Bound::Bound(_)) => None,
+        Some(Bound::OtherAccount) => Some(Bind::AccountExists),
+        Some(Bound::AccountHasOne) => Some(Bind::BindFailed),
+        Some(Bound::NoAccount) => Some(Bind::TicketExpired),
+    };
+    // Dropping `tx` rolls it back: nothing was written.
+    drop(tx);
+    if let Some(refused) = refused {
+        return Ok(Preview::Refused(refused));
+    }
+    Ok(Preview::Ready(TicketAccount {
+        username: Username::new(row.username)?,
+        display_name: row.display_name,
+        expires_at: ticket_expires_at,
+    }))
 }
 
 /// Ends bind ticket `id` inside `tx`.

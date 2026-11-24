@@ -640,6 +640,114 @@ async fn signing_in_needs_a_phone_and_binding_a_scan_too() {
 }
 
 #[tokio::test]
+async fn the_mini_program_names_the_account_before_it_binds() {
+    let (f, api, wechat) = with_wechat(None).await;
+    let mut browser = Browser::new(&f.state);
+    let csrf = browser.sign_in().await;
+    let ticket = show_qr(&mut browser, &csrf, &wechat).await;
+    let mini = Mini::new(&f);
+    let token = mini.signup(&api, "code-1", BOB_OPENID).await;
+    let body = |scene: u32, platform: &str, source: &str| {
+        json!({
+            "signup_token": token,
+            "ticket": ticket,
+            "scene": scene,
+            "platform": platform,
+            "source": source,
+        })
+    };
+    let preview = mini
+        .post("/gono/v1/wechat/bind/preview", &body(1011, "ios", "enter"))
+        .await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.json());
+    assert_eq!(preview.header("cache-control"), "no-store");
+    let expires_at = preview.json()["expires_at"].as_i64().unwrap();
+    assert!(expires_at > db::unix_now() && expires_at <= db::unix_now() + 600);
+    assert_eq!(
+        preview.json(),
+        json!({
+            "account": { "username": "alice", "display_name": "Alice Example" },
+            "expires_at": expires_at,
+        })
+    );
+    // The in-app scanner works for it as for `bind`.
+    let scanned = mini
+        .post(
+            "/gono/v1/wechat/bind/preview",
+            &body(1001, "android", "scan_code"),
+        )
+        .await;
+    assert_eq!(scanned.json(), preview.json());
+    // And so do `bind`'s rules and errors.
+    let mut address = 10;
+    for (body, status, code) in [
+        (
+            body(1001, "ios", "enter"),
+            StatusCode::FORBIDDEN,
+            "wrong_scene",
+        ),
+        (
+            body(1011, "windows", "enter"),
+            StatusCode::FORBIDDEN,
+            "desktop_client",
+        ),
+        (
+            body(1011, "ios", "album"),
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        ),
+        (
+            json!({ "signup_token": "short", "ticket": ticket, "scene": 1011, "platform": "ios" }),
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        ),
+        (
+            json!({
+                "signup_token": "a".repeat(43),
+                "ticket": ticket,
+                "scene": 1011,
+                "platform": "ios",
+            }),
+            StatusCode::UNAUTHORIZED,
+            "session_expired",
+        ),
+        (
+            json!({
+                "signup_token": token,
+                "ticket": "b".repeat(22),
+                "scene": 1011,
+                "platform": "ios",
+            }),
+            StatusCode::GONE,
+            "ticket_expired",
+        ),
+    ] {
+        address += 1;
+        let answer = mini
+            .at(address)
+            .post("/gono/v1/wechat/bind/preview", &body)
+            .await;
+        assert_eq!(answer.error(), (status, code.to_owned()), "{body}");
+    }
+    let get = mini
+        .send("GET", "/gono/v1/wechat/bind/preview", &[], Body::empty())
+        .await;
+    assert_eq!(get.error(), (StatusCode::NOT_FOUND, "not_found".to_owned()));
+    // Nothing was used up: the QR code is still on the page, and the same token binds.
+    assert!(wechat.shown_tickets().contains(&ticket));
+    let bound = mini.bind(&token, &ticket).await;
+    assert_eq!(bound.status, StatusCode::OK, "{}", bound.json());
+    assert_eq!(bound.json()["account"]["username"], "alice");
+    // Now both are used up.
+    assert_eq!(
+        mini.post("/gono/v1/wechat/bind/preview", &body(1011, "ios", "enter"))
+            .await
+            .error(),
+        (StatusCode::UNAUTHORIZED, "session_expired".to_owned())
+    );
+}
+
+#[tokio::test]
 async fn the_in_app_scanner_counts_as_a_scan() {
     let (f, api, _) = with_wechat(None).await;
     let mini = Mini::new(&f);
@@ -1046,15 +1154,24 @@ async fn clients_are_limited_per_address() {
         api.accept(&code, &format!("oUser{step}"));
         assert_eq!(mini.session(&code).await.status, StatusCode::OK, "{step}");
     }
-    // Every one that fails costs a token, whatever the reason: sign-ins and bindings alike.
+    // Every one that fails costs a token, whatever the reason: sign-ins, bindings and their
+    // previews alike.
+    let preview = json!({
+        "signup_token": "a".repeat(43),
+        "ticket": "b".repeat(22),
+        "scene": 1011,
+        "platform": "ios",
+    });
     for _ in 0..BURST / 2 {
         assert_eq!(mini.session("unknown").await.error().1, "code_invalid");
     }
-    for _ in BURST / 2..BURST {
-        assert_eq!(
-            mini.bind(&"a".repeat(43), &"b".repeat(22)).await.error().1,
-            "session_expired"
-        );
+    for step in BURST / 2..BURST {
+        let refused = if step % 2 == 0 {
+            mini.bind(&"a".repeat(43), &"b".repeat(22)).await
+        } else {
+            mini.post("/gono/v1/wechat/bind/preview", &preview).await
+        };
+        assert_eq!(refused.error().1, "session_expired");
     }
     // Then nothing gets through, not even a valid code, and WeChat is not asked.
     let asked = api.asked().len();
@@ -1064,6 +1181,13 @@ async fn clients_are_limited_per_address() {
     assert!(limited.header("retry-after").parse::<u64>().unwrap() >= 1);
     assert_eq!(
         mini.bind(&"a".repeat(43), &"b".repeat(22)).await.error().0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        mini.post("/gono/v1/wechat/bind/preview", &preview)
+            .await
+            .error()
+            .0,
         StatusCode::TOO_MANY_REQUESTS
     );
     assert_eq!(api.asked().len(), asked);

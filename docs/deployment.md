@@ -573,16 +573,17 @@ It never logs the AppSecret, sign-in codes, tickets, session tokens or openids.
 
 What users see:
 
-- **Binding.** On the account page (Overview, "Ways to sign in", WeChat's "Bind") a user
-  confirms with the web login password (unless the browser confirmed it in the last 5 minutes),
-  and the page shows a QR code with the time it expires. Scanned with WeChat on the phone, it
-  opens the mini program, which binds the user's WeChat to the account. A QR code is valid for
-  10 minutes and once, a new one ends the previous one, and it binds only when the mini program
-  reports that it was opened by scanning it on a phone, or that its own scanner read it with the
-  camera, not on a desktop and not from an image, the album or a chat (a safeguard against
-  forwarded codes; the mini program reports this itself). Whoever scans the code gets the account in the mini program, so the page says not to
-  share it. An account has one WeChat of the mini program at most, and a WeChat belongs to one
-  account.
+- **Binding.** On the account page (Overview, "Ways to sign in", WeChat's "Bind") a user confirms
+  with the web login password (unless the browser confirmed it in the last 5 minutes), and the page
+  shows a QR code with the time it expires. Scanned with WeChat on the phone, it opens the mini
+  program, which binds the user's WeChat to the account. A QR code is valid for 10 minutes and once,
+  a new one ends the previous one, and it binds only when the mini program reports that it was
+  opened by scanning it on a phone, or that its own scanner read it with the camera, not on a
+  desktop and not from an image, the album or a chat (a safeguard against forwarded codes; the mini
+  program reports this itself). Before it binds, the mini program can name the account the code is
+  for, so that a user who was sent someone else's code sees it. Whoever scans the code gets the
+  account in the mini program, so the page says not to share it. An account has one WeChat of the
+  mini program at most, and a WeChat belongs to one account.
 - **Signing in again.** Once bound, the WeChat signs in to the mini program however it was
   opened, on a phone: from the chat list, after logging out, on a new phone. Only binding needs
   the scan. WeChat on a desktop or in the developer tools signs in to nothing.
@@ -601,8 +602,9 @@ What users see:
   else's browser signs in nothing. It signs in without two-step verification, like every
   third-party sign-in; the admin UI admits admin accounts only. The account page confirms it is
   you the same way. Wrong digits count against the browser's address like failed sign-ins.
-- **Limits.** `session`, `bind`, `scan`, `confirm` and `deny` of the mini program are limited
-  per client address like the sign-in pages: failures count, successful calls do not.
+- **Limits.** `session`, `bind`, `bind/preview`, `scan`, `confirm` and `deny` of the mini
+  program are limited per client address like the sign-in pages: failures count, successful
+  calls do not.
 
 ## Google and GitHub sign-in
 
