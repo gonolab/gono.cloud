@@ -1,7 +1,8 @@
 # Third-party sign-in: WeChat, Google and GitHub (design)
 
-> 2026-11-23. **Status: design, nothing built.** No server code changes with this document; the
-> work is listed in section 10.
+> 2026-11-23. **Status: server work T1–T4 done (2026-11-24)**: T1 in `b6e6dc6`, T2 in
+> `92fe3bc`, T3 in `f0b7361`, T4 in `38c1b4b`. The work is listed in section 10; the mini
+> program's side (MP) is not built.
 >
 > Read for it:
 > - [docs/wechat-miniprogram.md](../docs/wechat-miniprogram.md) and the WeChat and Email
@@ -613,7 +614,7 @@ What changes on its side is in MP; in short:
 
 ## 10. Work (server)
 
-- [ ] **T1 The model.**
+- [x] **T1 The model.**
   - `external_identities`, `pending_identities`, `mp_sessions` on identities, the `users` columns
     (section 8);
   - `wechat.rs` and the mini program's API move onto them, with the same answers;
@@ -621,7 +622,7 @@ What changes on its side is in MP; in short:
   - the last-way-in rule, 3.5's confirmation with a password, the audit kinds;
   - the identities in the admin UI and the CLI;
   - password sign-in of an account without a password fails as a wrong password does.
-- [ ] **T2 Google and GitHub.**
+- [x] **T2 Google and GitHub.**
   - `[oauth.*]`, and 5.1 with `sign_in`, `bind` and `reauth`;
   - automatic binding and its mail (3.3);
   - the unbound page and binding after a password sign-in (3.4);
@@ -629,7 +630,7 @@ What changes on its side is in MP; in short:
   - setting a password (5.4);
   - docs/deployment.md "Google and GitHub sign-in", with the redirect URIs, the scopes, the
     security notes of section 6, and reachability.
-- [ ] **T3 WeChat on the web.**
+- [x] **T3 WeChat on the web.**
   - `wechat_sign_in_tickets` and `/login/wechat` (also under `/manage` and on the Login Flow v2
     page);
   - `scan`, `confirm`, `deny`, `flow` with `kind`;
@@ -637,7 +638,7 @@ What changes on its side is in MP; in short:
   - 3.5 by WeChat;
   - docs/wechat-miniprogram.md for the new calls. It needs the mini program's confirm page
     (MP phase 3).
-- [ ] **T4 Sign-up and deletion.**
+- [x] **T4 Sign-up and deletion.**
   - `allow_signup` per provider, the web sign-up page (4.5), the mini program's `signup` (MP S13);
   - generated usernames and renaming (MP S16);
   - deletion with the cooling-off period for accounts without a password (4.6, MP S15);
