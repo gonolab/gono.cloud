@@ -2033,9 +2033,18 @@ async fn the_mini_program_signs_up_renames_and_deletes_an_account() {
         rename("alice").await.error(),
         (StatusCode::CONFLICT, "username_taken".to_owned())
     );
-    let renamed = rename("wanda").await;
+    // Both at once.
+    let renamed = mini
+        .act(
+            "PATCH",
+            "/gono/v1/wechat/account",
+            &session,
+            &json!({ "username": "wanda", "display_name": "Wanda W" }),
+        )
+        .await;
     assert_eq!(renamed.status, StatusCode::OK, "{}", renamed.json());
     assert_eq!(renamed.json()["username"], "wanda");
+    assert_eq!(renamed.json()["display_name"], "Wanda W");
     assert_eq!(renamed.json()["wechat"]["bound_at"], made_at);
     assert_eq!(renamed.json()["offered"]["webdav"], true);
     assert_eq!(rename("wanda2").await.status, StatusCode::TOO_MANY_REQUESTS);
@@ -2679,4 +2688,74 @@ async fn the_mini_program_revokes_a_device_and_the_devices_ticked_with_it() {
         mini.send("POST", &path, &[], Body::empty()).await.error(),
         (StatusCode::UNAUTHORIZED, "not_signed_in".to_owned())
     );
+}
+
+#[tokio::test]
+async fn the_mini_program_changes_the_display_name_with_the_session_alone() {
+    let (f, api, _) = with_wechat(None).await;
+    let mini = Mini::new(&f);
+    let session = alice_session(&f, &mini, &api).await;
+    let patch = |body: Value| {
+        let mini = &mini;
+        let session = session.clone();
+        async move {
+            mini.act("PATCH", "/gono/v1/wechat/account", &session, &body)
+                .await
+        }
+    };
+    let stored = || {
+        let db = f.state.db.clone();
+        async move { alice_by(&db).await.display_name }
+    };
+    async fn alice_by(db: &db::Pool) -> users::User {
+        users::get(db, &Username::new("alice").unwrap())
+            .await
+            .unwrap()
+    }
+
+    // No fresh code (decided on 2026-11-24); trimmed, as on the account page.
+    let changed = patch(json!({ "display_name": "  爱丽丝  " })).await;
+    assert_eq!(changed.status, StatusCode::OK, "{}", changed.json());
+    assert_eq!(changed.json()["display_name"], "爱丽丝");
+    assert_eq!(changed.json()["username"], "alice");
+    assert_eq!(stored().await, "爱丽丝");
+    assert_eq!(
+        mini.account(&session).await.json()["display_name"],
+        "爱丽丝"
+    );
+
+    // The account page's rules, and something to change.
+    for body in [
+        json!({ "display_name": "" }),
+        json!({ "display_name": "   " }),
+        json!({ "display_name": "a\u{7}b" }),
+        json!({ "display_name": "x".repeat(256) }),
+        json!({ "display_name": 5 }),
+        json!({}),
+    ] {
+        assert_eq!(
+            patch(body.clone()).await.error(),
+            (StatusCode::BAD_REQUEST, "bad_request".to_owned()),
+            "{body}"
+        );
+    }
+    // A refused username leaves the display name as it was: alice was not made by a sign-up.
+    assert_eq!(
+        patch(json!({ "username": "alice2", "display_name": "Other" }))
+            .await
+            .error(),
+        (StatusCode::CONFLICT, "username_locked".to_owned())
+    );
+    assert_eq!(stored().await, "爱丽丝");
+
+    // Eight changes so far: two more, then the account waits.
+    for name in ["A", "B"] {
+        assert_eq!(
+            patch(json!({ "display_name": name })).await.status,
+            StatusCode::OK
+        );
+    }
+    let limited = patch(json!({ "display_name": "C" })).await;
+    assert_eq!(limited.error().0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(stored().await, "B");
 }

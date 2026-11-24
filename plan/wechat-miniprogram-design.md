@@ -1098,8 +1098,11 @@ fields, as `/gono/v1/` allows. A ticked item is built and committed (checked aga
   the path's ID. `also` must be among `introduced`. Built: either refusal is `bad_request` and
   revokes nothing; a revoked device answers `409 device_revoked`; no service needed, as on the
   account page; `by` is `mini_program` (P 6.2 and 9.1 updated).
-- [ ] **S10 `PATCH /gono/v1/wechat/account`** `{display_name}` → the account. The account page's
-  rules for display names apply.
+- [x] **S10 `PATCH /gono/v1/wechat/account`** `{display_name}` → the account. The account page's
+  rules for display names apply. Built: the session alone, no fresh code (decided on
+  2026-11-24); `display_name` and `username` (S16) can come together, the username first; each
+  request counts against the account's 10 actions a minute. No audit record, as on the account
+  page.
 - [ ] **S11 `POST /gono/v1/wechat/unbind`** `{code, platform}` → `204`. It ends every session of
   the identity and records `identity.unbound` with `how: "mini_program"` (TP 8). It answers
   `409 last_sign_in` when WeChat is the account's last way in (TP 3.2).

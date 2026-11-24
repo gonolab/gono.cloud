@@ -14,9 +14,9 @@ turns it on is in [deployment.md](deployment.md#wechat), what the reverse proxy 
   confirms with the web login password, and the page shows a QR code that the user scans with
   WeChat on the phone. It opens the mini program, which signs in and binds. Unbinding is done on
   the same page, in the admin UI, or with `gono-cloud user unlink`.
-- A mini program session reads the account's name, its services and its devices, and with a
-  fresh sign-in code of the account's WeChat stops remote access for a device or revokes it;
-  nothing else: no files, no WebDAV, no S3, no page of the server.
+- A mini program session reads the account's name, its services and its devices, and changes
+  its display name; with a fresh sign-in code of the account's WeChat it stops remote access for
+  a device or revokes it. Nothing else: no files, no WebDAV, no S3, no page of the server.
 - Without `[wechat]` every path below `/gono/v1/wechat/` answers
   `404 {"error":"not_found"}`, and the account page says that the server does not offer a mini
   program.
@@ -277,6 +277,28 @@ The session's account. `Authorization: Bearer <session>`.
   `session_expired` (not used for 30 days), `account_disabled`, `rate_limited`, `unavailable`.
   Both `401` answers carry `WWW-Authenticate: Bearer realm="gono"`.
 
+### `PATCH /gono/v1/wechat/account`
+
+Changes the display name, and the username of an account made by a sign-up.
+`Authorization: Bearer <session>`; the session is enough, no fresh code.
+
+```json
+{ "display_name": "爱丽丝", "username": "alice2" }
+```
+
+- Either field, or both. `display_name` follows the account page's rules: trimmed, not empty, at
+  most 255 characters, no control characters. Use `<input type="nickname">` so that WeChat
+  offers the user's nickname and checks it.
+- `username` only for an account made by a sign-up
+  ([below](#accounts-made-in-the-mini-program-signup-patch-account-accountdelete-accountrestore)),
+  until an app password or a device signed in to it, once a day: `username_taken` (409),
+  `username_locked` (409), `rate_limited` (429, `Retry-After` a day). It changes first: when it is
+  refused, the display name stays as it was too.
+- `200` with the account, as `GET account` answers it. `bad_request` for a body with neither
+  field, or a display name or username that breaks the rules.
+- Each request counts against the account's 10 actions a minute
+  ([Actions on the account](#actions-on-the-account)).
+
 ### `POST /gono/v1/wechat/logout`
 
 Ends the session. `Authorization: Bearer <session>`; a body is ignored (at most 4096 bytes).
@@ -437,10 +459,9 @@ With `wechat.allow_signup` (off by default), `session` answers a WeChat bound to
   `session_expired` (401) for a token that is gone, `account_exists` (409), `signup_limited`
   (429: 5 accounts a day per network, 200 for the server), and the platform rule of `session`
   (any scene).
-- `PATCH /gono/v1/wechat/account {"username"}` (Bearer) changes the username of an account made
-  by a sign-up, until an app password or a device signed in to it (their statements name the
-  account by its username), once a day: `200` with the account; `username_taken` (409),
-  `username_locked` (409), `rate_limited` (429, `Retry-After` a day).
+- [`PATCH /gono/v1/wechat/account {"username"}`](#patch-gonov1wechataccount) (Bearer) changes
+  the username of an account made by a sign-up, until an app password or a device signed in to
+  it (their statements name the account by its username), once a day.
 - `POST /gono/v1/wechat/account/delete {"code", "platform", "confirm"}` (Bearer, a fresh code of
   the session's WeChat, `confirm` the username) asks for the deletion of an account without a web
   login password: `204`. The account is disabled at once, its sessions end, and the server deletes
@@ -569,8 +590,8 @@ server (its 45011), `session` answers `rate_limited` with `Retry-After: 60`.
 - A WeChat has at most 5 sessions; a sixth ends the oldest.
 - A session is bound to the AppID: if the operator changes `wechat.app_id`, the sessions and
   bindings of the old AppID no longer count.
-- A session reads `account` and `devices`, and acts on the account's devices with a fresh code;
-  nothing else. It is not an app password: WebDAV, the Nextcloud endpoints, S3 and the pages
+- A session reads `account` and `devices`, changes the display name, and acts on the account's
+  devices with a fresh code; nothing else. It is not an app password: WebDAV, the Nextcloud endpoints, S3 and the pages
   answer it as if it were absent.
 
 The server keeps the openid WeChat reports and the unionid when WeChat reports one. It never

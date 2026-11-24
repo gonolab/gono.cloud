@@ -13,7 +13,7 @@
 //! | `POST /gono/v1/wechat/devices/<endpoint id>/sign-out` | Stops remote access for the device (protocol 9.4), with a fresh code of the account's WeChat. |
 //! | `POST /gono/v1/wechat/devices/<endpoint id>/revoke` | Revokes the device and the introduced devices ticked with it (protocol 9.1, 9.2), with a fresh code. |
 //! | `POST /gono/v1/wechat/signup` | With `[wechat] allow_signup`: creates an account (no service, no password, a generated username) for the WeChat of a signup token, and opens a session. |
-//! | `PATCH /gono/v1/wechat/account` | Changes the username of an account made by a sign-up, until a device or app signed in to it. |
+//! | `PATCH /gono/v1/wechat/account` | Changes the display name, and the username of an account made by a sign-up until a device or app signed in to it. |
 //! | `POST /gono/v1/wechat/account/delete` | An account without a web password asks for its deletion (a fresh code of its WeChat): disabled at once, deleted after 7 days. |
 //! | `POST /gono/v1/wechat/account/restore` | Undoes that within the 7 days (a fresh code names the WeChat), and opens a session. |
 //! | `POST /gono/v1/wechat/scan` | With `[wechat] web_sign_in`: the WeChat that scanned the QR code of a sign-in page (`{qr_url_prefix}<ticket>`) locks the sign-in, and learns which account and browser it is for. |
@@ -1582,10 +1582,18 @@ async fn signup_with(
 
 #[derive(Deserialize)]
 struct RenameRequest {
-    username: String,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
 }
 
-/// `PATCH /gono/v1/wechat/account`: a new username.
+/// `PATCH /gono/v1/wechat/account` `{username, display_name}`, either or both: a new username
+/// (an account made by a sign-up, until a device or app signed in to it, once a day) and a new
+/// display name (the account page's rules: not empty, at most 255 characters, no control
+/// characters, trimmed). The session is enough, no fresh code (decided on 2026-11-24), and each
+/// request counts against the account's [`MAX_ACTIONS`] a minute. The username changes first,
+/// so a refused one leaves the display name as it was too. The answer is the account.
 pub async fn rename(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1610,37 +1618,62 @@ pub async fn rename(
         Ok(Lookup::Unknown) => return wechat.refused(client),
         Err(err) => return failed(&err),
     };
+    if let Some(wait) = wechat.actions.take(account.user_id, Instant::now()) {
+        return rate_limited(wait);
+    }
     let request: RenameRequest = match parse(body) {
         Ok(request) => request,
         Err(response) => return *response,
     };
-    let Ok(username) = gono_server_core::Username::new(request.username.trim()) else {
+    if request.username.is_none() && request.display_name.is_none() {
         return bad_request();
-    };
-    match users::rename(
-        &state.db,
-        account.user_id,
-        &username,
-        Actor::User,
-        Some(client),
-        now,
-    )
-    .await
+    }
+    let display_name = match request
+        .display_name
+        .as_deref()
+        .map(users::validate_display_name)
     {
-        // Read again through the session, as `account` would.
-        Ok(users::Renamed::Done) => {
-            match store::lookup(&state.db, &wechat.app_id, token, now).await {
-                Ok(Lookup::Live(account)) => json(StatusCode::OK, &account_json(&state, &account)),
-                Ok(Lookup::Expired | Lookup::Unknown) => not_signed_in("not_signed_in"),
-                Ok(Lookup::Disabled) => error(StatusCode::FORBIDDEN, "account_disabled"),
-                Err(err) => failed(&err),
+        None => None,
+        Some(Ok(display_name)) => Some(display_name),
+        Some(Err(_)) => return bad_request(),
+    };
+    let mut username = account.username.clone();
+    if let Some(wanted) = &request.username {
+        let Ok(wanted) = gono_server_core::Username::new(wanted.trim()) else {
+            return bad_request();
+        };
+        match users::rename(
+            &state.db,
+            account.user_id,
+            &wanted,
+            Actor::User,
+            Some(client),
+            now,
+        )
+        .await
+        {
+            Ok(users::Renamed::Done) => username = wanted,
+            Ok(users::Renamed::Taken) => return error(StatusCode::CONFLICT, "username_taken"),
+            Ok(users::Renamed::Locked) => return error(StatusCode::CONFLICT, "username_locked"),
+            Ok(users::Renamed::TooSoon) => {
+                return rate_limited(Duration::from_secs(
+                    users::RENAME_INTERVAL_SECS.unsigned_abs(),
+                ));
             }
+            Err(err) => return failed(&err),
         }
-        Ok(users::Renamed::Taken) => error(StatusCode::CONFLICT, "username_taken"),
-        Ok(users::Renamed::Locked) => error(StatusCode::CONFLICT, "username_locked"),
-        Ok(users::Renamed::TooSoon) => rate_limited(Duration::from_secs(
-            users::RENAME_INTERVAL_SECS.unsigned_abs(),
-        )),
+    }
+    if let Some(display_name) = display_name {
+        if let Err(err) = users::set_display_name(&state.db, &username, &display_name).await {
+            return database(&err, "change a display name");
+        }
+        tracing::info!(%client, user = %username, "display name changed in the mini program");
+    }
+    // Read again through the session, as `account` would.
+    match store::lookup(&state.db, &wechat.app_id, token, now).await {
+        Ok(Lookup::Live(account)) => json(StatusCode::OK, &account_json(&state, &account)),
+        Ok(Lookup::Expired | Lookup::Unknown) => not_signed_in("not_signed_in"),
+        Ok(Lookup::Disabled) => error(StatusCode::FORBIDDEN, "account_disabled"),
         Err(err) => failed(&err),
     }
 }

@@ -141,7 +141,9 @@ compatible within a major version: released clients keep working with newer serv
   introduced devices ticked (`also`) after a second confirmation that repeats its ID
   (`confirm`); other devices get `device.revoked` with `by: "mini_program"`. Such actions need a fresh `wx.login()` code of the WeChat bound to the account
   (`not_permitted` for another WeChat's), in place of the account page's second step; each
-  account may act 10 times a minute, and the audit log names the new actor `mini_program`.
+  account may act 10 times a minute, and the audit log names the new actor `mini_program`. `PATCH
+  /gono/v1/wechat/account` also changes the display name, with the account page's rules and the
+  session alone, like the username.
 - **Services per account**: every account has five switches, all off for new accounts, the
   first admin included: `files` (the web file UI), `webdav` (WebDAV and the other endpoints of
   Nextcloud clients), `s3` (the S3 API), `direct` (remote access for devices, with the relay at
