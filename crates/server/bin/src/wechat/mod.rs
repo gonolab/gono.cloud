@@ -14,7 +14,7 @@
 //! | `POST /gono/v1/wechat/devices/<endpoint id>/revoke` | Revokes the device and the introduced devices ticked with it (protocol 9.1, 9.2), with a fresh code. |
 //! | `POST /gono/v1/wechat/unbind` | Unbinds the WeChat from the account (every session of it ends), with a fresh code; never its last way in. |
 //! | `POST /gono/v1/wechat/signup` | With `[wechat] allow_signup`: creates an account (no service, no password, a generated username) for the WeChat of a signup token, and opens a session. |
-//! | `PATCH /gono/v1/wechat/account` | Changes the display name, and the username of an account made by a sign-up until a device or app signed in to it. |
+//! | `POST /gono/v1/wechat/account` | Changes the display name, and the username of an account made by a sign-up until a device or app signed in to it. |
 //! | `POST /gono/v1/wechat/account/delete` | An account without a web password asks for its deletion (a fresh code of its WeChat): disabled at once, deleted after 7 days. |
 //! | `POST /gono/v1/wechat/account/restore` | Undoes that within the 7 days (a fresh code names the WeChat), and opens a session. |
 //! | `POST /gono/v1/wechat/scan` | With `[wechat] web_sign_in`: the WeChat that scanned the QR code of a sign-in page (`{qr_url_prefix}<ticket>`) locks the sign-in, and learns which account and browser it is for. |
@@ -467,7 +467,7 @@ pub fn routes(wechat: Option<&WeChat>) -> Router<AppState> {
             )
             .route(
                 &format!("{API_PATH}/account"),
-                get(account).patch(rename).fallback(not_found),
+                get(account).post(rename).fallback(not_found),
             )
             .route(
                 &format!("{API_PATH}/signup"),
@@ -1595,7 +1595,7 @@ struct RenameRequest {
     display_name: Option<String>,
 }
 
-/// `PATCH /gono/v1/wechat/account` `{username, display_name}`, either or both: a new username
+/// `POST /gono/v1/wechat/account` `{username, display_name}`, either or both: a new username
 /// (an account made by a sign-up, until a device or app signed in to it, once a day) and a new
 /// display name (the account page's rules: not empty, at most 255 characters, no control
 /// characters, trimmed). The session is enough, no fresh code (decided on 2026-11-24), and each

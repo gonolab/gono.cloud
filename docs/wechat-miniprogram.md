@@ -58,6 +58,7 @@ The page that made the QR code shows "Bound since ..." once the user reloads it.
 - **Base URL.** The endpoints are below `/gono/v1/wechat/` on the host the mini program is
   configured for: `server.base_url`'s host, or another host name that the operator forwards to
   the server ([Deployment](#deployment)). HTTPS only.
+- **Methods** are GET and POST only: `wx.request` has no PATCH.
 - **Requests** with a body send JSON (`Content-Type: application/json`, what `wx.request`
   sends by default) of at most 4096 bytes. Unknown fields are ignored. A body that is not JSON,
   lacks a field, has a field of the wrong type or is larger answers `bad_request`.
@@ -89,7 +90,7 @@ to have been opened by scanning a code:
 | `session`, `signup` | a phone | any (still sent) |
 | `bind`, `bind/preview`, `scan`, `confirm`, `deny` | a phone | `1011` or `1047`, or any with `"source": "scan_code"` |
 | `account/delete`, `account/restore` | a phone | none sent |
-| `account`, `logout`, `PATCH account`, `flow` | none | none |
+| `account` (GET and POST), `logout`, `flow` | none | none |
 
 The platform is checked first: a desktop client gets `desktop_client` whatever its scene.
 
@@ -278,7 +279,7 @@ The session's account. `Authorization: Bearer <session>`.
   `session_expired` (not used for 30 days), `account_disabled`, `rate_limited`, `unavailable`.
   Both `401` answers carry `WWW-Authenticate: Bearer realm="gono"`.
 
-### `PATCH /gono/v1/wechat/account`
+### `POST /gono/v1/wechat/account`
 
 Changes the display name, and the username of an account made by a sign-up.
 `Authorization: Bearer <session>`; the session is enough, no fresh code.
@@ -291,7 +292,7 @@ Changes the display name, and the username of an account made by a sign-up.
   most 255 characters, no control characters. Use `<input type="nickname">` so that WeChat
   offers the user's nickname and checks it.
 - `username` only for an account made by a sign-up
-  ([below](#accounts-made-in-the-mini-program-signup-patch-account-accountdelete-accountrestore)),
+  ([below](#accounts-made-in-the-mini-program-signup-post-account-accountdelete-accountrestore)),
   until an app password or a device signed in to it, once a day: `username_taken` (409),
   `username_locked` (409), `rate_limited` (429, `Retry-After` a day). It changes first: when it is
   refused, the display name stays as it was too.
@@ -462,7 +463,7 @@ account page.
 other identity (Google, GitHub). Nothing changes; the page says to set a password or bind
 another way to sign in on the web first, or to delete the account.
 
-### Accounts made in the mini program: `signup`, `PATCH account`, `account/delete`, `account/restore`
+### Accounts made in the mini program: `signup`, `POST account`, `account/delete`, `account/restore`
 
 With `wechat.allow_signup` (off by default), `session` answers a WeChat bound to no account with
 `"signup": true` beside its signup token, and the mini program may offer 新建账号:
@@ -476,7 +477,7 @@ With `wechat.allow_signup` (off by default), `session` answers a WeChat bound to
   `session_expired` (401) for a token that is gone, `account_exists` (409), `signup_limited`
   (429: 5 accounts a day per network, 200 for the server), and the platform rule of `session`
   (any scene).
-- [`PATCH /gono/v1/wechat/account {"username"}`](#patch-gonov1wechataccount) (Bearer) changes
+- [`POST /gono/v1/wechat/account {"username"}`](#post-gonov1wechataccount) (Bearer) changes
   the username of an account made by a sign-up, until an app password or a device signed in to
   it (their statements name the account by its username), once a day.
 - `POST /gono/v1/wechat/account/delete {"code", "platform", "confirm"}` (Bearer, a fresh code of

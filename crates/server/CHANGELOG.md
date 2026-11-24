@@ -20,7 +20,7 @@ compatible within a major version: released clients keep working with newer serv
   login password and no service; `created_via` names the provider, and the audit log records
   `account.created` and `identity.bound` with `how: "signup"`. 5 sign-ups a day per network and 200
   for the server. `[sign_in] terms_url` adds terms to accept. The username can be changed (account
-  page, `PATCH /gono/v1/wechat/account`) once a day until an app password or a device uses it
+  page, `POST /gono/v1/wechat/account`) once a day until an app password or a device uses it
   (`account.renamed`). An account without a password deletes itself (account page, `POST
   /gono/v1/wechat/account/delete`): disabled at once, undone by a sign-in within 7 days
   (`/login/restore`, `account/restore`; `account.deletion_requested`, `account.deletion_cancelled`),
@@ -142,7 +142,7 @@ compatible within a major version: released clients keep working with newer serv
   `device.revoked` with `by: "mini_program"`. Such actions need a fresh `wx.login()` code of the
   WeChat bound to the account (`not_permitted` for another WeChat's), in place of the account page's
   second step; each account may act 10 times a minute, and the audit log names the new actor
-  `mini_program`. `PATCH /gono/v1/wechat/account` also changes the display name, with the account
+  `mini_program`. `POST /gono/v1/wechat/account` also changes the display name, with the account
   page's rules and the session alone, like the username. `POST /gono/v1/wechat/unbind` unbinds the
   WeChat and ends its sessions on every phone (`identity.unbound` with `how: "mini_program"`),
   unless it is the account's last way in (`last_sign_in`). The account page's WeChat panel says

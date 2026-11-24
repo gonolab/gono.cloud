@@ -77,6 +77,7 @@
 | The mini program also confirms web sign-ins made by scanning the web sign-in page's QR code, always with 6 digits typed into the browser (TP 1, TP 5.3) | user | 2026-11-23 |
 | 停止远程访问 in the mini program (S8) needs no service: unlike the account page, it works for an account without 远程直连, as 吊销 does | user | 2026-11-24 |
 | Changing the display name (S10) or the username (S16) needs the session only, no fresh `wx.login` code: S10 leaves the fresh-code rule of S8–S11 | user | 2026-11-24 |
+| `wx.request` has no PATCH: changing the account is `POST /gono/v1/wechat/account` (was `PATCH`, never released) | user | 2026-11-24 |
 
 ## 2. What exists and what each phase adds
 
@@ -94,7 +95,7 @@
 | Confirmations `{qr_url_prefix}<ticket>`: web sign-in, device sign-in | web sign-in: yes (`scan`, `confirm`, `deny`, `flow`, TP T3); device sign-in: no | 3: TP 5.3 (T3), RD 5.1–5.2 |
 | `wechat_identities` as the WeChat rows of `external_identities` | yes (TP T1) | before phase 3: TP T1 |
 | Subscription messages, `access_token` | no | 3: S12 |
-| Sign-up, accounts without a web password, renaming, deletion in the mini program | yes (`signup`, `PATCH account {username}`, `account/delete`, `account/restore`, TP T4) | 4: S13–S16 |
+| Sign-up, accounts without a web password, renaming, deletion in the mini program | yes (`signup`, `POST account {username}`, `account/delete`, `account/restore`, TP T4) | 4: S13–S16 |
 
 ## 3. Phases
 
@@ -830,7 +831,7 @@ confirmation (phase 3) follows RD 2.1.
    `[wechat] allow_signup`).
 2. `POST signup {signup_token, terms_version, scene, platform}` (S13) → `{session, account}`,
    with no service → 账号已创建 (4.14) → Home.
-3. Optional: ‹修改› → `PATCH account {username}` (S16), until the first app password or device.
+3. Optional: ‹修改› → `POST account {username}` (S16), until the first app password or device.
 4. The account reaches the web pages by scanning the sign-in page's QR code (TP 5.3). There it
    can set a password, add an email address, enrol two-step verification and grant devices and
    apps on the consent page, once an administrator has turned the services on.
@@ -874,8 +875,8 @@ Unknown codes follow the API's rule: `5xx` as `unavailable`, anything else as a 
 | Phase 2: `device_revoked` (409) | `sign-out` | toast | 这台设备已经被吊销 | — |
 | Phase 3 | `scan`, `confirm` | Result | RD 2.1 and RD 5.2's codes (`ticket_taken`, `wrong_pick`, ...), plus `service_not_enabled`: the refusal of 4.14 | — |
 | Phase 4: `deletion_pending` (409) | `session` | Deletion pending (4.14) | 账号将于 … 注销 | 撤销注销 · ‹退出登录› |
-| Phase 4: `username_taken` (409) | `PATCH account` | inline | 这个用户名已被使用 | — |
-| Phase 4: `username_locked` (409) | `PATCH account` | Result | 用户名不能再改了 / 这个账号已经登录过设备，设备记录里用的是现在的用户名。 | 我知道了 |
+| Phase 4: `username_taken` (409) | `POST account` | inline | 这个用户名已被使用 | — |
+| Phase 4: `username_locked` (409) | `POST account` | Result | 用户名不能再改了 / 这个账号已经登录过设备，设备记录里用的是现在的用户名。 | 我知道了 |
 | `last_sign_in` (409) | `unbind` | Result | 不能解除绑定 / 这个账号只能用这个微信登录。请先在网页上设置密码或绑定别的登录方式；不再使用的话，可以注销账号。 | 我知道了 |
 
 `wx.request` calls `success` for every status: the wrapper reads `statusCode` and `data.error`
@@ -1050,7 +1051,7 @@ fields, as `/gono/v1/` allows. A ticked item is built and committed (checked aga
   of `session` and `bind`) gains `"offered": {"files", "webdav", "s3", "direct", "relay"}` from
   `service_view::offered`, and `"wechat": {"bound_at": <unix>}` from
   `wechat_identities.created_at`. Built on `external_identities.created_at` (TP T1); the
-  `account` of `signup`, `account/restore` and `PATCH account` has both too. Not in the
+  `account` of `signup`, `account/restore` and `POST account` has both too. Not in the
   acceptance suite: it needs a session, which needs WeChat.
 - [x] **S3 The in-app scanner.** `bind` (and `bind/preview`) take an optional
   `"source": "enter" | "scan_code"`, default `enter`. With `scan_code` the scene test is
@@ -1099,7 +1100,7 @@ fields, as `/gono/v1/` allows. A ticked item is built and committed (checked aga
   the path's ID. `also` must be among `introduced`. Built: either refusal is `bad_request` and
   revokes nothing; a revoked device answers `409 device_revoked`; no service needed, as on the
   account page; `by` is `mini_program` (P 6.2 and 9.1 updated).
-- [x] **S10 `PATCH /gono/v1/wechat/account`** `{display_name}` → the account. The account page's
+- [x] **S10 `POST /gono/v1/wechat/account`** `{display_name}` → the account. The account page's
   rules for display names apply. Built: the session alone, no fresh code (decided on
   2026-11-24); `display_name` and `username` (S16) can come together, the username first; each
   request counts against the account's 10 actions a minute. No audit record, as on the account
@@ -1182,7 +1183,7 @@ Built in TP T4 (`38c1b4b`).
     devices, and the retired-username rule applies (P 9.1). `/manage` shows pending deletions
     and lets an administrator cancel one or delete at once;
   - the web account page offers the same deletion (TP 4.6).
-- [x] **S16 `PATCH /gono/v1/wechat/account {username}`**, for accounts created by sign-up,
+- [x] **S16 `POST /gono/v1/wechat/account {username}`**, for accounts created by sign-up,
   while the account has no app password and has never registered a device. Devices' pairing
   statements name the account by its username (P 8.3, 8.4), so a name in use by a device must
   not change. Otherwise `409 username_locked`. The new name follows `Username`'s rules (lower-case

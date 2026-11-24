@@ -934,7 +934,7 @@ async fn requests_are_bounded_and_validated() {
     // Unknown endpoints and methods.
     for (method, path) in [
         ("GET", "/gono/v1/wechat/session"),
-        ("POST", "/gono/v1/wechat/account"),
+        ("PATCH", "/gono/v1/wechat/account"),
         ("GET", "/gono/v1/wechat/logout"),
         ("POST", "/gono/v1/wechat/nope"),
         ("GET", "/gono/v1/wechat/"),
@@ -2018,7 +2018,7 @@ async fn the_mini_program_signs_up_renames_and_deletes_an_account() {
         let mini = &mini;
         async move {
             mini.send(
-                "PATCH",
+                "POST",
                 "/gono/v1/wechat/account",
                 &[
                     ("Authorization", &bearer),
@@ -2036,7 +2036,7 @@ async fn the_mini_program_signs_up_renames_and_deletes_an_account() {
     // Both at once.
     let renamed = mini
         .act(
-            "PATCH",
+            "POST",
             "/gono/v1/wechat/account",
             &session,
             &json!({ "username": "wanda", "display_name": "Wanda W" }),
@@ -2699,7 +2699,7 @@ async fn the_mini_program_changes_the_display_name_with_the_session_alone() {
         let mini = &mini;
         let session = session.clone();
         async move {
-            mini.act("PATCH", "/gono/v1/wechat/account", &session, &body)
+            mini.act("POST", "/gono/v1/wechat/account", &session, &body)
                 .await
         }
     };
