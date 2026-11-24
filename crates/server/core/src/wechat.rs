@@ -107,6 +107,9 @@ pub fn is_token(token: &str) -> bool {
 pub struct Account {
     /// The account's id.
     pub user_id: i64,
+    /// The WeChat identity of the session (never shown): a fresh code that acts on the account
+    /// must be of this identity's WeChat.
+    pub identity_id: i64,
     /// Its login name.
     pub username: Username,
     /// Its display name.
@@ -210,10 +213,12 @@ struct AccountRow {
 }
 
 impl AccountRow {
-    /// What a session of a WeChat identity bound at `bound_at` reads of the account.
-    fn into_account(self, bound_at: i64) -> Result<Account> {
+    /// What a session of WeChat identity `identity_id`, bound at `bound_at`, reads of the
+    /// account.
+    fn into_account(self, identity_id: i64, bound_at: i64) -> Result<Account> {
         Ok(Account {
             user_id: self.id,
+            identity_id,
             username: Username::new(self.username)?,
             display_name: self.display_name,
             services: self.services,
@@ -325,7 +330,7 @@ pub async fn sign_in(
         }
         identities::touch_in(&mut tx, identity.id, None, unionid, now).await?;
         let session = open_session(&mut tx, identity.id, now).await?;
-        let account = row.into_account(identity.created_at)?;
+        let account = row.into_account(identity.id, identity.created_at)?;
         tx.commit().await?;
         return Ok(SignIn::Session { session, account });
     }
@@ -359,7 +364,7 @@ pub async fn open_session_of(
         return Ok(None);
     };
     let session = open_session(&mut tx, identity_id, now).await?;
-    let account = row.into_account(bound_at)?;
+    let account = row.into_account(identity_id, bound_at)?;
     tx.commit().await?;
     Ok(Some((session, account)))
 }
@@ -495,7 +500,7 @@ pub async fn bind(
     end_ticket(&mut tx, ticket_id).await?;
     identities::end_pending_in(&mut tx, signup.id).await?;
     let session = open_session(&mut tx, identity.id, now).await?;
-    let account = row.into_account(identity.created_at)?;
+    let account = row.into_account(identity.id, identity.created_at)?;
     tx.commit().await?;
     Ok(Bind::Bound { session, account })
 }
@@ -587,7 +592,8 @@ struct SessionRow {
     session_id: i64,
     last_seen_at: i64,
     expires_at: i64,
-    /// When the session's identity was bound.
+    /// The session's identity, and when it was bound.
+    identity_id: i64,
     bound_at: i64,
     #[sqlx(flatten)]
     account: AccountRow,
@@ -597,7 +603,8 @@ struct SessionRow {
 /// as long as its identity: unbinding removes it.
 pub async fn lookup(pool: &Pool, app_id: &str, token: &str, now: i64) -> Result<Lookup> {
     let sql = format!(
-        "SELECT s.id AS session_id, s.last_seen_at, s.expires_at, i.created_at AS bound_at, \
+        "SELECT s.id AS session_id, s.last_seen_at, s.expires_at, i.id AS identity_id, \
+         i.created_at AS bound_at, \
          u.id, u.username, u.display_name, u.enabled, {} \
          FROM mp_sessions s JOIN external_identities i ON i.id = s.identity_id \
          JOIN users u ON u.id = i.user_id \
@@ -628,7 +635,9 @@ pub async fn lookup(pool: &Pool, app_id: &str, token: &str, now: i64) -> Result<
             .await?;
         tx.commit().await?;
     }
-    Ok(Lookup::Live(row.account.into_account(row.bound_at)?))
+    Ok(Lookup::Live(
+        row.account.into_account(row.identity_id, row.bound_at)?,
+    ))
 }
 
 /// Ends the session of bearer token `token` of AppID `app_id`, expired or not. Returns `false`

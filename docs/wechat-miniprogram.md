@@ -14,8 +14,9 @@ turns it on is in [deployment.md](deployment.md#wechat), what the reverse proxy 
   confirms with the web login password, and the page shows a QR code that the user scans with
   WeChat on the phone. It opens the mini program, which signs in and binds. Unbinding is done on
   the same page, in the admin UI, or with `gono-cloud user unlink`.
-- A mini program session reads the account's name, its services and its devices, nothing
-  else: no files, no WebDAV, no S3, no page of the server.
+- A mini program session reads the account's name, its services and its devices, and with a
+  fresh sign-in code of the account's WeChat stops remote access for a device; nothing else: no
+  files, no WebDAV, no S3, no page of the server.
 - Without `[wechat]` every path below `/gono/v1/wechat/` answers
   `404 {"error":"not_found"}`, and the account page says that the server does not offer a mini
   program.
@@ -360,6 +361,40 @@ One device of the session's account, by the 64 hex digits of its `endpoint_id`.
   lower-case hex digits, and on a server without remote access: the answer never tells whether
   another account's device exists. Otherwise the errors of `account`.
 
+### Actions on the account
+
+The calls that change something on the account (`devices/<endpoint_id>/sign-out`) take, beside
+the session, a JSON body with:
+
+- `code`: a fresh code of `wx.login()`. The server exchanges it with WeChat, and it must be of
+  the WeChat bound to the account, the session's: another WeChat's code, bound elsewhere or to
+  nothing, answers `not_permitted`. It stands in for the second step that the account page asks
+  for before the same actions. WeChat's refusals answer as in `session` (`code_invalid`,
+  `risky_user`, `rate_limited`, `unavailable`); get a new code for each call.
+- `platform`: a phone's ([Scenes and platforms](#scenes-and-platforms)), else
+  `desktop_client`. No scene.
+
+Each account may act 10 times a minute, beside the client's bucket: refused or not, every call
+counts, and the next one answers `rate_limited` with `Retry-After`. A refusal also takes a
+token of the client's bucket. The audit log names the actor `mini_program`.
+
+### `POST /gono/v1/wechat/devices/<endpoint_id>/sign-out`
+
+Stops remote access for a device (停止远程访问). `Authorization: Bearer <session>`, body `{"code",
+"platform"}` ([Actions on the account](#actions-on-the-account)).
+
+`204 No Content`. It does what the account page's "Stop remote access" does (protocol 9.4):
+
+- the device's credential is deleted and its connections end; its entry stays, as
+  `state: "signed_out"`, bound to the account and still revocable;
+- the account's other devices forget it in their lists but keep trusting it, and the device
+  can sign in to the account again later with the same key;
+- unlike the account page, it does not need the account's direct connection service: taking
+  access away is never refused for a switch.
+
+A device that is signed out already answers `204` as well; a revoked one `409 device_revoked`.
+`not_found` as in [`devices/<endpoint_id>`](#get-gonov1wechatdevicesendpoint_id).
+
 ### Accounts made in the mini program: `signup`, `PATCH account`, `account/delete`, `account/restore`
 
 With `wechat.allow_signup` (off by default), `session` answers a WeChat bound to no account with
@@ -470,8 +505,9 @@ are limited like `bind`.
 | `wrong_scene` | 403 | `bind`, `scan`, `confirm`, `deny`: the mini program was not opened by scanning ([Scenes and platforms](#scenes-and-platforms)). |
 | `desktop_client` | 403 | The mini program runs on a desktop or in the developer tools. |
 | `account_disabled` | 403 | The account is disabled. |
-| `not_found` | 404 | No such endpoint or method, or the server does not offer the mini program. |
-| `not_permitted` | 403 | A web sign-in this WeChat may not confirm: of the admin UI for a non-admin account, of another account, or locked by another WeChat (`confirm`, `deny`). |
+| `not_found` | 404 | No such endpoint or method, the server does not offer the mini program, or no such device of the account. |
+| `not_permitted` | 403 | A web sign-in this WeChat may not confirm: of the admin UI for a non-admin account, of another account, or locked by another WeChat (`confirm`, `deny`); or an action whose fresh code is of another WeChat than the session's. |
+| `device_revoked` | 409 | The device is revoked: it cannot be signed out. |
 | `account_exists` | 409 | The WeChat is bound to another account. |
 | `ticket_taken` | 409 | Another WeChat scanned the sign-in's QR code first. |
 | `signup_closed` | 403 | The server lets no WeChat sign up (`allow_signup` is off). |
@@ -490,7 +526,8 @@ refills by one every 10 seconds, as the server's sign-in pages do. A `session`, 
 `bind/preview` that does not succeed takes one (so do the other calls that sign in or act), and
 while the bucket is empty they answer `rate_limited` without doing anything. Successful ones cost nothing, so that many users behind one address (a
 carrier's NAT) do not lock each other out. `account` and `logout` take one only for a bearer
-token that is no session, and are refused only for those. When WeChat's own limit refuses the
+token that is no session, and are refused only for those. Each account may also act 10 times a
+minute ([Actions on the account](#actions-on-the-account)). When WeChat's own limit refuses the
 server (its 45011), `session` answers `rate_limited` with `Retry-After: 60`.
 
 ## Sessions
@@ -504,8 +541,9 @@ server (its 45011), `session` answers `rate_limited` with `Retry-After: 60`.
 - A WeChat has at most 5 sessions; a sixth ends the oldest.
 - A session is bound to the AppID: if the operator changes `wechat.app_id`, the sessions and
   bindings of the old AppID no longer count.
-- A session reads `account` and `devices` and nothing else. It is not an app password: WebDAV,
-  the Nextcloud endpoints, S3 and the pages answer it as if it were absent.
+- A session reads `account` and `devices`, and acts on the account's devices with a fresh code;
+  nothing else. It is not an app password: WebDAV, the Nextcloud endpoints, S3 and the pages
+  answer it as if it were absent.
 
 The server keeps the openid WeChat reports and the unionid when WeChat reports one. It never
 stores the `session_key` of `jscode2session` and never sends it to the mini program: nothing

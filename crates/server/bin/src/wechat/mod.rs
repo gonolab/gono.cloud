@@ -10,6 +10,7 @@
 //! | `POST /gono/v1/wechat/logout` | Ends the session. |
 //! | `GET /gono/v1/wechat/devices` | The devices of the session's account, as the account page lists them: active, signed out and revoked. |
 //! | `GET /gono/v1/wechat/devices/<endpoint id>` | One of them, with the devices it introduced (its approvals), which revoking it can take along. |
+//! | `POST /gono/v1/wechat/devices/<endpoint id>/sign-out` | Stops remote access for the device (protocol 9.4), with a fresh code of the account's WeChat. |
 //! | `POST /gono/v1/wechat/signup` | With `[wechat] allow_signup`: creates an account (no service, no password, a generated username) for the WeChat of a signup token, and opens a session. |
 //! | `PATCH /gono/v1/wechat/account` | Changes the username of an account made by a sign-up, until a device or app signed in to it. |
 //! | `POST /gono/v1/wechat/account/delete` | An account without a web password asks for its deletion (a fresh code of its WeChat): disabled at once, deleted after 7 days. |
@@ -61,6 +62,11 @@
 //!   mini program behind one address (a carrier's NAT) do not lock each other out. `account`
 //!   and `logout` cost a token only for a bearer token that is no session, and are refused for
 //!   those only, as device authentication is.
+//! - **Actions on the account** (`devices/<id>/sign-out`) need, beside the session, a fresh
+//!   code of `wx.login()` from the WeChat bound to the account, on a phone ([`fresh_code_of`]):
+//!   it stands in for the second step that the account page asks for (protocol 10). Each
+//!   account may act [`MAX_ACTIONS`] times a minute ([`ActionLimiter`]), beside the client's
+//!   bucket, and the audit log names the actor `mini_program`.
 //! - Tickets, tokens, codes and openids never reach the log (the paths below `/q/` are
 //!   redacted by [`crate::request_log`]); lines name the account instead.
 
@@ -72,7 +78,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::Path,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context as _;
@@ -85,6 +91,7 @@ use axum::{
     routing::{any, get, post},
 };
 use gono_server_core::{
+    audit::Actor,
     config::{WeChatConfig, verify_file_name},
     db,
     devices::{self, Device, EndpointId},
@@ -137,6 +144,34 @@ const UNAVAILABLE_RETRY_AFTER: &str = "30";
 
 /// Tickets shown on the account page at most (one per browser session).
 const MAX_SHOWN: usize = 1000;
+
+/// Actions on one account at most per [`ACTION_WINDOW`], beside the client's bucket.
+pub const MAX_ACTIONS: u32 = 10;
+
+/// The window of [`MAX_ACTIONS`].
+const ACTION_WINDOW: Duration = Duration::from_secs(60);
+
+/// Counts the actions on each account in windows of [`ACTION_WINDOW`].
+#[derive(Debug, Default)]
+struct ActionLimiter {
+    /// Each account's window: when it started and the actions in it so far.
+    windows: Mutex<HashMap<i64, (Instant, u32)>>,
+}
+
+impl ActionLimiter {
+    /// Counts an action on account `user_id` at `now`, or says how long to wait when the
+    /// account had [`MAX_ACTIONS`] in its window already.
+    fn take(&self, user_id: i64, now: Instant) -> Option<Duration> {
+        let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        windows.retain(|_, (start, _)| now.saturating_duration_since(*start) < ACTION_WINDOW);
+        let (start, count) = windows.entry(user_id).or_insert((now, 0));
+        if *count >= MAX_ACTIONS {
+            return Some(ACTION_WINDOW.saturating_sub(now.saturating_duration_since(*start)));
+        }
+        *count += 1;
+        None
+    }
+}
 
 /// The verification file of `wechat.verify_file`.
 #[derive(Debug, Clone)]
@@ -207,6 +242,8 @@ pub struct WeChat {
     allow_signup: bool,
     /// The sign-in tickets the browsers show.
     sign_ins: sign_in::Shown,
+    /// The actions on each account.
+    actions: ActionLimiter,
 }
 
 /// Reads the AppSecret of `wechat.secret_file`: its first line, without the line break.
@@ -240,6 +277,7 @@ impl WeChat {
             web_sign_in: false,
             allow_signup: false,
             sign_ins: sign_in::Shown::default(),
+            actions: ActionLimiter::default(),
         }
     }
 
@@ -376,6 +414,16 @@ impl WeChat {
         }
     }
 
+    /// [`Self::admit`], then counts an action on account `user_id`: `rate_limited` once it had
+    /// [`MAX_ACTIONS`] this minute.
+    fn admit_action(&self, client: IpAddr, user_id: i64) -> Result<(), Box<Response>> {
+        self.admit(client)?;
+        match self.actions.take(user_id, Instant::now()) {
+            Some(wait) => Err(Box::new(rate_limited(wait))),
+            None => Ok(()),
+        }
+    }
+
     /// `response` of a `session` or `bind` of `client`, which takes a token unless it succeeded.
     fn charge(&self, client: IpAddr, response: Response) -> Response {
         if !response.status().is_success() {
@@ -439,6 +487,10 @@ pub fn routes(wechat: Option<&WeChat>) -> Router<AppState> {
             .route(
                 &format!("{API_PATH}/devices/{{endpoint_id}}"),
                 get(show_device).fallback(not_found),
+            )
+            .route(
+                &format!("{API_PATH}/devices/{{endpoint_id}}/sign-out"),
+                post(sign_out_device).fallback(not_found),
             )
             .route(&format!("{API_PATH}/scan"), post(scan).fallback(not_found))
             .route(
@@ -1563,7 +1615,7 @@ pub async fn rename(
         &state.db,
         account.user_id,
         &username,
-        gono_server_core::audit::Actor::User,
+        Actor::User,
         Some(client),
         now,
     )
@@ -1628,6 +1680,89 @@ async fn fresh_identity(
     }
 }
 
+/// Refuses unless the fresh code of `request` is of the WeChat of the session that reads
+/// `account`: `not_permitted` for another WeChat's (bound elsewhere or to nothing), and the
+/// refusals of [`fresh_identity`] (the phone, WeChat's).
+async fn fresh_code_of(
+    state: &AppState,
+    wechat: &WeChat,
+    client: IpAddr,
+    request: &CodeRequest,
+    account: &Account,
+) -> Result<(), Box<Response>> {
+    let identity = fresh_identity(state, wechat, client, request).await?;
+    if identity.id == account.identity_id {
+        Ok(())
+    } else {
+        Err(Box::new(error(StatusCode::FORBIDDEN, "not_permitted")))
+    }
+}
+
+/// `409 device_revoked`.
+fn device_revoked() -> Response {
+    error(StatusCode::CONFLICT, "device_revoked")
+}
+
+/// `POST /gono/v1/wechat/devices/<endpoint id>/sign-out` `{code, platform}`: stops remote access
+/// for the device as the account page's "Stop remote access" does (protocol 9.4): its credential
+/// is deleted, the entry stays (bound to the account, revocable), the account's other devices
+/// get `device.removed`, and its connections end. Unlike the account page it needs no service
+/// (decided on 2026-11-24): taking access away is never refused for a switch. A device that is
+/// signed out already answers `204` as well; a revoked one `device_revoked`.
+pub async fn sign_out_device(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Path(hex): axum::extract::Path<String>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let wechat = match wechat_of(&state) {
+        Ok(wechat) => wechat,
+        Err(response) => return *response,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    let account = match session_account(&state, &wechat, client, &headers).await {
+        Ok(account) => account,
+        Err(response) => return *response,
+    };
+    if let Err(response) = wechat.admit_action(client, account.user_id) {
+        return *response;
+    }
+    let response = async {
+        let request: CodeRequest = match parse(body) {
+            Ok(request) => request,
+            Err(response) => return *response,
+        };
+        let device = match own_device(&state, &account, &hex).await {
+            Ok(device) => device,
+            Err(response) => return *response,
+        };
+        if device.is_revoked() {
+            return device_revoked();
+        }
+        if let Err(response) = fresh_code_of(&state, &wechat, client, &request, &account).await {
+            return *response;
+        }
+        let Some(connect) = &state.connect else {
+            return error(StatusCode::NOT_FOUND, "not_found");
+        };
+        match connect.sign_out(&device, Actor::MiniProgram).await {
+            Ok(_) => {
+                tracing::info!(
+                    %client,
+                    user = %account.username,
+                    device = %device.endpoint_id.short(),
+                    "remote access stopped for a device in the mini program"
+                );
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Err(err) => database(&err, "sign a device out"),
+        }
+    }
+    .await;
+    wechat.charge(client, response)
+}
+
 /// `POST /gono/v1/wechat/account/delete`.
 pub async fn delete_account(
     State(state): State<AppState>,
@@ -1674,7 +1809,7 @@ pub async fn delete_account(
         match users::request_deletion(
             &state.db,
             account.user_id,
-            gono_server_core::audit::Actor::User,
+            Actor::User,
             Some(client),
             now,
         )
@@ -1721,14 +1856,8 @@ pub async fn restore(
             Err(response) => return *response,
         };
         let now = db::unix_now();
-        match users::cancel_deletion(
-            &state.db,
-            identity.user_id,
-            gono_server_core::audit::Actor::User,
-            Some(client),
-            now,
-        )
-        .await
+        match users::cancel_deletion(&state.db, identity.user_id, Actor::User, Some(client), now)
+            .await
         {
             Ok(true) => {}
             Ok(false) => return error(StatusCode::CONFLICT, "not_pending"),
@@ -1776,5 +1905,25 @@ pub async fn verify_file(State(state): State<AppState>) -> Response {
     {
         Some(verify) => verify.response(),
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_account_may_act_ten_times_a_minute() {
+        let limiter = ActionLimiter::default();
+        let start = Instant::now();
+        for _ in 0..MAX_ACTIONS {
+            assert_eq!(limiter.take(1, start), None);
+        }
+        let wait = limiter.take(1, start + Duration::from_secs(20)).unwrap();
+        assert_eq!(wait, Duration::from_secs(40));
+        // Another account has a window of its own.
+        assert_eq!(limiter.take(2, start + Duration::from_secs(20)), None);
+        // A new window starts once the minute is over.
+        assert_eq!(limiter.take(1, start + ACTION_WINDOW), None);
     }
 }

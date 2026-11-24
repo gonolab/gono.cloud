@@ -1090,8 +1090,9 @@ fields, as `/gono/v1/` allows. A ticked item is built and committed (checked aga
   them (P 9.1). Another account's device, or none: `404 not_found` (P 10). Built: `introduced`
   comes from `devices::introduced_by` (the approvals the account page uses) and lists entries of
   S6; a malformed ID and a server without remote access answer `not_found` too.
-- [ ] **S8 `POST /gono/v1/wechat/devices/{endpoint_id}/sign-out`** `{code, platform}` → `204`
-  (P 9.4). A revoked device: `409 device_revoked`.
+- [x] **S8 `POST /gono/v1/wechat/devices/{endpoint_id}/sign-out`** `{code, platform}` → `204`
+  (P 9.4). A revoked device: `409 device_revoked`. Built with the common rules below; no service
+  needed (decided on 2026-11-24); a device signed out already answers `204`.
 - [ ] **S9 `POST /gono/v1/wechat/devices/{endpoint_id}/revoke`** `{code, platform, confirm:
   <endpoint_id>, also: [endpoint_id, ...]}` → `204` (P 9.1, 9.2 for each). `confirm` must repeat
   the path's ID. `also` must be among `introduced`.

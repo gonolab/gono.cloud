@@ -31,6 +31,9 @@ pub enum Actor {
     Device,
     /// The server itself (expiry, relay refusals).
     Server,
+    /// The account's user in the WeChat mini program, with a fresh sign-in code of the WeChat
+    /// bound to the account.
+    MiniProgram,
 }
 
 impl Actor {
@@ -42,6 +45,7 @@ impl Actor {
             Self::Cli => "cli",
             Self::Device => "device",
             Self::Server => "server",
+            Self::MiniProgram => "mini_program",
         }
     }
 }

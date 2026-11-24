@@ -171,6 +171,22 @@ impl Mini {
             .await
     }
 
+    /// `method` `path` with the session and a JSON body, as an action of a signed-in mini
+    /// program.
+    async fn act(&self, method: &str, path: &str, session: &str, body: &Value) -> Answer {
+        let bearer = format!("Bearer {session}");
+        self.send(
+            method,
+            path,
+            &[
+                ("Authorization", &bearer),
+                ("Content-Type", "application/json"),
+            ],
+            Body::from(body.to_string()),
+        )
+        .await
+    }
+
     async fn account(&self, session: &str) -> Answer {
         self.with_bearer("GET", "/gono/v1/wechat/account", session)
             .await
@@ -281,6 +297,20 @@ async fn connect_on(f: &mut Fixture) {
     .await
     .unwrap();
     f.state.connect = Some(connect);
+}
+
+/// A new account with direct connections, so that devices can register into it.
+async fn add_user_with_direct(f: &Fixture, name: &str) -> i64 {
+    let id = add_user(f, name).await;
+    users::set_services(
+        &f.state.db,
+        &Username::new(name).unwrap(),
+        gono_server_core::services::Services::NONE
+            .with(gono_server_core::services::Service::Direct, true),
+    )
+    .await
+    .unwrap();
+    id
 }
 
 /// A session of alice's WeChat, bound to her account directly.
@@ -2149,15 +2179,7 @@ async fn the_session_lists_the_devices_of_its_account() {
     let home = super::register_device(&f.state, alice_id, 1, "Home PC").await;
     let laptop = super::register_device(&f.state, alice_id, 2, "Laptop").await;
     let old = super::register_device(&f.state, alice_id, 3, "Old PC").await;
-    let bob = add_user(&f, "bob").await;
-    users::set_services(
-        &f.state.db,
-        &Username::new("bob").unwrap(),
-        gono_server_core::services::Services::NONE
-            .with(gono_server_core::services::Service::Direct, true),
-    )
-    .await
-    .unwrap();
+    let bob = add_user_with_direct(&f, "bob").await;
     super::register_device(&f.state, bob, 4, "Bob's PC").await;
     let now = db::unix_now();
     devices::leave(&f.state.db, laptop.id, audit::Actor::User, now)
@@ -2308,15 +2330,7 @@ async fn the_session_shows_a_device_with_the_devices_it_introduced() {
     assert_eq!(shown["introduced"].as_array().unwrap().len(), 1);
 
     // Another account's device, an unknown one and a malformed ID look the same.
-    let bob = add_user(&f, "bob").await;
-    users::set_services(
-        &f.state.db,
-        &Username::new("bob").unwrap(),
-        gono_server_core::services::Services::NONE
-            .with(gono_server_core::services::Service::Direct, true),
-    )
-    .await
-    .unwrap();
+    let bob = add_user_with_direct(&f, "bob").await;
     let bobs = super::register_device(&f.state, bob, 4, "Bob's PC").await;
     for hex in [
         bobs.endpoint_id.to_hex(),
@@ -2340,6 +2354,164 @@ async fn the_session_shows_a_device_with_the_devices_it_introduced() {
         )
         .await
         .error(),
+        (StatusCode::UNAUTHORIZED, "not_signed_in".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn the_mini_program_stops_remote_access_for_a_device_with_a_fresh_code() {
+    let (mut f, api, _) = with_wechat(None).await;
+    let session = alice_session(&f, &Mini::new(&f), &api).await;
+    let alice_id = alice(&f).await.id;
+    connect_on(&mut f).await;
+    let mini = Mini::new(&f);
+    let home = super::register_device(&f.state, alice_id, 1, "Home PC").await;
+    let lost = super::register_device(&f.state, alice_id, 2, "Lost PC").await;
+    let bob = add_user_with_direct(&f, "bob").await;
+    let bobs = super::register_device(&f.state, bob, 3, "Bob's PC").await;
+    insert_identity(&f, bob, BOB_OPENID).await;
+    let path = |device: &devices::Device| {
+        format!(
+            "/gono/v1/wechat/devices/{}/sign-out",
+            device.endpoint_id.to_hex()
+        )
+    };
+    let sign_out = |device: &devices::Device, body: Value| {
+        let path = path(device);
+        let mini = &mini;
+        let session = session.clone();
+        async move { mini.act("POST", &path, &session, &body).await }
+    };
+    let signed_out = |id: i64| {
+        let db = f.state.db.clone();
+        async move {
+            devices::get(&db, id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_signed_out()
+        }
+    };
+
+    // Each of these is refused, and counts as one of the account's actions.
+    api.accept("bobs-code", BOB_OPENID);
+    api.accept("strangers-code", "oStranger");
+    for (body, status, code) in [
+        (
+            json!({ "platform": "ios" }),
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        ),
+        (
+            json!({ "code": "c1", "platform": "windows" }),
+            StatusCode::FORBIDDEN,
+            "desktop_client",
+        ),
+        (
+            json!({ "code": "unknown", "platform": "ios" }),
+            StatusCode::BAD_REQUEST,
+            "code_invalid",
+        ),
+        // The fresh code must be of alice's WeChat: not of another account's, nor of a WeChat
+        // bound to nothing.
+        (
+            json!({ "code": "bobs-code", "platform": "ios" }),
+            StatusCode::FORBIDDEN,
+            "not_permitted",
+        ),
+        (
+            json!({ "code": "strangers-code", "platform": "android" }),
+            StatusCode::FORBIDDEN,
+            "not_permitted",
+        ),
+    ] {
+        assert_eq!(
+            sign_out(&home, body.clone()).await.error(),
+            (status, code.to_owned()),
+            "{body}"
+        );
+    }
+    assert!(!signed_out(home.id).await);
+
+    // With it, and even without direct connections (decided on 2026-11-24): the credential is
+    // gone, the entry stays, and the audit log names the mini program.
+    users::set_services(
+        &f.state.db,
+        &Username::new("alice").unwrap(),
+        gono_server_core::services::Services::NONE,
+    )
+    .await
+    .unwrap();
+    api.accept("alice-1", ALICE_OPENID);
+    let done = sign_out(&home, json!({ "code": "alice-1", "platform": "ios" })).await;
+    assert_eq!(done.status, StatusCode::NO_CONTENT, "{:?}", done.body);
+    assert!(signed_out(home.id).await);
+    let entries = audit::list(&f.state.db, Some(alice_id), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        (entries[0].kind.as_str(), entries[0].actor.as_str()),
+        ("device.removed", "mini_program")
+    );
+    // Signed out already: done all the same.
+    api.accept("alice-2", ALICE_OPENID);
+    assert_eq!(
+        sign_out(&home, json!({ "code": "alice-2", "platform": "ios" }))
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+    // A revoked device, and another account's.
+    devices::revoke(
+        &f.state.db,
+        alice_id,
+        &[lost.endpoint_id],
+        devices::RevokedBy::AccountPage,
+        None,
+        db::unix_now(),
+    )
+    .await
+    .unwrap();
+    api.accept("alice-3", ALICE_OPENID);
+    assert_eq!(
+        sign_out(&lost, json!({ "code": "alice-3", "platform": "ios" }))
+            .await
+            .error(),
+        (StatusCode::CONFLICT, "device_revoked".to_owned())
+    );
+    assert_eq!(
+        sign_out(&bobs, json!({ "code": "alice-3", "platform": "ios" }))
+            .await
+            .error(),
+        (StatusCode::NOT_FOUND, "not_found".to_owned())
+    );
+    assert!(!signed_out(bobs.id).await);
+
+    // That made ten actions this minute: the eleventh waits, from any address.
+    api.accept("alice-4", ALICE_OPENID);
+    assert_eq!(
+        sign_out(&home, json!({ "code": "alice-4", "platform": "ios" }))
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+    let limited = mini
+        .at(9)
+        .act(
+            "POST",
+            &path(&home),
+            &session,
+            &json!({ "code": "alice-4", "platform": "ios" }),
+        )
+        .await;
+    assert_eq!(limited.error().0, StatusCode::TOO_MANY_REQUESTS);
+    assert!(limited.header("retry-after").parse::<u64>().unwrap() >= 1);
+
+    // Without a session, nothing.
+    assert_eq!(
+        mini.send("POST", &path(&home), &[], Body::empty())
+            .await
+            .error(),
         (StatusCode::UNAUTHORIZED, "not_signed_in".to_owned())
     );
 }

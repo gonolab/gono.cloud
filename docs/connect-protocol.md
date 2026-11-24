@@ -1213,7 +1213,9 @@ remote access is not trusted on the LAN either.
 ### 9.4 Signing out
 
 `DELETE /gono/v1/device` (device app password) or `leave` on the control channel signs out a
-device that is still in its user's hands.
+device that is still in its user's hands. Its user can also sign it out on the account page
+("Stop remote access", below) or in the WeChat mini program, with a fresh sign-in code of the
+WeChat bound to the account (`docs/wechat-miniprogram.md`).
 
 - **What is deleted.** The app password. The directory entry stays, marked signed out.
 - **The key stays bound to the account.** The device can register again with the same key,
@@ -1263,7 +1265,7 @@ it (13.1).
 | `pair.withdraw` | device N | its own request |
 | `session` report | a device | the peer is a device of the account; one side of the session must be the reporter |
 | Revoke a device | a user / an admin | after the second confirmation (9.1). The user: own account, session past the second step. The admin: any account |
-| Sign out | a device / a user | the device itself; or its user on the account page, with a session past the second step (9.4) |
+| Sign out | a device / a user | the device itself; or its user on the account page, with a session past the second step, or in the WeChat mini program, with a fresh sign-in code of the account's WeChat (9.4) |
 | Relay admission | endpoint E | 11.1 |
 | Two-step verification | a user / an admin | 13 |
 
@@ -1349,7 +1351,7 @@ clipboard, no screen, no file names, and no addresses published by devices.
 | `device.registered`, `device.reregistered` | 4.3, 4.4 | user (web) | device, product, platform, name, client IP |
 | `device.renamed`, `device.settings` | 6.3 | device or user | old and new values |
 | `device.revoked` | 9.2 | user, admin, CLI | device; the devices it introduced that were revoked along with it |
-| `device.removed` | 9.4 | device | — |
+| `device.removed` | 9.4 | device, user, mini program | — |
 | `device.connected` | Control connection from an address the device did not use last time | device | client IP |
 | `device.flapping` | 5.1 | — | device, the client IPs involved |
 | `connect.requested` | 7.2 | device | target, service, purpose, outcome (allowed or error code) |

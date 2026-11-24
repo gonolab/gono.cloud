@@ -587,6 +587,10 @@ What users see:
 - **Signing in again.** Once bound, the WeChat signs in to the mini program however it was
   opened, on a phone: from the chat list, after logging out, on a new phone. Only binding needs
   the scan. WeChat on a desktop or in the developer tools signs in to nothing.
+- **Devices in the mini program.** The mini program lists the account's devices as the account
+  page does, and stops remote access for one. Every such action takes a fresh sign-in of the
+  account's WeChat on the phone, in place of the account page's second step, and works whether
+  or not the account has direct connections. The audit log names the actor `mini_program`.
 - **Unbinding** ("Unbind" in the same panel) asks to confirm it is you the same way, and signs
   the mini program out on every phone. Disabling or deleting an account ends its mini program
   sessions as well; otherwise a session ends 30 days after its last use.
@@ -604,7 +608,7 @@ What users see:
   you the same way. Wrong digits count against the browser's address like failed sign-ins.
 - **Limits.** `session`, `bind`, `bind/preview`, `scan`, `confirm` and `deny` of the mini
   program are limited per client address like the sign-in pages: failures count, successful
-  calls do not.
+  calls do not. Each account may act on its devices 10 times a minute from the mini program.
 
 ## Google and GitHub sign-in
 
