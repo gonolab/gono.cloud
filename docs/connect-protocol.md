@@ -693,7 +693,8 @@ again.
 | `device.removed` | A device signed out (9.4) | `endpoint_id`, `at` |
 
 `by` names the kind of actor, never a person or an address: `account_page`, `admin`, `cli`,
-`app_password_deleted`.
+`app_password_deleted`, `mini_program` (the user in the WeChat mini program). New kinds may
+appear.
 
 ### 6.3 Settings
 
@@ -1126,6 +1127,8 @@ model weighs this choice (5.4).
 
 **Who can revoke:**
 - the user, on the account page, with a session that passed the second step;
+- the user, in the WeChat mini program, with a fresh sign-in code of the WeChat bound to the
+  account (`docs/wechat-miniprogram.md`);
 - an admin, in the admin UI or with `gono-cloud device revoke <user> <endpoint id>`.
 
 
@@ -1156,6 +1159,9 @@ action opens a confirmation step, and nothing changes until it is confirmed:
   page also needs a session that passed the second step.
 - **CLI.** `gono-cloud device revoke` asks interactively. Without a terminal it needs
   `--confirm <endpoint id>`, repeating the full ID.
+- **Mini program.** A confirmation page of its own, where the user types the last 4
+  characters of the short ID; the request repeats the full ID (`confirm`), names the introduced
+  devices ticked (`also`), and carries a fresh sign-in code of the account's WeChat.
 
 
 ### 9.2 What the server does
@@ -1264,7 +1270,7 @@ it (13.1).
 | `pair.approve`, `pair.decline` | device A | 8.6; same account |
 | `pair.withdraw` | device N | its own request |
 | `session` report | a device | the peer is a device of the account; one side of the session must be the reporter |
-| Revoke a device | a user / an admin | after the second confirmation (9.1). The user: own account, session past the second step. The admin: any account |
+| Revoke a device | a user / an admin | after the second confirmation (9.1). The user: own account, session past the second step, or in the WeChat mini program with a fresh sign-in code of the account's WeChat. The admin: any account |
 | Sign out | a device / a user | the device itself; or its user on the account page, with a session past the second step, or in the WeChat mini program, with a fresh sign-in code of the account's WeChat (9.4) |
 | Relay admission | endpoint E | 11.1 |
 | Two-step verification | a user / an admin | 13 |
@@ -1350,7 +1356,7 @@ clipboard, no screen, no file names, and no addresses published by devices.
 |---|---|---|---|
 | `device.registered`, `device.reregistered` | 4.3, 4.4 | user (web) | device, product, platform, name, client IP |
 | `device.renamed`, `device.settings` | 6.3 | device or user | old and new values |
-| `device.revoked` | 9.2 | user, admin, CLI | device; the devices it introduced that were revoked along with it |
+| `device.revoked` | 9.2 | user, admin, CLI, mini program | device; the devices it introduced that were revoked along with it |
 | `device.removed` | 9.4 | device, user, mini program | — |
 | `device.connected` | Control connection from an address the device did not use last time | device | client IP |
 | `device.flapping` | 5.1 | — | device, the client IPs involved |

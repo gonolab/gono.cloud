@@ -11,6 +11,7 @@
 //! | `GET /gono/v1/wechat/devices` | The devices of the session's account, as the account page lists them: active, signed out and revoked. |
 //! | `GET /gono/v1/wechat/devices/<endpoint id>` | One of them, with the devices it introduced (its approvals), which revoking it can take along. |
 //! | `POST /gono/v1/wechat/devices/<endpoint id>/sign-out` | Stops remote access for the device (protocol 9.4), with a fresh code of the account's WeChat. |
+//! | `POST /gono/v1/wechat/devices/<endpoint id>/revoke` | Revokes the device and the introduced devices ticked with it (protocol 9.1, 9.2), with a fresh code. |
 //! | `POST /gono/v1/wechat/signup` | With `[wechat] allow_signup`: creates an account (no service, no password, a generated username) for the WeChat of a signup token, and opens a session. |
 //! | `PATCH /gono/v1/wechat/account` | Changes the username of an account made by a sign-up, until a device or app signed in to it. |
 //! | `POST /gono/v1/wechat/account/delete` | An account without a web password asks for its deletion (a fresh code of its WeChat): disabled at once, deleted after 7 days. |
@@ -62,7 +63,8 @@
 //!   mini program behind one address (a carrier's NAT) do not lock each other out. `account`
 //!   and `logout` cost a token only for a bearer token that is no session, and are refused for
 //!   those only, as device authentication is.
-//! - **Actions on the account** (`devices/<id>/sign-out`) need, beside the session, a fresh
+//! - **Actions on the account** (`devices/<id>/sign-out`, `devices/<id>/revoke`) need, beside
+//!   the session, a fresh
 //!   code of `wx.login()` from the WeChat bound to the account, on a phone ([`fresh_code_of`]):
 //!   it stands in for the second step that the account page asks for (protocol 10). Each
 //!   account may act [`MAX_ACTIONS`] times a minute ([`ActionLimiter`]), beside the client's
@@ -491,6 +493,10 @@ pub fn routes(wechat: Option<&WeChat>) -> Router<AppState> {
             .route(
                 &format!("{API_PATH}/devices/{{endpoint_id}}/sign-out"),
                 post(sign_out_device).fallback(not_found),
+            )
+            .route(
+                &format!("{API_PATH}/devices/{{endpoint_id}}/revoke"),
+                post(revoke_device).fallback(not_found),
             )
             .route(&format!("{API_PATH}/scan"), post(scan).fallback(not_found))
             .route(
@@ -1645,6 +1651,9 @@ struct CodeRequest {
     platform: String,
     #[serde(default)]
     confirm: Option<String>,
+    /// `devices/<id>/revoke`: the introduced devices to revoke along with it.
+    #[serde(default)]
+    also: Vec<String>,
 }
 
 /// The identity of the fresh code of `request` and its account, or the answer to refuse
@@ -1757,6 +1766,97 @@ pub async fn sign_out_device(
                 StatusCode::NO_CONTENT.into_response()
             }
             Err(err) => database(&err, "sign a device out"),
+        }
+    }
+    .await;
+    wechat.charge(client, response)
+}
+
+/// `POST /gono/v1/wechat/devices/<endpoint id>/revoke` `{code, platform, confirm, also}`: revokes
+/// the device (protocol 9.1, 9.2) after the mini program's second confirmation, which `confirm`
+/// repeats: the device's full ID, as `--confirm` of `gono-cloud device revoke`. `also` names
+/// devices it introduced (those of `introduced`) to revoke along with it, as the account page's
+/// boxes do. Another `confirm`, or an `also` that is not among `introduced`, is `bad_request`
+/// and revokes nothing. Revoking needs no service, as on the account page; a revoked device
+/// answers `device_revoked`.
+pub async fn revoke_device(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Path(hex): axum::extract::Path<String>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let wechat = match wechat_of(&state) {
+        Ok(wechat) => wechat,
+        Err(response) => return *response,
+    };
+    let client = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    let account = match session_account(&state, &wechat, client, &headers).await {
+        Ok(account) => account,
+        Err(response) => return *response,
+    };
+    if let Err(response) = wechat.admit_action(client, account.user_id) {
+        return *response;
+    }
+    let response = async {
+        let request: CodeRequest = match parse(body) {
+            Ok(request) => request,
+            Err(response) => return *response,
+        };
+        let device = match own_device(&state, &account, &hex).await {
+            Ok(device) => device,
+            Err(response) => return *response,
+        };
+        if device.is_revoked() {
+            return device_revoked();
+        }
+        if request.confirm.as_deref() != Some(device.endpoint_id.to_hex().as_str()) {
+            return bad_request();
+        }
+        let introduced = match devices::introduced_by(&state.db, device.id).await {
+            Ok(introduced) => introduced,
+            Err(err) => return database(&err, "list the devices a device introduced"),
+        };
+        let mut keys = vec![device.endpoint_id];
+        for hex in &request.also {
+            match introduced
+                .iter()
+                .find(|other| other.endpoint_id.to_hex() == *hex)
+            {
+                Some(other) if !keys.contains(&other.endpoint_id) => keys.push(other.endpoint_id),
+                Some(_) => {}
+                None => return bad_request(),
+            }
+        }
+        if let Err(response) = fresh_code_of(&state, &wechat, client, &request, &account).await {
+            return *response;
+        }
+        let revoked = devices::revoke(
+            &state.db,
+            account.user_id,
+            &keys,
+            devices::RevokedBy::MiniProgram,
+            Some(client),
+            db::unix_now(),
+        )
+        .await;
+        match revoked {
+            Ok(revoked) => {
+                for device in &revoked {
+                    tracing::info!(
+                        %client,
+                        user = %account.username,
+                        device = %device.endpoint_id.short(),
+                        "device revoked in the mini program"
+                    );
+                }
+                // The running server closes their connections and tells the other devices.
+                if let Some(connect) = &state.connect {
+                    connect.poke();
+                }
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Err(err) => database(&err, "revoke a device"),
         }
     }
     .await;

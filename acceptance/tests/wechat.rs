@@ -215,6 +215,7 @@ async fn the_calls_of_a_session_need_one() {
         ("GET", "devices".to_owned()),
         ("GET", format!("devices/{some_device}")),
         ("POST", format!("devices/{some_device}/sign-out")),
+        ("POST", format!("devices/{some_device}/revoke")),
     ] {
         let url = ctx.url(&format!("/gono/v1/wechat/{path}"));
         let request = match method {

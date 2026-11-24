@@ -137,7 +137,9 @@ compatible within a major version: released clients keep working with newer serv
   introduced, as the account page's revocation step lists them. Other accounts' devices answer
   `not_found`. `POST /gono/v1/wechat/devices/<endpoint id>/sign-out` stops remote access for a
   device as the account page does (protocol 9.4), also for an account without direct
-  connections. Such actions need a fresh `wx.login()` code of the WeChat bound to the account
+  connections, and `POST /gono/v1/wechat/devices/<endpoint id>/revoke` revokes it with the
+  introduced devices ticked (`also`) after a second confirmation that repeats its ID
+  (`confirm`); other devices get `device.revoked` with `by: "mini_program"`. Such actions need a fresh `wx.login()` code of the WeChat bound to the account
   (`not_permitted` for another WeChat's), in place of the account page's second step; each
   account may act 10 times a minute, and the audit log names the new actor `mini_program`.
 - **Services per account**: every account has five switches, all off for new accounts, the

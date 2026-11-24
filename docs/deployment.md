@@ -588,7 +588,8 @@ What users see:
   opened, on a phone: from the chat list, after logging out, on a new phone. Only binding needs
   the scan. WeChat on a desktop or in the developer tools signs in to nothing.
 - **Devices in the mini program.** The mini program lists the account's devices as the account
-  page does, and stops remote access for one. Every such action takes a fresh sign-in of the
+  page does, stops remote access for one, and revokes one (after a second confirmation, with the
+  devices it introduced that the user ticks). Every such action takes a fresh sign-in of the
   account's WeChat on the phone, in place of the account page's second step, and works whether
   or not the account has direct connections. The audit log names the actor `mini_program`.
 - **Unbinding** ("Unbind" in the same panel) asks to confirm it is you the same way, and signs

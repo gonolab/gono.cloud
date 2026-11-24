@@ -519,7 +519,8 @@ pub enum ServerMessage {
         endpoint_id: DeviceId,
         /// When.
         at: i64,
-        /// `account_page`, `admin` or `cli`.
+        /// `account_page`, `admin`, `cli` or `mini_program` (the user in the WeChat mini
+        /// program); new kinds may appear.
         by: String,
     },
     /// A device signed out (protocol 9.4).

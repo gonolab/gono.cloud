@@ -759,6 +759,8 @@ pub enum RevokedBy {
     Admin,
     /// The operator, with `gono-cloud device revoke`.
     Cli,
+    /// The user, in the WeChat mini program, with a fresh sign-in code of the account's WeChat.
+    MiniProgram,
 }
 
 impl RevokedBy {
@@ -768,6 +770,7 @@ impl RevokedBy {
             Self::AccountPage => "account_page",
             Self::Admin => "admin",
             Self::Cli => "cli",
+            Self::MiniProgram => "mini_program",
         }
     }
 
@@ -776,6 +779,7 @@ impl RevokedBy {
             Self::AccountPage => Actor::User,
             Self::Admin => Actor::Admin,
             Self::Cli => Actor::Cli,
+            Self::MiniProgram => Actor::MiniProgram,
         }
     }
 }

@@ -2515,3 +2515,168 @@ async fn the_mini_program_stops_remote_access_for_a_device_with_a_fresh_code() {
         (StatusCode::UNAUTHORIZED, "not_signed_in".to_owned())
     );
 }
+
+#[tokio::test]
+async fn the_mini_program_revokes_a_device_and_the_devices_ticked_with_it() {
+    let (mut f, api, _) = with_wechat(None).await;
+    let session = alice_session(&f, &Mini::new(&f), &api).await;
+    let alice_id = alice(&f).await.id;
+    connect_on(&mut f).await;
+    let mini = Mini::new(&f);
+    let phone = super::register_device(&f.state, alice_id, 1, "Phone").await;
+    let work = super::register_device(&f.state, alice_id, 2, "Work PC").await;
+    let laptop = super::register_device(&f.state, alice_id, 3, "Laptop").await;
+    let tablet = super::register_device(&f.state, alice_id, 4, "Tablet").await;
+    for subject in [&work, &laptop] {
+        devices::record_approval(&f.state.db, alice_id, phone.id, subject.id, &json!({}), 1)
+            .await
+            .unwrap();
+    }
+    let bob = add_user_with_direct(&f, "bob").await;
+    let bobs = super::register_device(&f.state, bob, 5, "Bob's PC").await;
+    insert_identity(&f, bob, BOB_OPENID).await;
+    let hex = |device: &devices::Device| device.endpoint_id.to_hex();
+    let revoke = |device: &devices::Device, body: Value| {
+        let path = format!("/gono/v1/wechat/devices/{}/revoke", hex(device));
+        let mini = &mini;
+        let session = session.clone();
+        async move { mini.act("POST", &path, &session, &body).await }
+    };
+    let revoked = |id: i64| {
+        let db = f.state.db.clone();
+        async move { devices::get(&db, id).await.unwrap().unwrap().is_revoked() }
+    };
+    for code in ["a1", "a2", "a3", "a4", "a5"] {
+        api.accept(code, ALICE_OPENID);
+    }
+    api.accept("bobs-code", BOB_OPENID);
+
+    // The second confirmation must repeat the full ID, and only introduced devices go along.
+    for (body, status, code) in [
+        (
+            json!({ "code": "a1", "platform": "ios" }),
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        ),
+        (
+            json!({ "code": "a1", "platform": "ios", "confirm": phone.endpoint_id.short() }),
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        ),
+        (
+            json!({
+                "code": "a1",
+                "platform": "ios",
+                "confirm": hex(&phone),
+                "also": [hex(&tablet)],
+            }),
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        ),
+        (
+            json!({
+                "code": "a1",
+                "platform": "ios",
+                "confirm": hex(&phone),
+                "also": [hex(&bobs)],
+            }),
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        ),
+        (
+            json!({ "code": "bobs-code", "platform": "ios", "confirm": hex(&phone) }),
+            StatusCode::FORBIDDEN,
+            "not_permitted",
+        ),
+    ] {
+        assert_eq!(
+            revoke(&phone, body.clone()).await.error(),
+            (status, code.to_owned()),
+            "{body}"
+        );
+    }
+    for device in [&phone, &work, &laptop, &tablet, &bobs] {
+        assert!(!revoked(device.id).await, "{}", device.name);
+    }
+
+    // Revoked with the ticked device; the other one it introduced stays trusted.
+    let done = revoke(
+        &phone,
+        json!({ "code": "a2", "platform": "ios", "confirm": hex(&phone), "also": [hex(&work)] }),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::NO_CONTENT, "{:?}", done.body);
+    assert!(revoked(phone.id).await && revoked(work.id).await);
+    assert!(!revoked(laptop.id).await);
+    let records: Vec<(String, String, Value)> = audit::list(&f.state.db, Some(alice_id), None, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.kind == "device.revoked")
+        .map(|entry| {
+            let details: Value = serde_json::from_str(&entry.details).unwrap();
+            (entry.kind, entry.actor, details["by"].clone())
+        })
+        .collect();
+    assert_eq!(records.len(), 2);
+    for record in &records {
+        assert_eq!(
+            (record.1.as_str(), &record.2),
+            ("mini_program", &json!("mini_program"))
+        );
+    }
+    // The other devices learn who revoked it.
+    let (events, _) = devices::events_since(&f.state.db, alice_id, 0, 100)
+        .await
+        .unwrap();
+    let by: Vec<Value> = events
+        .iter()
+        .filter(|event| event.kind == "device.revoked")
+        .map(|event| serde_json::from_str::<Value>(&event.body).unwrap()["by"].clone())
+        .collect();
+    assert_eq!(by, [json!("mini_program"), json!("mini_program")]);
+
+    // Once revoked, there is nothing left to revoke; another account's device is not found.
+    assert_eq!(
+        revoke(
+            &phone,
+            json!({ "code": "a3", "platform": "ios", "confirm": hex(&phone) })
+        )
+        .await
+        .error(),
+        (StatusCode::CONFLICT, "device_revoked".to_owned())
+    );
+    assert_eq!(
+        revoke(
+            &bobs,
+            json!({ "code": "a3", "platform": "ios", "confirm": hex(&bobs) })
+        )
+        .await
+        .error(),
+        (StatusCode::NOT_FOUND, "not_found".to_owned())
+    );
+    assert!(!revoked(bobs.id).await);
+
+    // Revoking needs no service, as on the account page.
+    users::set_services(
+        &f.state.db,
+        &Username::new("alice").unwrap(),
+        gono_server_core::services::Services::NONE,
+    )
+    .await
+    .unwrap();
+    let done = revoke(
+        &tablet,
+        json!({ "code": "a4", "platform": "android", "confirm": hex(&tablet) }),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::NO_CONTENT, "{:?}", done.body);
+    assert!(revoked(tablet.id).await);
+
+    // Without a session, nothing.
+    let path = format!("/gono/v1/wechat/devices/{}/revoke", hex(&laptop));
+    assert_eq!(
+        mini.send("POST", &path, &[], Body::empty()).await.error(),
+        (StatusCode::UNAUTHORIZED, "not_signed_in".to_owned())
+    );
+}

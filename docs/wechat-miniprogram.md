@@ -15,8 +15,8 @@ turns it on is in [deployment.md](deployment.md#wechat), what the reverse proxy 
   WeChat on the phone. It opens the mini program, which signs in and binds. Unbinding is done on
   the same page, in the admin UI, or with `gono-cloud user unlink`.
 - A mini program session reads the account's name, its services and its devices, and with a
-  fresh sign-in code of the account's WeChat stops remote access for a device; nothing else: no
-  files, no WebDAV, no S3, no page of the server.
+  fresh sign-in code of the account's WeChat stops remote access for a device or revokes it;
+  nothing else: no files, no WebDAV, no S3, no page of the server.
 - Without `[wechat]` every path below `/gono/v1/wechat/` answers
   `404 {"error":"not_found"}`, and the account page says that the server does not offer a mini
   program.
@@ -363,8 +363,8 @@ One device of the session's account, by the 64 hex digits of its `endpoint_id`.
 
 ### Actions on the account
 
-The calls that change something on the account (`devices/<endpoint_id>/sign-out`) take, beside
-the session, a JSON body with:
+The calls that change something on the account (`devices/<endpoint_id>/sign-out`,
+`devices/<endpoint_id>/revoke`) take, beside the session, a JSON body with:
 
 - `code`: a fresh code of `wx.login()`. The server exchanges it with WeChat, and it must be of
   the WeChat bound to the account, the session's: another WeChat's code, bound elsewhere or to
@@ -394,6 +394,34 @@ Stops remote access for a device (停止远程访问). `Authorization: Bearer <s
 
 A device that is signed out already answers `204` as well; a revoked one `409 device_revoked`.
 `not_found` as in [`devices/<endpoint_id>`](#get-gonov1wechatdevicesendpoint_id).
+
+### `POST /gono/v1/wechat/devices/<endpoint_id>/revoke`
+
+Revokes a device (吊销), for one that is lost, stolen or compromised. `Authorization: Bearer
+<session>`, body ([Actions on the account](#actions-on-the-account)):
+
+```json
+{
+  "code": "0e3Kq0Ga1ZxPlq0LrQIa1HxGWQ0Kq0Gq",
+  "platform": "ios",
+  "confirm": "3f6a91c47e20d6f8…",
+  "also": ["9c01…"]
+}
+```
+
+- `confirm` repeats the device's full `endpoint_id`: send it once the user passed the second
+  confirmation (the last 4 characters of `short_id` typed in, protocol 9.1).
+- `also` (optional) names devices of the device's `introduced` that the user ticked, to revoke
+  along with it.
+
+`204 No Content`. It does what the account page's revocation does (protocol 9.2): the devices
+are revoked for good (their keys can never be used on this server again, and the account's
+other devices forget them, on the LAN too), their connections end, and the other devices get
+`device.revoked` with `by: "mini_program"`. It needs no service, as on the account page.
+
+Another `confirm`, or an `also` that is not among `introduced`, answers `bad_request` and revokes
+nothing. A revoked device answers `409 device_revoked`, and `not_found` is as in
+[`devices/<endpoint_id>`](#get-gonov1wechatdevicesendpoint_id).
 
 ### Accounts made in the mini program: `signup`, `PATCH account`, `account/delete`, `account/restore`
 
@@ -507,7 +535,7 @@ are limited like `bind`.
 | `account_disabled` | 403 | The account is disabled. |
 | `not_found` | 404 | No such endpoint or method, the server does not offer the mini program, or no such device of the account. |
 | `not_permitted` | 403 | A web sign-in this WeChat may not confirm: of the admin UI for a non-admin account, of another account, or locked by another WeChat (`confirm`, `deny`); or an action whose fresh code is of another WeChat than the session's. |
-| `device_revoked` | 409 | The device is revoked: it cannot be signed out. |
+| `device_revoked` | 409 | The device is revoked: it cannot be signed out or revoked again. |
 | `account_exists` | 409 | The WeChat is bound to another account. |
 | `ticket_taken` | 409 | Another WeChat scanned the sign-in's QR code first. |
 | `signup_closed` | 403 | The server lets no WeChat sign up (`allow_signup` is off). |
