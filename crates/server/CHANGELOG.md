@@ -10,6 +10,19 @@ compatible within a major version: released clients keep working with newer serv
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-11-26
+
+Ways to sign in besides the web login password: a WeChat mini program, Google, GitHub and
+WeChat on the web, and WeChat in the products' phone apps, with sign-up by these identities
+where the configuration allows it. Also email addresses and password resets by mail, services
+that administrators turn on per account, and MySQL as an alternative to SQLite. **The database
+starts anew**: a database of 2.0.x cannot be migrated to 3.0.0, so an upgrade from 2.0.x starts
+with a new database, new accounts and new app passwords, while the configuration and the files
+stay; the steps of "Upgrading from 1.x" in `docs/deployment.md` apply. **Every new account
+starts with no service, the first admin included**: turn them on in `/manage/` or with
+`gono-cloud user services NAME --enable all`. The account page moves to `/account/` and the
+admin UI to `/manage/`.
+
 ### Added
 
 - **WeChat login for phone apps** (`[[wechat.mobile_apps]]`, none by default). A phone app of the
@@ -574,7 +587,8 @@ their tags stay as they are.
 - Documentation: deployment (`docs/deployment.md`), reverse proxies (`docs/reverse-proxy.md`),
   v1 scope and the mobile test checklist.
 
-[Unreleased]: https://github.com/gonolab/gono.cloud/compare/server-v2.0.2...HEAD
+[Unreleased]: https://github.com/gonolab/gono.cloud/compare/server-v3.0.0...HEAD
+[3.0.0]: https://github.com/gonolab/gono.cloud/compare/server-v2.0.2...server-v3.0.0
 [2.0.2]: https://github.com/gonolab/gono.cloud/compare/server-v2.0.0...server-v2.0.2
 [2.0.0]: https://github.com/gonolab/gono.cloud/compare/server-v1.2.0...server-v2.0.0
 [1.2.0]: https://github.com/gonolab/gono.cloud/compare/server-v1.1.1...server-v1.2.0

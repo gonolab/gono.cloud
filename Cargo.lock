@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "gono-protocol"
-version = "2.0.2"
+version = "3.0.0"
 dependencies = [
  "base64 0.22.1",
  "iroh-base",
@@ -1530,7 +1530,7 @@ dependencies = [
 
 [[package]]
 name = "gono-server"
-version = "2.0.2"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "askama",
@@ -1580,7 +1580,7 @@ dependencies = [
 
 [[package]]
 name = "gono-server-connect"
-version = "2.0.2"
+version = "3.0.0"
 dependencies = [
  "gono-protocol",
  "gono-server-core",
@@ -1599,7 +1599,7 @@ dependencies = [
 
 [[package]]
 name = "gono-server-core"
-version = "2.0.2"
+version = "3.0.0"
 dependencies = [
  "argon2",
  "gono-protocol",
@@ -1624,7 +1624,7 @@ dependencies = [
 
 [[package]]
 name = "gono-server-dav"
-version = "2.0.2"
+version = "3.0.0"
 dependencies = [
  "bytes",
  "dav-server",
@@ -1654,7 +1654,7 @@ dependencies = [
 
 [[package]]
 name = "gono-server-nextcloud"
-version = "2.0.2"
+version = "3.0.0"
 dependencies = [
  "bytes",
  "dav-server",
@@ -1676,7 +1676,7 @@ dependencies = [
 
 [[package]]
 name = "gono-server-relay"
-version = "2.0.2"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1704,7 +1704,7 @@ dependencies = [
 
 [[package]]
 name = "gono-server-s3"
-version = "2.0.2"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
