@@ -128,10 +128,12 @@ async fn mysql_writers_of_different_processes_take_turns() {
         .execute(&first)
         .await
         .unwrap();
-    // Another URL for the same database: another gate, as in another process.
+    // Another URL for the same database: another gate, as in another process. The parameter is
+    // added to the URL's own ones, such as the ssl-mode of GONO_TEST_MYSQL_URL.
     let mut other = config.clone();
     let mut url = other.url.clone().unwrap();
-    url.set_query(Some("statement-cache-capacity=99"));
+    url.query_pairs_mut()
+        .append_pair("statement-cache-capacity", "99");
     other.url = Some(url);
     let second = db::connect(&other, OpenMode::MustExist).await.unwrap();
 
