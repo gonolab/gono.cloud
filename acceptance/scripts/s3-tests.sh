@@ -183,6 +183,10 @@ echo "==> initializing a fresh installation in ${WORK_DIR}"
 random_password | gono init --admin main --password-stdin >/dev/null
 random_password | gono user add alt --display-name "Alt User" --password-stdin >/dev/null
 random_password | gono user add tenant --password-stdin >/dev/null
+# Accounts start without services; the scenarios use all of them.
+for name in main alt tenant; do
+  gono user services "${name}" --enable all >/dev/null
+done
 
 # Creates an access key for every bucket of a user; prints "<access key id> <secret key>".
 make_key() {

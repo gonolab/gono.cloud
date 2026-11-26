@@ -168,6 +168,10 @@ for ((i = 2; i <= ACCOUNTS; i++)); do
     gono user add "load${i}" --password-stdin >/dev/null
   ACCOUNT_NAMES+=("load${i}")
 done
+# Accounts start without services; the scenarios use all of them.
+for name in "${ACCOUNT_NAMES[@]}"; do
+  gono user services "${name}" --enable all >/dev/null
+done
 : >"${WORK_DIR}/rclone.conf"
 for i in "${!ACCOUNT_NAMES[@]}"; do
   KEY_OUTPUT="$(gono s3 key create "${ACCOUNT_NAMES[${i}]}" --label s3-load 2>&1)"

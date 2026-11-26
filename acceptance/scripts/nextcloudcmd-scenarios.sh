@@ -160,6 +160,8 @@ EOF
 echo "==> initializing a fresh installation in ${WORK_DIR}"
 python3 -c 'import secrets; print(secrets.token_urlsafe(18))' |
   "${BIN}" --config "${CONFIG_FILE}" init --admin "${USER_NAME}" --password-stdin >/dev/null
+# Accounts start without services; the scenarios use all of them.
+"${BIN}" --config "${CONFIG_FILE}" user services "${USER_NAME}" --enable all >/dev/null
 PASSWORD="$("${BIN}" --config "${CONFIG_FILE}" app-password add "${USER_NAME}" --label nextcloudcmd 2>&1 |
   sed -n 's/^App password: \([^[:space:]]*\)$/\1/p' | tail -n 1)"
 [[ -n "${PASSWORD}" ]] || fail "app-password add did not print a password"
