@@ -1461,17 +1461,32 @@ async fn mysql_installations_are_initialized_and_managed() {
     let root = testing::mysql_server().unwrap();
     sqlx::any::install_default_drivers();
     let admin = sqlx::AnyPool::connect(root.as_str()).await.unwrap();
+    // The host the server sees the tests connect from, which the account is limited to as an
+    // installation's is: 127.0.0.1 (or localhost) for a server on this machine, but the
+    // gateway of the container network for CI's MySQL in a service container.
+    let host = sqlx::query_scalar::<_, gono_server_core::db::Text>(
+        "SELECT SUBSTRING_INDEX(USER(), '@', -1)",
+    )
+    .fetch_one(&admin)
+    .await
+    .unwrap()
+    .0;
+    assert!(
+        host.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '_')),
+        "unexpected client host {host:?}"
+    );
     let account = format!("u{}", &name[name.len() - 12..]);
     let secret = "pa'ss w0rd";
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE USER '{account}'@'127.0.0.1' IDENTIFIED BY 'pa''ss w0rd'"
+        "CREATE USER '{account}'@'{host}' IDENTIFIED BY 'pa''ss w0rd'"
     )))
     .execute(&admin)
     .await
     .unwrap();
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP, REFERENCES \
-         ON `{name}`.* TO '{account}'@'127.0.0.1'"
+         ON `{name}`.* TO '{account}'@'{host}'"
     )))
     .execute(&admin)
     .await
@@ -1533,7 +1548,7 @@ async fn mysql_installations_are_initialized_and_managed() {
     assert!(!refused.status.success());
 
     let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "DROP USER '{account}'@'127.0.0.1'"
+        "DROP USER '{account}'@'{host}'"
     )))
     .execute(&admin)
     .await;
