@@ -66,8 +66,12 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 30
+    # The image is linked with OpenSSL 1.0.2 and offers TLS without elliptic-curve key exchange,
+    # which rustls does not speak: with the default ssl-mode=preferred every connection fails
+    # with "HandshakeFailure". The server is on the runner, so the tests connect without TLS
+    # (docs/deployment.md, "Setting up MySQL").
     env:
-      GONO_TEST_MYSQL_URL: mysql://root@127.0.0.1:3306
+      GONO_TEST_MYSQL_URL: mysql://root@127.0.0.1:3306?ssl-mode=disabled
     steps:
       - name: Checkout
         uses: actions/checkout@v6

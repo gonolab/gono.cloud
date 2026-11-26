@@ -208,6 +208,13 @@ use TLS: the default `ssl-mode=preferred` does when the server offers TLS (MySQL
 the box), and `ssl-mode=required` or `verify_identity` insist on it. Where the server still
 offers it, an account `IDENTIFIED WITH mysql_native_password` works without TLS.
 
+**Some builds of MySQL 5.7**, among them the official `mysql:5.7` Docker image (linked with
+OpenSSL 1.0.2), offer TLS only without elliptic-curve key exchange, which Gono Cloud's TLS
+library does not support. They offer TLS out of the box, so with the default
+`ssl-mode=preferred` every connection fails with `received fatal alert: HandshakeFailure`. For
+a database on the same host, add `?ssl-mode=disabled` to `db.url`. For one on another host,
+use a MySQL 5.7 linked with a newer OpenSSL, such as Percona Server for MySQL 5.7, or MySQL 8.
+
 ## The first admin account
 
 `gono-cloud init` creates the database, the data directory layout and one account with the
