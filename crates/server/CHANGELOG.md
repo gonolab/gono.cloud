@@ -18,8 +18,10 @@ where the configuration allows it. Also email addresses and password resets by m
 that administrators turn on per account, and MySQL as an alternative to SQLite. **The database
 starts anew**: a database of 2.0.x cannot be migrated to 3.0.0, so an upgrade from 2.0.x starts
 with a new database, new accounts and new app passwords, while the configuration and the files
-stay; the steps of "Upgrading from 1.x" in `docs/deployment.md` apply. **Every new account
-starts with no service, the first admin included**: turn them on in `/manage/` or with
+stay. The install script stops before it changes anything when it finds 2.x; "Upgrading from
+1.x or 2.x" in `docs/deployment.md` describes the steps, among them removing the
+`path = "/apps/manage"` that the install script of 2.0 wrote, which 3.0.0 refuses. **Every new
+account starts with no service, the first admin included**: turn them on in `/manage/` or with
 `gono-cloud user services NAME --enable all`. The account page moves to `/account/` and the
 admin UI to `/manage/`.
 
@@ -229,9 +231,10 @@ admin UI to `/manage/`.
   path below `/apps`, which holds the pages of every account). Its user page has the
   account's services as switches, an admin's own included, and the list of users shows them.
 - **The database schema changed in place and starts anew**: a database created by 2.0.x is
-  refused (its migration checksum differs); create the installation again as after "Upgrading
-  from 1.x" in `docs/deployment.md`. Ids now come from a table of sequences instead of
-  SQLite's AUTOINCREMENT, the same way on both databases.
+  refused (its migration checksum differs), and the install script stops, without changing
+  anything, when it would upgrade a 2.x server; create the installation again as "Upgrading
+  from 1.x or 2.x" in `docs/deployment.md` describes. Ids now come from a table of sequences
+  instead of SQLite's AUTOINCREMENT, the same way on both databases.
 - Paths are limited to 4096 bytes in total (each name still to 255 bytes), on every database;
   longer paths are refused like overlong names.
 

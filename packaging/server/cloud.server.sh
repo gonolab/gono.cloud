@@ -433,21 +433,25 @@ backup_database() {
 	log "Backed the database up to $target"
 }
 
-# Stops before anything changes when the installed server is 1.x and its database exists: 2.0
-# starts with a new database schema, which databases of 1.x cannot be migrated to.
-refuse_upgrade_from_1x() {
+# The database schema a version uses: 2.0.0 and 3.0.0 each started a new one, which the databases
+# of the versions before them cannot be migrated to. Releases from 3.0.0 on migrate in place.
+schema_generation() {
+	case $1 in
+	0.* | 1.*) echo 1 ;;
+	2.*) echo 2 ;;
+	*) echo 3 ;;
+	esac
+}
+
+# Stops before anything changes when the installed server's database exists and uses an older
+# schema than the new version: the new server would refuse it.
+refuse_upgrade_across_schemas() {
 	db=$1
 	[ -x "$BIN" ] || return 0
 	installed=$("$BIN" --version 2>/dev/null) || return 0
 	installed=${installed#gono-cloud }
-	case $installed in
-	1.*) ;;
-	*) return 0 ;;
-	esac
-	case $NEW_VERSION in
-	1.*) return 0 ;;
-	esac
-	die "gono-cloud $installed cannot be upgraded to $NEW_VERSION in place: $NEW_VERSION starts with a new database schema, which the database of $installed cannot be migrated to. Nothing was changed. To start over with $NEW_VERSION, stop the service, move $db and the data directory away (keep them), and run the installer again; see \"Upgrading from 1.x\" in docs/deployment.md"
+	[ "$(schema_generation "$installed")" -lt "$(schema_generation "$NEW_VERSION")" ] || return 0
+	die "gono-cloud $installed cannot be upgraded to $NEW_VERSION in place: $NEW_VERSION starts with a new database schema, which the database of $installed cannot be migrated to. Nothing was changed. To start over with $NEW_VERSION, stop the service, move $db and the data directory away (keep them), and run the installer again; see \"Upgrading from 1.x or 2.x\" in docs/deployment.md"
 }
 
 # Writes the configuration of a fresh install to $WORK/config.toml and validates it.
@@ -555,7 +559,7 @@ install_release() {
 			db_path=$(setting "$PAYLOAD/gono-cloud" "$CONFIG_FILE" db.path)
 			# A configuration without a database: an earlier install stopped before `init`.
 			[ -e "$db_path" ] || needs_init=1
-			[ "$needs_init" = 1 ] || refuse_upgrade_from_1x "$db_path"
+			[ "$needs_init" = 1 ] || refuse_upgrade_across_schemas "$db_path"
 		fi
 	fi
 	if [ "$needs_init" = 1 ] && [ "$PASSWORD_STDIN" = 0 ] && ! [ -t 0 ]; then

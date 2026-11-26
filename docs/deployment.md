@@ -30,7 +30,7 @@ sudo sh cloud.server.sh --base-url https://cloud.example.com
 ```
 
 To install a particular release, take its script instead
-(`https://github.com/gonolab/gono.cloud/releases/download/server-v2.0.0/cloud.server.sh`) or
+(`https://github.com/gonolab/gono.cloud/releases/download/server-v3.0.0/cloud.server.sh`) or
 pass `--version`. Release 1.0.0 also carries the same script under its original name,
 `install.sh`.
 
@@ -72,7 +72,7 @@ hand, and that they were built by this repository's release workflow:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify gono-cloud-2.0.0-x86_64-unknown-linux-musl.tar.gz --repo gonolab/gono.cloud
+gh attestation verify gono-cloud-3.0.0-x86_64-unknown-linux-musl.tar.gz --repo gonolab/gono.cloud
 ```
 
 ### Paths
@@ -97,8 +97,8 @@ users.
 The release archive contains everything the script uses. On Linux:
 
 ```sh
-tar -xzf gono-cloud-2.0.0-x86_64-unknown-linux-musl.tar.gz
-cd gono-cloud-2.0.0-x86_64-unknown-linux-musl
+tar -xzf gono-cloud-3.0.0-x86_64-unknown-linux-musl.tar.gz
+cd gono-cloud-3.0.0-x86_64-unknown-linux-musl
 
 sudo useradd --system --user-group --home-dir /var/lib/gono-cloud --no-create-home \
   --shell /usr/sbin/nologin gono-cloud
@@ -1028,12 +1028,12 @@ database from the backup taken before the upgrade (see [Restoring](#restoring)),
 service:
 
 ```sh
-sudo sh cloud.server.sh --version 2.0.0 --no-start   # the cloud.server.sh of any release
-# restore /var/lib/gono-cloud/backups/<time>-2.0.0/gono-cloud.db as described below
+sudo sh cloud.server.sh --version 3.0.0 --no-start   # the cloud.server.sh of any release
+# restore /var/lib/gono-cloud/backups/<time>-3.0.0/gono-cloud.db as described below
 sudo systemctl start gono-cloud
 ```
 
-A release before 2.0.0 cannot read the database of 2.0.0 or later at all.
+A release before 3.0.0 cannot read the database of 3.0.0 or later at all.
 
 Changes made since the upgrade are lost from the database; `rescan --all` picks up the files
 uploaded in the meantime.
@@ -1042,37 +1042,42 @@ Without the script: stop the service, back up the database, replace `/usr/local/
 and the unit file with the ones from the new archive, run `systemctl daemon-reload` and start
 the service.
 
-### Upgrading from 1.x
+### Upgrading from 1.x or 2.x
 
-2.0.0 starts with a new database schema, and the database of a 1.x server cannot be migrated to
-it: there were no production deployments to carry over. The install script of 2.0.0 and later
-stops, without changing anything, when it finds a 1.x server with its database, and a 2.0.0
-server refuses to start on a 1.x database. The configuration of 1.x keeps working and the files
-stay, but accounts, app passwords and file metadata (ids, favorites, locks) start anew. To start
-over:
+2.0.0 and 3.0.0 each start with a new database schema, and the database of an earlier server
+cannot be migrated to it: there were no production deployments to carry over. The install
+script of 3.0.0 and later stops, without changing anything, when it finds a 1.x or 2.x server
+with its database (the one of 2.0.0 and later stops for 1.x), and the server refuses to start
+on such a database. The configuration keeps working, apart from the admin path below, and the
+files stay, but accounts, app passwords and file metadata (ids, favorites, locks) start anew. To
+start over:
 
 1. Stop the service: `sudo systemctl stop gono-cloud`.
 2. Move the database and the data directory away, and keep them until the new installation
-   works:
+   works (`2.x` here; name the directory after the old version):
 
    ```sh
-   sudo mkdir /var/lib/gono-cloud/1.x
-   sudo sh -c 'mv /var/lib/gono-cloud/gono-cloud.db* /var/lib/gono-cloud/data /var/lib/gono-cloud/1.x/'
+   sudo mkdir /var/lib/gono-cloud/2.x
+   sudo sh -c 'mv /var/lib/gono-cloud/gono-cloud.db* /var/lib/gono-cloud/data /var/lib/gono-cloud/2.x/'
    ```
 
    (`storage.data_dir` and `db.path` in the configuration say where they are, if you moved them.)
-3. Run the new install script without `--base-url`, from a terminal: it keeps the configuration,
+3. From 2.x: remove `path = "/apps/manage"` from `[admin]` in `/etc/gono-cloud/config.toml`. The
+   install script of 2.0 wrote it, and 3.0.0 refuses every path below `/apps`; without it the
+   admin UI lives at `/manage/`.
+4. Run the new install script without `--base-url`, from a terminal: it keeps the configuration,
    finds no database, creates one with a new admin account (`--admin`, `admin` by default) as a
    fresh install does, and starts the service.
-4. Create the other accounts again ([Managing accounts](#managing-accounts)), and sign the
-   Nextcloud clients and devices in again: their app passwords are gone.
-5. Bring the files back, through a client, or by copying an account's files from the old data
+5. Turn the admin account's services on (from 3.0.0 every new account starts without them) and
+   create the other accounts again ([Managing accounts](#managing-accounts)). Sign the Nextcloud
+   clients and devices in again: their app passwords are gone.
+6. Bring the files back, through a client, or by copying an account's files from the old data
    directory into its new one (owned by the service user) and running `rescan` for it. The files
    of the account with id `<n>` are in `files/<n>/` of a data directory; `user list` shows the
    new ids.
 
-Configurations written by the install script of 1.0 to 1.2 set `admin.path = "/gono-admin"`;
-the admin UI now lives at `/manage/` by default (see the changelog).
+Configurations written by the install script of 1.0 to 1.2 set `admin.path = "/gono-admin"`,
+which still works; the admin UI otherwise lives at `/manage/` (see the changelog).
 
 ## Backup and restore
 

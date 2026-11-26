@@ -1,7 +1,7 @@
 #!/bin/sh
 # End-to-end test of cloud.server.sh on a throwaway machine: refused installs, a fresh install, the
 # running service, WebDAV through the (sandboxed) service, the root guard of the CLI, a
-# graceful stop, an upgrade, a refused upgrade from 1.x and the uninstall.
+# graceful stop, an upgrade, refused upgrades from 1.x and 2.x and the uninstall.
 #
 # Usage: packaging/server/test-install.sh <cloud.server.sh> <archive> [<SHA256SUMS>]
 #
@@ -174,6 +174,10 @@ token=$(as_service_user app-password add admin --label install-test | sed -n 's/
 [ -n "$token" ] || fail "no app password"
 printf 'hello from the install test\n' >"$work/hello.txt"
 dav=http://$ADDR/remote.php/dav/files/admin
+# Accounts start without services, the first admin too: WebDAV answers 403 until it is on.
+status=$(curl -s -o /dev/null -w '%{http_code}' -u "admin:$token" -X PROPFIND -H 'Depth: 0' "$dav/")
+[ "$status" = 403 ] || fail "PROPFIND without the WebDAV service answered $status"
+as_service_user user services admin --enable webdav
 curl -fsS -u "admin:$token" -T "$work/hello.txt" "$dav/hello.txt"
 curl -fsS -u "admin:$token" "$dav/hello.txt" >"$work/back.txt"
 cmp "$work/hello.txt" "$work/back.txt" || fail "downloaded file differs"
@@ -221,21 +225,25 @@ sudo rm "$key"
 sudo mv "$key.saved" "$key"
 wait_until_healthy
 
-step "An upgrade from 1.x stops before it changes anything"
-sudo cp -p "$BIN" "$work/gono-cloud.real"
-printf '#!/bin/sh\necho "gono-cloud 1.2.0"\n' >"$work/gono-cloud.old"
-sudo install -m 0755 "$work/gono-cloud.old" "$BIN"
-backups_before=$(sudo ls "$state/backups" | wc -l)
-if run_installer </dev/null >"$work/out" 2>&1; then
+# 2.0.0 and 3.0.0 each started a new database schema: stand-in binaries of the last release
+# before each must not be upgraded in place.
+for old in 1.2.0 2.0.2; do
+	step "An upgrade from $old stops before it changes anything"
+	sudo cp -p "$BIN" "$work/gono-cloud.real"
+	printf '#!/bin/sh\necho "gono-cloud %s"\n' "$old" >"$work/gono-cloud.old"
+	sudo install -m 0755 "$work/gono-cloud.old" "$BIN"
+	backups_before=$(sudo ls "$state/backups" | wc -l)
+	if run_installer </dev/null >"$work/out" 2>&1; then
+		cat "$work/out"
+		fail "the installer upgraded $old in place"
+	fi
 	cat "$work/out"
-	fail "the installer upgraded 1.2.0 in place"
-fi
-cat "$work/out"
-grep -q "cannot be upgraded to .* in place" "$work/out" || fail "no explanation of the refused upgrade"
-sudo cmp -s "$work/gono-cloud.old" "$BIN" || fail "the refused upgrade replaced the binary"
-[ "$backups_before" = "$(sudo ls "$state/backups" | wc -l)" ] || fail "the refused upgrade made a backup"
-sudo install -m 0755 "$work/gono-cloud.real" "$BIN"
-wait_until_healthy
+	grep -q "cannot be upgraded to .* in place" "$work/out" || fail "no explanation of the refused upgrade"
+	sudo cmp -s "$work/gono-cloud.old" "$BIN" || fail "the refused upgrade replaced the binary"
+	[ "$backups_before" = "$(sudo ls "$state/backups" | wc -l)" ] || fail "the refused upgrade made a backup"
+	sudo install -m 0755 "$work/gono-cloud.real" "$BIN"
+	wait_until_healthy
+done
 
 step "Uninstall keeps the configuration, the data and the service user"
 sudo sh "$installer" --uninstall
