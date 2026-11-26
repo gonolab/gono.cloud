@@ -13,7 +13,14 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # The S3 tests use the AWS SDK as it ships: with its default checksums (CRC32 in aws-chunked
 # trailers) and SigV4, presigned URLs included.
-aws-sdk-s3 = "1"
+# Default features minus the deprecated `rustls` one: it adds the legacy hyper 0.14 client on
+# rustls 0.21, which no longer gets security fixes. The default HTTPS client stays.
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+  "default-https-client",
+  "http-1x",
+  "rt-tokio",
+  "sigv4a",
+] }
 # Signs browser form uploads (POST policies), which the SDK does not build.
 aws-sigv4 = "1"
 base64 = "0.22"
